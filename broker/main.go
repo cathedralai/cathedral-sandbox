@@ -180,10 +180,13 @@ type config struct {
 	// turned off for every hotel or for joined hotels. The ops escape is
 	// "sealed_admission": "off" on one operator hotel's entry.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
-	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // a gated hotel's measurement must be one of these; empty refuses every gated hotel
-	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
-	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
-	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	SealedMeasurements []string `json:"sealed_measurements,omitempty"` // a gated hotel's measurement must be one of these; empty refuses every gated hotel
+	SealedHostData     []string `json:"sealed_host_data,omitempty"`    // non-empty: its HOST_DATA must be one of these
+	// An optional Genoa SNP firmware component floor. Zero leaves it unset
+	// until patched hosts are available. It does not prove the OEM PI fix.
+	MinGenoaSNPSPL     int     `json:"min_genoa_snp_spl,omitempty"`
+	AttestTTLSeconds   float64 `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
+	AttestEverySeconds float64 `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
 	// RequireSealedGuestTLS (AB#378): every sealed hotel is reached only over
 	// its attested guest TLS key. A sealed config hotel must set "guest_tls":
 	// true, and a sealed join must pass the keyless HTTPS bootstrap. Off by
@@ -430,6 +433,9 @@ func loadBroker(path string) (*broker, error) {
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return nil, err
 	}
+	if c.MinGenoaSNPSPL < 0 || c.MinGenoaSNPSPL > 255 {
+		return nil, errors.New("config: min_genoa_snp_spl must be an 8-bit SNP component value")
+	}
 	if c.MinerEnrollKeySHA256 != "" {
 		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
 		if err != nil || len(hash) != sha256.Size {
@@ -489,6 +495,9 @@ func loadBroker(path string) (*broker, error) {
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
 			return nil, err
+		}
+		if c.MinGenoaSNPSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
+			return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_snp_spl", hc.ID)
 		}
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
@@ -1965,6 +1974,7 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	b.mu.Unlock()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
 	res := map[string]int{}
+	claimBusy := false
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
@@ -1974,17 +1984,53 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
-			status, _, _, err := h.do(r.Context(), "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
-			if err != nil {
-				status = 502
-			}
+			status, busy := bulkDeleteFromHotel(r.Context(), h, q)
 			mu.Lock()
 			res[h.cfg.ID] = status
+			claimBusy = claimBusy || busy
 			mu.Unlock()
 		}(h)
 	}
 	wg.Wait()
+	if claimBusy {
+		writeJSON(w, 409, map[string]any{"error": map[string]string{
+			"code": "bulk_delete_claim_busy", "message": "bulk deletion may be incomplete after a room claim; retry it",
+		}, "hotels": res})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"hotels": res})
+}
+
+// A claim's lifetime call is bounded at the hotel. Retry only its explicit
+// refusal; another 409 can mean a permanent problem and must keep its status.
+func bulkDeleteFromHotel(ctx context.Context, h *hotel, q url.Values) (int, bool) {
+	deadline := time.Now().Add(12 * time.Second)
+	sawClaimBusy := false
+	for {
+		status, _, body, err := h.do(ctx, "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
+		if err != nil {
+			if sawClaimBusy {
+				return 409, true
+			}
+			return 502, false
+		}
+		if status != 409 || errCodeOf(body) != "bulk_delete_claim_busy" {
+			return status, sawClaimBusy && (status < 200 || status >= 300)
+		}
+		sawClaimBusy = true
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 409, true
+		}
+		wait := min(100*time.Millisecond, remaining)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 409, true
+		case <-timer.C:
+		}
+	}
 }
 
 // ---------------------------------------------------------------- stats

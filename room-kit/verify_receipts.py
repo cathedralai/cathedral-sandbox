@@ -22,6 +22,9 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      equal the report; the report's ECDSA P-384 signature verifies with the VCEK.
      Optional --ark-sha256 pins the ARK certificate; repeat it to accept
      any of several roots (one per product: Milan, Genoa, ...).
+     Optional --min-genoa-snp-spl checks the current, reported, committed and
+     launch SNP TCB components after the AMD chain; it cannot prove the OEM
+     PI, mitigation bit or full microcode patch in AMD-SB-3059/3061.
   4. receipts: each statement names this binding and the sealed hotel receipt
      schema, receipt_sha256 = sha256(canonical(statement)), the Ed25519
      signature verifies with the binding's receipt key, and the chain links
@@ -100,7 +103,8 @@ Run mode (--oneshot FILE, a cathedral_oneshot_bundle_v1) checks one run's file o
 caller expects, in eight checks. The AMD certificates come from the file (amd_certs) and must match
 --ark-sha256, which run mode requires. Any missing input is a FAIL, never a guess.
 Run mode takes --oneshot, --recipe, --context or --no-context, --run-id, --input-sha256, --input-file,
---output-file, --expected-measurement, --allowed-measurements, --ark-sha256, --product and --require-sealed (which
+--output-file, --expected-measurement, --allowed-measurements, --ark-sha256, --product,
+--min-genoa-snp-spl and --require-sealed (which
 changes nothing: run mode always requires an SEV-SNP attestation). These flags are usage errors with exit 2:
 --receipts, --attestation, --broker, --origin, --key-file, --operator-key-file, --hotel, --sandbox,
 --receipt-header, --cathedral-sandbox, --save, --owner-pubkey, --tls-spki-sha256, --require-tls and --kds-cache,
@@ -453,7 +457,8 @@ def verify_hotel_attestation(att: dict) -> dict:
 
 
 def verify_attestation(att: dict, expected_measurement: str | list[str] | None, prod: str | None, cache: str,
-                       ark_sha256: str | list[str] | None, skip_amd: bool, certs: dict | None = None) -> dict:
+                       ark_sha256: str | list[str] | None, skip_amd: bool, certs: dict | None = None,
+                       min_genoa_snp_spl: int = 0) -> dict:
     binding = att["binding"]
     bsha = sha(canonical(binding))
     need(bsha == att["binding_sha256"], "binding_sha256 does not match the binding")
@@ -482,6 +487,17 @@ def verify_attestation(att: dict, expected_measurement: str | list[str] | None, 
            "kernel_cmdline": cmdline}
     if not skip_amd:
         out["amd"] = verify_amd(report, rep, product(rep, prod), cache, ark_sha256, certs)
+    if min_genoa_snp_spl:
+        need(not skip_amd and out["amd"]["product"] in ("Genoa", "Milan"),
+             "Genoa SNP floor requires a verified AMD processor generation")
+        if out["amd"]["product"] == "Genoa":
+            for name, offset in (("current", 0x38), ("reported", 0x180),
+                                 ("committed", 0x1E0), ("launch", 0x1F0)):
+                need(report[offset + 6] >= min_genoa_snp_spl,
+                     f"{name} TCB SNP component is below Genoa floor 0x{min_genoa_snp_spl:02x}")
+            out["amd"]["min_genoa_snp_spl_checked"] = min_genoa_snp_spl
+        else:
+            out["amd"]["min_genoa_snp_spl_not_applied"] = "Genoa floor not applied to Milan"
     return out
 
 
@@ -1993,7 +2009,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
          "check 1: the file holds no AMD certificates (amd_certs)")
     try:
         attestation_out = verify_attestation(att, trust["measurements"], trust.get("product"), "", trust["ark_sha256"],
-                                             False, certs)
+                                             False, certs, trust.get("min_genoa_snp_spl", 0))
         chain_out = verify_receipts(att, receipts, None)
         edges = check_snapshot_edges(receipts)
         if edges is not None:
@@ -2307,7 +2323,8 @@ def run_mode(a) -> int:
             held[path] = read_file(value, "the output file")
         caller = {"context": context, "run_id": a.run_id, "input_hashes": hashes, "output_bytes": held}
         out = verify_oneshot(bundle, recipe, {"measurements": list(dict.fromkeys(measurements)),
-                                              "ark_sha256": a.ark_sha256, "product": a.product}, caller)
+                                              "ark_sha256": a.ark_sha256, "product": a.product,
+                                              "min_genoa_snp_spl": a.min_genoa_snp_spl or 0}, caller)
         print(json.dumps(out, indent=1))
         return 0
     except (KeyError, TypeError, AttributeError, IndexError, ValueError, OverflowError, RecursionError):
@@ -2347,6 +2364,8 @@ def main() -> int:
                     help="run mode: an output file you hold, to check against the receipts; repeat per output")
     ap.add_argument("--ark-sha256", action="append",
                     help="pin the AMD ARK certificate (sha256 of its DER); repeat to accept any of several")
+    ap.add_argument("--min-genoa-snp-spl", type=int, metavar="N",
+                    help="require Genoa current/reported/committed/launch SNP TCB components >= N (e.g. 30 for AMD-SB-3059); requires AMD chain")
     ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
     ap.add_argument("--kds-cache", help="list mode: where fetched AMD certificates are cached "
                                         "(default ~/.cache/amd-kds)")
@@ -2363,6 +2382,8 @@ def main() -> int:
     ap.add_argument("--cathedral-sandbox", help="a Cathedral sandbox id (UUID): fail unless a successful create "
                                                 "receipt names it")
     a = ap.parse_args()
+    if a.min_genoa_snp_spl is not None and not 1 <= a.min_genoa_snp_spl <= 255:
+        ap.error("--min-genoa-snp-spl must be an integer from 1 to 255")
     if a.oneshot:
         # Every flag run mode does not act on is refused, so no caller believes a check ran that did not.
         # --require-sealed is accepted: run mode always requires an SEV-SNP attestation.
@@ -2438,7 +2459,8 @@ def main() -> int:
                 raise Fail("--receipt-header is not base64url JSON") from exc
         check_receipt_shapes(receipts)
         owner = owner_key_bytes(a.owner_pubkey) if a.owner_pubkey else None
-        sealed_asked = a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product or owner
+        sealed_asked = (a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product
+                        or a.min_genoa_snp_spl or owner)
         if is_hotel_level(att) and sealed_asked:
             # A sealed guest whose TSM is missing runs level 1 under the same
             # hotel name. Asking for a measurement means asking for SNP.
@@ -2463,7 +2485,8 @@ def main() -> int:
             chain_out = verify_receipts(att, live_receipts, chain_head)
         else:
             attestation_out = verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
-                                                 a.ark_sha256, a.skip_amd)
+                                                 a.ark_sha256, a.skip_amd,
+                                                 min_genoa_snp_spl=a.min_genoa_snp_spl or 0)
             guest_tls = verify_guest_tls(att, peer_spki, require=bool(a.require_tls or a.origin))
             if guest_tls is not None:
                 if a.origin:
