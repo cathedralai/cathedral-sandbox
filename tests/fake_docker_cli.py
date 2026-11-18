@@ -418,6 +418,9 @@ def main(argv):
             return 127
         if rest == ["true"]:
             return 0
+        if rest[:3] == ["sh", "-c", ":"] and b.get("no_sh"):
+            print("exec: \"sh\": executable file not found in $PATH", file=sys.stderr)
+            return 127
         line = " ".join(rest)
         for rule in b.get("exec_rules", []):
             if rule["contains"] in line:
@@ -427,6 +430,11 @@ def main(argv):
                 print(rule.get("stdout", ""), end="")
                 if rule.get("sleep"):
                     time.sleep(rule["sleep"])
+                if rule.get("wait_for"):
+                    # A long-running command that ends once another call creates the file.
+                    deadline = time.time() + 20
+                    while not os.path.exists(rule["wait_for"]) and time.time() < deadline:
+                        time.sleep(0.02)
                 if rule.get("kill_container"):
                     # A room killed by the host cgroup: the container ends and docker exec gives 128.
                     # inspect_lag: docker still says running (OOMKilled already true) for that many inspects.
@@ -475,6 +483,28 @@ def main(argv):
             return 1
         extra = f" {'true' if c.get('oom_killed') else 'false'}" if "OOMKilled" in argv[argv.index("--format") + 1] else ""
         print((f"false {c.get('exit_code') or 0}" if c.get("status") == "exited" else "true 0") + extra)
+        return 0
+
+    if cmd == "logs":
+        # AB#419: docker logs --timestamps [--since sec.nanos] <cid>. --since is
+        # inclusive, as the daemon's json-file reader is. Lines are
+        # [ns, stream, text]; text carries its own newline (none for a partial).
+        with Locked() as st:
+            cid = find(st, argv[-1])
+            c = st["containers"].get(cid) if cid else None
+        if c is None or b.get("logs_fail"):
+            print(f"Error response from daemon: No such container: {argv[-1]}", file=sys.stderr)
+            return 1
+        since = 0
+        if "--since" in argv:
+            sec, _, frac = argv[argv.index("--since") + 1].partition(".")
+            since = int(sec) * 1_000_000_000 + int(frac.ljust(9, "0"))
+        for ns, stream, text in c.get("logs", []):
+            if ns < since:
+                continue
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ns // 1_000_000_000))
+            out = sys.stdout if stream == "stdout" else sys.stderr
+            out.write(f"{stamp}.{ns % 1_000_000_000:09d}Z {text}")
         return 0
 
     if cmd == "save":
@@ -587,6 +617,19 @@ class FakeDocker:
         state = self._load()
         state["containers"][cid] = {"name": name, "labels": labels, "status": "running", "argv": []}
         self._save(state)
+
+    def add_log(self, cid: str, stream: str, text: str, ns: int) -> None:
+        """Append one entrypoint log line (AB#419) as the daemon would keep it."""
+        state = self._load()
+        state["containers"][cid].setdefault("logs", []).append([ns, stream, text])
+        self._save(state)
+
+    def add_long_line(self, cid: str, stream: str, text: str, ns: int, chunk: int = 16 * 1024) -> None:
+        """One line as the daemon keeps a long one (AB#419): partial messages of
+        *chunk* bytes, all with the first one's time (moby copier.go partialTS)."""
+        data = text.encode()
+        for start in range(0, len(data), chunk):
+            self.add_log(cid, stream, data[start:start + chunk].decode(), ns)
 
     @property
     def state(self) -> dict[str, Any]:

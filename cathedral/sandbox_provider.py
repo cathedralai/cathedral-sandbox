@@ -27,8 +27,10 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import errno
 import io
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -78,6 +80,69 @@ from cathedral.sandbox_api import (
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# One page of a process log (AB#419). The API holds a page in memory, so a page
+# is capped like exec output.
+LOG_PAGE_CAP = 16 * 1024 * 1024
+
+
+def utf8_page_end(chunk: bytes) -> int:
+    """Length of *chunk* cut back to a UTF-8 character boundary.
+
+    A page that ended inside a character would decode to a replacement mark on
+    both sides of the cut. When the tail is not the start of a valid character
+    (invalid bytes, or no lead byte within reach), keep the whole chunk so a read
+    always makes progress.
+    """
+    n = len(chunk)
+    for back in range(1, min(4, n) + 1):
+        b = chunk[n - back]
+        if b < 0x80:
+            return n
+        if b >= 0xC0:
+            need = 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+            if back >= need:
+                return n
+            return n - back if n - back > 0 else n
+    return n
+
+
+def validated_log_page(offset: Any, limit: Any) -> tuple[int, int]:
+    """(offset, limit) of a process log read; offset 0 and the cap by default."""
+    if offset is None:
+        offset = 0
+    if limit is None:
+        limit = LOG_PAGE_CAP
+    if type(offset) is not int or offset < 0:
+        raise SandboxContractError("invalid_request", "offset must be a whole number of bytes, 0 or more")
+    if type(limit) is not int or not 1 <= limit <= LOG_PAGE_CAP:
+        raise SandboxContractError("invalid_request", f"limit must be from 1 to {LOG_PAGE_CAP} bytes")
+    return offset, limit
+
+
+def read_log_page(fh: Any, size: int, offset: int, limit: int) -> dict[str, Any]:
+    """Read one page of an open log file: bytes [offset, offset + limit) cut to a character.
+
+    ``next_offset`` is the byte offset to pass back for the bytes after this page,
+    so a second read returns only what the first did not.
+    """
+    if offset >= size:
+        chunk = b""
+    else:
+        fh.seek(offset)
+        chunk = fh.read(min(limit, size - offset))
+        # Also at the end of the file: a writer may be mid character, and the
+        # next read returns that character whole.
+        chunk = chunk[: utf8_page_end(chunk)]
+    next_offset = offset + len(chunk)
+    return {
+        "logs": chunk.decode("utf-8", "replace"),
+        "offset": offset,
+        "next_offset": next_offset,
+        "size": size,
+        "more": next_offset < size,
+    }
 
 
 class SandboxOpError(Exception):
@@ -234,6 +299,23 @@ class SnapshotCapture:
     done: bool = False
 
 
+@contextlib.contextmanager
+def _disk_full_is_413(sandbox: "_Sandbox"):
+    """A write that hits the room's xfs cap (AB#396) or a full volume is a 413, not a 500.
+
+    The pre-check sums file sizes; the cap counts allocated blocks, so a write
+    that passed it can still run out.
+    """
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            raise SandboxOpError(
+                "disk_quota_exceeded", 413, f"write would exceed disk_gib={sandbox.resources.disk_gib}"
+            ) from None
+        raise
+
+
 # AB#534: how stale a room's disk_bytes may be in a list answer.
 _DISK_LIST_MAX_AGE = 10.0
 
@@ -283,11 +365,17 @@ class SandboxProvider(Protocol):
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult: ...
     def write_file(self, sandbox_id: str, path: str, data: bytes, mode: int | None) -> None: ...
     def read_file(self, sandbox_id: str, spec: FileGet) -> tuple[bytes, int]: ...
+    def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]: ...
+    def make_directory(self, sandbox_id: str, path: str) -> bool: ...
+    def remove_entry(self, sandbox_id: str, path: str) -> bool: ...
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None: ...
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes: ...
     def stat(self, sandbox_id: str, path: str) -> StatResult: ...
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle: ...
     def process_logs(self, sandbox_id: str, process_id: str) -> str: ...
+    def process_logs_page(
+        self, sandbox_id: str, process_id: str, *, offset: int | None = None, limit: int | None = None
+    ) -> dict[str, Any]: ...
     def stop_process(self, sandbox_id: str, process_id: str) -> None: ...
     def snapshot(self, sandbox_id: str, *, ttl_seconds: int | None = None, name: str | None = None, labels: dict[str, str] | None = None) -> str: ...
     def list_snapshots(self, labels: Iterable[str] = (), *, owner: str | None = None) -> list[dict[str, Any]]: ...
@@ -315,7 +403,7 @@ class SandboxProvider(Protocol):
     def quota(self) -> dict[str, Any]: ...
     def usage(self, *, group_by: str | None, labels: Iterable[str]) -> dict[str, Any]: ...
     def status(self) -> dict[str, Any]: ...
-    def logs(self, sandbox_id: str) -> dict[str, Any]: ...
+    def logs(self, sandbox_id: str, *, entrypoint_cursor: str | None = None) -> dict[str, Any]: ...
     def get_operation(self, operation_id: str) -> dict[str, Any]: ...
     def sweep(self) -> int: ...
     def freeze(self, sandbox_id: str) -> dict[str, Any]: ...
@@ -956,6 +1044,24 @@ class InMemorySandboxProvider:
                 raise SandboxOpError("process_not_found", 404, f"no process {process_id}")
             return entry[1].read_bytes().decode("utf-8", "replace") if entry[1].exists() else ""
 
+    def process_logs_page(
+        self, sandbox_id: str, process_id: str, *, offset: int | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
+        """One page of a background process's log from a byte offset (AB#419)."""
+        offset, limit = validated_log_page(offset, limit)
+        with self._lock:
+            sandbox = self._require_active(sandbox_id)
+            entry = sandbox.processes.get(process_id)
+            if entry is None:
+                raise SandboxOpError("process_not_found", 404, f"no process {process_id}")
+            path = entry[1]
+        try:
+            with open(path, "rb") as fh:
+                page = read_log_page(fh, os.fstat(fh.fileno()).st_size, offset, limit)
+        except FileNotFoundError:
+            page = read_log_page(None, 0, offset, limit)
+        return {"process_id": process_id, **page}
+
     def stop_process(self, sandbox_id: str, process_id: str) -> None:
         with self._lock:
             sandbox = self._require_active(sandbox_id)
@@ -1022,13 +1128,14 @@ class InMemorySandboxProvider:
                 self._touch(sandbox)
                 self._assert_disk_room(sandbox, extra_bytes=len(data), replacing=path)
             self._host(sandbox, path)
-            fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
-            with os.fdopen(fd, "wb") as fh:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
-                fh.write(data)
-                if mode is not None:
-                    os.fchmod(fd, mode)
+            with _disk_full_is_413(sandbox):
+                fd = _open_beneath(sandbox.root, path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, make_dirs=True)
+                with os.fdopen(fd, "wb") as fh:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise SandboxOpError("not_a_file", 400, f"{path} is not a regular file")
+                    fh.write(data)
+                    if mode is not None:
+                        os.fchmod(fd, mode)
         finally:
             self._end_api_write(sandbox_id)
 
@@ -1055,6 +1162,100 @@ class InMemorySandboxProvider:
                 return fh.read(length), total
             return fh.read(), total
 
+    def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]:
+        """List plain entries through a directory fd, without following room links."""
+        with self._lock:
+            sandbox = self._require_active(sandbox_id)
+            self._touch(sandbox)
+        self._host(sandbox, path)
+        try:
+            fd = _open_beneath(sandbox.root, path, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            raise SandboxOpError("directory_not_found", 404, f"no directory {path}") from None
+        entries: list[dict[str, str]] = []
+        try:
+            with os.scandir(fd) as scan:
+                scanned = 0
+                for entry in scan:
+                    scanned += 1
+                    if scanned > 1000:
+                        raise SandboxOpError(
+                            "directory_too_large", 413, "directory has more than 1000 entries"
+                        )
+                    # Links and special files are not navigable through this API.
+                    if entry.is_dir(follow_symlinks=False):
+                        kind = "directory"
+                    elif entry.is_file(follow_symlinks=False):
+                        kind = "file"
+                    else:
+                        continue
+                    entries.append({"name": entry.name, "kind": kind})
+        finally:
+            os.close(fd)
+        return sorted(entries, key=lambda entry: entry["name"])
+
+    def make_directory(self, sandbox_id: str, path: str) -> bool:
+        """Create one directory beneath /work, without following room links."""
+        parent, name = _work_entry_parent(path)
+        with self._lock:
+            sandbox = self._require_running(sandbox_id)
+            self._touch(sandbox)
+        try:
+            parent_fd = _open_beneath(sandbox.root, parent, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            raise SandboxOpError("directory_not_found", 404, f"no directory {parent}") from None
+        try:
+            try:
+                os.mkdir(name, 0o755, dir_fd=parent_fd)
+            except FileExistsError:
+                try:
+                    entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    raise SandboxOpError("entry_changed", 409, f"entry {path} changed during create") from None
+                if stat.S_ISDIR(entry.st_mode):
+                    return False
+                raise SandboxOpError("entry_exists", 409, f"{path} is not a plain directory") from None
+        finally:
+            os.close(parent_fd)
+        return True
+
+    def remove_entry(self, sandbox_id: str, path: str) -> bool:
+        """Remove one plain file or empty directory by path; never recurse."""
+        parent, name = _work_entry_parent(path)
+        with self._lock:
+            sandbox = self._require_running(sandbox_id)
+            self._touch(sandbox)
+        try:
+            parent_fd = _open_beneath(sandbox.root, parent, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            raise SandboxOpError("directory_not_found", 404, f"no directory {parent}") from None
+        try:
+            try:
+                entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            if stat.S_ISDIR(entry.st_mode):
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        return False
+                    if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                        raise SandboxOpError("directory_not_empty", 409, f"directory {path} is not empty") from exc
+                    raise SandboxOpError("entry_changed", 409, f"entry {path} changed during delete") from exc
+            elif stat.S_ISREG(entry.st_mode):
+                try:
+                    os.unlink(name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    return False
+                except OSError as exc:
+                    raise SandboxOpError("entry_changed", 409, f"entry {path} changed during delete") from exc
+            else:
+                raise SandboxOpError("entry_not_plain", 409, f"{path} is not a plain file or directory")
+        finally:
+            os.close(parent_fd)
+        return True
+
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         with self._lock:
             sandbox = self._begin_api_write(sandbox_id)
@@ -1068,7 +1269,7 @@ class InMemorySandboxProvider:
             target.mkdir(parents=True, exist_ok=True)
             import io
 
-            with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
+            with _disk_full_is_413(sandbox), tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
                 _safe_extract(tf, target)
             with self._lock:
                 sandbox = self._require_active(sandbox_id)
@@ -1469,8 +1670,12 @@ class InMemorySandboxProvider:
             "retained_until": sandbox.deleted_at + timedelta(hours=api.PROCESS_LOG_RETENTION_HOURS),
         }
 
-    def logs(self, sandbox_id: str) -> dict[str, Any]:
-        """§3.13: container stdout/stderr + exec history, retained 24 h after delete."""
+    def logs(self, sandbox_id: str, *, entrypoint_cursor: str | None = None) -> dict[str, Any]:
+        """§3.13: container stdout/stderr + exec history, retained 24 h after delete.
+
+        ``entrypoint_cursor`` is for a guest provider's entrypoint log (AB#419); a
+        sandbox here has no container, so it is not read.
+        """
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
             if sandbox is not None and sandbox.state != "deleted":
@@ -2312,6 +2517,21 @@ class InMemorySandboxProvider:
             "snapshot_gib_month_usd": self._pricing.snapshot_gib_month_usd,
             "reference": self._pricing.reference_comparisons(),
         }
+
+
+def _work_entry_parent(path: str) -> tuple[str, str]:
+    if (
+        not isinstance(path, str)
+        or len(path) > 2048
+        or "\x00" in path
+        or not path.startswith("/work/")
+        or posixpath.normpath(path) != path
+    ):
+        raise SandboxOpError("invalid_path", 400, "entry path must be normalized and beneath /work")
+    parent, name = posixpath.split(path)
+    if not name or name in (".", ".."):
+        raise SandboxOpError("invalid_path", 400, "entry name is invalid")
+    return parent, name
 
 
 def _open_beneath(root: Path, path: str, flags: int, *, make_dirs: bool = False) -> int:

@@ -273,7 +273,8 @@ No lock is held anywhere in these files unless stated. "none" means none.
   does needs root (key is group readable, socket is group writable, the store could be a
   RuntimeDirectory); root is needed only for the TSM configfs in the sealed guest. It is
   the customer facing HTTP front for every call except /room/health. The store
-  (chain-<boot_id>.jsonl, 0700 dir) is on tmpfs and the whole chain is also kept in memory;
+  (chain-<boot_id>-<binding_sha256[:16]>.jsonl and attestation-<boot_id>-<binding_sha256[:16]>.json,
+  one pair per front process, 0700 dir) is on tmpfs and the whole chain is also kept in memory;
   neither is pruned. Requires= on the API means `systemctl restart $ROOM_ID.service`
   restarts receipts too (new chain key), so step 13 re-keys the chain twice.
 - Dependency graph: data <- docker <- {API, egress (PartOf)}; API <- receipts; health and

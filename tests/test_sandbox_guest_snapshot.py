@@ -1222,6 +1222,112 @@ def test_a_failed_unpause_is_owed_reported_truthfully_logged_and_retried_by_the_
     assert provider.pending_reconciles() == {}
 
 
+def test_a_marked_room_whose_engine_cannot_be_read_fails_closed_on_get(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert list(provider.pending_reconciles()) == [sid]
+    real = provider._client.engine_status  # noqa: SLF001
+
+    def unreadable(cid):
+        raise SandboxOpError("docker_inspect_failed", 502, "docker inspect failed")
+
+    provider._client.engine_status = unreadable  # noqa: SLF001
+    with pytest.raises(SandboxOpError) as err:
+        provider.get(sid)
+    assert err.value.code == "reconcile_unreadable" and err.value.http_status == 503
+    provider._client.engine_status = real  # noqa: SLF001
+    assert provider.get(sid)["state"] == "frozen"
+
+
+def test_a_marked_room_reports_the_engine_now_not_a_stale_read(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert provider.get(sid)["state"] == "frozen"
+    # The unpause took effect late: the engine runs the room while the mark is still owed.
+    provider._client.engine_status = lambda cid: "running"  # noqa: SLF001
+    assert provider.get(sid)["state"] == "running"
+    # The container exited: never reported running.
+    provider._client.engine_status = lambda cid: "exited"  # noqa: SLF001
+    assert provider.get(sid)["state"] == "failed"
+
+
+def _end_container(fake, sid: str) -> None:
+    """The room's container stops on its own (the entrypoint exited, or the engine killed it)."""
+    state = fake.state
+    for c in state["containers"].values():
+        if c["labels"].get("cathedral.sandbox.id") == sid:
+            c["status"] = "exited"
+    fake._save(state)  # noqa: SLF001
+
+
+def test_a_marked_room_that_exits_before_the_sweep_stays_failed_after_it(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    _end_container(fake, sid)
+    provider.sweep()  # the reconcile finds nothing to unpause and drops the mark
+    assert provider.pending_reconciles() == {}
+    assert provider.get(sid)["state"] == "failed"  # not the record's "running"
+    provider.sweep()
+    assert provider.get(sid)["state"] == "failed"
+
+
+def _unpause_finds_it_stopped(fake, provider, sid: str) -> None:
+    """The container stops between the engine read and the unpause: Docker then says "is not paused"."""
+    def unpause(container_id):
+        _end_container(fake, sid)
+        raise SandboxOpError("docker_unpause_failed", 502, f"Error response from daemon: Container {container_id} is not paused")
+
+    provider._client.unpause = unpause  # noqa: SLF001
+
+
+def test_a_reconcile_whose_room_stops_before_the_unpause_says_failed(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert fake.status_of(sid) == "paused"
+    _unpause_finds_it_stopped(fake, provider, sid)
+    provider.sweep()
+    assert provider.pending_reconciles() == {}
+    assert provider.get(sid)["state"] == "failed"
+
+
+def test_a_capture_whose_room_stops_before_the_unpause_says_failed(fake, provider) -> None:
+    sid = _source(provider)
+    _unpause_finds_it_stopped(fake, provider, sid)
+    try:
+        provider.snapshot(sid)
+    except SandboxOpError:
+        pass  # whether the capture itself is kept is not this test's business
+    assert provider.get(sid)["state"] == "failed"
+
+
+def test_a_thaw_of_a_room_whose_container_stopped_is_refused_and_says_failed(fake, provider) -> None:
+    sid = _source(provider)
+    provider.freeze(sid)
+    _end_container(fake, sid)
+    with pytest.raises(SandboxOpError) as err:
+        provider.thaw(sid)
+    assert (err.value.code, err.value.http_status) == ("sandbox_not_running", 409)
+    assert provider.get(sid)["state"] == "failed"
+    provider.delete(sid)
+    assert sid not in provider._ended_rooms  # noqa: SLF001
+
+
+def test_a_thaw_of_a_room_already_running_in_the_engine_still_succeeds(fake, provider) -> None:
+    sid = _source(provider)
+    provider.freeze(sid)
+    provider._client.unpause(provider._guests[sid].container_id)  # noqa: SLF001  unpaused behind the record
+    assert provider.thaw(sid)["state"] == "running"
+    assert provider.get(sid)["state"] == "running"
+
+
 def test_an_owed_unpause_is_dropped_when_the_room_is_gone(fake, provider) -> None:
     sid = _source(provider)
     fake.set(unpause_fail_times=1)

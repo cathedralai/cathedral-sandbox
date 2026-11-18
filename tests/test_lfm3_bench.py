@@ -274,3 +274,35 @@ def test_sealed_bench_parses_the_real_line(room):
     assert done.returncode == 0, done.stderr
     line = sealed_bench.parse_bench(done.stdout, hashlib.sha256(prompts.encode()).hexdigest(), 1)
     assert line["harness"] == sealed_bench.ROOM_HARNESS and line["ttft_ms"] >= 0
+
+
+# AB#761: one SSE event must carry exactly one JSON object. Each bad event sits
+# before a valid final chunk and [DONE], which main used to accept.
+@pytest.mark.parametrize("bad", [
+    'data: 1',                               # jq error() on an early input did not fail the run
+    'data: {"x":1}{"y":2}',                  # two values in one data line
+    'data: {"x":1} {"y":2}',
+    'data: {"x":1}\r\ndata: {"y":2}',        # two data lines in one event
+    'data: {"choices":\r\n\r\ndata: []}',    # one object split across two events
+    'data:',                                 # empty event
+])
+def test_event_that_is_not_one_json_object_fails(room, bad):
+    FakeServer.chunks = [delta(None, role="assistant"), delta("Fo"), bad, *normal_stream()[3:]]
+    done = bench(room, "--index", "0", canon(["p"]))
+    assert done.returncode == 1 and "malformed" in done.stderr and "lfm3-bench {" not in done.stdout
+
+
+def test_done_in_the_same_event_as_a_chunk_fails(room):
+    final = normal_stream()[3]
+    FakeServer.chunks = [delta(None, role="assistant"), delta("Fo"),
+                         "data: " + json.dumps(final) + "\r\ndata: [DONE]"]
+    done = bench(room, "--index", "0", canon(["p"]))
+    assert done.returncode == 1 and "malformed" in done.stderr and "lfm3-bench {" not in done.stdout
+
+
+def test_comments_and_bare_data_prefix_still_pass(room):
+    FakeServer.chunks = [": keep-alive", delta(None, role="assistant"),
+                         "data:" + json.dumps(delta("Fo")), ": ping", *normal_stream()[2:]]
+    done = bench(room, "--index", "0", canon(["p"]))
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines()[0] == "Four"
