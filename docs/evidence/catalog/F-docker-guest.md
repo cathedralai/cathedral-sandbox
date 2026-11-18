@@ -518,13 +518,28 @@ Trusts: /work and the layer fit on the volume; the store caps are per machine.
 Side effects: tar file, docker image (kept until delete_snapshot or expiry).
 Callers: server snapshot route.
 
+### fork (create with snapshot_id; AB#604)
+What a fork gets: A fork gets a copy of the files. It does not get the first room's sealed env, secret mounts or the values of variables given at create. A secret that was written into a file is a file.
+Purpose: the fork starts from the record's committed image id and from /work as the stored tar held it. It is
+refused 404 snapshot_not_found after the snapshot's lifetime, even before the sweep runs. The stored tar is
+opened once; the bytes that are unpacked are the bytes that are hashed, into a staging folder inside the new
+room. The files become /work only if the digest equals the record's. A digest mismatch, a short or damaged
+tar, a missing image, or an image with another id is 409 snapshot_corrupt, and the new room is removed before
+any start (no container, no record, no folder, no image tag). The commit blanked each create-time variable with
+`--change "ENV NAME="`, which leaves the name with an empty value; the fork's own request env wins. A plain
+create of a snapshot's image, by id, name, tag, digest, template or another tag on it, is 400
+snapshot_image_fork_only for a caller who holds the image; another caller keeps image_not_owned. A fork is a new
+room: terminals, PTY sessions and kept exec results are keyed by room id in memory, and the fork has a new id.
+
 ### _snapshot_sizes, list_snapshots (1594-1618)
 Purpose: byte accounting; list from the inner store plus sizes.
 
-### delete_snapshot (1620-1626)
-Purpose: inner delete (False when the record is gone), drop meta, `docker
-image rm` when this process knows the image. The server answers 404 when the
-inner record was gone even though the image was just removed.
+### delete_snapshot (AB#604)
+Purpose: inner delete (False when the record is gone), drop meta, `docker image rm`. A removal that fails while
+the image is still there (a fork still runs from it) is kept in _pending_image_rm and retried by every sweep
+until it is gone; the delete answers 200 {"deleted": true, "image_removal": "pending"} (a clean delete answers
+{"deleted": true}). An expired snapshot's image goes the same way. A delete is a delete request; it does not
+say the bytes are erased.
 Callers: server route.
 
 ### push_snapshot (1628-1639)

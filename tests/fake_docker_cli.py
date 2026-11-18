@@ -98,6 +98,9 @@ def main(argv):
     if cmd == "image" and argv[1] == "inspect":
         ref = argv[-1]
         with Locked() as st:
+            if ref not in st["images"] and ref.startswith("sha256:"):
+                # An image id names the image whose id it is (docker resolves ids as well as names).
+                ref = next((r for r in st["images"] if image_id_for(r, b) == ref), ref)
             present = ref in st["images"]
             # Distinct immutable ids per ref so ownership tests can prove an
             # ID-based boundary (AB#650). Operators may override via behaviour.
@@ -123,6 +126,12 @@ def main(argv):
 
     if cmd == "image" and argv[1] == "rm":
         with Locked() as st:
+            # image_rm_fail_times: the next N removals fail (an image a running room still uses).
+            left = st["behaviour"].get("image_rm_fail_times", 0)
+            if left:
+                st["behaviour"]["image_rm_fail_times"] = left - 1
+                print(f"Error response from daemon: conflict: unable to delete {argv[-1]} (image is being used)", file=sys.stderr)
+                return 1
             if argv[-1] in st["images"]:
                 st["images"].remove(argv[-1])
         return 0
@@ -137,6 +146,13 @@ def main(argv):
                 return 1
             if argv[-1] not in st["images"]:
                 st["images"].append(argv[-1])
+            # The image keeps the container's environment; each --change "ENV NAME=" sets NAME to empty.
+            env = dict(st["containers"][find(st, argv[-2])].get("env") or {})
+            for i, part in enumerate(argv):
+                if part == "--change" and argv[i + 1].startswith("ENV "):
+                    name, _, value = argv[i + 1][4:].partition("=")
+                    env[name] = value
+            st.setdefault("image_env", {})[argv[-1]] = env
         return 0
 
     if cmd == "push":
@@ -294,7 +310,18 @@ def main(argv):
             # exit_at_once: {argv token: exit code}. The container starts and
             # its entrypoint ends at once; docker run -d still prints the id.
             exited = next((code for tok, code in b.get("exit_at_once", {}).items() if tok in argv), None)
+            # The environment a process in the container sees: the image's own, then each -e over it.
+            image_env = st.get("image_env", {})
+            env = {}
+            for ref, kept in image_env.items():
+                if ref in argv or image_id_for(ref, b) in argv:
+                    env = dict(kept)
+            for i, part in enumerate(argv):
+                if part == "-e":
+                    name, _, value = argv[i + 1].partition("=")
+                    env[name] = value
             st["containers"][cid] = {
+                "env": env,
                 "name": name,
                 "labels": labels,
                 "status": "created" if fail else ("exited" if exited is not None else "running"),
