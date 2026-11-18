@@ -20,6 +20,9 @@ func ParseKeepingNumbers(data []byte) (any, error) {
 	if !utf8.Valid(data) {
 		return nil, errors.New("input is not valid UTF-8")
 	}
+	if err := checkRawLimits(data); err != nil {
+		return nil, err
+	}
 	if err := checkSurrogates(data); err != nil {
 		return nil, err
 	}
@@ -33,6 +36,95 @@ func ParseKeepingNumbers(data []byte) (any, error) {
 		return nil, errors.New("trailing data after JSON value")
 	}
 	return v, nil
+}
+
+// The raw-text limits of Python's load_json_bounded (verify_receipts.py), counted
+// on the text before any parse: nesting of [ and { deeper than 64, or a run of
+// number characters (digits, signs, points, e and E) longer than 100, is refused.
+const (
+	jsonMaxDepth       = 64
+	jsonMaxNumberChars = 100
+	numberRunChars     = "0123456789+-.eE"
+)
+
+func hex4At(data []byte, at int) (rune, bool) {
+	if at < 0 || at+4 > len(data) {
+		return 0, false
+	}
+	var r rune
+	for _, c := range data[at : at+4] {
+		switch {
+		case c >= '0' && c <= '9':
+			r = r<<4 | rune(c-'0')
+		case c >= 'a' && c <= 'f':
+			r = r<<4 | rune(c-'a'+10)
+		case c >= 'A' && c <= 'F':
+			r = r<<4 | rune(c-'A'+10)
+		default:
+			return 0, false
+		}
+	}
+	return r, true
+}
+
+// checkRawLimits is json_shape() in verify_receipts.py, minus the surrogate part
+// that checkSurrogates covers: strings are skipped, structure is counted as written.
+func checkRawLimits(data []byte) error {
+	depth, deepest, run, longest := 0, 0, 0, 0
+	inString := false
+	for i := 0; i < len(data); {
+		ch := data[i]
+		if inString {
+			if ch == '\\' {
+				if i+1 < len(data) && data[i+1] == 'u' {
+					if code, ok := hex4At(data, i+2); ok {
+						if code >= 0xD800 && code <= 0xDBFF && i+8 <= len(data) && data[i+6] == '\\' && data[i+7] == 'u' {
+							if low, ok := hex4At(data, i+8); ok && low >= 0xDC00 && low <= 0xDFFF {
+								i += 12
+								continue
+							}
+						}
+						i += 6
+						continue
+					}
+				}
+				i += 2
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			i++
+			continue
+		}
+		i++
+		if strings.IndexByte(numberRunChars, ch) >= 0 {
+			run++
+			if run > longest {
+				longest = run
+			}
+			continue
+		}
+		run = 0
+		switch ch {
+		case '"':
+			inString = true
+		case '[', '{':
+			depth++
+			if depth > deepest {
+				deepest = depth
+			}
+		case ']', '}':
+			depth--
+		}
+	}
+	if deepest > jsonMaxDepth {
+		return errors.New("JSON nests too deeply to read")
+	}
+	if longest > jsonMaxNumberChars {
+		return fmt.Errorf("JSON holds a number literal of more than %d characters", jsonMaxNumberChars)
+	}
+	return nil
 }
 
 // maxDepth is far below Python's recursion limit, so a document this parser

@@ -303,9 +303,14 @@ func TestHugeIntegerInDocuments(t *testing.T) {
 	} else {
 		wantCode(t, err, CodeBadInput)
 	}
-	ok := "{\"pad\":" + strings.Repeat("9", 4300) + "," + strings.TrimPrefix(strings.TrimSpace(good), "{")
+	// Python's load_json_bounded refuses a number token of more than 100 characters.
+	ok := "{\"pad\":" + strings.Repeat("9", 100) + "," + strings.TrimPrefix(strings.TrimSpace(good), "{")
 	if _, err := ParseAttestation([]byte(ok)); err != nil {
-		t.Fatalf("4300 digits is allowed: %v", err)
+		t.Fatalf("100 digits is allowed: %v", err)
+	}
+	long := "{\"pad\":" + strings.Repeat("9", 101) + "," + strings.TrimPrefix(strings.TrimSpace(good), "{")
+	if _, err := ParseAttestation([]byte(long)); err == nil {
+		t.Fatal("101 characters must be refused, as Python refuses them")
 	}
 	_, _, err := ParseReceipts([]byte("[" + digits + "]"))
 	wantCode(t, err, CodeBadInput)

@@ -143,25 +143,29 @@ func TestPythonNumbers(t *testing.T) {
 }
 
 func TestNumberLimits(t *testing.T) {
-	if _, err := ParseKeepingNumbers([]byte("[" + strings.Repeat("7", 4300) + "]")); err != nil {
-		t.Fatalf("4300 digits: %v", err)
+	// Python's raw-text limit: a number token of at most 100 characters, sign included.
+	if _, err := ParseKeepingNumbers([]byte("[" + strings.Repeat("7", 100) + "]")); err != nil {
+		t.Fatalf("100 digits: %v", err)
 	}
-	if _, err := ParseKeepingNumbers([]byte("[-" + strings.Repeat("7", 4300) + "]")); err != nil {
-		t.Fatalf("sign is not a digit: %v", err)
+	if _, err := ParseKeepingNumbers([]byte("[-" + strings.Repeat("7", 99) + "]")); err != nil {
+		t.Fatalf("sign is a character of the token: %v", err)
 	}
 	for name, in := range map[string]string{
-		"4301 digits":  "[" + strings.Repeat("7", 4301) + "]",
-		"overflow":     "[1e999]",
-		"neg overflow": "[-1e999]",
-		"NaN":          "[NaN]",
-		"Infinity":     "[Infinity]",
-		"too deep":     strings.Repeat("[", 150) + strings.Repeat("]", 150),
+		"101 digits":           "[" + strings.Repeat("7", 101) + "]",
+		"sign plus 100 digits": "[-" + strings.Repeat("7", 100) + "]",
+		"4301 digits":          "[" + strings.Repeat("7", 4301) + "]",
+		"depth 65":             strings.Repeat("[", 65) + strings.Repeat("]", 65),
+		"overflow":             "[1e999]",
+		"neg overflow":         "[-1e999]",
+		"NaN":                  "[NaN]",
+		"Infinity":             "[Infinity]",
+		"too deep":             strings.Repeat("[", 150) + strings.Repeat("]", 150),
 	} {
 		if _, err := ParseKeepingNumbers([]byte(in)); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
 	}
-	if _, err := ParseKeepingNumbers([]byte(strings.Repeat("[", 50) + strings.Repeat("]", 50))); err != nil {
-		t.Fatalf("depth 50: %v", err)
+	if _, err := ParseKeepingNumbers([]byte(strings.Repeat("[", 64) + strings.Repeat("]", 64))); err != nil {
+		t.Fatalf("depth 64: %v", err)
 	}
 }
