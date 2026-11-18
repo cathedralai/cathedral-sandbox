@@ -569,6 +569,9 @@ daemon keeps the values and adds them to requests outside the room.
   host you trust.
 - Owner: a hash of the hotel API key plus the broker guest id. A secret of
   another owner is never used and answers 404.
+- Limit: 64 secrets per owner, or `ROOM_SECRETS_PER_OWNER` (1 to 65536).
+  Sealed hotels set 4096: the platform guest holds the secrets of many
+  Polaris users under one owner, and the Polaris API caps each user at 64.
 - Storage: memory, and with `ROOM_SECRETS_PERSIST=1` (default) also
   `/var/lib/pool-room-egress/secrets.json` (AES-256-GCM; key file
   `secrets.key`, root only, mode 0600). Sealed hotels set
