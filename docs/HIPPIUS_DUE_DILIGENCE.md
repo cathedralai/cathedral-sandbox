@@ -25,7 +25,8 @@ say). Treat every byte as readable by Hippius and its miners; encrypt in the gue
 `scripts/hippius_restic_bench.py` runs pinned restic 0.19.1 against a fresh
 prefix in a test bucket and writes one JSON file: init, backup MiB/s, median
 and p95 of `cat config` with no cache, `check --read-data`, restore with a
-sha256 compare, then `forget --prune` with raw-data bytes before and after.
+sha256 compare, then `forget --prune` with the pack files `restic list packs` finds in the
+bucket before and after (a bucket listing, not snapshot references).
 Pinned binary: `restic_0.19.1_linux_amd64.bz2`, sha256
 `f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c`
 ([SHA256SUMS](https://github.com/restic/restic/releases/download/v0.19.1/SHA256SUMS)).
@@ -37,7 +38,7 @@ Pinned binary: `restic_0.19.1_linux_amd64.bz2`, sha256
 Restic leaves `config` and `keys/` under the prefix after prune; delete the
 prefix by hand. Use neutral region labels, not host or supplier names.
 
-| Hotel region | Backup MiB/s | Restore MiB/s | `cat config` median / p95 ms | check --read-data | Bytes gone after prune |
+| Hotel region | Backup MiB/s | Restore MiB/s | `cat config` median / p95 ms | check --read-data | Packs left after prune |
 |---|---|---|---|---|---|
 | region-a | not measured | not measured | not measured | not measured | not measured |
 

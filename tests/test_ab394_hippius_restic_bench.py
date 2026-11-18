@@ -54,11 +54,12 @@ elif cmd == "restore":
         (target / "data.bin").write_bytes(b"corrupt")
     else:
         shutil.copy(data, target / "data.bin")
-elif cmd == "stats":
-    data = state / "repo" / "data.bin"
-    print(json.dumps({{"total_size": data.stat().st_size if data.exists() else 0}}))
+elif cmd == "list" and rest[:1] == ["packs"]:
+    if (state / "repo" / "data.bin").exists():
+        print("0" * 64)
 elif cmd == "forget":
-    (state / "repo" / "data.bin").unlink()
+    if not os.environ.get("FAKE_RESTIC_KEEP_PACKS"):
+        (state / "repo" / "data.bin").unlink()
 '''
 
 
@@ -106,8 +107,8 @@ def test_happy_path_records_every_step(fake, tmp_path, capsys):
     assert result["steps"]["backup"]["snapshot_id"] == "abc123"
     assert result["steps"]["latency"]["runs"] == 3
     assert result["steps"]["restore"]["sha256_match"] is True
-    assert result["steps"]["delete"]["raw_bytes_before"] == 1024 * 1024
-    assert result["steps"]["delete"]["raw_bytes_after"] == 0
+    assert result["steps"]["delete"]["packs_before"] == 1
+    assert result["steps"]["delete"]["packs_after"] == 0
 
     argv = commands(fake)
     repo_args = argv[1]
@@ -152,7 +153,7 @@ def test_check_failure_skips_restore_but_still_cleans_up(fake, tmp_path, monkeyp
     steps = json.loads(out.read_text())["steps"]
     assert steps["check"]["ok"] is False
     assert steps["restore"] == {"ok": False, "skipped": True}
-    assert steps["delete"]["ok"] is True and steps["delete"]["raw_bytes_after"] == 0
+    assert steps["delete"]["ok"] is True and steps["delete"]["packs_after"] == 0
 
 
 def test_restore_mismatch_fails(fake, tmp_path, monkeypatch):
@@ -162,3 +163,10 @@ def test_restore_mismatch_fails(fake, tmp_path, monkeypatch):
     steps = json.loads(out.read_text())["steps"]
     assert "does not match" in steps["restore"]["error"]
     assert steps["delete"]["ok"] is True
+
+
+def test_a_prune_that_leaves_packs_in_the_bucket_shows_them(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_RESTIC_KEEP_PACKS", "1")
+    code, out = run_bench(tmp_path)
+    delete = json.loads(out.read_text())["steps"]["delete"]
+    assert delete["packs_before"] == 1 and delete["packs_after"] == 1

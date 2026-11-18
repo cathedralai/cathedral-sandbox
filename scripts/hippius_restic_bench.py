@@ -11,7 +11,7 @@ Steps, each timed, in order; the first failure skips the rest:
   latency    --latency-runs x `restic --no-cache cat config`; median and p95
   check      restic check --read-data (every pack downloaded and verified)
   restore    restore the snapshot and compare sha256 with the source
-  delete     forget --prune every snapshot; raw-data bytes before and after
+  delete     forget --prune every snapshot; pack files listed in the bucket before and after
 Cleanup (the delete step) still runs when a step after init fails.
 
 Credentials reach restic only through the environment, never argv or output.
@@ -116,9 +116,11 @@ class Bench:
             raise StepFailed(f"restic {cmd[0]} exit {out.returncode}: {out.stderr.strip()[-400:]}")
         return out.stdout
 
-    def raw_bytes(self) -> int:
-        doc = json.loads(self.restic("stats", "--mode", "raw-data", "--json").strip().splitlines()[-1])
-        return int(doc.get("total_size", 0))
+    def stored_packs(self) -> int:
+        # `list packs` lists the backend's data/ files. `stats --mode raw-data` counts
+        # only what snapshots still reference, which is 0 after forget whether or not
+        # the bucket dropped anything, so it cannot show a deletion.
+        return len([line for line in self.restic("list", "packs", no_cache=True).splitlines() if line.strip()])
 
     def step_init(self) -> dict:
         self.restic("init")
@@ -178,15 +180,17 @@ class Bench:
         return {"sha256_match": True, "mib_s": round(self.args.size_mib / seconds, 2) if seconds > 0 else None}
 
     def step_delete(self) -> dict:
-        before = self.raw_bytes()
+        before = self.stored_packs()
         if self.snapshots:
             self.restic("forget", "--prune", *self.snapshots)
-        after = self.raw_bytes()
-        return {"raw_bytes_before": before, "raw_bytes_after": after}
+        after = self.stored_packs()
+        return {"packs_before": before, "packs_after": after}
 
 
 def run(args: argparse.Namespace, restic: list[str], work: Path) -> tuple[dict, int]:
     bench = Bench(args, restic, work)
+    # Printed first, so an interrupted run still says which prefix to delete by hand.
+    print(f"bench prefix: {args.bucket}/{bench.prefix}", file=sys.stderr, flush=True)
     result = {
         "card": "AB#394",
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
