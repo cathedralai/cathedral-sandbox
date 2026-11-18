@@ -126,6 +126,26 @@ func TestGenoaFloorRechecksAMDSignatureWhenBindingIsUnchanged(t *testing.T) {
 	}
 }
 
+func TestGenoaFloorGatesMinerTLSBootstrap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MinGenoaSNPSPL = 1
+	join := func(id string, att []byte) (int, map[string]any) {
+		m, url := newMinerHotel(t, 5, att)
+		tc.hotels[id] = m.fakeHotel
+		return tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+			"id": id, "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+		})
+	}
+	old := snpAttestation(t, attestOpts{chip: 91})
+	if status, doc := join("old-miner", old); status != 422 || !strings.Contains(fmt.Sprint(doc), "current TCB SNP component below") {
+		t.Fatalf("old SNP miner passed bootstrap: %d %v", status, doc)
+	}
+	patched := floorTestReport(t, snpAttestation(t, attestOpts{chip: 92}), false)
+	if status, doc := join("patched-miner", patched); status != 201 {
+		t.Fatalf("SNP floor-compliant miner refused bootstrap: %d %v", status, doc)
+	}
+}
+
 func TestConfigHotelOptInTakesRoomsOnlyAfterAttestation(t *testing.T) {
 	tc, _ := newConfigHotelChain(t, []configHotel{{id: "s1", att: attestOpts{chip: 46}, optIn: true}}, nil)
 
