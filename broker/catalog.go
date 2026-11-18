@@ -54,11 +54,12 @@ type catalogTemplate struct {
 	SealedOnly bool
 }
 
-// LFM3-1.7B image. Same GHCR digest as cathedralai/cathedral PR #446
-// (sandbox_models LFM3_IMAGE_REF). llama.cpp b11960, Q4_K_M GGUF.
+// LFM3-1.7B image. llama.cpp b11960, Q4_K_M GGUF. Published from #574
+// (dd39ce17, AB#763): llama-server, llama-bench, python and curl ship next to
+// llama-cli for the sealed benchmark.
 const (
 	lfm31_7bRepo   = "ghcr.io/cathedralai/room-lfm3-1.7b"
-	lfm31_7bDigest = "sha256:b1ba8837ea388c8c98720772b0f41af5813d4cebf214637fde20aae58a1ea761"
+	lfm31_7bDigest = "sha256:7d0aa94f7bf7d0356a02c65adfc2f3d08f6a26bf750d6d3127780ff8f68d54cb"
 )
 
 var digestPin = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)

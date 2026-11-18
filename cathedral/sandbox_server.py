@@ -575,7 +575,19 @@ class SandboxApplication:
         handle = self.provider.start_process(id, req)
         return Response.json(202, {"process_id": handle.process_id, "running": handle.running})
 
-    def process_logs(self, *, id, pid, **_):
+    def process_logs(self, *, id, pid, query, **_):
+        """A process log from ?offset= (bytes, default 0), at most ?limit= bytes (AB#419).
+
+        The answer's next_offset is the offset of the next read: it returns only
+        bytes this one did not.
+        """
+        offset = _int_param(query, "offset")
+        limit = _int_param(query, "limit")
+        pager = getattr(self.provider, "process_logs_page", None)
+        if callable(pager):
+            return Response.json(200, pager(id, pid, offset=offset, limit=limit))
+        if offset or limit is not None:
+            return Response.error(501, "log_paging_not_supported", "this runtime reads a process log whole")
         return Response.json(200, {"process_id": pid, "logs": self.provider.process_logs(id, pid)})
 
     def stop_process(self, *, id, pid, **_):
@@ -808,7 +820,12 @@ class SandboxApplication:
         return Response.json(200, self.provider.desktop(id))
 
     # ------------------------------------------------------------------ §3.13 logs
-    def logs(self, *, id, **_):
+    def logs(self, *, id, query, **_):
+        # ?entrypoint_cursor= is the entrypoint.next_cursor of the read before (AB#419).
+        # Present (even empty) asks for the entrypoint log; empty reads from the start.
+        cursor = (query.get("entrypoint_cursor") or [None])[0]
+        if cursor is not None:
+            return Response.json(200, self.provider.logs(id, entrypoint_cursor=cursor))
         return Response.json(200, self.provider.logs(id))
 
     # ------------------------------------------------------------------ §3.9 images
@@ -897,6 +914,17 @@ class SandboxApplication:
         return Response.json(200, openapi_document(base_url=base))
 
 
+def _int_param(query: Mapping[str, list[str]], name: str) -> int | None:
+    """A whole-number query parameter, None when absent."""
+    values = query.get(name)
+    if not values or values[0] == "":
+        return None
+    raw = values[0]
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 18:
+        raise api.SandboxContractError("invalid_request", f"query parameter '{name}' must be a whole number")
+    return int(raw)
+
+
 def _require_param(query: Mapping[str, list[str]], name: str) -> str:
     values = query.get(name)
     if not values:
@@ -918,7 +946,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/lifetime", "post", "Extend lifetime (alias)", "§3.1"),
     ("/v1/sandboxes/{id}/lifetime", "patch", "Extend lifetime (PATCH alias)", "§3.1"),
     ("/v1/sandboxes/{id}/processes", "post", "Start a background process", "§3.2"),
-    ("/v1/sandboxes/{id}/processes/{pid}/logs", "get", "Background-process logs", "§3.2; Range supported"),
+    ("/v1/sandboxes/{id}/processes/{pid}/logs", "get", "Background-process logs", "§3.2; ?offset= and ?limit= bytes, answers next_offset (AB#419)"),
     ("/v1/sandboxes/{id}/processes/{pid}", "delete", "Stop a background process", "§3.2"),
     ("/v1/sandboxes/{id}/processes/{pid}/attach", "post", "Attach to a process", "§3.2; not supported (501)"),
     ("/v1/sandboxes/{id}/files", "put", "Write a file", "§3.3"),
@@ -951,7 +979,7 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/sandboxes/{id}/desktop/ws", "get", "Desktop RFB WebSocket", "Agent IDE G5; ticket + CATHEDRAL_AGENT_DESKTOP=1"),
     ("/v1/sandbox-templates", "get", "List sandbox templates", "Agent IDE G6"),
     ("/v1/sandbox-templates/{uid}", "get", "Get sandbox template", "Agent IDE G6"),
-    ("/v1/sandboxes/{id}/logs", "get", "Container + exec logs", "§3.13; kept 24 h after delete"),
+    ("/v1/sandboxes/{id}/logs", "get", "Container + exec logs", "§3.13; kept 24 h after delete; entrypoint log from ?entrypoint_cursor= (AB#419)"),
     ("/v1/snapshots", "get", "List snapshots", "§3.5"),
     ("/v1/snapshots/{id}", "delete", "Delete a snapshot", "§3.5"),
     ("/v1/snapshots/{id}/push", "post", "Push a snapshot image to a registry", "§3.5"),

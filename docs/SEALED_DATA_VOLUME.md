@@ -436,3 +436,83 @@ window fell inside the 15:00 to 17:00 UTC escape rehearsal on 7 Nov, which is
 off limits. The planned hardware check is a `cipher_null` header edit on a
 throwaway `data.raw`, confirming `verify_header()` reports `tampered` and does
 not mkfs or mount; it runs after 17:15 UTC or in the next free window.
+
+## Volume head log, shred and prune (AB#398)
+
+`cathedral/volume_log.py` defines the append-only log of volume heads
+(Decision 6, 4 Nov) and the shred receipt. `VolumeRegistry`
+(`cathedral/volume_chain.py`) writes it: every accepted head appends a `head`
+entry, an exact resend appends nothing, and a refused commit leaves the log and
+the head unchanged. The log is in memory like the rest of the registry; nothing
+publishes it yet.
+
+- Entry `cathedral_volume_log_entry_v1`: `seq`, `prev_entry_sha256`, `kind`
+  (`head` or `shred`), `volume_id`, `generation`, `manifest_sha256`,
+  `commit_receipt_sha256` (the 395 commit receipt), `logged_at`.
+- `verify_log`: contiguous `seq`, hash chain, a volume's heads run 1, 2, 3
+  with no repeat or skip (head+1), a shred names the current head and is the
+  volume's last entry.
+- `verify_extends(old, new)`: the new log holds the old one as its exact
+  prefix. A reader who kept an older copy sees a rollback or a rewrite here.
+- `verify_extends_checkpoint(checkpoint, entries)`: the same check for a
+  reader who kept only an older signed checkpoint.
+- `check_restore`: only the latest logged head restores; a shredded volume
+  never does.
+- Checkpoint `cathedral_volume_log_checkpoint_v1` and shred receipt
+  `cathedral_volume_shred_receipt_v1`: Ed25519 over canonical JSON.
+
+Not covered by the format: a log operator showing two readers two different
+logs. Readers comparing checkpoints (`verify_extends_checkpoint`) catch it; where the
+log and checkpoints are published is still open.
+
+Registry wiring:
+
+- Head entry: `manifest_sha256` is `volume_chain.manifest_sha256(commit)`, the
+  digest of the restic repo id and snapshot id (`volume_chain.canonical`);
+  `commit_receipt_sha256` is the digest of the lease holder's signed commit.
+- Restore: a restoring guest runs `verify_chain`, then `check_restore` on the
+  log with the head commit's manifest digest. Storage still holds a shredded
+  volume's chain, so `verify_chain` alone passes; `check_restore` refuses it.
+- `VolumeRegistry.shred(volume_id, key_id=..., destroy_key=...)`, under the
+  registry lock: checks the volume has a committed head and is not shredded,
+  checks `key_id` is the volume's key (recorded by `create(..., key_id=...)` or
+  `bind_key`, set once; otherwise `key_not_bound` or `shred_key_mismatch`),
+  builds the shred entry, ends the lease and freezes the volume
+  (`shred_pending`, with the pending `key_id`: grant, accept and head refuse,
+  and a retry with another `key_id` refuses `shred_key_mismatch`), then calls
+  `destroy_key(volume_id, key_id)`. Only when that returns `True` does it log the shred and
+  return a signed `cathedral_volume_shred_receipt_v1`. When the key service
+  refuses or its answer is lost, nothing is logged and the volume stays frozen,
+  since the key may already be gone; retrying `shred` finishes it. After a
+  shred, grant, accept (including a resend) and head refuse `volume_shredded`;
+  `shred` again with the same `key_id` returns the same receipt.
+- The receipt attests that the key service confirmed destroying `key_id`.
+  `destroy_key` is the key release service's call (AB#392, not built); it must
+  raise on an unknown key and be idempotent (an already destroyed key returns
+  `True`), so a retry after a lost answer succeeds. It is given `volume_id` too
+  and must refuse a key that is not that volume's.
+- Provisional until Fred decides who holds the log key: the registry signs the
+  shred receipt with its own key, `signing_key_id` `registry:<first 16 hex of
+  sha256(public key)>`. That receipt is Ed25519 over canonical JSON with no
+  label, an exception to the registry's labelled statements above. It cannot
+  collide with them: a labelled message starts with `c`, canonical JSON with `{`.
+- Prune token `cathedral_volume_prune_token_v1`
+  (`volume_subtoken.issue_prune`, `VolumeRegistry.issue_prune_token`,
+  `authorize_prune`): its own label, never issued against a lease, bound to
+  `volumes/<volume_id>/` (built from the volume id, never taken from the
+  caller, so it cannot cover another volume), the prune runner's address and at most one hour. It is the only
+  token that carries `delete`; it also carries get, put and list, because restic
+  prune reads packs and writes index and lock files. The guest sub-token
+  (`authorize`) never allows delete, and neither token passes the other's check.
+  It is still issued after a shred, so the data can be cleaned up.
+
+A volume with no accepted commit cannot be shredded yet (`nothing_to_shred`):
+the log format has no shred entry without a head. Packs a guest uploaded before
+its first commit was accepted are left to prune.
+
+Still open for AB#398: the commit every N minutes with a receipt (needs the
+guest volume agent and pinned restic, AB#789), the customer-held root key mode
+(AB#392), the storage gateway that calls `authorize`/`authorize_prune` in front
+of the bucket (AB#394), where the log and checkpoints are published and who
+holds the log key (Fred), and a live restore-after-shred on two sealed hotels
+(Toby).
