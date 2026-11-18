@@ -56,7 +56,7 @@ func (s *synth) chain(t *testing.T, extras ...map[string]any) []Receipt {
 	prev := s.att.BindingSHA256
 	for i, extra := range extras {
 		st := map[string]any{
-			"action": "exec", "binding_sha256": s.att.BindingSHA256,
+			"action": "exec", "binding_sha256": s.att.BindingSHA256, "schema": SealedReceiptSchema,
 			"sequence": json.Number(strconv.Itoa(i + 1)), "previous_receipt_sha256": prev,
 		}
 		for k, v := range extra {
@@ -116,9 +116,9 @@ func TestPythonCanonicalNumbersInReceipts(t *testing.T) {
 	b := s.att.BindingSHA256
 	// The statement as the hotel sent it carries 1E5. Python loads that as the
 	// float 100000.0 and hashes and verifies the bytes below.
-	text := `{"action":"exec","binding_sha256":"` + b + `","n":1E5,"previous_receipt_sha256":"` + b + `","sequence":1}`
-	pythonBytes := `{"action":"exec","binding_sha256":"` + b + `","n":100000.0,"previous_receipt_sha256":"` + b + `","sequence":1}`
-	literalBytes := `{"action":"exec","binding_sha256":"` + b + `","n":1E5,"previous_receipt_sha256":"` + b + `","sequence":1}`
+	text := `{"action":"exec","binding_sha256":"` + b + `","n":1E5,"previous_receipt_sha256":"` + b + `","schema":"` + SealedReceiptSchema + `","sequence":1}`
+	pythonBytes := `{"action":"exec","binding_sha256":"` + b + `","n":100000.0,"previous_receipt_sha256":"` + b + `","schema":"` + SealedReceiptSchema + `","sequence":1}`
+	literalBytes := `{"action":"exec","binding_sha256":"` + b + `","n":1E5,"previous_receipt_sha256":"` + b + `","schema":"` + SealedReceiptSchema + `","sequence":1}`
 
 	t.Run("signed over the Python bytes passes", func(t *testing.T) {
 		rc := s.signBytes(t, text, pythonBytes)
@@ -279,14 +279,14 @@ func TestGuestTLSRule(t *testing.T) {
 func TestSequenceSpanLimit(t *testing.T) {
 	s := newSynth(t, nil)
 	first := s.chain(t, map[string]any{})
-	far := map[string]any{"action": "exec", "binding_sha256": s.att.BindingSHA256, "sequence": num(strconv.FormatInt(math.MaxInt64, 10)),
+	far := map[string]any{"schema": SealedReceiptSchema, "action": "exec", "binding_sha256": s.att.BindingSHA256, "sequence": num(strconv.FormatInt(math.MaxInt64, 10)),
 		"previous_receipt_sha256": "x"}
 	c, _ := Canonical(far)
 	last := Receipt{Statement: far, ReceiptSHA256: sha256Hex(c), SignatureB64: base64.StdEncoding.EncodeToString(ed25519.Sign(s.priv, c))}
 	_, err := VerifyReceipts(s.att, []Receipt{first[0], last}, "")
 	wantCode(t, err, CodeChainGap)
 	// A span at the limit is still checked, not refused.
-	near := map[string]any{"action": "exec", "binding_sha256": s.att.BindingSHA256, "sequence": num("10000001"), "previous_receipt_sha256": "x"}
+	near := map[string]any{"schema": SealedReceiptSchema, "action": "exec", "binding_sha256": s.att.BindingSHA256, "sequence": num("10000001"), "previous_receipt_sha256": "x"}
 	c, _ = Canonical(near)
 	nearRc := Receipt{Statement: near, ReceiptSHA256: sha256Hex(c), SignatureB64: base64.StdEncoding.EncodeToString(ed25519.Sign(s.priv, c))}
 	if res, err := VerifyReceipts(s.att, []Receipt{first[0], nearRc}, ""); err != nil || res.Contiguous {

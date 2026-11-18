@@ -90,6 +90,42 @@ func ParseAttestation(data []byte) (Attestation, error) {
 	return att, nil
 }
 
+// strictBase64 is base64.b64decode(s, validate=True): standard alphabet, correct
+// padding, no other byte. Go's decoder skips CR and LF, so they are refused first.
+func strictBase64(s string) ([]byte, bool) {
+	if strings.ContainsAny(s, "\r\n") {
+		return nil, false
+	}
+	raw, err := base64.StdEncoding.Strict().DecodeString(s)
+	return raw, err == nil
+}
+
+// checkAttestationShape is check_attestation_shape() in verify_receipts.py for a
+// sealed binding: the receipt key is base64 of 32 bytes, the five report fields
+// are strings, and report_b64 is strict base64.
+func checkAttestationShape(att Attestation) error {
+	if att.Binding == nil || att.BindingSHA256 == "" {
+		return fail(CodeBadInput, "the attestation is not an object with a binding object and a binding_sha256 string")
+	}
+	if !b64Key32(att.Binding["receipt_key_ed25519_b64"]) {
+		return fail(CodeBadInput, "the attestation's binding receipt_key is not base64 of a 32-byte key")
+	}
+	if c, present := att.Binding["kernel_cmdline"]; present && c != nil {
+		if _, ok := c.(string); !ok {
+			return fail(CodeBadInput, "the attestation's binding kernel_cmdline is not a string")
+		}
+	}
+	if _, ok := strictBase64(att.ReportB64); !ok {
+		return fail(CodeBadInput, "the attestation's report_b64 is not base64")
+	}
+	for _, k := range []string{"measurement", "chip_id", "reported_tcb", "policy", "host_data"} {
+		if _, ok := att.Binding[k].(string); !ok {
+			return fail(CodeBadInput, "the attestation's binding has no %s string", k)
+		}
+	}
+	return nil
+}
+
 func bindingString(b map[string]any, key string) (string, bool) {
 	s, ok := b[key].(string)
 	return s, ok
@@ -99,6 +135,9 @@ func bindingString(b map[string]any, key string) (string, bool) {
 // in verify_receipts.py.
 func VerifyAttestation(att Attestation, opts Options) (Result, error) {
 	var res Result
+	if err := checkAttestationShape(att); err != nil {
+		return res, err
+	}
 	canon, err := Canonical(att.Binding)
 	if err != nil {
 		return res, fail(CodeBadInput, "binding cannot be canonicalised: %v", err)
@@ -115,9 +154,11 @@ func VerifyAttestation(att Attestation, opts Options) (Result, error) {
 	if schema != SealedBindingSchema {
 		return res, fail(CodeNotSealed, "binding schema %q is not %s", schema, SealedBindingSchema)
 	}
-	report, err := base64.StdEncoding.DecodeString(att.ReportB64)
-	if err != nil {
-		return res, fail(CodeBadInput, "report_b64 is not base64: %v", err)
+	// check_attestation_shape decodes with validate=True: a newline or any byte
+	// outside the alphabet is refused, where a plain decode would skip it.
+	report, ok := strictBase64(att.ReportB64)
+	if !ok {
+		return res, fail(CodeBadInput, "the attestation's report_b64 is not base64")
 	}
 	rep, err := ParseReport(report)
 	if err != nil {

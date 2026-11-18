@@ -209,6 +209,47 @@ func sequenceOf(st map[string]any) (int64, bool) {
 	return i, err == nil
 }
 
+// checkStartCommands is check_start_commands(): each create that carries a
+// start_command has a start_command_sha256 that matches it (AB#709). A create with
+// no start_command is the default and has nothing to check.
+func checkStartCommands(receipts []Receipt) error {
+	for _, rc := range receipts {
+		st := rc.Statement
+		if action, _ := st["action"].(string); action != "create" {
+			continue
+		}
+		raw, present := st["start_command"]
+		if !present {
+			continue
+		}
+		seq, _ := sequenceOf(st)
+		stored, hasStored := st["start_command_sha256"]
+		if raw == nil {
+			if hasStored && stored != nil {
+				return fail(CodeStartCommand, "receipt %d: start_command_sha256 must be absent when start_command is null", seq)
+			}
+			continue
+		}
+		list, ok := raw.([]any)
+		for _, part := range list {
+			if _, isStr := part.(string); !isStr {
+				ok = false
+			}
+		}
+		if !ok {
+			return fail(CodeStartCommand, "receipt %d: start_command must be a list of strings", seq)
+		}
+		sum, err := sha256Canonical(list)
+		if err != nil {
+			return fail(CodeStartCommand, "receipt %d: start_command: %v", seq, err)
+		}
+		if s, _ := stored.(string); !hasStored || s != sum {
+			return fail(CodeStartCommand, "receipt %d: start_command_sha256 does not match the start command", seq)
+		}
+	}
+	return nil
+}
+
 const maxSequenceSpan = 10_000_000
 
 // VerifyReceipts mirrors verify_receipts() in verify_receipts.py. head is the
@@ -219,11 +260,10 @@ func VerifyReceipts(att Attestation, receipts []Receipt, head string) (ReceiptsR
 	if att.BindingSHA256 == "" {
 		return res, fail(CodeBadInput, "attestation has no binding_sha256")
 	}
-	keyB64, _ := att.Binding["receipt_key_ed25519_b64"].(string)
-	keyRaw, err := base64.StdEncoding.DecodeString(keyB64)
-	if err != nil || len(keyRaw) != ed25519.PublicKeySize {
+	if !b64Key32(att.Binding["receipt_key_ed25519_b64"]) {
 		return res, fail(CodeBadInput, "binding receipt_key_ed25519_b64 is not a base64 32-byte key")
 	}
+	keyRaw, _ := base64.StdEncoding.DecodeString(att.Binding["receipt_key_ed25519_b64"].(string))
 	key := ed25519.PublicKey(keyRaw)
 	bsha := att.BindingSHA256
 
@@ -235,6 +275,9 @@ func VerifyReceipts(att Attestation, receipts []Receipt, head string) (ReceiptsR
 		}
 		st := rc.Statement
 		seq, _ := sequenceOf(st)
+		if schema, _ := st["schema"].(string); schema != SealedReceiptSchema {
+			return res, fail(CodeReceiptSchema, "receipt %d: not a %s statement", seq, SealedReceiptSchema)
+		}
 		if b, _ := st["binding_sha256"].(string); b != bsha {
 			return res, fail(CodeReceiptBindingMismatch, "receipt %d names another binding", seq)
 		}
@@ -249,9 +292,11 @@ func VerifyReceipts(att Attestation, receipts []Receipt, head string) (ReceiptsR
 		if err != nil || len(sig) != ed25519.SignatureSize || !ed25519.Verify(key, canon, sig) {
 			return res, fail(CodeReceiptSignature, "receipt %d: signature does not verify", seq)
 		}
-		if _, seen := bySeq[seq]; !seen {
-			order = append(order, seq)
+		// A repeated sequence would be counted twice in the totals; a chain has one receipt per sequence.
+		if _, seen := bySeq[seq]; seen {
+			return res, fail(CodeReceiptSequenceRepeat, "receipt %d: sequence appears more than once", seq)
 		}
+		order = append(order, seq)
 		bySeq[seq] = rc
 	}
 	links := 0
@@ -297,6 +342,9 @@ func VerifyReceipts(att Attestation, receipts []Receipt, head string) (ReceiptsR
 		if bySeq[seqs[len(seqs)-1]].ReceiptSHA256 != head {
 			return res, fail(CodeChainHead, "the chain does not end at the hotel's head")
 		}
+	}
+	if err := checkStartCommands(receipts); err != nil {
+		return res, err
 	}
 	res.Receipts = len(receipts)
 	res.SignaturesOK = len(receipts)

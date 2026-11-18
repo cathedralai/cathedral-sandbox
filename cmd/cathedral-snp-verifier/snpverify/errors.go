@@ -30,6 +30,14 @@ const (
 	CodeSandboxLinkMalformed   = "sandbox_link_malformed"
 	CodeGuestTLSMalformed      = "guest_tls_malformed"
 	CodeChainHead              = "chain_head"
+	CodeReceiptSchema          = "receipt_schema"
+	CodeReceiptSequenceRepeat  = "receipt_sequence_repeat"
+	CodeStartCommand           = "start_command_mismatch"
+	CodeSnapshotMalformed      = "snapshot_malformed"
+	CodeSnapshotEdge           = "snapshot_edge"
+	CodeRoomNumbering          = "room_numbering"
+	CodePoolRoom               = "pool_room"
+	CodeListDocument           = "list_document"
 )
 
 // VerifyError carries one stable code and a human detail.

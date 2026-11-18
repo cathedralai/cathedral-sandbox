@@ -144,7 +144,7 @@ func signedChain(t *testing.T, links func(i int, prevHash string) string) (Attes
 	var rcs []Receipt
 	for i := 1; i <= 3; i++ {
 		st := map[string]any{
-			"action": "exec", "binding_sha256": att.BindingSHA256, "sequence": json.Number(string(rune('0' + i))),
+			"action": "exec", "binding_sha256": att.BindingSHA256, "schema": SealedReceiptSchema, "sequence": json.Number(string(rune('0' + i))),
 			"previous_receipt_sha256": links(i, prev),
 		}
 		c, _ := Canonical(st)
@@ -178,11 +178,10 @@ func TestSyntheticChain(t *testing.T) {
 	})
 	_, err = VerifyReceipts(att, rcs, "")
 	wantCode(t, err, CodeChainLink)
-	// Duplicate sequence: the later receipt wins in the map, as in Python.
+	// Duplicate sequence: Python refuses it (verify_receipts.py, AB#710), so does this.
 	att, rcs = signedChain(t, good)
-	if _, err = VerifyReceipts(att, append(rcs, rcs[2]), ""); err != nil {
-		t.Fatal(err)
-	}
+	_, err = VerifyReceipts(att, append(rcs, rcs[2]), "")
+	wantCode(t, err, CodeReceiptSequenceRepeat)
 	// Malformed: no integer sequence.
 	rcs[0].Statement["sequence"] = "1"
 	_, err = VerifyReceipts(att, rcs, "")
