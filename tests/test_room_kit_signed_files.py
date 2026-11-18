@@ -27,7 +27,7 @@ def _signed_action(method: str, path: str) -> str | None:
 def test_signed_table_includes_file_routes() -> None:
     assert _signed_action("PUT", "/v1/sandboxes/rm_1/files?path=/work/a.txt") == "file_put"
     assert _signed_action("GET", "/v1/sandboxes/rm_1/files?path=/work/a.txt") == "file_get"
-    assert _signed_action("PUT", "/v1/sandboxes/rm_1/tar?path=/work") is None
+    assert _signed_action("PUT", "/v1/sandboxes/rm_1/stat?path=/work") is None
 
 
 @pytest.fixture

@@ -110,7 +110,11 @@ type guestConfig struct {
 	NextKeySHA256   string `json:"next_key_sha256,omitempty"`
 	ViewTokenSHA256 string `json:"view_token_sha256"` // token for /<id>/live
 	Ops             bool   `json:"ops"`               // may run the probe and reset the broker counters
-	guestLimits            // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
+	// LiveShares lets this guest mint share links to its live view (AB#584).
+	// Off unless set: with it off, /v1/live/shares answers 403 and no share
+	// link or cookie opens the view.
+	LiveShares  bool `json:"live_shares,omitempty"`
+	guestLimits      // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
 }
 
 type config struct {
@@ -176,10 +180,13 @@ type config struct {
 	// turned off for every hotel or for joined hotels. The ops escape is
 	// "sealed_admission": "off" on one operator hotel's entry.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
-	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // a gated hotel's measurement must be one of these; empty refuses every gated hotel
-	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
-	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
-	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	SealedMeasurements []string `json:"sealed_measurements,omitempty"` // a gated hotel's measurement must be one of these; empty refuses every gated hotel
+	SealedHostData     []string `json:"sealed_host_data,omitempty"`    // non-empty: its HOST_DATA must be one of these
+	// An optional Genoa SNP firmware component floor. Zero leaves it unset
+	// until patched hosts are available. It does not prove the OEM PI fix.
+	MinGenoaSNPSPL     int     `json:"min_genoa_snp_spl,omitempty"`
+	AttestTTLSeconds   float64 `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
+	AttestEverySeconds float64 `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
 	// RequireSealedGuestTLS (AB#378): every sealed hotel is reached only over
 	// its attested guest TLS key. A sealed config hotel must set "guest_tls":
 	// true, and a sealed join must pass the keyless HTTPS bootstrap. Off by
@@ -303,6 +310,7 @@ type hotel struct {
 	baselineTry    time.Time
 	leaving        bool               // a leave passed its empty check; no new rooms (hotels.go)
 	stop           context.CancelFunc // stops the sync loop when the hotel leaves
+	syncDone       chan struct{}      // closed when the sync loop has returned: its last step is stored
 	alerts         hotelAlerts        // missed heartbeat and drop alerts sent (alerts.go)
 	// unreaped: create requests (by batch id) whose rooms on this hotel were
 	// not confirmed removed after the hotel failed the create. The sync loop
@@ -371,6 +379,10 @@ type broker struct {
 	// minerExits: miner hotels that went down holding customer rooms
 	// (miner_exits.go). Guarded by b.mu.
 	minerExits []*minerExit
+
+	// shares is sha256(share token) -> live view share link (live_share.go).
+	// In memory only. Guarded by b.mu.
+	shares map[string]*liveShare
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -420,6 +432,9 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return nil, err
+	}
+	if c.MinGenoaSNPSPL < 0 || c.MinGenoaSNPSPL > 255 {
+		return nil, errors.New("config: min_genoa_snp_spl must be an 8-bit SNP component value")
 	}
 	if c.MinerEnrollKeySHA256 != "" {
 		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
@@ -475,11 +490,14 @@ func loadBroker(path string) (*broker, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), started: time.Now()}
+	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), shares: map[string]*liveShare{}, started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		if err := validateSealedAdmission(hc); err != nil {
 			return nil, err
+		}
+		if c.MinGenoaSNPSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
+			return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_snp_spl", hc.ID)
 		}
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
@@ -1956,6 +1974,7 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	b.mu.Unlock()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
 	res := map[string]int{}
+	claimBusy := false
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
@@ -1965,17 +1984,53 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
-			status, _, _, err := h.do(r.Context(), "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
-			if err != nil {
-				status = 502
-			}
+			status, busy := bulkDeleteFromHotel(r.Context(), h, q)
 			mu.Lock()
 			res[h.cfg.ID] = status
+			claimBusy = claimBusy || busy
 			mu.Unlock()
 		}(h)
 	}
 	wg.Wait()
+	if claimBusy {
+		writeJSON(w, 409, map[string]any{"error": map[string]string{
+			"code": "bulk_delete_claim_busy", "message": "bulk deletion may be incomplete after a room claim; retry it",
+		}, "hotels": res})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"hotels": res})
+}
+
+// A claim's lifetime call is bounded at the hotel. Retry only its explicit
+// refusal; another 409 can mean a permanent problem and must keep its status.
+func bulkDeleteFromHotel(ctx context.Context, h *hotel, q url.Values) (int, bool) {
+	deadline := time.Now().Add(12 * time.Second)
+	sawClaimBusy := false
+	for {
+		status, _, body, err := h.do(ctx, "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
+		if err != nil {
+			if sawClaimBusy {
+				return 409, true
+			}
+			return 502, false
+		}
+		if status != 409 || errCodeOf(body) != "bulk_delete_claim_busy" {
+			return status, sawClaimBusy && (status < 200 || status >= 300)
+		}
+		sawClaimBusy = true
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 409, true
+		}
+		wait := min(100*time.Millisecond, remaining)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 409, true
+		case <-timer.C:
+		}
+	}
 }
 
 // ---------------------------------------------------------------- stats
@@ -2227,6 +2282,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 }
 
 func (b *broker) syncLoop(ctx context.Context, h *hotel) {
+	defer close(h.syncDone)
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for {
@@ -2241,19 +2297,52 @@ func (b *broker) syncLoop(ctx context.Context, h *hotel) {
 
 // ---------------------------------------------------------------- live view
 
-func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, string) {
+// viewAuth is how a live view request got in.
+type viewAuth struct {
+	freshView  string     // ?token= view token to move into the bv_ cookie
+	freshShare string     // ?share= token to move into the bvs_ cookie
+	shareHash  string     // set when a share link let the request in; the stream rechecks it
+	share      *liveShare // that link
+	triedShare bool       // a share link or cookie was offered and did not work
+}
+
+// viewGuest checks the view token (?token= or the bv_<guest> cookie) and then
+// a share link (?share= or the bvs_<guest> cookie, AB#584). A share link works
+// for a guest with no view token.
+func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, viewAuth) {
+	var a viewAuth
 	g := b.guests[guestID]
-	if g == nil || g.cfg.ViewTokenSHA256 == "" {
-		return nil, ""
+	if g == nil {
+		return nil, a
 	}
-	want := []byte(strings.ToLower(g.cfg.ViewTokenSHA256))
-	if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(sha(t)), want) == 1 {
-		return g, t
+	if g.cfg.ViewTokenSHA256 != "" {
+		want := []byte(strings.ToLower(g.cfg.ViewTokenSHA256))
+		if t := r.URL.Query().Get("token"); t != "" && subtle.ConstantTimeCompare([]byte(sha(t)), want) == 1 {
+			a.freshView = t
+			return g, a
+		}
+		if c, err := r.Cookie("bv_" + guestID); err == nil && subtle.ConstantTimeCompare([]byte(sha(c.Value)), want) == 1 {
+			return g, a
+		}
 	}
-	if c, err := r.Cookie("bv_" + guestID); err == nil && subtle.ConstantTimeCompare([]byte(sha(c.Value)), want) == 1 {
-		return g, ""
+	if !g.cfg.LiveShares {
+		return nil, a
 	}
-	return nil, ""
+	if t := r.URL.Query().Get("share"); t != "" {
+		a.triedShare = true
+		if s := b.shareFor(sha(t), guestID); s != nil {
+			a.freshShare, a.shareHash, a.share = t, sha(t), s
+			return g, a
+		}
+	}
+	if c, err := r.Cookie(liveShareCookiePfx + guestID); err == nil && c.Value != "" {
+		a.triedShare = true
+		if s := b.shareFor(sha(c.Value), guestID); s != nil {
+			a.shareHash, a.share = sha(c.Value), s
+			return g, a
+		}
+	}
+	return nil, a
 }
 
 // writeSignIn answers 401 with a form that asks for the view token. The form posts the token in the body,
@@ -2307,13 +2396,23 @@ func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tai
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Frame-Options", "DENY")
-	g, fresh := b.viewGuest(r, guestID)
+	g, a := b.viewGuest(r, guestID)
 	if g == nil {
-		writeSignIn(w, guestID, "")
+		msg := ""
+		if a.triedShare {
+			msg = "This share link has ended or was revoked. Ask the person who sent it for a new one."
+		}
+		writeSignIn(w, guestID, msg)
 		return
 	}
-	if fresh != "" {
-		b.setViewCookie(w, guestID, fresh)
+	if a.freshView != "" {
+		b.setViewCookie(w, guestID, a.freshView)
+		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
+		return
+	}
+	if a.freshShare != "" {
+		// Move the token out of the address bar and into a cookie that ends with the link.
+		b.setShareCookie(w, guestID, a.freshShare, a.share.Expires)
 		http.Redirect(w, r, "/"+guestID+"/live", http.StatusSeeOther)
 		return
 	}
@@ -2323,7 +2422,7 @@ func (b *broker) handleLive(w http.ResponseWriter, r *http.Request, guestID, tai
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'")
 		_, _ = w.Write(liveHTML)
 	case "live/events":
-		b.stream(w, r, g)
+		b.stream(w, r, g, a.shareHash)
 	default:
 		http.NotFound(w, r)
 	}
@@ -2411,7 +2510,9 @@ func seenAge(t, now time.Time) float64 {
 	return float64(now.Sub(t).Milliseconds()) / 1000
 }
 
-func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState) {
+// stream sends a snapshot each second. shareHash is set when a share link let
+// the request in: the stream ends once that link is revoked or expires.
+func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState, shareHash string) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "no streaming", 500)
@@ -2422,6 +2523,9 @@ func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
+		if shareHash != "" && b.shareFor(shareHash, g.cfg.ID) == nil {
+			return
+		}
 		data, _ := json.Marshal(b.snapshot(g))
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return
@@ -2540,6 +2644,8 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 				return
 			}
 			b.handleSecrets(w, r, g, name)
+		case p == "/v1/live/shares" || strings.HasPrefix(p, "/v1/live/shares/"):
+			b.handleLiveShares(w, r, g, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/live/shares"), "/"))
 		case p == "/v1/broker/hotels" && r.Method == "GET":
 			b.handleHotels(w, g)
 		case p == "/v1/broker/capacity" && r.Method == "GET":

@@ -57,3 +57,11 @@ Open: the Go vector test belongs to the broker slice (work packages 3 and 4).
 ## Publisher
 
 `scripts/cathedral_sealed_hotels_publish.py` signs via `signer_from_config(path, "sealed_hotels")`, checks the signer key against the pin file, verifies its own output, and keeps durable state (last release and digest, mode 600, atomic write with directory sync, outside the repository). A missing state needs `--init-state` with an explicit `--release` above every release ever published (`--release 1` for the first); a corrupt state refuses and is never reset silently. Outputs are never overwritten.
+
+## Renewal (AB#800)
+
+A release is valid for at most 24 hours, so it is re-signed on a timer on the key host. `ops/sealed-hotels-renew.sh` runs the publisher (next release = recorded + 1; it never creates state), verifies the output with `room-kit/verify_sealed_hotels.py` (built-in pins, expected digest, successor of the recorded release), then writes the exact bytes to Workers KV key `sealed_hotels_current` in the namespace the site Worker binds as `SEALED_HOTELS_STORE`, and reads them back to confirm. It refuses to replace a newer or conflicting release already in KV. `--no-upload` signs and verifies only (it still consumes a release number).
+
+- Units: `ops/sealed-hotels-renew.service` and `ops/sealed-hotels-renew.timer` (every 6 hours at 00, 06, 12, 18 UTC plus up to 15 minutes of jitter, `Persistent=true`). Configuration: `/etc/cathedral/sealed-hotels-renew.env`, see `ops/sealed-hotels-renew.env.example`.
+- The Cloudflare token is read from `CLOUDFLARE_API_TOKEN_FILE` (mode 600, Workers KV Storage:Edit on the account) and handed to curl on stdin; it never appears in argv or output.
+- Installing the timer is a key custody action for the key's custodians: copy both units to `/etc/systemd/system/`, write the environment file, then `systemctl enable --now sealed-hotels-renew.timer`.
