@@ -6,7 +6,12 @@ evidence_dir=${1:-/tmp/hyprland-trial-evidence}
 umask 077
 mkdir -p "$evidence_dir" "$XDG_RUNTIME_DIR"
 chmod 0700 "$XDG_RUNTIME_DIR"
-rm -f "$HOME/keyboard.ok"
+marker=$evidence_dir/keyboard.ok
+if [ -e "$marker" ]; then
+    printf '%s\n' 'NO-GO: evidence directory already contains a keyboard marker' >&2
+    exit 1
+fi
+export PROBE_MARKER=$marker
 compositor_pid=
 vnc_pid=
 terminal_pid=
@@ -65,7 +70,7 @@ while [ "$attempt" -lt 20 ]; do
 done
 test -s "$evidence_dir/frame-before.png"
 
-foot -e sh -c 'read -r line; if [ "$line" = cathedral-probe ]; then printf "%s\n" ok > "$HOME/keyboard.ok"; fi; sleep 30' \
+foot -e sh -c 'read -r line; if [ "$line" = cathedral-probe ]; then printf "%s\n" ok > "$PROBE_MARKER"; fi; sleep 30' \
     > "$evidence_dir/terminal.log" 2>&1 &
 terminal_pid=$!
 sleep 2
@@ -73,8 +78,8 @@ hyprctl cursorpos > "$evidence_dir/cursor-before.txt" 2>&1
 vncdo -s localhost::5900 move 123 234 click 1 type cathedral-probe key enter \
     > "$evidence_dir/input.log" 2>&1
 hyprctl cursorpos > "$evidence_dir/cursor-after.txt" 2>&1
-test -f "$HOME/keyboard.ok"
-test "$(cat "$HOME/keyboard.ok")" = ok
+test -f "$marker"
+test "$(cat "$marker")" = ok
 if cmp -s "$evidence_dir/cursor-before.txt" "$evidence_dir/cursor-after.txt"; then
     printf '%s\n' 'NO-GO: pointer did not move' >&2
     exit 1
