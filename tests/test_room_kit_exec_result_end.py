@@ -118,3 +118,41 @@ def test_a_signed_delete_that_retires_late_keeps_the_new_rooms_results(front, mo
     assert result(front, NEW)[0] == 200
     assert result(front, OLD)[0] == 404
     assert_idle(front.ledger)
+
+
+# ---------------------------------------------------------------- a create answered again is the same life of the room
+
+def test_a_create_replay_keeps_the_rooms_exec_results(front) -> None:
+    front.api.new_ids = [ROOM, ROOM]
+    assert front.create()[0] == 200
+    assert exec_with(front, OLD)[0] == 200
+    status, headers, _out = front.create()  # the same create answered again: the API returns the same room
+    assert status == 200 and receipt_of(headers)["statement"]["room_sequence"] == 3
+    status, headers, _out = result(front, OLD)
+    assert status == 200 and headers["X-Room-Exec-State"] == "done", "a create replay lost a finished exec"
+    status, _headers, out = result(front, OLD, "DELETE")
+    assert status == 200 and json.loads(out) == {"dropped": True}
+    assert code(result(front, OLD)[2]) == "exec_unknown"
+    assert_idle(front.ledger)
+
+
+def test_an_exec_started_after_a_create_replay_is_kept_and_served(front) -> None:
+    front.api.new_ids = [ROOM, ROOM]
+    assert front.create()[0] == 200
+    assert exec_with(front, OLD)[0] == 200
+    assert front.create()[0] == 200
+    assert exec_with(front, NEW, "second")[0] == 200
+    assert result(front, OLD)[0] == 200 and result(front, NEW)[0] == 200
+    assert_idle(front.ledger)
+
+
+def test_a_replay_then_a_room_end_still_forgets_the_results(front) -> None:
+    front.api.new_ids = [ROOM, ROOM]
+    assert front.create()[0] == 200
+    assert exec_with(front, OLD)[0] == 200
+    assert front.create()[0] == 200
+    front.api.rooms.discard(ROOM)
+    front.server.look_all()
+    assert code(result(front, OLD)[2]) == "exec_unknown"
+    assert not front.server.exec_results.entries
+    assert_idle(front.ledger)

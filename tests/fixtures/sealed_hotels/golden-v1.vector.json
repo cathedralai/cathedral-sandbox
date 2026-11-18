@@ -1,0 +1,11 @@
+{
+  "description": "cathedral_sealed_hotels_v1 golden vector; throwaway test key, never production",
+  "envelope_sha256": "f6cab33061ac3c2224d7364e42a3901e01eca0319f166bfc780bf43045dca2d6",
+  "public_key_hex": "031972914d0e8083fd17c99f5f780f425e314e1c8a765595b5cfd0d3d5c31ae6",
+  "seed": "sha256 of the ASCII label below is the Ed25519 private seed",
+  "seed_label": "cathedral_sealed_hotels_v1 golden vector throwaway test key, never production",
+  "signature_base64": "vymXht0upWQxnUrSwSBo8pC2tQk/XAjUihD//j7Ps2YCxg036FfJ1HzbCNpPr7ScG/v+ULjfdCzKZx6sbtVoCA==",
+  "signed_bytes": "{\"generated_at\":\"2026-11-17T12:00:00Z\",\"hotels\":{\"golden-hotel-a\":{\"chip_id\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"measurements\":[\"111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111\",\"222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222\"]},\"golden-hotel-a-2\":{\"chip_id\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"measurements\":[\"333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333\"]},\"golden-hotel-b\":{\"chip_id\":\"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\",\"measurements\":[\"444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444\",\"555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555\"]}},\"key_id\":\"sealed-hotels-golden-test\",\"release\":7,\"schema\":\"cathedral_sealed_hotels_v1\",\"valid_from\":\"2026-11-17T12:00:00Z\",\"valid_until\":\"2026-11-18T12:00:00Z\"}",
+  "signed_bytes_sha256": "891be56c5ce632edf4375d2a9222267d4754eb2e54a0f6a7085e45377a6ac474",
+  "verify_at": "2026-11-17T18:00:00Z"
+}
