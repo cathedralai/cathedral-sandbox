@@ -89,6 +89,7 @@ def build(front_patch=None) -> bytes:
             server.image_digest = lambda ref: None
             threading.Thread(target=server.serve_forever, daemon=True).start()
             api.expires_at = "2023-11-14T22:13:20+00:00"
+            api._stamp = lambda seconds: "2023-11-14T22:13:20+00:00"  # the fake API stamps created_at with the wall clock
             api.new_ids = [ROOM_A, ROOM_B]
             port = server.server_address[1]
 

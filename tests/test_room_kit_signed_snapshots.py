@@ -34,9 +34,9 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "snapshot_fork_v1"
 FIXTURE = FIXTURES / "snapshot_fork_v1.json"
 GENERATOR = FIXTURES / "generate.py"
 # sha256 of snapshot_fork_v1.json. Filled in when the generator exists (step two of CS-3).
-FIXTURE_SHA256 = "4b57e2329e5a7588f9869e9e63a4ccd58e35c13e4dc4b15b1746f9ed542483b0"
+FIXTURE_SHA256 = "2e57d7f4fc7f87f667829ee33ae2a478e722f30edcbfb51e3ba731f28d6aebce"
 # sha256 of the receipts a fixed scripted run of the old actions makes on main (see scripted_old_actions).
-OLD_ACTIONS_SHA256 = "1bbacb44f99c04319eff0ff209c64ee4d483c8536740408c2ecd7c4ee7d4d103"
+OLD_ACTIONS_SHA256 = "a65d824dd997e9895ba7c0f9bc13f171df4fd79b2d2a22a856de938359620a79"
 
 SERIAL = {"image": "repo/app:1", "labels": {"cathedral_serial": "1"}}
 SNAP_MEMBERS = ["snapshot_id", "snapshot_image_id", "snapshot_work_archive_sha256", "snapshot_size_bytes",
@@ -473,7 +473,9 @@ def test_a_fork_that_carries_the_pool_label_is_400_reserved_label_invalid_unsent
     assert status == 400 and code(out) == "reserved_label_invalid" and "X-Room-Receipt" not in headers
     assert len(front.api.seen) == before
     # the same label on an ordinary create is not this rule's business: it passes as on main
-    assert front.create({"image": "repo/app:1", "labels": {"cathedral_pool": "1"}})[0] == 200
+    pool = {"image": "repo/app@sha256:" + "a" * 64, "resources": {"cpu": 1}, "network": {"mode": "deny_all", "allow": []},
+            "labels": {"cathedral_pool": "1"}, "ttl_seconds": 900}  # a pool create as main admits it
+    assert front.create(pool)[0] == 200
     assert_idle(front.ledger)
 
 
@@ -954,6 +956,8 @@ def scripted_old_actions(front: Front, monkeypatch) -> bytes:
     monkeypatch.setattr(rr.time, "time", lambda: 1_700_000_000)
     monkeypatch.setattr(front.server, "image_digest", lambda ref: None)
     front.api.expires_at = "2023-11-14T22:13:20+00:00"
+    # The fake room API stamps created_at with the wall clock (since the pool work on main): fixed here too.
+    monkeypatch.setattr(front.api, "_stamp", lambda seconds: "2023-11-14T22:13:20+00:00")
     front.api.new_ids = ["sbx_pin_1", "sbx_pin_2", "sbx_pin_3", "sbx_pin_4"]
     assert front.create({"image": "repo/app:1"})[0] == 200
     assert front.create({"image": "repo/other:2", "labels": {"k": "v"}})[0] == 200
