@@ -440,13 +440,17 @@ boots, and reads health. Verdicts:
 |---|---|
 | `tampered`, persistent false | PASS: `verify_header()` refused the header |
 | `locked` or `broken` | SAFE, `verify_header()` not exercised: cryptsetup refused the edited header itself |
-| `new`, `open` or `unknown` | FAIL |
+| `new`, `open` or `unknown`, or persistent true | FAIL: the guest used the edited volume |
+| `absent`, `nokey` or `error` | FAIL, inconclusive: no data disk, no key, or cryptsetup below the floor, so the edited header was never tried |
 
 It then stops the guest again and requires the hash of `data.raw` to be
 unchanged (no mkfs, no write). The paste carries the `[sealed-data]` serial
 lines, which show the branch the guest took. `--target keyslot` edits key slot
 0's area instead; that is a negative control (a null key slot area never
 decrypts the key, so `locked` is expected with or without the 2.8.1 refusal).
+There `locked` is PASS, `broken` is SAFE, and any other state is FAIL.
+Every run that got as far as saving the header ends with a `Restore:` line,
+including one whose `--start-cmd` failed.
 Restore with `sealed_data_proof.py edit-header data.raw --restore <backup>`.
 `edit-header` alone edits or restores a header in place (both copies,
 checksums recomputed; it refuses anything but two equal, valid sha256 LUKS2

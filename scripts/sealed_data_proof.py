@@ -177,7 +177,9 @@ def restore_header(path: Path, backup: Path) -> dict:
         cur_uuid = f.read(LUKS2_BIN_SIZE)[OFF_UUID:OFF_UUID + 40]
     if a["uuid"] != cur_uuid:
         raise Luks2Error("backup is from another LUKS2 volume (uuid differs)")
-    _parse_one(saved[hdr_size:], LUKS2_MAGIC_2, hdr_size, hdr_size)
+    b = _parse_one(saved[hdr_size:], LUKS2_MAGIC_2, hdr_size, hdr_size)
+    if a["seqid"] != b["seqid"] or a["uuid"] != b["uuid"] or a["json"] != b["json"]:
+        raise Luks2Error("the backup's primary and secondary headers differ; not restoring a pair cryptsetup would repair")
     with open(path, "r+b") as f:
         f.write(saved)
         f.flush()
@@ -629,6 +631,23 @@ SEGMENT_VERDICT = {
     "locked": (None, "SAFE, verify_header not exercised: cryptsetup refused to activate the edited volume"),
     "broken": (None, "SAFE, verify_header not exercised: cryptsetup refused to load the edited header"),
 }
+# --target keyslot: a null key slot area must never yield the volume key. locked is the expected refusal.
+KEYSLOT_VERDICT = {
+    "locked": (True, "negative control: a null key slot area does not open"),
+    "broken": (None, "SAFE, negative control not exercised: cryptsetup refused to load the edited header"),
+}
+
+
+def null_cipher_verdict(target: str, state, persistent) -> tuple:
+    """(ok, why) for the storage state the guest reported after booting the edited header.
+
+    Only a state that proves cryptsetup or verify_header looked at the edited header counts. absent, nokey and
+    error (no data disk, no key, cryptsetup below the floor) mean the check never ran, so they fail as
+    inconclusive rather than pass as safe."""
+    if state in ("new", "open", "unknown", None) or persistent is not False:
+        return False, "the guest used the edited volume"
+    table = SEGMENT_VERDICT if target == "segment" else KEYSLOT_VERDICT
+    return table.get(state, (False, f"INCONCLUSIVE: state `{state}` means the edited header was never tried"))
 
 
 def cmd_null_cipher(args) -> int:
@@ -665,6 +684,18 @@ def cmd_null_cipher(args) -> int:
     backup.write_bytes(area)
     os.chmod(backup, 0o600)
     r.step("3. header saved", True, f"`{backup}` ({len(area)} bytes)")
+    # From here on the volume may be on the edited header: every exit must carry the restore command.
+    try:
+        _null_cipher_after_backup(p, r, data, start, stop, before)
+    except Exception as exc:  # noqa: BLE001 (report and still print the restore line)
+        r.step("aborted", False, f"{type(exc).__name__}: {exc}")
+    r.add("")
+    r.add(f"Restore: `{os.path.abspath(__file__)} edit-header {data} --restore {backup}`, then `{start}`.")
+    return finish(r)
+
+
+def _null_cipher_after_backup(p, r, data: Path, start: str, stop: str, before: dict) -> None:
+    args = p.args
     res = edit_header(data, args.target)
     r.step("4. header edited, both copies, checksums recomputed", True,
            f"{args.target}: segment0 `{res['before']['segment0']}` -> `{res['after']['segment0']}`, "
@@ -674,17 +705,12 @@ def cmd_null_cipher(args) -> int:
 
     rc, out = run_cmd(start)
     if not r.step("6. guest started", rc == 0, f"`{start}` exit {rc}" + (f": {out}" if rc else "")):
-        return finish(r)
+        return
     t0 = time.monotonic()
     after, st2 = p.wait_new_boot(before.get("boot_id"))
     if r.step("7. new boot answers", bool(after and st2), f"in {time.monotonic() - t0:.0f} s"):
         state = st2.get("state")
-        if state in ("new", "open", "unknown", None) or st2.get("persistent") is not False:
-            ok, why = False, "the guest used the edited volume"
-        elif args.target == "segment":
-            ok, why = SEGMENT_VERDICT.get(state, (None, "SAFE, unexpected state"))
-        else:
-            ok, why = True, "negative control: a null key slot area does not open"
+        ok, why = null_cipher_verdict(args.target, state, st2.get("persistent"))
         r.step(f"8. workspaces_storage `{state}`, persistent {st2.get('persistent')}", ok, why)
         r.add(f"    detail: `{st2.get('detail')}`")
         for ln in p.serial_lines(6):
@@ -696,9 +722,6 @@ def cmd_null_cipher(args) -> int:
     r.step("10. guest stopped", rc == 0, f"exit {rc}")
     digest2, _ = extents_digest(data)
     r.step("11. data.raw unchanged by the boot (no mkfs, no write)", digest2 == digest, f"`{digest2[:16]}`")
-    r.add("")
-    r.add(f"Restore: `{os.path.abspath(__file__)} edit-header {data} --restore {backup}`, then `{start}`.")
-    return finish(r)
 
 
 # --------------------------------------------------------------------------- edit-header

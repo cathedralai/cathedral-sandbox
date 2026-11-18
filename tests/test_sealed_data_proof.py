@@ -105,6 +105,7 @@ class FakeHotel:
         self.lose_data = False
         self.leak_to = None        # (file name, offset): write the marker in clear on the host disk
         self.write_on_boot = False
+        self.force_state = None    # report this storage state after boot, whatever the header says
         self.next_id = 0
         hotel = self
 
@@ -156,6 +157,8 @@ class FakeHotel:
                 self.state = self.after_state
         except sdp.Luks2Error:
             self.state = self.after_state
+        if self.force_state:
+            self.state = self.force_state
         if self.after_key_id:
             self.key_id = self.after_key_id
         if self.lose_data or self.state not in ("new", "open"):
@@ -449,6 +452,37 @@ def test_null_cipher_guest_write_fails(hotel_dir, hotel, capsys):
     assert rc == 1 and "**FAIL** 11. data.raw unchanged" in out
 
 
+@pytest.mark.parametrize("target", ["segment", "keyslot"])
+@pytest.mark.parametrize("state", ["absent", "nokey", "error"])
+def test_null_cipher_check_not_run_is_inconclusive_fail(hotel_dir, hotel, capsys, target, state):
+    env, _ = hotel_dir
+    hotel.force_state = state
+    rc, out, _ = run_null(env, hotel, capsys, "--throwaway", "--target", target)
+    assert rc == 1, out
+    assert f"**FAIL** 8. workspaces_storage `{state}`, persistent False" in out and "INCONCLUSIVE" in out
+    assert "Result: **FAIL**" in out and "Restore: `" in out
+
+
+@pytest.mark.parametrize("target,state,ok", [("segment", "locked", None), ("segment", "broken", None),
+                                             ("keyslot", "broken", None), ("keyslot", "tampered", False)])
+def test_null_cipher_other_refusals(hotel_dir, hotel, capsys, target, state, ok):
+    env, _ = hotel_dir
+    hotel.force_state = state
+    rc, out, _ = run_null(env, hotel, capsys, "--throwaway", "--target", target)
+    assert rc == (1 if ok is False else 0), out
+    assert ("**FAIL** 8." in out) == (ok is False)
+
+
+def test_null_cipher_failed_start_still_prints_restore(hotel_dir, hotel, capsys):
+    env, d = hotel_dir
+    rc = sdp.main(["null-cipher", "--throwaway", "--env", str(env), "--api", hotel.url, "--poll", "0.02",
+                   "--timeout", "10", "--stop-cmd", hotel.ctl("stop"), "--start-cmd", "false"])
+    out = capsys.readouterr().out
+    assert rc == 1 and "**FAIL** 6. guest started" in out
+    backup = next(d.glob("data.raw.luks-header-*"))
+    assert f"--restore {backup}" in out
+
+
 def test_null_cipher_refuses_volume_with_workspaces(hotel_dir, hotel, capsys):
     env, _ = hotel_dir
     hotel.workspaces["customer"] = {}
@@ -482,6 +516,22 @@ def test_edit_header_synthetic_round_trip(tmp_path):
     assert res["after"]["segment0"] == sdp.NULL_CIPHER and res["after"]["keyslot0"] == "aes-xts-plain64"
     _, _, meta = sdp.read_luks2(f)  # both copies equal, checksums valid
     assert meta["segments"]["0"]["encryption"] == sdp.NULL_CIPHER
+
+
+def test_restore_refuses_a_backup_whose_two_headers_differ(tmp_path):
+    f = tmp_path / "v"
+    luks2_header(f)
+    hdr_size, original, _ = sdp.read_luks2(f)
+    sdp.edit_header(f, "segment")
+    _, edited, _ = sdp.read_luks2(f)
+    mixed = tmp_path / "mixed"
+    mixed.write_bytes(original[:hdr_size] + edited[hdr_size:])
+    with pytest.raises(sdp.Luks2Error, match="differ"):
+        sdp.restore_header(f, mixed)
+    good = tmp_path / "good"
+    good.write_bytes(original)
+    sdp.restore_header(f, good)
+    assert sdp.read_luks2(f)[1] == original
 
 
 @pytest.mark.skipif(CRYPTSETUP is None, reason="needs cryptsetup")
