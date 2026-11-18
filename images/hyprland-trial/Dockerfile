@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN printf '%s\n' 'deb http://deb.debian.org/debian trixie-backports main' > /etc/apt/sources.list.d/trixie-backports.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && apt-get install -y -t trixie-backports --no-install-recommends \
        hyprland=0.55.2+ds-1~bpo13+1 wayvnc vncdotool foot procps python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --user-group --create-home --home-dir /home/trial --shell /bin/sh trial
