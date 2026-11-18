@@ -1,0 +1,25 @@
+{
+ "args": [
+  "--attestation",
+  "{dir}/attestation_doc.json",
+  "--receipts",
+  "{dir}/receipts.json",
+  "--skip-amd",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1",
+  "--cathedral-sandbox",
+  "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b"
+ ],
+ "description": "A pre-made room: receipt 1 is a pool create, receipt 2 is the claim made from it. The claim's id is the link.",
+ "expect": {
+  "exit_code": 0,
+  "pointers": {
+   "/pool_rooms/pool-1/pooled_from": "9eb4fec6aa95656224194845f31a523e7d2d5f814857c4a253ed6824651bcbbb",
+   "/pool_rooms/pool-1/shows/0": "Nothing ran in this room before the claim except the machine's own main process, and no request reached it through the front. This rests on the rules of the measured front, so it holds only for the measurements you allowed.",
+   "/pool_rooms/pool-1/state": "claimed",
+   "/room_links/pool-1": "5b7c1a2e-9d3f-4e6a-8b10-2c4d6e8f0a1b",
+   "/sandbox_link/rooms/0": "pool-1"
+  },
+  "verdict": "PASS"
+ }
+}

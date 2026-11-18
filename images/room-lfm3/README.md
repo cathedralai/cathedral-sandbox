@@ -28,6 +28,12 @@ the answer only. The prompt goes to the model as typed (backslashes are not
 unescaped). A prompt longer than `LFM3_CTX` tokens exits 1 with llama-cli's
 error on stderr.
 
+For the sealed benchmark the image also ships `llama-server`, `llama-bench`,
+`python` (`python3`) and `curl`. The build fails unless each one runs, and
+`smoke-tools.sh` (run by the publish workflow on every pull request build and
+on the published digest) times the model with `llama-bench` and checks that
+`llama-server` answers `/health` on loopback under `--network none`.
+
 ## Pins
 
 | What | Pin |

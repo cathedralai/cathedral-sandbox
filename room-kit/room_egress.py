@@ -90,7 +90,18 @@ FORBIDDEN_HEADERS = frozenset({"host", "connection", "content-length", "transfer
                                "trailer", "keep-alive", "expect"})
 OWNER_HASH = re.compile(r"^[0-9a-f]{64}$")
 SECRET_MAX_CHARS = 8192
-SECRETS_PER_OWNER = 64
+SECRETS_PER_OWNER = 64  # ROOM_SECRETS_PER_OWNER overrides it at start (AB#624)
+SECRETS_PER_OWNER_MAX = 65536
+
+
+def secrets_per_owner(env) -> int:
+    """The secret cap for each owner. A platform guest (Polaris) holds the secrets of many users under one
+    owner and keeps its own per-user cap, so its hotels raise this; a bad value keeps the default."""
+    try:
+        n = int(env.get("ROOM_SECRETS_PER_OWNER", SECRETS_PER_OWNER))
+    except (TypeError, ValueError):
+        return SECRETS_PER_OWNER
+    return n if 1 <= n <= SECRETS_PER_OWNER_MAX else SECRETS_PER_OWNER
 
 
 # ---------------------------------------------------------------- policy
@@ -1301,6 +1312,8 @@ def main() -> int:
     # Secrets (#304). ROOM_SECRETS_PERSIST=0 (sealed hotels): memory only.
     state_dir = os.environ.get("ROOM_EGRESS_STATE_DIR", "/var/lib/pool-room-egress")
     persist = env.get("ROOM_SECRETS_PERSIST", "1") != "0"
+    global SECRETS_PER_OWNER
+    SECRETS_PER_OWNER = secrets_per_owner(env)
     secrets = SecretStore(os.path.join(state_dir, "secrets.json") if persist else None,
                           os.path.join(state_dir, "secrets.key"))
     proxy = Proxy(table, secrets=secrets)
