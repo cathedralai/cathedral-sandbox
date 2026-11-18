@@ -106,6 +106,15 @@ health does not say `sealed`. Verify a chain offline with
 `verify_receipts.py`: signature, link to the previous receipt, and head. A
 level 1 chain has no SNP report.
 
+For snapshots and forks, `verify_receipts.py` also reads each snapshot receipt and each fork's create receipt (in
+list mode, header mode and run mode alike; run mode adds the prefix `check 1: `). It recomputes
+`snapshot_content_sha256` from `snapshot_image_id` and `snapshot_work_archive_sha256`, and, when a fork's
+`snapshot_receipt_sha256` is in the list, checks that it names an earlier successful snapshot receipt in the same
+binding with the same snapshot id, content hash and source room, and is the first receipt to sign that snapshot. A snapshot that was deleted and made again under the same id is treated as one id, so a fork of the second one fails the first-receipt rule; the machine gives every snapshot a fresh id, so this does not happen with an honest machine. A fork whose snapshot receipt is not in the list is
+reported as `fork_source: not_in_list` in `chain.forks`, not refused. A fork after a successful delete of its
+snapshot is refused. The content hash covers the image id and the hash of the tar of `/work`; the image's layers are
+not hashed again at a fork.
+
 `verify_receipts.py --oneshot FILE` checks one one-shot run's file offline (run mode). It takes `--recipe`,
 `--context` or `--no-context`, `--run-id`, `--input-sha256`, `--input-file`, `--output-file`,
 `--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`. The other
@@ -569,6 +578,9 @@ daemon keeps the values and adds them to requests outside the room.
   host you trust.
 - Owner: a hash of the hotel API key plus the broker guest id. A secret of
   another owner is never used and answers 404.
+- Limit: 64 secrets per owner, or `ROOM_SECRETS_PER_OWNER` (1 to 65536).
+  Sealed hotels set 4096: the platform guest holds the secrets of many
+  Polaris users under one owner, and the Polaris API caps each user at 64.
 - Storage: memory, and with `ROOM_SECRETS_PERSIST=1` (default) also
   `/var/lib/pool-room-egress/secrets.json` (AES-256-GCM; key file
   `secrets.key`, root only, mode 0600). Sealed hotels set
