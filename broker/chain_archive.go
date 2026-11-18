@@ -71,7 +71,15 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 		_ = json.Unmarshal(raw, &have)
 	}
 	if after > len(have.Receipts) || after+len(page.Receipts) > chainReceiptsMax {
-		return nil
+		// The receipts are not stored (a gap, or past the cap), but the page
+		// still names the hotel's head. If the archive does not hold that head,
+		// the hotel has grown past it: record the head and drop complete, or an
+		// archive that was complete at the old tail would pass for the whole chain.
+		if len(have.Receipts) == 0 || page.Head == "" || chainHolds(have.Receipts, page.Head) ||
+			(have.Head == page.Head && !have.Complete) {
+			return nil
+		}
+		return writeChain(dir, name, archivedChain{Binding: binding, Head: page.Head, Receipts: have.Receipts})
 	}
 	merged := append(have.Receipts[:after:after], page.Receipts...)
 	if len(merged) < len(have.Receipts) {
@@ -92,6 +100,11 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	default:
 		doc.Head = have.Head // the page has not shown a newer head
 	}
+	return writeChain(dir, name, doc)
+}
+
+// writeChain replaces the archive file atomically. Caller holds chainArchiveMu.
+func writeChain(dir, name string, doc archivedChain) error {
 	out, err := marshalRaw(doc)
 	if err != nil {
 		return err

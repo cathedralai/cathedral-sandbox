@@ -254,3 +254,56 @@ func TestPartialChainArchiveKeepsHeadAcrossRestart(t *testing.T) {
 		t.Fatalf("grown chain: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
 	}
 }
+
+// HOLD #464 at 77ea5f0e: a page past chainReceiptsMax is not stored, but the
+// head it names still proves the chain grew. A complete archive at the cap must
+// turn incomplete with the new head (the verifier then says NOT PROVEN, see
+// tests/test_room_kit_level1_receipts.py test_incomplete_broker_archive_...).
+func TestCapPageRecordsNewHeadAndDropsComplete(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	bind := strings.Repeat("f", 64)
+	h := attestedHotel(b, bind)
+	capHead := fmt.Sprintf("%064x", chainReceiptsMax)
+	b.archiveHotelPage(h, 0, headPage(bind, 0, chainReceiptsMax, capHead))
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != chainReceiptsMax || doc.Complete == nil || !*doc.Complete {
+		t.Fatalf("archive at the cap: receipts=%d complete=%v; want the cap, complete=true", len(doc.Receipts), doc.Complete)
+	}
+
+	next := fmt.Sprintf("%064x", chainReceiptsMax+1)
+	b.archiveHotelPage(h, chainReceiptsMax, headPage(bind, chainReceiptsMax, 1, next))
+	doc := getArchive(t, dir, bind)
+	if len(doc.Receipts) != chainReceiptsMax || doc.Head != next || doc.Complete == nil || *doc.Complete {
+		t.Fatalf("one receipt past the cap: receipts=%d head=%q complete=%v; want the cap, the new head, complete=false",
+			len(doc.Receipts), doc.Head, doc.Complete)
+	}
+
+	// A page that starts below the cap and crosses it says the same.
+	b2 := &broker{}
+	b2.cfg.StateDir = dir
+	bind2 := strings.Repeat("9", 64)
+	h2 := attestedHotel(b2, bind2)
+	b2.archiveHotelPage(h2, 0, headPage(bind2, 0, chainReceiptsMax-1, fmt.Sprintf("%064x", chainReceiptsMax-1)))
+	far := fmt.Sprintf("%064x", chainReceiptsMax+2)
+	b2.archiveHotelPage(h2, chainReceiptsMax-1, headPage(bind2, chainReceiptsMax-1, 3, far))
+	if doc := getArchive(t, dir, bind2); doc.Head != far || doc.Complete == nil || *doc.Complete {
+		t.Fatalf("page crossing the cap: head=%q complete=%v; want the new head, complete=false", doc.Head, doc.Complete)
+	}
+
+	// A gap page past a complete archive is skipped too, and also reveals growth.
+	bind3 := strings.Repeat("8", 64)
+	h3 := attestedHotel(b2, bind3)
+	h2nd := fmt.Sprintf("%064x", 2)
+	b2.archiveHotelPage(h3, 0, headPage(bind3, 0, 2, h2nd))
+	gapHead := fmt.Sprintf("%064x", 9)
+	b2.archiveHotelPage(h3, 5, headPage(bind3, 5, 4, gapHead))
+	if doc := getArchive(t, dir, bind3); len(doc.Receipts) != 2 || doc.Head != gapHead || doc.Complete == nil || *doc.Complete {
+		t.Fatalf("gap page: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
+	}
+	// A stale gap page whose head the archive holds changes nothing.
+	b2.archiveHotelPage(h3, 5, headPage(bind3, 5, 1, h2nd))
+	if doc := getArchive(t, dir, bind3); doc.Head != gapHead {
+		t.Fatalf("stale gap page moved the head back to %q", doc.Head)
+	}
+}
