@@ -1046,6 +1046,7 @@ def test_host_net_ingress_forwards_443_to_the_guest_ingress_port(host: FakeHost)
         "-o snp0 -j DROP"]
     assert INGRESS_DNAT in ipt
     assert not [c for c in ipt if "9443" in c or "18443" in c], "ingress alone adds no miner port"
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
     proc = _run_host_net(host, "check", INGRESS, FAKE_IPTABLES_RULES="present")
     assert proc.returncode == 0 and "were missing; restoring" in proc.stderr  # the fake lists 5 rules, ingress needs 7
     assert any(c.startswith("iptables -t nat -C PREROUTING -p tcp --dport 443 ") for c in host.calls("iptables"))
@@ -1087,6 +1088,7 @@ def test_host_net_down_removes_the_ingress_forward_after_the_flag_is_turned_off(
 
 def test_host_net_check_and_up_drop_a_forward_the_config_no_longer_wants(host: FakeHost) -> None:
     # Ingress off now, but the old 443 forward is still on the host: check must not call that healthy.
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
     proc = _run_host_net(host, "check", None, FAKE_IPTABLES_RULES="present", FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS)
     assert proc.returncode == 0, proc.stderr[-3000:]
     assert "were missing; restoring" in proc.stderr
