@@ -79,12 +79,28 @@ func (s *synth) chain(t *testing.T, extras ...map[string]any) []Receipt {
 	return out
 }
 
-// runChecks is VerifyAll without the AMD part, in the same order.
+// runChecks is VerifyAllWithList without the AMD part, in the same order.
 func runChecks(att Attestation, rcs []Receipt, head string) error {
+	return runChecksList(att, rcs, head, nil)
+}
+
+func runChecksList(att Attestation, rcs []Receipt, head string, list *ListDoc) error {
 	if err := verifyGuestTLS(att); err != nil {
 		return err
 	}
+	if err := verifyGuestIngress(att); err != nil {
+		return err
+	}
 	if _, err := VerifyReceipts(att, rcs, head); err != nil {
+		return err
+	}
+	if err := checkSnapshotEdges(rcs); err != nil {
+		return err
+	}
+	if _, err := checkRoomNumbering(rcs, list); err != nil {
+		return err
+	}
+	if _, _, err := checkPoolRooms(rcs); err != nil {
 		return err
 	}
 	if _, err := policyTimeline(rcs); err != nil {
@@ -95,6 +111,38 @@ func runChecks(att Attestation, rcs []Receipt, head string) error {
 	}
 	_, err := roomLinks(rcs)
 	return err
+}
+
+// chainFn builds receipts 1..n; fn(i, prev) returns the extras of statement i (1-based),
+// where prev is the receipt_sha256 of the receipt before it (the binding for the first),
+// so a test can number rooms with real hashes. A nil value deletes a key, as in chain.
+func (s *synth) chainFn(t *testing.T, n int, fn func(i int, prev string) map[string]any) []Receipt {
+	t.Helper()
+	var out []Receipt
+	prev := s.att.BindingSHA256
+	for i := 1; i <= n; i++ {
+		st := map[string]any{
+			"action": "exec", "binding_sha256": s.att.BindingSHA256, "schema": SealedReceiptSchema,
+			"sequence": json.Number(strconv.Itoa(i)), "previous_receipt_sha256": prev,
+		}
+		for k, v := range fn(i, prev) {
+			if _, isNull := v.(explicitNull); isNull {
+				st[k] = nil
+			} else if v == nil {
+				delete(st, k)
+			} else {
+				st[k] = v
+			}
+		}
+		c, err := Canonical(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rc := Receipt{Statement: st, ReceiptSHA256: sha256Hex(c), SignatureB64: base64.StdEncoding.EncodeToString(ed25519.Sign(s.priv, c))}
+		out = append(out, rc)
+		prev = rc.ReceiptSHA256
+	}
+	return out
 }
 
 func policyHash(t *testing.T, p any) string {

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -135,5 +137,45 @@ func TestCLIMeasurementFlags(t *testing.T) {
 	}
 	if code, _, _ := runWith("--head", good); code != 2 {
 		t.Fatalf("--head no longer exists, got %d", code)
+	}
+}
+
+// The reported hole: Go said PASS on a receipts file that repeats a sequence, which Python refuses.
+func TestCLIRefusesRepeatedSequenceAndRoomHeadMismatch(t *testing.T) {
+	raw, err := os.ReadFile("snpverify/testdata/receipts-first5.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Receipts []json.RawMessage `json:"receipts"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, v any) string {
+		b, _ := json.Marshal(v)
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cases := map[string]struct {
+		doc  any
+		code string
+	}{
+		"repeated sequence": {map[string]any{"receipts": append(append([]json.RawMessage{}, doc.Receipts...), doc.Receipts[4])}, snpverify.CodeReceiptSequenceRepeat},
+		"count of 3 over 5": {map[string]any{"count": 3, "room_head": "x", "receipts": doc.Receipts}, snpverify.CodeListDocument},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var out, errb bytes.Buffer
+			code := run(cliArgs("--ark-sha256", genoaPin, "--receipts", write("r.json", tc.doc)), &out, &errb)
+			var f struct{ Verdict, Code string }
+			json.Unmarshal(out.Bytes(), &f)
+			if code != 1 || f.Verdict != "FAIL" || f.Code != tc.code {
+				t.Fatalf("exit %d %s", code, out.String())
+			}
+		})
 	}
 }

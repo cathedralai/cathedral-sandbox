@@ -147,19 +147,23 @@ func TestNumberLimits(t *testing.T) {
 	if _, err := ParseKeepingNumbers([]byte("[" + strings.Repeat("7", 100) + "]")); err != nil {
 		t.Fatalf("100 digits: %v", err)
 	}
+	if _, err := ParseKeepingNumbers([]byte("[1e" + strings.Repeat("0", 98) + "]")); err != nil {
+		t.Fatalf("exponent token of 100: %v", err)
+	}
 	if _, err := ParseKeepingNumbers([]byte("[-" + strings.Repeat("7", 99) + "]")); err != nil {
 		t.Fatalf("sign is a character of the token: %v", err)
 	}
 	for name, in := range map[string]string{
-		"101 digits":           "[" + strings.Repeat("7", 101) + "]",
-		"sign plus 100 digits": "[-" + strings.Repeat("7", 100) + "]",
-		"4301 digits":          "[" + strings.Repeat("7", 4301) + "]",
-		"depth 65":             strings.Repeat("[", 65) + strings.Repeat("]", 65),
-		"overflow":             "[1e999]",
-		"neg overflow":         "[-1e999]",
-		"NaN":                  "[NaN]",
-		"Infinity":             "[Infinity]",
-		"too deep":             strings.Repeat("[", 150) + strings.Repeat("]", 150),
+		"exponent token of 101": "[1e" + strings.Repeat("0", 99) + "]",
+		"101 digits":            "[" + strings.Repeat("7", 101) + "]",
+		"sign plus 100 digits":  "[-" + strings.Repeat("7", 100) + "]",
+		"4301 digits":           "[" + strings.Repeat("7", 4301) + "]",
+		"depth 65":              strings.Repeat("[", 65) + strings.Repeat("]", 65),
+		"overflow":              "[1e999]",
+		"neg overflow":          "[-1e999]",
+		"NaN":                   "[NaN]",
+		"Infinity":              "[Infinity]",
+		"too deep":              strings.Repeat("[", 150) + strings.Repeat("]", 150),
 	} {
 		if _, err := ParseKeepingNumbers([]byte(in)); err == nil {
 			t.Errorf("%s: expected an error", name)
