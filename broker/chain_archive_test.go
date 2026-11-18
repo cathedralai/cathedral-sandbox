@@ -307,3 +307,56 @@ func TestCapPageRecordsNewHeadAndDropsComplete(t *testing.T) {
 		t.Fatalf("stale gap page moved the head back to %q", doc.Head)
 	}
 }
+
+// Re-review of ce332333: an empty page, late pages out of order, and a first
+// page that starts past offset 0 must all leave the newest head on record.
+func TestEveryPageHeadIsRecorded(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+
+	// Empty page past the end of a complete archive names a newer head.
+	bind := strings.Repeat("7", 64)
+	h := attestedHotel(b, bind)
+	b.archiveHotelPage(h, 0, headPage(bind, 0, 5, hx(5)))
+	b.archiveHotelPage(h, 6, headPage(bind, 6, 0, hx(6)))
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != 5 || doc.Head != hx(6) || doc.Complete == nil || *doc.Complete {
+		t.Fatalf("empty page: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
+	}
+
+	// Gap page names head 7; late pages from when the hotel was at 6 arrive after it.
+	bind = strings.Repeat("6", 64)
+	h = attestedHotel(b, bind)
+	b.archiveHotelPage(h, 0, headPage(bind, 0, 5, hx(5)))
+	b.archiveHotelPage(h, 6, headPage(bind, 6, 1, hx(7)))
+	b.archiveHotelPage(h, 0, headPage(bind, 0, 2, hx(6)))
+	b.archiveHotelPage(h, 5, headPage(bind, 5, 1, hx(6)))
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != 6 || doc.Complete == nil || *doc.Complete || doc.Head != hx(7) {
+		t.Fatalf("late pages: receipts=%d head=%q complete=%v; want 6, head 7, complete=false",
+			len(doc.Receipts), doc.Head, doc.Complete)
+	}
+	// Receipt 7 arrives: now the archive holds every head it saw.
+	b.archiveHotelPage(h, 6, headPage(bind, 6, 1, hx(7)))
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != 7 || doc.Complete == nil || !*doc.Complete || doc.Head != hx(7) {
+		t.Fatalf("caught up: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
+	}
+
+	// First read starts past offset 0: no receipts stored, but the head is on record.
+	bind = strings.Repeat("5", 64)
+	h = attestedHotel(b, bind)
+	b.archiveHotelPage(h, 5, headPage(bind, 5, 1, hx(6)))
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != 0 || doc.Head != hx(6) || doc.Complete == nil || *doc.Complete {
+		t.Fatalf("first page past 0: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
+	}
+	// Re-reading what is already archived does not rewrite the file.
+	name := filepath.Join(dir, chainsDir, strings.Repeat("6", 64)+".json")
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(name, old, old); err != nil {
+		t.Fatal(err)
+	}
+	b.archiveHotelPage(attestedHotel(b, strings.Repeat("6", 64)), 0, headPage(strings.Repeat("6", 64), 0, 3, hx(7)))
+	if info, err := os.Stat(name); err != nil || !info.ModTime().Equal(old) {
+		t.Fatalf("unchanged archive was rewritten: %v %v", info.ModTime(), err)
+	}
+}

@@ -36,7 +36,16 @@ type archivedChain struct {
 	Head     string            `json:"head,omitempty"`
 	Complete bool              `json:"complete"`
 	Receipts []json.RawMessage `json:"receipts"`
+	// Unheld lists hotel heads seen for this binding that the receipts do not
+	// reach yet. Pages can arrive late and out of order, and a head hash says
+	// nothing about its position, so every unheld head keeps complete=false
+	// until the receipts hold it.
+	Unheld []string `json:"unheld_heads,omitempty"`
 }
+
+// chainUnheldMax bounds Unheld. Past it the oldest are dropped; the newest
+// are kept, so the archive still stays incomplete.
+const chainUnheldMax = 16
 
 func receiptSHA(raw json.RawMessage) string {
 	var rc struct {
@@ -48,8 +57,10 @@ func receiptSHA(raw json.RawMessage) string {
 
 // archiveChainPage merges one hotel /room/receipts page that started at
 // offset after into the archive of binding. The caller has checked that
-// binding is the hotel's attested one. A page that would leave a gap is
-// skipped: the next read from offset 0 fills it.
+// binding is the hotel's attested one. Receipts that would leave a gap or pass
+// chainReceiptsMax are not stored (the next read from offset 0 fills a gap),
+// but the head every page names is always recorded: an empty page, a gap page
+// or a page past the cap still proves the hotel's chain reaches that head.
 func (b *broker) archiveChainPage(binding string, after int, body []byte) error {
 	binding = strings.ToLower(binding)
 	if b.cfg.StateDir == "" || !sha256HexRE.MatchString(binding) || after < 0 {
@@ -59,7 +70,7 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 		Head     string            `json:"head"`
 		Receipts []json.RawMessage `json:"receipts"`
 	}
-	if err := json.Unmarshal(body, &page); err != nil || len(page.Receipts) == 0 {
+	if err := json.Unmarshal(body, &page); err != nil {
 		return err
 	}
 	chainArchiveMu.Lock()
@@ -67,48 +78,61 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	dir := filepath.Join(b.cfg.StateDir, chainsDir)
 	name := filepath.Join(dir, binding+".json")
 	var have archivedChain
-	if raw, err := os.ReadFile(name); err == nil {
-		_ = json.Unmarshal(raw, &have)
+	old, readErr := os.ReadFile(name)
+	if readErr == nil {
+		_ = json.Unmarshal(old, &have)
 	}
-	if after > len(have.Receipts) || after+len(page.Receipts) > chainReceiptsMax {
-		// The receipts are not stored (a gap, or past the cap), but the page
-		// still names the hotel's head. If the archive does not hold that head,
-		// the hotel has grown past it: record the head and drop complete, or an
-		// archive that was complete at the old tail would pass for the whole chain.
-		if len(have.Receipts) == 0 || page.Head == "" || chainHolds(have.Receipts, page.Head) ||
-			(have.Head == page.Head && !have.Complete) {
-			return nil
+	if readErr != nil && len(page.Receipts) == 0 && page.Head == "" {
+		return nil // nothing to record
+	}
+	merged := have.Receipts
+	if len(page.Receipts) > 0 && after <= len(have.Receipts) && after+len(page.Receipts) <= chainReceiptsMax {
+		if m := append(have.Receipts[:after:after], page.Receipts...); len(m) >= len(have.Receipts) {
+			merged = m // a short re-read must not shrink the archive
 		}
-		return writeChain(dir, name, archivedChain{Binding: binding, Head: page.Head, Receipts: have.Receipts})
 	}
-	merged := append(have.Receipts[:after:after], page.Receipts...)
-	if len(merged) < len(have.Receipts) {
-		merged = have.Receipts // a short re-read must not shrink the archive
+	if merged == nil {
+		merged = []json.RawMessage{}
 	}
 	doc := archivedChain{Binding: binding, Receipts: merged}
-	last := receiptSHA(merged[len(merged)-1])
+	seen := map[string]bool{}
+	for _, h := range append(append(append([]string{}, have.Unheld...), have.Head), page.Head) {
+		if h != "" && !seen[h] && !chainHolds(merged, h) {
+			seen[h] = true
+			doc.Unheld = append(doc.Unheld, h)
+		}
+	}
+	if n := len(doc.Unheld); n > chainUnheldMax {
+		doc.Unheld = doc.Unheld[n-chainUnheldMax:]
+	}
+	last := ""
+	if len(merged) > 0 {
+		last = receiptSHA(merged[len(merged)-1])
+	}
 	switch {
-	case page.Head != "" && !chainHolds(merged, page.Head):
-		// A short page can still report a newer hotel head. Never let an
-		// earlier complete archive hide growth that this page revealed.
+	case seen[have.Head]:
+		doc.Head = have.Head // keep the head already on record; others wait in Unheld
+	case seen[page.Head]:
 		doc.Head = page.Head
-	case have.Head != "" && !chainHolds(merged, have.Head):
-		// A stale page must not erase a previously observed, unarchived head.
-		doc.Head = have.Head
+	case len(doc.Unheld) > 0:
+		doc.Head = doc.Unheld[len(doc.Unheld)-1]
 	case last != "" && (page.Head == last || have.Head == last):
 		doc.Head, doc.Complete = last, true
 	default:
-		doc.Head = have.Head // the page has not shown a newer head
+		doc.Head = have.Head // the receipts hold every head seen, but none ends them
 	}
-	return writeChain(dir, name, doc)
-}
-
-// writeChain replaces the archive file atomically. Caller holds chainArchiveMu.
-func writeChain(dir, name string, doc archivedChain) error {
 	out, err := marshalRaw(doc)
 	if err != nil {
 		return err
 	}
+	if readErr == nil && string(out) == string(old) {
+		return nil // nothing changed: no rewrite of a large archive per read
+	}
+	return writeBytes(dir, name, out)
+}
+
+// writeBytes replaces the archive file atomically. Caller holds chainArchiveMu.
+func writeBytes(dir, name string, out []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
