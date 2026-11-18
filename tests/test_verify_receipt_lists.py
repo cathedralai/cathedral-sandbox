@@ -1312,7 +1312,7 @@ def test_list_mode_fills_in_the_default_cache_folder_only_when_the_flag_is_absen
     folder = PACK / "good" / "numbered_rooms_interleaved"
 
     def captured(cache, flag):
-        monkeypatch.setattr(vr, "verify_attestation", lambda att, m, prod, cache_dir, *rest: (_ for _ in ()).throw(
+        monkeypatch.setattr(vr, "verify_attestation", lambda att, m, prod, cache_dir, *rest, **kwargs: (_ for _ in ()).throw(
             vr.Fail(f"captured {cache_dir}")))
         monkeypatch.setattr(sys, "argv", ["verify_receipts.py", "--attestation", str(folder / "attestation_doc.json"),
                                           "--receipts", str(folder / "receipts.json"), *flag])
