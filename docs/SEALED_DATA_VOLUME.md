@@ -239,6 +239,47 @@ Rejected:
 - Customer export and import of workspaces: product work; a later phase for
   customers who want their own copies.
 
+## Synced volumes: signed generation chain (AB#395, phase 1 contract)
+
+Status: protocol and tests only (`cathedral/volume_chain.py`,
+`tests/test_ab395_volume_chain.py`). Nothing runs on a hotel. It is in the
+cathedral package, not `room-kit/`, so the measured guest does not change until
+a deliberate pin move.
+
+A synced volume is an encrypted restic repo that one sealed guest writes and
+another may restore. Storage and hosts are not trusted, so its history is a
+chain of Ed25519-signed statements, each signed over a fixed label plus its
+canonical JSON (a room receipt signed by the same key is never a commit):
+
+- **volume** (registry): its digest is the parent of generation 1.
+- **lease** (registry): one write lease per volume, to one boot. It names the
+  boot's `receipt_key_ed25519_b64`, the binding digest and the measurement.
+  The registry grants only to a sealed binding whose SNP report the verifier
+  already checked. Renewal by the same key keeps `lease_id` and `lease_seq`; a
+  reboot is a new key, so a new lease once the old one ends or is released.
+- **commit** (lease holder's receipt key): restic repo id and snapshot id at
+  generation head + 1 on top of the head digest. The registry accepts it only
+  from the current, unexpired lease (Decision 6, 4 Nov). An exact resend of
+  the head commit returns the same head, even after its lease expired or was
+  handed over, so a holder that lost the answer learns its write landed.
+- **head** (registry): signed on every accept.
+
+Restore checks the whole chain against a registry-signed head: links,
+generations, lease order (each new lease starts at the head it was granted on,
+with a higher `lease_seq`) and every signature. A prefix short of the head, or
+a commit a former holder signed after its lease ended, is refused. The
+restoring guest must fetch the head from the registry over an authenticated
+channel, not from storage: an older signed head with its matching prefix would
+otherwise pass. Lease expiry is not checked at restore time.
+
+Not in this phase: the pinned restic and the volume agent, the guest route by
+which the agent gets a commit signed by the receipt key (and who may call it),
+volume-key-install through key release (AB#392), the storage gateway that calls
+the sub-token check (cathedral/volume_subtoken.py: prefix, IP, expiry, no delete;
+the token and its check are built, enforcement on Hippius (AB#394) is not), the control plane's
+persistent registry, and the live proof: a workspace written on one sealed
+hotel restores on another host.
+
 ## Still not covered
 
 - **Integrity and freshness (tracked separately, see AB#396).** XTS has no
@@ -246,7 +287,8 @@ Rejected:
   data blocks: the host can corrupt sectors (the guest reads garbage) or put
   back an older copy of the whole disk, and the guest does not notice.
   dm-integrity or AEAD would catch corruption, not an old copy; a generation
-  counter is needed for rollback.
+  counter is needed for rollback. For volumes synced off the machine, the
+  signed generation chain below (AB#395) is that counter.
 - **Availability.** The host can delete `data.raw`. There is no backup and
   no replica.
 - **The hotel API.** On a config hotel the host holds the hotel key and can
@@ -455,3 +497,83 @@ Restore with `sealed_data_proof.py edit-header data.raw --restore <backup>`.
 `edit-header` alone edits or restores a header in place (both copies,
 checksums recomputed; it refuses anything but two equal, valid sha256 LUKS2
 headers, so cryptsetup has nothing to repair on the next open).
+
+## Volume head log, shred and prune (AB#398)
+
+`cathedral/volume_log.py` defines the append-only log of volume heads
+(Decision 6, 4 Nov) and the shred receipt. `VolumeRegistry`
+(`cathedral/volume_chain.py`) writes it: every accepted head appends a `head`
+entry, an exact resend appends nothing, and a refused commit leaves the log and
+the head unchanged. The log is in memory like the rest of the registry; nothing
+publishes it yet.
+
+- Entry `cathedral_volume_log_entry_v1`: `seq`, `prev_entry_sha256`, `kind`
+  (`head` or `shred`), `volume_id`, `generation`, `manifest_sha256`,
+  `commit_receipt_sha256` (the 395 commit receipt), `logged_at`.
+- `verify_log`: contiguous `seq`, hash chain, a volume's heads run 1, 2, 3
+  with no repeat or skip (head+1), a shred names the current head and is the
+  volume's last entry.
+- `verify_extends(old, new)`: the new log holds the old one as its exact
+  prefix. A reader who kept an older copy sees a rollback or a rewrite here.
+- `verify_extends_checkpoint(checkpoint, entries)`: the same check for a
+  reader who kept only an older signed checkpoint.
+- `check_restore`: only the latest logged head restores; a shredded volume
+  never does.
+- Checkpoint `cathedral_volume_log_checkpoint_v1` and shred receipt
+  `cathedral_volume_shred_receipt_v1`: Ed25519 over canonical JSON.
+
+Not covered by the format: a log operator showing two readers two different
+logs. Readers comparing checkpoints (`verify_extends_checkpoint`) catch it; where the
+log and checkpoints are published is still open.
+
+Registry wiring:
+
+- Head entry: `manifest_sha256` is `volume_chain.manifest_sha256(commit)`, the
+  digest of the restic repo id and snapshot id (`volume_chain.canonical`);
+  `commit_receipt_sha256` is the digest of the lease holder's signed commit.
+- Restore: a restoring guest runs `verify_chain`, then `check_restore` on the
+  log with the head commit's manifest digest. Storage still holds a shredded
+  volume's chain, so `verify_chain` alone passes; `check_restore` refuses it.
+- `VolumeRegistry.shred(volume_id, key_id=..., destroy_key=...)`, under the
+  registry lock: checks the volume has a committed head and is not shredded,
+  checks `key_id` is the volume's key (recorded by `create(..., key_id=...)` or
+  `bind_key`, set once; otherwise `key_not_bound` or `shred_key_mismatch`),
+  builds the shred entry, ends the lease and freezes the volume
+  (`shred_pending`, with the pending `key_id`: grant, accept and head refuse,
+  and a retry with another `key_id` refuses `shred_key_mismatch`), then calls
+  `destroy_key(volume_id, key_id)`. Only when that returns `True` does it log the shred and
+  return a signed `cathedral_volume_shred_receipt_v1`. When the key service
+  refuses or its answer is lost, nothing is logged and the volume stays frozen,
+  since the key may already be gone; retrying `shred` finishes it. After a
+  shred, grant, accept (including a resend) and head refuse `volume_shredded`;
+  `shred` again with the same `key_id` returns the same receipt.
+- The receipt attests that the key service confirmed destroying `key_id`.
+  `destroy_key` is the key release service's call (AB#392, not built); it must
+  raise on an unknown key and be idempotent (an already destroyed key returns
+  `True`), so a retry after a lost answer succeeds. It is given `volume_id` too
+  and must refuse a key that is not that volume's.
+- Provisional until Fred decides who holds the log key: the registry signs the
+  shred receipt with its own key, `signing_key_id` `registry:<first 16 hex of
+  sha256(public key)>`. That receipt is Ed25519 over canonical JSON with no
+  label, an exception to the registry's labelled statements above. It cannot
+  collide with them: a labelled message starts with `c`, canonical JSON with `{`.
+- Prune token `cathedral_volume_prune_token_v1`
+  (`volume_subtoken.issue_prune`, `VolumeRegistry.issue_prune_token`,
+  `authorize_prune`): its own label, never issued against a lease, bound to
+  `volumes/<volume_id>/` (built from the volume id, never taken from the
+  caller, so it cannot cover another volume), the prune runner's address and at most one hour. It is the only
+  token that carries `delete`; it also carries get, put and list, because restic
+  prune reads packs and writes index and lock files. The guest sub-token
+  (`authorize`) never allows delete, and neither token passes the other's check.
+  It is still issued after a shred, so the data can be cleaned up.
+
+A volume with no accepted commit cannot be shredded yet (`nothing_to_shred`):
+the log format has no shred entry without a head. Packs a guest uploaded before
+its first commit was accepted are left to prune.
+
+Still open for AB#398: the commit every N minutes with a receipt (needs the
+guest volume agent and pinned restic, AB#789), the customer-held root key mode
+(AB#392), the storage gateway that calls `authorize`/`authorize_prune` in front
+of the bucket (AB#394), where the log and checkpoints are published and who
+holds the log key (Fred), and a live restore-after-shred on two sealed hotels
+(Toby).

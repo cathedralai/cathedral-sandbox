@@ -110,6 +110,17 @@ def test_two_at_once_one_runs_and_the_second_is_refused_unsent(front) -> None:
     assert_idle(front.ledger)
 
 
+def test_an_encoded_serial_room_id_cannot_bypass_the_serial_gate(front) -> None:
+    room = serial_room(front)
+    encoded = "%73" + room[1:]
+    seen = len(front.api.seen)
+    status, headers, out = front.call("POST", f"/v1/sandboxes/{encoded}/exec", {"cmd": ["true"]})
+    assert status == 400 and code(out) == "non_canonical_room_id"
+    assert "X-Room-Receipt" not in headers and len(front.api.seen) == seen
+    assert room in front.ledger.serial
+    assert_idle(front.ledger)
+
+
 def test_a_slow_first_request_signs_before_any_later_one(front) -> None:
     room = serial_room(front)
     held = front.api.hold(rf"POST /v1/sandboxes/{room}/exec")

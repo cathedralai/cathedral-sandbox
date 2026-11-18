@@ -43,14 +43,16 @@ blocking `speak` gate (ADO 552) and
 the warm cache saved in the image (#403, #405), on top of `liquid --json` and
 greedy plus frequency penalty 0.3 for Audio (ADO 547) and `--swa-full` with
 answers sampled after a greedy tool check for Omni (ADO 549, 550). Run
-summaries have the commit tags. All six packages are public; anonymous pull
+summaries have the commit tags. Audio moved to the `62686dd` build (#506, run
+43862309556: example turns so it stops calling a tool for every message, AB#545).
+All six packages are public; anonymous pull
 checked.
 
 | Model | Pin |
 |---|---|
 | `lfm3-1.7b-base` | `ghcr.io/cathedralai/room-lfm3-1.7b-base@sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8` |
 | `lfm3-vl-2b` | `ghcr.io/cathedralai/room-lfm3-vl-2b@sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1` |
-| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:78c2c7d7b6d577c48da6254be23764c5a2be97f4cd2cbe5a7988bb4b4c64a1f5` |
+| `lfm3-audio-2b` | `ghcr.io/cathedralai/room-lfm3-audio-2b@sha256:4f9ab1457d67d8fba8c9890a612c81ad4274e5f83ea1903becafc5c51a14d5f9` |
 | `lfm3-omni-2b` | `ghcr.io/cathedralai/room-lfm3-omni-2b@sha256:df5cea815abd5ba5be781c07558dc72dc45a1334c5b97d0b5a93a907bc9911d6` |
 | `d1-2b` | `ghcr.io/cathedralai/room-d1-2b@sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6` |
 | `d1-omni-2b` | `ghcr.io/cathedralai/room-d1-omni-2b@sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd` |
@@ -231,6 +233,21 @@ kinds of room:
   file). Each call is printed on stderr as it runs (`$ ls -la`); the output
   the model reads is cut at 2,000 characters. At most 4 tool rounds a
   message, then the model must answer. `--no-tools` answers without them.
+- **Audio's tool choice (AB#545).** Offered tools, LFM3-Audio-2B called one
+  for every message, even "What is 2+2?": its first token was `<tool_call>`
+  at 0.89 to 1.00 whatever the question, so neither sampling nor a reworded
+  system prompt changed it. In Audio rooms a round that offers tools starts
+  with three fixed example turns after the system prompt: a sum and a
+  translation answered in text, and "What umask is this machine set to?"
+  answered with `run`. They are not kept in the conversation, never shown,
+  count against the 4,000-character budget, and are not sent with
+  `--no-tools`, `--json` or the last round. Local eval (pinned GGUF and
+  llama.cpp, 14 no-tool and 17 tool questions, 2 runs): needless calls 26/28
+  before, 0/28 after; tool questions kept a call 34/34. The tool example
+  holds a fact nobody asks about: a fact there (an IP address, a timezone)
+  came back as Audio's answer to the matching question with no call. An
+  example about an installed program or an open port made Audio answer
+  "What is the hostname?" with `hostname -I` and an IP address.
 - **JSON.** `--json` sends a JSON schema (an object or an array) as
   `response_format`, which llama-server turns into a grammar, plus one system
   line asking for valid JSON with no comments, and no tools. The grammar fixes
