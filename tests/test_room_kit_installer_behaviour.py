@@ -144,7 +144,8 @@ cp "$src" "$out"
     "iptables": r"""
 t=filter; [ "${1:-}" = -t ] && { t=$2; shift 2; }
 case "${1:-}" in
-  -S) chain=${2:-}
+  -S) [ -n "${FAKE_IPTABLES_S_FAIL:-}" ] && exit 4
+      chain=${2:-}
       [ "$chain" = INPUT ] && echo "-P INPUT ${FAKE_INPUT_POLICY:-ACCEPT}"
       if [ -z "$chain" ]; then v=FAKE_IPTABLES_TAGGED_$t; [ -n "${!v:-}" ] && printf '%s\n' "${!v}"; fi
       if [ "${FAKE_IPTABLES_RULES:-}" = present ] && [ -n "$chain" ] && [ "$chain" != INPUT ]; then
@@ -853,7 +854,8 @@ def test_host_net_check_leaves_a_stopped_guests_link_down(host: FakeHost) -> Non
     # bring the old tap and NAT back, or install refuses the move it was asked to make.
     proc = _run_host_net(host, "check")
     assert proc.returncode == 0 and "restoring" not in proc.stderr
-    assert not host.calls("iptables") and not [c for c in host.calls("ip") if "addr replace" in c or "tuntap" in c]
+    assert not [c for c in host.calls("iptables") if " -A " in c or " -I " in c or " -D " in c]
+    assert not [c for c in host.calls("ip") if "addr replace" in c or "tuntap" in c]
 
 
 def test_host_net_refuses_the_link_a_stopped_sibling_hotel_is_set_to(host: FakeHost) -> None:
@@ -1094,6 +1096,33 @@ def test_host_net_check_and_up_drop_a_forward_the_config_no_longer_wants(host: F
     assert "were missing; restoring" in proc.stderr
     assert STALE_INGRESS_DELETE in host.calls("iptables")
     assert not [c for c in host.calls("iptables") if " -A PREROUTING" in c]
+
+
+def test_host_net_check_removes_a_stopped_guests_leftover_forward(host: FakeHost) -> None:
+    proc = _run_host_net(host, "check", None, FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS)
+    assert proc.returncode == 0 and "restoring" not in proc.stderr
+    assert STALE_INGRESS_DELETE in host.calls("iptables")
+    assert not [c for c in host.calls("iptables") if " -A " in c or " -I " in c]
+
+
+def test_host_net_down_fails_loudly_when_it_cannot_list_the_forwards(host: FakeHost) -> None:
+    proc = _run_host_net(host, "down", INGRESS, FAKE_IPTABLES_S_FAIL="1")
+    assert proc.returncode == 1 and "could not list or delete the public port forwards" in proc.stderr
+    assert host.calls("ip link del") == ["ip link del snp0"], "the rest of down still ran"
+
+
+def test_host_net_refuses_a_public_port_another_hotel_forwards(host: FakeHost) -> None:
+    other = STALE_INGRESS.replace("sealed-hotel:sealed-1", "sealed-hotel:other").replace("10.215.0.2", "10.215.0.6")
+    proc = _run_host_net(host, "up", INGRESS, FAKE_IPTABLES_TAGGED_nat=other)
+    assert proc.returncode == 1 and "already forwards public port 443" in proc.stderr
+    assert not [c for c in host.calls("iptables") if " -A " in c or " -I " in c]
+    proc = _run_host_net(host, "clash", INGRESS, FAKE_IPTABLES_TAGGED_nat=other)
+    assert proc.returncode == 1
+    # Another port, or our own earlier rule, is not a clash.
+    proc = _run_host_net(host, "up", {**INGRESS, "SEALED_INGRESS_PUBLIC_PORT": "8444"}, FAKE_IPTABLES_TAGGED_nat=other)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    proc = _run_host_net(host, "up", INGRESS, FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS)
+    assert proc.returncode == 0, proc.stderr[-3000:]
 
 
 def test_host_net_up_replaces_a_forward_whose_public_port_was_edited(host: FakeHost) -> None:

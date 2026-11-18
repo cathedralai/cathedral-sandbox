@@ -521,8 +521,12 @@ made there; the certificate is the hotel's Let's Encrypt wildcard, proven over
 DNS-01 through the broker (broker README, "Preview URL certificates"). Before
 turning it on: nothing else on the host may need port 443 on its own
 addresses, the port must be open in any outer firewall, and `*.<hotel
-id>.<zone>` must point at this host. Turn it off only with the guest stopped:
-`down` removes only the rules the current `sealed.env` names.
+id>.<zone>` must point at this host. `down` removes every port forward tagged
+for this hotel, whatever `sealed.env` says now, so turning ingress off or
+editing the public port leaves no old forward behind; `up` and `check` drop
+such a leftover too, and `down` exits non-zero if it could not. A forward
+matches every local address, so `up` refuses a public port that another
+sealed hotel on this host already forwards.
 
 Still open: the guest side (an nft accept for the ingress port, the server on
 it, the ACME client that signs its challenge with the receipt key). It is in

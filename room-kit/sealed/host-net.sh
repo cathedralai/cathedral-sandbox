@@ -40,10 +40,30 @@ RULES=5
 # current flags and ports: sealed.env may have changed since "up" (ingress
 # turned off, a public port edited), and the old forward must still go.
 tagged_dnat() { { iptables -t nat -S 2>/dev/null | grep -F -- "--comment \"$TAG\"" | grep -- '^-A PREROUTING ' || true; }; }
+# Fails when the rules cannot be listed or a delete fails, so "down" can say so.
 purge_dnat() {
-  tagged_dnat | sed 's/^-A /-D /' | while read -r rule; do
-    eval "iptables -t nat $rule" 2>/dev/null || true
+  local rules rule rc=0
+  rules=$(iptables -t nat -S 2>/dev/null) || return 1
+  while read -r rule; do
+    [ -n "$rule" ] || continue
+    eval "iptables -t nat ${rule/#-A /-D }" 2>/dev/null || rc=1
+  done < <(printf '%s\n' "$rules" | grep -F -- "--comment \"$TAG\"" | grep -- '^-A PREROUTING ' || true)
+  return $rc
+}
+# A public port forward matches every local address, so two hotels on one
+# host cannot share one: the first rule would take the other hotel's traffic.
+dnat_port_clash() {
+  local rules port
+  [ "$WANT_DNAT" -gt 0 ] || return 0
+  rules=$(iptables -t nat -S 2>/dev/null) || return 0
+  for port in $([ "$MINER" = 1 ] && echo "$PUBLIC_PORT") $([ "$INGRESS" = 1 ] && echo "$INGRESS_PUBLIC_PORT"); do
+    if printf '%s\n' "$rules" | grep -- '^-A PREROUTING ' | grep -F -- '--comment "sealed-hotel:' \
+       | grep -vF -- "--comment \"$TAG\"" | grep -qE -- "--dport $port( |\$)"; then
+      echo "sealed-hotel: another sealed hotel on this host already forwards public port $port; give $SEALED_NAME its own port (SEALED_INGRESS_PUBLIC_PORT or SEALED_MINER_PUBLIC_PORT) or host" >&2
+      return 1
+    fi
   done
+  return 0
 }
 WANT_DNAT=0
 [ "$MINER" = 1 ] && WANT_DNAT=$((WANT_DNAT + 1))
@@ -102,10 +122,11 @@ link_clash() {
 
 case "${1:?up|down|check|clash}" in
 clash)
-  link_clash
+  link_clash && dnat_port_clash
   ;;
 up)
   link_clash || exit 1
+  dnat_port_clash || exit 1
   ip link show "$TAP" >/dev/null 2>&1 || ip tuntap add dev "$TAP" mode tap
   ip addr replace "$SEALED_HOST_IP/30" dev "$TAP"
   ip link set "$TAP" up
@@ -149,6 +170,8 @@ check)
   # A stopped guest needs no link: do not bring its tap back (a link move is
   # drain, stop, edit sealed.env, install). Only the timer runs "check".
   if command -v systemctl >/dev/null && ! systemctl is-active -q "room-sealed-$SEALED_NAME.service"; then
+    # But a public forward must not outlive its guest (a "down" that could not delete it).
+    [ -z "$(tagged_dnat)" ] || purge_dnat || true
     exit 0
   fi
   # Put the rules back when a firewall reload took them (idempotent "up").
@@ -174,9 +197,15 @@ down)
   if [ "$INGRESS" = 1 ]; then
     iptables -t nat -D PREROUTING "${INGRESS_DNAT[@]}" 2>/dev/null || true
   fi
-  purge_dnat  # whatever the flags say now
+  dnat_left=0
+  purge_dnat || dnat_left=1  # whatever the flags say now
   iptables -F "$FWD" 2>/dev/null && iptables -X "$FWD" 2>/dev/null || true
   iptables -F "$IN" 2>/dev/null && iptables -X "$IN" 2>/dev/null || true
   ip link del "$TAP" 2>/dev/null || true
+  if [ "$dnat_left" = 1 ]; then
+    # Everything else is down; say so loudly rather than leave a public forward silently.
+    echo "sealed-hotel: could not list or delete the public port forwards tagged $TAG; check 'iptables -t nat -S PREROUTING'" >&2
+    exit 1
+  fi
   ;;
 esac
