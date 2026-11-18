@@ -27,7 +27,7 @@ def _signed_action(method: str, path: str) -> str | None:
 def test_signed_table_includes_file_routes() -> None:
     assert _signed_action("PUT", "/v1/sandboxes/rm_1/files?path=/work/a.txt") == "file_put"
     assert _signed_action("GET", "/v1/sandboxes/rm_1/files?path=/work/a.txt") == "file_get"
-    assert _signed_action("PUT", "/v1/sandboxes/rm_1/tar?path=/work") is None
+    assert _signed_action("PUT", "/v1/sandboxes/rm_1/stat?path=/work") is None
 
 
 @pytest.fixture
@@ -66,7 +66,7 @@ def front(tmp_path, monkeypatch):
     api = ThreadingHTTPServer(("127.0.0.1", 0), Api)
     threading.Thread(target=api.serve_forever, daemon=True).start()
     ledger = rr.Ledger("room-a", str(tmp_path))
-    server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, KEY, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, KEY, "/nonexistent.sock", pool_scan=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield server.server_address[1], seen, ledger
     server.shutdown()

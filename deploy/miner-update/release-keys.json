@@ -1,0 +1,11 @@
+{
+  "keys": {
+    "miner-canary-local-1": {
+      "channels": [
+        "canary"
+      ],
+      "public_key_hex": "a805f5e29a058372d51122e9c5b2554c97e485199c7273a6966d6c838296d1e1"
+    }
+  },
+  "schema": "cathedral_miner_release_keys_v1"
+}

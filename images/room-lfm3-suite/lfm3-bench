@@ -176,17 +176,21 @@ if [ "$rc" -ne 0 ] || [ "$code" != 200 ]; then
 fi
 [ -s "$work/first" ] || fail "the stream ended with no token"
 
-# Chunks as JSON, one per line. The final choice and timings must arrive
-# before [DONE]; data after it, a second terminator or malformed data fails.
+# One JSON object per SSE event, one per line. An event is its data line up to
+# the blank line that ends it; a second data line in the same event, an empty
+# event, or anything but exactly one object fails. jq -n with inputs runs one
+# program over every event, so the first bad event stops it (error() per input
+# would let later events reset the exit status). The final choice and timings
+# must arrive before [DONE]; data after it or a second terminator fails.
 if ! awk '
     { sub(/\r$/, "") }
-    /^data: ?\[DONE\]$/ { if (done) exit 1; done = 1; next }
-    /^data:/ { if (done) exit 1; sub(/^data: ?/, ""); print; next }
-    /^$/ { next }
+    /^$/ { if (open) { print data; open = 0 } next }
     /^:/ { if (done) exit 1; next }
+    /^data: ?\[DONE\]$/ { if (done || open) exit 1; done = 1; next }
+    /^data:/ { if (done || open) exit 1; sub(/^data: ?/, ""); data = $0; open = 1; next }
     { exit 1 }
-    END { if (!done) exit 1 }
-  ' "$work/raw" | jq -c 'if type == "object" then . else error("non-object chunk") end' \
+    END { if (!done || open) exit 1 }
+  ' "$work/raw" | jq -n -R -c 'inputs | fromjson | if type == "object" then . else error("non-object chunk") end' \
       >"$work/chunks" 2>/dev/null; then
   fail "the stream is incomplete or malformed"
 fi
