@@ -1,0 +1,71 @@
+{
+ "attestation": {
+  "binding_sha256": "358c1ab52a87b4a2b75f98f16aac407698c7c861b681a0378f15abd89e528b6c",
+  "measurement": "abababababababababababababababababababababababababababababababababababababababababababababababab",
+  "chip_id": "cdcdcdcdcdcdcdcd...",
+  "policy": "0x30000",
+  "host_data": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+  "report_version": 3,
+  "kernel_cmdline": ""
+ },
+ "chain": {
+  "receipts": 6,
+  "signatures_ok": 6,
+  "links_checked": 6,
+  "contiguous": true,
+  "first": 1,
+  "last": 6,
+  "actions": {
+   "create": 2,
+   "network_set": 2,
+   "exec": 1,
+   "delete": 1
+  }
+ },
+ "policy_timeline": {
+  "r1": [
+   {
+    "sequence": 1,
+    "issued_at": 1700000001,
+    "action": "create",
+    "status": 202,
+    "mode": "allowlist",
+    "allow": [
+     "example.org",
+     "example.net"
+    ],
+    "policy_sha256": "d49d5205c32cfe3c56078b54c174264c2b239c0cd3c00b9abbce2f48b9a7b7ff"
+   },
+   {
+    "sequence": 2,
+    "issued_at": 1700000002,
+    "action": "network_set",
+    "status": 200,
+    "mode": "deny_all",
+    "allow": [],
+    "policy_sha256": "b1dad3cb08025f5fd7a1c2419631a24729952344bc0d9cc898afa04e92415f68"
+   },
+   {
+    "sequence": 5,
+    "issued_at": 1700000005,
+    "action": "delete",
+    "status": 200
+   },
+   {
+    "sequence": 6,
+    "issued_at": 1700000006,
+    "action": "create",
+    "status": 202,
+    "mode": "deny_all",
+    "allow": [],
+    "policy_sha256": "b1dad3cb08025f5fd7a1c2419631a24729952344bc0d9cc898afa04e92415f68"
+   }
+  ]
+ },
+ "room_tunables": {
+  "r1": "031504f4e9c2160cba50fed5883e2c66a20049f5b2889c1320a7d3af97e77602"
+ },
+ "room_links": {},
+ "verdict": "PASS",
+ "checked": "whole chain to the head the server named"
+}

@@ -376,6 +376,7 @@ func TestEscapeNoncePlantPlaintextFlagDoesNotDeliverOnAMinerHotel(t *testing.T) 
 	h := tc.b.hotelByID("a")
 	admitEscapeHotel(tc, h, receiptPub, "binding-a")
 	h.cfg.MinerHotkey = minerHotkey
+	h.guestPin.Store(&[32]byte{1}) // a miner is admitted only with a verified guest TLS pin (AB#378)
 	h.runtime = true
 	nonce := "control-plane-nonce-1"
 	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels/a/escape-nonce",
