@@ -110,6 +110,17 @@ def test_two_at_once_one_runs_and_the_second_is_refused_unsent(front) -> None:
     assert_idle(front.ledger)
 
 
+def test_an_encoded_serial_room_id_cannot_bypass_the_serial_gate(front) -> None:
+    room = serial_room(front)
+    encoded = "%73" + room[1:]
+    seen = len(front.api.seen)
+    status, headers, out = front.call("POST", f"/v1/sandboxes/{encoded}/exec", {"cmd": ["true"]})
+    assert status == 400 and code(out) == "non_canonical_room_id"
+    assert "X-Room-Receipt" not in headers and len(front.api.seen) == seen
+    assert room in front.ledger.serial
+    assert_idle(front.ledger)
+
+
 def test_a_slow_first_request_signs_before_any_later_one(front) -> None:
     room = serial_room(front)
     held = front.api.hold(rf"POST /v1/sandboxes/{room}/exec")
@@ -160,7 +171,8 @@ def test_a_semicolon_alias_patch_cannot_bypass_the_serial_gate(front) -> None:
     # AB#384: urlparse (API) strips ";alias"; urlsplit (old front) did not, so
     # PATCH /v1/sandboxes/{id};alias skipped the serial token and mutated the room.
     room = serial_room(front)
-    seen, before = len(front.api.seen), len(front.statements(room))
+    before = len(front.statements(room))  # a read of the list looks at the room once: count after it
+    seen = len(front.api.seen)
     status, _headers, out = front.call("PATCH", f"/v1/sandboxes/{room};alias", {"labels": {"x": "y"}})
     assert status == 409 and code(out) == "room_serial_unsigned"
     assert len(front.api.seen) == seen

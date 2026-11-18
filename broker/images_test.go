@@ -69,10 +69,25 @@ type fakeHotel struct {
 	sealedExecPaths  []string
 	sealedExecBodies [][]byte
 	sealedExecAnswer []byte
+	// Cancel of a background exec (POST /v1/sandboxes/{id}/exec/cancel, AB#406).
+	execCancelPaths  []string
+	execCancelBodies [][]byte
+	execCancelAnswer []byte
 	// ownerScoped: list, delete and push snapshots only for the guest in the
 	// X-Cathedral-Guest header, as a hotel with per-guest ownership does
 	// (cathedral/sandbox_guest.py list_snapshots and delete_snapshot, AB#650).
 	ownerScoped bool
+
+	// createFail: answer creates with this status and no room id (AB#338).
+	// createFailAfterStart: start the room first, as a hotel or a proxy in
+	// front of it that fails after the room exists.
+	createFail           int
+	createFailAfterStart bool
+	// labelListFail: answer a room list with a label filter (the broker's
+	// orphan reap) with this status. roomDeleteFail: answer a room delete
+	// with this status and keep the room (AB#338).
+	labelListFail  int
+	roomDeleteFail int
 	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
 	// runs without f.mu so it may hijack and hold the connection.
 	upgrade http.HandlerFunc
@@ -128,6 +143,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 401, "unauthorized", "bad hotel key")
 			return
 		}
+		if f.createFail != 0 && !f.createFailAfterStart {
+			writeErr(w, f.createFail, "create_failed", "the hotel could not start the room")
+			return
+		}
 		if nw, ok := req["network"].(map[string]any); ok && nw["mode"] == "allowlist" {
 			if allow, _ := nw["allow"].([]any); len(allow) > 0 && allow[0] == "bad.example:9" {
 				writeErr(w, 400, "invalid_network_allowlist", "port 9 is not allowed")
@@ -143,6 +162,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
 		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		if f.createFail != 0 {
+			writeErr(w, f.createFail, "create_failed", "the room started but the answer is an error")
+			return
+		}
 		w.Header().Set("X-Room-Receipt", "signed-create"+f.receiptTag)
 		out := map[string]any{"id": id, "state": "running", "snapshot_id": req["snapshot_id"]}
 		if t, ok := req["tunables"]; ok && t != nil && f.appliesTunables {
@@ -151,6 +174,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 202, out)
 	case p == "/v1/sandboxes" && r.Method == "GET":
+		if f.labelListFail != 0 && len(r.URL.Query()["label"]) > 0 {
+			writeErr(w, f.labelListFail, "list_failed", "the hotel could not list its rooms")
+			return
+		}
 		// Like a hotel: every "label" filter must match.
 		out := []map[string]any{}
 		for _, rm := range f.rooms {
@@ -291,6 +318,13 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Room-Receipt", "signed-sealed-exec")
 		w.WriteHeader(200)
 		_, _ = w.Write(f.sealedExecAnswer)
+	case strings.HasSuffix(p, "/exec/cancel") && r.Method == "POST":
+		f.execCancelPaths = append(f.execCancelPaths, p)
+		f.execCancelBodies = append(f.execCancelBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Room-Receipt", "signed-exec-cancel")
+		w.WriteHeader(200)
+		_, _ = w.Write(f.execCancelAnswer)
 	case strings.HasSuffix(p, "/exec") && r.Method == "POST":
 		f.execs = append(f.execs, req)
 		w.Header().Set("X-Room-Receipt", "signed-exec")
@@ -390,6 +424,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.Count(p, "/") == 3 && r.Method == "DELETE":
 		id := strings.TrimPrefix(p, "/v1/sandboxes/")
 		f.roomDeletes = append(f.roomDeletes, id)
+		if f.roomDeleteFail != 0 {
+			writeErr(w, f.roomDeleteFail, "delete_failed", "the hotel could not remove the room")
+			return
+		}
 		for i, rm := range f.rooms {
 			if rm["id"] == id {
 				f.rooms = append(f.rooms[:i], f.rooms[i+1:]...)
@@ -467,6 +505,7 @@ func (tc *testChain) start(t *testing.T) {
 	for _, h := range b.hotelList() {
 		h.ok, h.slots = true, 100
 	}
+	b.resumeNativeExecs()
 	tc.b = b
 	tc.srv = httptest.NewServer(b)
 	t.Cleanup(tc.srv.Close)

@@ -121,7 +121,7 @@ class Api:
 
 
 def _front(ledger, api_port: int) -> int:
-    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock", pool_scan=False)
     Thread(target=server.serve_forever, daemon=True).start()
     return server.server_address[1]
 
@@ -467,17 +467,17 @@ def test_the_sweep_drops_rooms_that_are_gone(guest) -> None:
 
 
 @pytest.mark.parametrize("method", ["PUT", "POST", "GET", "DELETE"])
-@pytest.mark.parametrize("path", [
-    f"/v1/sandboxes/{ROOM}/env-sealed",
-    f"/v1/sandboxes/{ROOM}/env-sealed;x=1",
-    f"/v1/sandboxes/{ROOM}/env%2Dsealed",
-    f"/v1/sandboxes/{ROOM}/env-sealed?env=1",
-    "/v1/sandboxes/a%2Fb/env-sealed",
+@pytest.mark.parametrize("path,expected", [
+    (f"/v1/sandboxes/{ROOM}/env-sealed", (404, "route_not_found")),
+    (f"/v1/sandboxes/{ROOM}/env-sealed;x=1", (404, "route_not_found")),
+    (f"/v1/sandboxes/{ROOM}/env%2Dsealed", (404, "route_not_found")),
+    (f"/v1/sandboxes/{ROOM}/env-sealed?env=1", (404, "route_not_found")),
+    ("/v1/sandboxes/a%2Fb/env-sealed", (400, "non_canonical_room_id")),
 ])
-def test_no_caller_reaches_the_room_apis_env_route(guest, method, path) -> None:
+def test_no_caller_reaches_the_room_apis_env_route(guest, method, path, expected) -> None:
     _, api, port = guest
     status, _, body = _request(port, method, path, canonical({"env": {"A": VALUE}}))
-    assert (status, _code(body)) == (404, "route_not_found")
+    assert (status, _code(body)) == expected
     assert api.seen == []
 
 

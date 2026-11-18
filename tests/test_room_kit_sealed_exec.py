@@ -122,7 +122,7 @@ class Api:
 
 
 def _front(ledger, api_port: int):
-    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/nonexistent.sock", pool_scan=False)
     Thread(target=server.serve_forever, daemon=True).start()
     return server.server_address[1]
 
@@ -335,18 +335,18 @@ def test_every_seal_draws_fresh_keys_and_nonces_both_ways(guest) -> None:
     assert all(base64.b64decode(d["nonce_b64"]) != bytes(12) for d in docs + answers)
 
 
-@pytest.mark.parametrize("path", [
-    f"/v1/sandboxes/{ROOM}/exec-sealed",
-    f"/v1/sandboxes/{ROOM}/exec-sealed;x=1",      # urlparse, as the API parses, drops ";params"
-    f"/v1/sandboxes/{ROOM}/exec%2Dsealed",
-    f"/v1/sandboxes/{ROOM}/exec-sealed?cmd=true",
-    "/v1/sandboxes/a%2Fb/exec-sealed",              # the API's raw match takes a%2Fb as one id
+@pytest.mark.parametrize("path,expected", [
+    (f"/v1/sandboxes/{ROOM}/exec-sealed", (404, "route_not_found")),
+    (f"/v1/sandboxes/{ROOM}/exec-sealed;x=1", (404, "route_not_found")),
+    (f"/v1/sandboxes/{ROOM}/exec%2Dsealed", (404, "route_not_found")),
+    (f"/v1/sandboxes/{ROOM}/exec-sealed?cmd=true", (404, "route_not_found")),
+    ("/v1/sandboxes/a%2Fb/exec-sealed", (400, "non_canonical_room_id")),
 ])
-def test_no_caller_reaches_the_room_apis_sealed_route(guest, path) -> None:
+def test_no_caller_reaches_the_room_apis_sealed_route(guest, path, expected) -> None:
     # That route runs an exec with no history or log, and the front signs no receipt for it.
     _, api, port, _ = guest
     status, _, body = _request(port, "POST", path, canonical({"cmd": ["true"]}))
-    assert (status, _code(body)) == (404, "route_not_found")
+    assert (status, _code(body)) == expected
     assert api.seen == []
 
 
