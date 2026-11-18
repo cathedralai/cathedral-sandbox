@@ -130,7 +130,7 @@ def test_bad_report_data_is_a_400(sealed, body) -> None:
 def test_attest_needs_the_hotel_key(sealed, key) -> None:
     port, _ledger, tsm = sealed
     before = len(tsm.inputs)
-    status, _h, _doc = _attest(port, {"report_data_hex": "00" * 64}, key=key)
+    status, _h, _doc = _attest(port, {"report_data_hex": "01" * 64}, key=key)
     assert status == 401 and len(tsm.inputs) == before
 
 
@@ -155,7 +155,7 @@ def test_reports_over_the_limit_get_429(tmp_path, monkeypatch) -> None:
     port = server.server_address[1]
     try:
         for i in range(3):
-            assert _attest(port, {"report_data_hex": f"{i:02x}" * 64})[0] == 200
+            assert _attest(port, {"report_data_hex": f"{i + 1:02x}" * 64})[0] == 200
         status, headers, doc = _attest(port, {"report_data_hex": "ff" * 64})
         assert status == 429 and doc == {"error": "attest_rate_limit"}
         assert 1 <= int(headers["Retry-After"]) <= 61
@@ -228,3 +228,23 @@ def test_a_changed_measurement_is_refused(sealed, monkeypatch) -> None:
     monkeypatch.setattr(rr, "_read_tsm_aux", other)
     status, _h, doc = _attest(port, {"report_data_hex": "22" * 64})
     assert status == 500 and doc["error"] == "attest_failed"
+
+
+@pytest.mark.parametrize("head", [bytes(32), hashlib.sha256(b"a forged binding").digest()])
+def test_binding_shaped_report_data_is_refused(sealed, head) -> None:
+    """sha256(binding) || 32 zero bytes is the boot binding's shape: never signed on request (AB#392)."""
+    port, ledger, tsm = sealed
+    before = len(tsm.inputs)
+    status, _h, doc = _attest(port, {"report_data_hex": (head + bytes(32)).hex()})
+    assert status == 400 and doc["error"] == "report_data_reserved"
+    assert len(tsm.inputs) == before
+    with pytest.raises(ValueError):
+        ledger.attest(head + bytes(32))
+    assert len(tsm.inputs) == before
+
+
+def test_one_nonzero_byte_in_the_tail_is_accepted(sealed) -> None:
+    port, _ledger, tsm = sealed
+    rd = hashlib.sha256(b"x").digest() + bytes(31) + b"\x01"
+    status, _h, _doc = _attest(port, {"report_data_hex": rd.hex()})
+    assert status == 200 and tsm.inputs[-1] == rd

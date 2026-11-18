@@ -2175,6 +2175,8 @@ class Ledger:
 
     def attest(self, report_data: bytes) -> dict:
         """A fresh SNP report over the caller's 64 bytes, tied to this boot's binding."""
+        if binding_shaped(report_data):
+            raise ValueError("REPORT_DATA of the boot binding shape is reserved")
         report, chain = fresh_report(report_data)
         measurement = report_fields(report)["measurement"]
         if measurement != self.binding["measurement"]:
@@ -2683,6 +2685,18 @@ READS = [  # (method, path pattern)
 # was in flight (see Ledger.touched). Past this many, no create is flagged until the creates end.
 TOUCHED_CAP = 4096
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
+
+
+def binding_shaped(report_data: bytes) -> bool:
+    """True for sha256(something) || 32 zero bytes: the shape of the boot binding report.
+
+    Every verifier accepts a binding when REPORT_DATA = sha256(canonical(binding)) || 32 zero
+    bytes. If /room/attest signed caller bytes of that shape, its caller (the hotel bearer: our
+    broker and API, and customers through POST /v1/hotels/{hotel}/attest) could get a fresh
+    AMD-signed report over a binding this guest never made, naming keys the caller holds, and
+    clients would seal to them (AB#392). So that shape comes only from the boot binding.
+    """
+    return len(report_data) == 64 and report_data[32:] == bytes(32)
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host", "x-room-exec-handle"}
 
@@ -3427,6 +3441,9 @@ class Handler(BaseHTTPRequestHandler):
         raw = doc.get("report_data_hex") if isinstance(doc, dict) else None
         if not isinstance(raw, str) or not HEX64.fullmatch(raw):
             return self.reply(400, b'{"error":"report_data_hex must be 128 hex characters (64 bytes)"}')
+        if binding_shaped(bytes.fromhex(raw)):
+            return self.reply(400, b'{"error":"report_data_reserved","message":"the last 32 bytes must not all be zero: '
+                                   b'that shape is reserved for the boot binding report"}')
         room = doc.get("sandbox_id")
         if room is not None and (not isinstance(room, str) or not re.fullmatch(r"[^/\s]{1,200}", room)):
             return self.reply(400, b'{"error":"sandbox_id must be a room id"}')
