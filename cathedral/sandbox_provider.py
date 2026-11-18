@@ -353,6 +353,9 @@ class _Sandbox:
     # outside the provider lock so a big /work never stalls other calls.
     disk_bytes: int = 0
     disk_bytes_at: float | None = None  # time.monotonic() when that walk started
+    # A fork room whose files are being unpacked outside the lock (AB#604): nothing may run in it or
+    # write to its folder until the unpack is published.
+    unpacking: bool = False
 
 
 class SandboxProvider(Protocol):
@@ -587,6 +590,12 @@ class InMemorySandboxProvider:
                 409,
                 f"sandbox {sandbox_id} is {sandbox.state}",
             )
+        if sandbox.unpacking:
+            raise SandboxOpError(
+                "sandbox_not_running",
+                409,
+                f"sandbox {sandbox_id} is creating; its snapshot files are still being unpacked",
+            )
         return sandbox
 
     def authorize(self, api_key: str | None) -> None:
@@ -736,6 +745,7 @@ class InMemorySandboxProvider:
                 raise SandboxOpError("sandbox_deleting", 409, f"sandbox {sandbox.id} was removed while it was created")
         for sandbox in d.sandboxes:
             sandbox.state = "running"
+            sandbox.unpacking = False
             sandbox.started_at = d.now
             self._touch(sandbox)  # the unpack may have outlasted a short idle window
         if len(d.sandboxes) == 1:
@@ -880,6 +890,7 @@ class InMemorySandboxProvider:
             id=sid,
             root=root,
             state="creating" if defer else "running",
+            unpacking=defer,
             created_at=now,
             expires_at=now + timedelta(seconds=request.ttl_seconds),
             ttl_seconds=request.ttl_seconds,

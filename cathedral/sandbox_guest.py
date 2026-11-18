@@ -2056,6 +2056,11 @@ class DockerGuestProvider:
             owner = owner_id(api_key, None)
         if request.build is not None:
             refuse_shared_hotel_build()
+        replay = self._replay_of_started_create(api_key, owner, idempotency, body_digest)
+        if replay is not None:
+            # A retry of a create that already started its rooms answers as it did, even if its snapshot
+            # has since expired or gone: nothing new starts, so there is nothing to resolve.
+            return replay
         pin: _ForkPin | None = None
         if request.snapshot_id is not None:
             # Fail before any record exists. A fork never starts another image. The snapshot is resolved
@@ -2112,6 +2117,29 @@ class DockerGuestProvider:
                     if seen is not None and seen[1] is docs:
                         del self._inner._idempotency[(api_key, scoped_idem)]  # noqa: SLF001
             raise
+        if "sandboxes" in docs:
+            return {"sandboxes": started, "count": len(started)}
+        return started[0]
+
+    def _replay_of_started_create(
+        self, api_key: str | None, owner: str, idempotency: str | None, body_digest: str
+    ) -> dict[str, Any] | None:
+        """The stored answer of an Idempotency-Key create with the same body whose rooms all have a guest, or None.
+
+        None sends the request down the full create path, which checks the snapshot and answers any conflict.
+        """
+        if idempotency is None:
+            return None
+        with self._inner._lock:  # noqa: SLF001
+            seen = self._inner._idempotency.get((api_key, f"{owner_hash(owner)}:{idempotency}"))  # noqa: SLF001
+        if seen is None or seen[0] != body_digest:
+            return None
+        docs = seen[1]
+        batch = docs["sandboxes"] if "sandboxes" in docs else [docs]
+        guests = [self._guests.get(doc["id"]) for doc in batch]
+        if any(guest is None for guest in guests):
+            return None
+        started = [self._enrich_doc(doc, guest) for doc, guest in zip(batch, guests)]
         if "sandboxes" in docs:
             return {"sandboxes": started, "count": len(started)}
         return started[0]

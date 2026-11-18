@@ -2237,3 +2237,59 @@ def test_a_fork_room_is_not_idle_collected_while_it_unpacks(fake, provider, monk
     doc = provider.create(req, api_key="k", idempotency=None, body_digest="idle-fork")
     assert seen == [[]]
     assert doc["id"] not in provider._inner.collectable_ids()  # noqa: SLF001  its idle window starts when it runs
+
+
+def test_a_fork_room_takes_no_write_or_exec_while_its_files_are_unpacked(fake, provider, monkeypatch) -> None:
+    # Bugbot on 587b0b9: the room is listed as creating during the unlocked unpack; a write there would land
+    # in its folder and break the unpack. Writes and runs are refused until the fork is published.
+    import threading
+
+    from cathedral.sandbox_api import ExecRequest
+
+    result, _path, payload = _captured(provider)
+    gate, reached = threading.Event(), threading.Event()
+    monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive",
+                        lambda p: _SlowReader(p, lambda: (reached.set(), gate.wait(10))))
+    out: dict = {}
+    worker = threading.Thread(target=lambda: out.setdefault("doc", _fork(provider, result["snapshot_id"])), daemon=True)
+    worker.start()
+    assert reached.wait(10)
+    provider._inner._ctx.api_key = "k"  # noqa: SLF001
+    (room,) = [s for s in provider._inner._sandboxes.values() if s.unpacking]  # noqa: SLF001
+    for call in (lambda: provider.write_file(room.id, "/work/planted.txt", b"x", None),
+                 lambda: provider._inner.write_file(room.id, "/work/planted.txt", b"x", None),  # noqa: SLF001
+                 lambda: provider._inner.exec(room.id, ExecRequest(cmd=["true"], timeout_seconds=5))):  # noqa: SLF001
+        with pytest.raises(SandboxOpError) as err:
+            call()
+        assert (err.value.code, err.value.http_status) == ("sandbox_not_running", 409)
+    gate.set()
+    worker.join(10)
+    doc = out["doc"]
+    assert doc["id"] == room.id and doc["state"] == "running" and not room.unpacking
+    assert (_fork_root(provider, doc) / "a.txt").read_bytes() == payload
+    assert not (_fork_root(provider, doc) / "planted.txt").exists()
+
+
+def test_a_retry_of_a_started_fork_answers_the_same_room_after_its_snapshot_expired(fake, provider) -> None:
+    # Bugbot on 587b0b9: a retry with the same Idempotency-Key got 404 once the snapshot aged out, while the
+    # fork it made still ran, so a caller would make a second room.
+    from dataclasses import replace as _replace
+    from datetime import timedelta
+
+    result, _path, _payload = _captured(provider)
+    snap = result["snapshot_id"]
+    req = CreateSandboxRequest(snapshot_id=snap, resources=RES)
+    first = provider.create(req, api_key="k", idempotency="fork-1", body_digest="fork")
+    runs = len(fake.calls_of("run"))
+    with provider._inner._lock:  # noqa: SLF001
+        path, rec = provider._inner._snapshots[snap]  # noqa: SLF001
+        provider._inner._snapshots[snap] = (path, _replace(rec, created_at=rec.created_at - timedelta(seconds=rec.ttl_seconds + 1)))  # noqa: SLF001
+    again = provider.create(req, api_key="k", idempotency="fork-1", body_digest="fork")
+    assert again["id"] == first["id"] and len(fake.calls_of("run")) == runs
+    # A new key still sees the expired snapshot as gone, and another body under the same key is a conflict.
+    with pytest.raises(SandboxOpError) as err:
+        provider.create(req, api_key="k", idempotency="fork-2", body_digest="fork")
+    assert (err.value.code, err.value.http_status) == ("snapshot_not_found", 404)
+    with pytest.raises(SandboxOpError) as err:
+        provider.create(req, api_key="k", idempotency="fork-1", body_digest="other")
+    assert err.value.http_status in (404, 409)
