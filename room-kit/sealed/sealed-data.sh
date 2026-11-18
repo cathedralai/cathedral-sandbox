@@ -244,7 +244,8 @@ fi
 
 mkdir -p "$MNT"
 if ! mountpoint -q "$MNT"; then
-  if ! mount -t xfs -o nosuid,nodev,noexec,noatime "$MAP" "$MNT"; then
+  # prjquota: the API caps each workspace with an xfs project quota (AB#396).
+  if ! mount -t xfs -o nosuid,nodev,noexec,noatime,prjquota "$MAP" "$MNT"; then
     status broken "the volume opened but its xfs file system did not mount; left untouched"
     exit 0
   fi

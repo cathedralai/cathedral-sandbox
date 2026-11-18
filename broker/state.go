@@ -44,6 +44,7 @@ type savedState struct {
 	Tombs      map[string]savedTomb                  `json:"tombstones"`
 	Images     map[string]*compatImage               `json:"images"`
 	GuestRooms map[string]map[string]map[string]bool `json:"guest_rooms"` // guest -> hotel -> room id
+	MinerExits []minerExit                           `json:"miner_exits"` // miner_exits.go
 }
 
 func (b *broker) markDirty() { b.dirty.Store(true) }
@@ -116,6 +117,7 @@ func (b *broker) saveCompat() error {
 			st.GuestRooms[guest] = outHotel
 		}
 	}
+	st.MinerExits = b.minerExitsSnapshot()
 	b.mu.Unlock()
 	now := time.Now()
 	b.compat.mu.Lock()
@@ -138,11 +140,7 @@ func (b *broker) saveCompat() error {
 		}
 		st.Tombs[u] = savedTomb{BID: t.bid, At: t.at}
 	}
-	for id, ex := range b.compat.execs { // a finished result (up to 32 MiB) is kept execKeep
-		if !ex.doneAt.IsZero() && now.Sub(ex.doneAt) > execKeep {
-			delete(b.compat.execs, id)
-		}
-	}
+	b.compat.pruneExecsLocked(now) // execKeep and the memory bounds (AB#752)
 	for id, img := range b.compat.images {
 		st.Images[id] = img
 	}
@@ -221,7 +219,7 @@ func (b *broker) loadCompat() error {
 	var st savedState
 	var bad []string
 	for name, into := range map[string]any{"uuids": &st.UUIDs, "idempotency": &st.Idem, "tombstones": &st.Tombs,
-		"images": &st.Images, "guest_rooms": &st.GuestRooms} {
+		"images": &st.Images, "guest_rooms": &st.GuestRooms, "miner_exits": &st.MinerExits} {
 		if v, ok := sections[name]; ok && len(v) > 0 {
 			if err := json.Unmarshal(v, into); err != nil {
 				bad = append(bad, name)
@@ -233,6 +231,7 @@ func (b *broker) loadCompat() error {
 		log.Printf("client state: sections %v did not parse and were skipped", bad)
 	}
 	b.mu.Lock()
+	b.restoreMinerExits(st.MinerExits, time.Now())
 	b.savedUUIDs = map[string]string{}
 	for u, bid := range st.UUIDs {
 		b.savedUUIDs[bid] = u

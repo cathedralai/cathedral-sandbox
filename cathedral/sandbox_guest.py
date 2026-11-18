@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -31,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from cathedral import exec_cancel
+from cathedral.agent_pty import PtyProcess
 from cathedral.exec_spill import StreamSpill, close_spill, open_spill, read_spill, spill_path_parts
 from cathedral.sandbox_api import (
     CreateSandboxRequest,
@@ -60,6 +63,7 @@ from cathedral.start_commands import (
     start_command_sha256,
 )
 from cathedral.sandbox_workspaces import WorkspaceStore
+from cathedral.sandbox_quota import GIB, ROOM_IDS, QuotaUnavailable, XfsProjectQuota, pick_id
 from cathedral.sandbox_owner import owner_hash, owner_id
 from cathedral.sandbox_provider import (
     InMemorySandboxProvider,
@@ -67,6 +71,8 @@ from cathedral.sandbox_provider import (
     _parse_label_filters,
     _render_cmd,
     provider_from_environment,
+    read_log_page,
+    validated_log_page,
 )
 
 
@@ -352,6 +358,8 @@ class GuestRecord:
     timeout_form: str | None = None
     # Whether the image can run ``bash``. None: not probed yet.
     has_bash: bool | None = None
+    # Whether the image can run ``sh`` (the cancel wrapper needs it). None: not probed yet.
+    has_sh: bool | None = None
     # (owner, name, path, version_on_delete) of the mounted workspace (#305).
     workspace: tuple[str, str, str, bool] | None = None
     # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
@@ -993,6 +1001,28 @@ class DockerClient:
                 return None
             time.sleep(ROOM_DEATH_POLL_SECONDS)
 
+    def entrypoint_logs(self, container_id: str, *, since_ns: int, cap: int) -> tuple[int, str, str, tuple[bool, bool]]:
+        """(rc, stdout, stderr, (stdout cut, stderr cut)) of ``docker logs --timestamps``.
+
+        Each stream keeps at most *cap* bytes; a cut stream says so. ``since_ns``
+        0 reads from the start of what the daemon kept.
+        """
+        argv = ["docker", "logs", "--timestamps"]
+        if since_ns > 0:
+            argv += ["--since", f"{since_ns // 1_000_000_000}.{since_ns % 1_000_000_000:09d}"]
+        argv.append(container_id)
+        raw: dict[str, bytearray] = {"out": bytearray(), "err": bytearray()}
+        result = self.run(
+            argv, timeout=30.0, output_cap=cap,
+            on_stdout=raw["out"].extend, on_stderr=raw["err"].extend,
+        )
+        # The hooks see at most cap bytes of each stream. A stream of exactly cap
+        # bytes reads as cut too: its last line waits for the next read, none is lost.
+        cut = (len(raw["out"]) >= cap, len(raw["err"]) >= cap)
+        out = raw["out"].decode("utf-8", "replace")
+        err = raw["err"].decode("utf-8", "replace")
+        return result.returncode, out, err, cut
+
     def remove(self, container_id: str) -> None:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
         self.run(["docker", "rm", "-f", container_id], timeout=60.0)
@@ -1246,7 +1276,12 @@ def _in_work(path: str) -> str:
 
 
 def _read_room_log(path: Path) -> str:
-    """Read a process log from the room's /work without following a symlink.
+    """The first EXEC_OUTPUT_CAP bytes of a process log in the room's /work."""
+    return _read_room_log_page(path, 0, EXEC_OUTPUT_CAP)["logs"]
+
+
+def _read_room_log_page(path: Path, offset: int, limit: int) -> dict[str, Any]:
+    """One page of a process log from the room's /work, without following a symlink.
 
     The room can write /work, so it can swap its log for a link to a host file
     (the hotel API key). O_NOFOLLOW refuses that; a FIFO or device reads empty.
@@ -1254,11 +1289,189 @@ def _read_room_log(path: Path) -> str:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
-        return ""
+        return read_log_page(None, 0, offset, limit)
     with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return ""
-        return fh.read(EXEC_OUTPUT_CAP).decode("utf-8", errors="replace")
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return read_log_page(None, 0, offset, limit)
+        return read_log_page(fh, st.st_size, offset, limit)
+
+
+# The room container's own log (AB#419): what its entrypoint writes to stdout and
+# stderr, kept by the daemon (json-file on a room kit host). One read returns at
+# most this many bytes of each stream; ``more`` says there is more to read.
+ENTRYPOINT_LOG_PAGE = 4 * 1024 * 1024
+_DOCKER_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$")
+_ENTRYPOINT_CURSOR = re.compile(r"^(\d{1,20}):(\d{1,9}):(\d{1,20}):(\d{1,9})$")
+
+
+def parse_entrypoint_cursor(cursor: str | None) -> tuple[int, int, int, int]:
+    """(stdout ns, stdout lines at it read, stderr ns, stderr lines at it read) of a cursor.
+
+    Each stream keeps its own place, so one stream's unfinished line does not
+    hold back the other. "" reads from the start of what the daemon kept.
+    """
+    if cursor is None or cursor == "":
+        return 0, 0, 0, 0
+    match = _ENTRYPOINT_CURSOR.match(cursor) if isinstance(cursor, str) else None
+    if match is None:
+        raise SandboxOpError("invalid_request", 400, "entrypoint_cursor must be empty or a next_cursor this API returned")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+
+
+def _docker_log_ns(stamp: str) -> int | None:
+    """Unix ns of a ``docker logs --timestamps`` prefix (RFC 3339 with up to 9 fraction digits)."""
+    match = _DOCKER_LOG_TS.match(stamp)
+    if match is None:
+        return None
+    base, frac, zone = match.groups()
+    try:
+        whole = int(datetime.strptime(base, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return None
+    if zone != "Z":
+        sign = 1 if zone[0] == "+" else -1
+        whole -= sign * (int(zone[1:3]) * 3600 + int(zone[4:6]) * 60)
+    return whole * 1_000_000_000 + int((frac or "").ljust(9, "0"))
+
+
+def _join_partials(stamp: str, rest: str, *, cut: bool = False) -> str:
+    """One logical line from docker's partial messages.
+
+    The daemon keeps a line over 16 KiB as partial messages that all carry the
+    first one's time (moby daemon/logger/copier.go, partialTS), and docker logs
+    prints each with that stamp and no newline between them. So the line's own
+    stamp inside its text is docker's, and is dropped. A cut line may end inside
+    one of those stamps; that piece is dropped too.
+    """
+    marker = stamp + " "
+    text = rest.replace(marker, "")
+    if cut:
+        for size in range(len(marker) - 1, 0, -1):
+            if text.endswith(marker[:size]):
+                return text[:-size]
+    return text
+
+
+def _docker_log_lines(
+    text: str, cut: bool, hold_partial: bool
+) -> tuple[list[tuple[int, str]], tuple[int, str] | None]:
+    """(ns, line) of each whole line of one stream, and its held last line (ns, text).
+
+    A stream cut at the read cap ends in a cut line, and a running room's last
+    line may lack its newline yet (docker prints the rest later, with the same
+    stamp). Such a last line is held: it is not returned as a line, so the next
+    read starts at or before it. A line with no timestamp prefix (not something
+    docker writes) belongs to the line before it.
+    """
+    parts = text.split("\n")
+    tail = parts.pop()  # "" when the text ends in a newline
+    lines: list[tuple[int, str]] = []
+    for part in parts:
+        stamp, sep, rest = part.partition(" ")
+        ns = _docker_log_ns(stamp) if sep else None
+        if ns is None:
+            if lines:
+                lines[-1] = (lines[-1][0], lines[-1][1] + part + "\n")
+            continue
+        lines.append((ns, _join_partials(stamp, rest) + "\n"))
+    held = None
+    if tail:
+        stamp, sep, rest = tail.partition(" ")
+        ns = _docker_log_ns(stamp) if sep else None
+        if ns is not None and (cut or hold_partial):
+            held = (ns, _join_partials(stamp, rest, cut=cut))
+        elif ns is not None:
+            lines.append((ns, _join_partials(stamp, rest)))
+        elif lines and not (cut or hold_partial):
+            lines[-1] = (lines[-1][0], lines[-1][1] + tail)
+    return lines, held
+
+
+def _entrypoint_stream_page(
+    text: str, cut: bool, hold_partial: bool, since: int, seen: int, read_since: int
+) -> tuple[str, tuple[int, int], bool, bool]:
+    """(new text, next (ns, lines at ns), truncated, idle) of one stream after its cursor.
+
+    Idle: the read holds all of this stream and nothing of it is new or held.
+    """
+    lines, held = _docker_log_lines(text, cut, hold_partial)
+    skip = seen
+    kept: list[tuple[int, str]] = []
+    for ns, line in lines:
+        if ns < since:
+            continue
+        if ns == since and skip > 0:
+            skip -= 1
+            continue
+        kept.append((ns, line))
+    next_place = (since, seen)
+    if kept:
+        last = kept[-1][0]
+        next_place = (last, sum(1 for ns, _ in kept if ns == last) + (seen if last == since else 0))
+    if held is not None and held[0] > next_place[0]:
+        # Stamps only rise within a stream, so nothing of it lies between the
+        # last line returned and the held one. The next read starts at the held
+        # line and does not spend its cap on lines already returned.
+        next_place = (held[0], 0)
+    if kept:
+        return "".join(line for _, line in kept), next_place, False, False
+    if not cut:
+        return "", next_place, False, held is None
+    if read_since != since:
+        # The other stream is behind and the read started at its place: the cap
+        # went on lines already returned. Wait for a read from this stream's place.
+        return "", next_place, False, False
+    if held is not None and held[0] == since:
+        # The read started at this line and still holds nothing but it, so it is
+        # longer than a read. Its parts share one time and --since cannot start
+        # inside it: return what was read and move past it.
+        return held[1], (since + 1, 0), True, False
+    if held is None:
+        # The cap fell inside the next line's stamp or right after a line already
+        # returned: that next line is later than the lines read, so step past them.
+        return "", (since + 1, 0), False, False
+    return "", next_place, False, False
+
+
+def entrypoint_log_page(
+    stdout: str,
+    stderr: str,
+    cut: tuple[bool, bool],
+    cursor: tuple[int, int, int, int],
+    *,
+    running: bool = True,
+) -> dict[str, Any]:
+    """The lines after *cursor* from one ``docker logs --timestamps --since`` read.
+
+    docker logs has no byte offset (json-file rotates its files), so the cursor
+    is, per stream, a time and how many lines at that time the read before
+    returned: ``--since`` is inclusive, so those come back and are dropped here.
+    The read itself starts at the earlier of the two times.
+    """
+    read_since = min(cursor[0], cursor[2])
+    out, out_next, out_cut, out_idle = _entrypoint_stream_page(
+        stdout, cut[0], running, cursor[0], cursor[1], read_since
+    )
+    err, err_next, err_cut, err_idle = _entrypoint_stream_page(
+        stderr, cut[1], running, cursor[2], cursor[3], read_since
+    )
+    # The read starts at the earlier stream's place. A stream with nothing new
+    # moves up to the other one's, so a quiet stream does not make every read
+    # start over from its last line.
+    if out_idle and err_next[0] > out_next[0]:
+        out_next = (err_next[0], 0)
+    if err_idle and out_next[0] > err_next[0]:
+        err_next = (out_next[0], 0)
+    return {
+        "stdout": out,
+        "stderr": err,
+        "next_cursor": f"{out_next[0]}:{out_next[1]}:{err_next[0]}:{err_next[1]}",
+        # A stream hit the read cap: read again from next_cursor for the rest.
+        "more": any(cut),
+        # A line longer than a read came back cut; the rest of it is not readable.
+        "truncated": out_cut or err_cut,
+    }
 
 
 def _sweep_stale_bases(own: Path) -> None:
@@ -1327,6 +1540,13 @@ class DockerGuestProvider:
         self._egress = EgressClient.from_env()
         # Persistent workspaces (#305). None: CATHEDRAL_WORKSPACE_ROOT is unset.
         self._workspaces = WorkspaceStore.from_env(self._client)
+        # Byte quota on each room's directory, so /work cannot fill the data
+        # volume (AB#396). The kit turns it on; the create fails without it.
+        self._work_quota = (
+            XfsProjectQuota() if os.environ.get("CATHEDRAL_SANDBOX_WORK_QUOTA", "").strip() == "1" else None
+        )
+        self._work_quota_ids: dict[str, tuple[int, Path]] = {}  # sandbox_id -> (project id, base dir)
+        self._work_quota_lock = threading.Lock()
         # Per-guest image ownership (AB#650 Gate S.1). Fail closed when metadata
         # is missing: a local image with no grant cannot start.
         self._image_owners = ImageOwnerStore()
@@ -1999,6 +2219,7 @@ class DockerGuestProvider:
             self._image_owners.require(run_image, effective_owner)
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
+        self._limit_work(sandbox_id, work.parent, request.resources.disk_gib)
         name = f"cathedral-{sandbox_id}"
         entrypoint, image_default, start_command = self._resolve_start(
             request, dind=dind, inspected=inspected,
@@ -2088,6 +2309,46 @@ class DockerGuestProvider:
             prime = "done" if self._client.prime_image(image) else "failed"
         view = room_view(request.tunables, runtime=runtime, runtime_args=args, image_prime=prime)
         return runtime, docker_run_args(request.tunables), view
+
+    def _limit_work(self, sandbox_id: str, room_dir: Path, disk_gib: int) -> None:
+        """Cap the room's directory (its /work and its resolv.conf) at disk_gib.
+
+        Before the container starts, so no write escapes it. A room that writes
+        past the cap gets ENOSPC. disk_gib 0 sets no cap, as for the overlay
+        root. A cap that cannot be set fails the create: a room with no cap
+        can fill the hotel's data volume.
+        """
+        if self._work_quota is None or disk_gib <= 0:
+            return
+        with self._work_quota_lock:
+            in_use = {pid for pid, _ in self._work_quota_ids.values()}
+            project = pick_id(ROOM_IDS, in_use, seed=sandbox_id.removeprefix("sbx_"))
+            self._work_quota_ids[sandbox_id] = (project, room_dir.parent)
+        try:
+            self._work_quota.assign(room_dir, project, int(disk_gib) * GIB)
+        except QuotaUnavailable as exc:
+            with self._work_quota_lock:
+                self._work_quota_ids.pop(sandbox_id, None)
+            raise SandboxOpError(
+                "work_quota_unavailable",
+                503,
+                f"the hotel could not cap this room's /work: {exc}; nothing started",
+                retry_after=30,
+            ) from None
+
+    def _finish_delete(self, sandbox_id: str) -> None:
+        """Drop the record (and its directory), then the room's /work cap."""
+        self._inner.finish_delete(sandbox_id)
+        with self._work_quota_lock:
+            held = self._work_quota_ids.pop(sandbox_id, None)
+        if held is None or self._work_quota is None:
+            return
+        try:
+            self._work_quota.clear(held[1], held[0])
+        except QuotaUnavailable as exc:
+            # The directory is gone, so the id charges nothing; only a stale
+            # limit record stays.
+            print(f"cathedral-sandbox quota: clear for {sandbox_id} failed: {exc}", file=sys.stderr, flush=True)
 
     def _release_pending(self, sandbox_id: str) -> None:
         with self._doomed_lock:
@@ -2192,12 +2453,30 @@ class DockerGuestProvider:
                     "or run the command without a limit.",
                 )
             wrapped = argv
+        token = request.spill_token
+        run_argv = wrapped
+        registered = False
+        if token:
+            # A start that carries a token can be cancelled (AB#406). The wrapper writes the
+            # pid of the process that becomes the command; an image with no sh runs unwrapped
+            # and its cancel answers `unsupported`.
+            wrap = self._has_sh(guest)
+            registered = exec_cancel.registry.begin(
+                sandbox_id, token, request.launch_by, request.user, ("gnu" if form == "gnu" else "busybox") if wrap else None
+            )
+            if not registered:
+                return ExecResult(
+                    exit_code=143, stdout="", stderr="cancelled before it started\n", duration_ms=0, timed_out=False, cancelled=True
+                )
+            if wrap:
+                run_argv = ["sh", "-c", exec_cancel.WRAP_SCRIPT, "sh", exec_cancel.pid_file(token), *wrapped]
+        cancelled = False
         t0 = time.perf_counter()
         spill = open_spill(sandbox_id, request.spill_token, EXEC_OUTPUT_CAP) if request.spill_token else None
         try:
             code, out, err, timed_out = self._client.exec(
                 guest.container_id,
-                wrapped,
+                run_argv,
                 cwd=cwd,
                 env={**guest.env_overlay, **dict(request.env)},
                 timeout_seconds=timeout_seconds + 15 if wrapped is not argv else timeout_seconds,
@@ -2208,6 +2487,8 @@ class DockerGuestProvider:
         finally:
             if request.spill_token:
                 close_spill(sandbox_id, request.spill_token)
+            if registered:
+                cancelled = exec_cancel.registry.finish(sandbox_id, token)
         # The command's own time, before any look at the container below.
         elapsed = time.perf_counter() - t0
         # A room that outgrows its memory limit can still be killed whole by
@@ -2233,6 +2514,9 @@ class DockerGuestProvider:
         killed_early = code == 137 and elapsed < timeout_seconds
         if not oom_killed and not killed_early and code in {124, 137, 143}:
             timed_out = True
+        if cancelled:
+            # Our own TERM or KILL ended it: a cancel, never a timeout.
+            timed_out = False
         duration_ms = int(elapsed * 1000)
         with self._inner._lock:  # noqa: SLF001
             sandbox = self._inner._require_active(sandbox_id)  # noqa: SLF001
@@ -2267,7 +2551,113 @@ class DockerGuestProvider:
             truncated=truncated,
             oom_killed=oom_killed,
             room_alive=room_alive,
+            cancelled=cancelled,
         )
+
+    def cancel_exec(self, sandbox_id: str, token: str) -> str:
+        """Stop the exec that started with ``token``. The answer is a word, see AB#406 spec 3.1."""
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+        guest = self._guests.get(sandbox_id)
+        registry = exec_cancel.registry
+        # One lock hold decides running, ended or not seen yet, so a start cannot slip in between.
+        kind, found = registry.cancel_lookup(sandbox_id, token)
+        if kind == "result":
+            return "already_stopped" if found == "cancelled" else "finished_before_cancel"
+        if kind == "tombstoned":
+            return "cancelled_before_start"
+        entry = found
+        if guest is None or entry.form is None:
+            return "unsupported"
+        deadline = time.monotonic() + exec_cancel.CANCEL_WINDOW_SECONDS
+        # The first signal goes through the pid file guard and names the process group.
+        rc, out = self._signal_exec_group(guest, entry, token, "TERM", None)
+        # A cancel that wins the start by a few ms can come before the wrapper wrote the pid file. The
+        # exec is registered as wrapped, so give the file a short chance before answering unsupported.
+        pid_file_until = time.monotonic() + exec_cancel.PID_FILE_WAIT_SECONDS
+        while rc == exec_cancel.NO_PID_FILE and time.monotonic() < pid_file_until and not entry.done.is_set():
+            time.sleep(exec_cancel.POLL_SECONDS)
+            rc, out = self._signal_exec_group(guest, entry, token, "TERM", None)
+        if rc in (exec_cancel.NO_PID_FILE, exec_cancel.REFUSED) and entry.done.is_set():
+            # The exec ended on its own while the first signal was being tried: say so, never unsupported or refused.
+            held = registry.result(sandbox_id, token)
+            if held is not None:
+                return "already_stopped" if held == "cancelled" else "finished_before_cancel"
+        if rc == exec_cancel.NO_PID_FILE:
+            return "unsupported"
+        # A guard refusal on the first signal means nothing was sent: not progress.
+        if rc == exec_cancel.REFUSED:
+            return "refused"
+        pgid = exec_cancel.parse_pgid(out)
+        if pgid is None:
+            # The signal may have gone out but no group was named, so nothing can be confirmed empty.
+            return "signalled"
+        # The group id stays valid across the escalation: the leader may be gone and its children not.
+        term_until = min(time.monotonic() + exec_cancel.TERM_WAIT_SECONDS, deadline)
+        if self._wait_group_stopped(guest, entry, token, pgid, term_until):
+            return "stopped"
+        # TERM did not end the exec or its children: KILL the whole group. A KILL that fails is not
+        # reported as sent, but the group is still watched until the window closes.
+        self._signal_exec_group(guest, entry, token, "KILL", pgid)
+        if self._wait_group_stopped(guest, entry, token, pgid, deadline):
+            return "stopped"
+        return "signalled"
+
+    def _wait_group_stopped(self, guest: GuestRecord, entry: Any, token: str, pgid: str, until: float) -> bool:
+        """True once the exec call returned and no process of its group is left, before ``until``."""
+        while True:
+            entry.done.wait(max(0.0, min(exec_cancel.POLL_SECONDS, until - time.monotonic())))
+            if entry.done.is_set() and self._group_empty(guest, entry, token, pgid):
+                return True
+            if time.monotonic() >= until:
+                return False
+
+    def _group_empty(self, guest: GuestRecord, entry: Any, token: str, pgid: str) -> bool:
+        rc, out = self._signal_exec_group(guest, entry, token, "PROBE", pgid, count=False)
+        return rc == 0 and out.strip() == "empty"
+
+    def _signal_exec_group(
+        self, guest: GuestRecord, entry: Any, token: str, sig: str, pgid: str | None, *, count: bool = True
+    ) -> tuple[int, str]:
+        """Run KILL_SCRIPT in the room: (exit code, stdout). ``count``: a signal that went out marks the exec cancelled.
+
+        The signal is registered before it is sent and settled after the guard answered, so a natural
+        finish in between waits for the answer instead of guessing (ExecRegistry.finish).
+        """
+        registry = exec_cancel.registry
+        if count:
+            registry.signal_begin(entry)
+        sent = False
+        try:
+            try:
+                code, out, _, timed_out = self._client.exec(
+                    guest.container_id,
+                    ["sh", "-c", exec_cancel.KILL_SCRIPT, "sh", exec_cancel.pid_file(token), entry.form, sig, *([pgid] if pgid else [])],
+                    cwd=None,
+                    env={},
+                    timeout_seconds=20,
+                    stdin=None,
+                    user=entry.user,
+                )
+            except SandboxOpError:
+                return exec_cancel.SIGNAL_FAILED, ""
+            if timed_out and code != 0:
+                return exec_cancel.SIGNAL_FAILED, ""
+            # The guard passed and kill returned 0: `sent` in group mode, a pgid line on the first call.
+            sent = code == 0 and sig != "PROBE" and out.strip() != "empty"
+            return code, out
+        finally:
+            if count:
+                registry.signal_end(entry, sent)
+
+    def _has_sh(self, guest: GuestRecord) -> bool:
+        """True when the guest image can run ``sh``. Probe once; the probe has no side effect."""
+        if guest.has_sh is None:
+            code, _, _, _ = self._client.exec(
+                guest.container_id, ["sh", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+            guest.has_sh = code == 0
+        return guest.has_sh
 
     def _has_bash(self, guest: GuestRecord) -> bool:
         """True when the guest image can run ``bash``. Probe once; the probe has no side effect."""
@@ -2352,7 +2742,62 @@ class DockerGuestProvider:
         guest = self._guests.get(sandbox_id)
         if guest is None or process_id not in guest.guest_processes:
             return self._inner.process_logs(sandbox_id, process_id)
+        self._require_process_owner(sandbox_id)
         return _read_room_log(guest.guest_processes[process_id])
+
+    def _require_process_owner(self, sandbox_id: str) -> None:
+        """The caller owns the room: the in-memory record's owner check (AB#419)."""
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+
+    def process_logs_page(
+        self, sandbox_id: str, process_id: str, *, offset: int | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
+        """One page of a background process's log from a byte offset (AB#419)."""
+        guest = self._guests.get(sandbox_id)
+        if guest is None or process_id not in guest.guest_processes:
+            return self._inner.process_logs_page(sandbox_id, process_id, offset=offset, limit=limit)
+        offset, limit = validated_log_page(offset, limit)
+        self._require_process_owner(sandbox_id)
+        return {"process_id": process_id, **_read_room_log_page(guest.guest_processes[process_id], offset, limit)}
+
+    def logs(self, sandbox_id: str, *, entrypoint_cursor: str | None = None) -> dict[str, Any]:
+        """§3.13 logs plus the room's entrypoint log from *entrypoint_cursor* (AB#419).
+
+        The record and its owner check are the in-memory provider's. A room
+        whose container is gone (deleted, tombstone) has no entrypoint read.
+        """
+        cursor = parse_entrypoint_cursor(entrypoint_cursor) if entrypoint_cursor is not None else None
+        doc = self._inner.logs(sandbox_id)
+        guest = self._guests.get(sandbox_id)
+        if cursor is None or guest is None or doc.get("state") == "deleted":
+            # Asked for only: docker logs reads the whole kept log on each call.
+            return doc
+        page: dict[str, Any] = {"cursor": entrypoint_cursor}
+        if self._secrets_root is not None:
+            # A hotel with customer-sealed secrets keeps the room's own output from
+            # whoever holds the hotel key, as it keeps sealed exec output
+            # (docs/SEALED_COMMANDS.md): the entrypoint can read /run/secrets.
+            page["error"] = "entrypoint_log_withheld: this hotel keeps sealed rooms' output to the room"
+            return {**doc, "entrypoint": page}
+        try:
+            code, out, err, cut = self._client.entrypoint_logs(
+                guest.container_id, since_ns=min(cursor[0], cursor[2]), cap=ENTRYPOINT_LOG_PAGE
+            )
+        except SandboxOpError as exc:
+            code, err = -1, str(exc)
+        if code != 0:
+            # The exec record is still worth answering; say why there is no entrypoint
+            # log (a room started with --log-driver none has none to read).
+            page["error"] = (err.strip().splitlines() or ["docker logs failed"])[-1][:300]
+            return {**doc, "entrypoint": page}
+        running = True
+        if (out and not out.endswith("\n")) or (err and not err.endswith("\n")):
+            # A last line without its newline is whole only once the room has stopped.
+            state = self._client.container_state(guest.container_id)
+            running = state is None or state[0]
+        page.update(entrypoint_log_page(out, err, cut, cursor, running=running))
+        return {**doc, "entrypoint": page}
 
     def stop_process(self, sandbox_id: str, process_id: str) -> None:
         guest = self._guests.get(sandbox_id)
@@ -2393,6 +2838,15 @@ class DockerGuestProvider:
 
     def write_tar(self, sandbox_id: str, path: str, tarball: bytes) -> None:
         self._inner.write_tar(sandbox_id, _in_work(path), tarball)
+
+    def list_directory(self, sandbox_id: str, path: str) -> list[dict[str, str]]:
+        return self._inner.list_directory(sandbox_id, _in_work(path))
+
+    def make_directory(self, sandbox_id: str, path: str) -> bool:
+        return self._inner.make_directory(sandbox_id, _in_work(path))
+
+    def remove_entry(self, sandbox_id: str, path: str) -> bool:
+        return self._inner.remove_entry(sandbox_id, _in_work(path))
 
     def read_tar(self, sandbox_id: str, spec: TarGet) -> bytes:
         _in_work(spec.path)
@@ -2694,7 +3148,7 @@ class DockerGuestProvider:
         if guest is None:
             cid = self._find_labeled_container(sandbox_id)
             if cid is None:
-                self._inner.finish_delete(sandbox_id)
+                self._finish_delete(sandbox_id)
                 return True
             with self._doomed_lock:
                 self._doomed[sandbox_id] = cid
@@ -2720,7 +3174,7 @@ class DockerGuestProvider:
             self._net_pool.release(network)
         if workspace is not None:
             self._release_workspace(sandbox_id, workspace)
-        self._inner.finish_delete(sandbox_id)
+        self._finish_delete(sandbox_id)
 
     def _release_workspace(self, sandbox_id: str, workspace: tuple[str, str, str, bool]) -> None:
         """The room container is gone: free the workspace, then version it if asked.
@@ -2967,10 +3421,56 @@ class DockerGuestProvider:
             self._inner._images[ref] = entry  # noqa: SLF001
         return entry
 
-    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str) -> dict[str, Any]:
+    def terminal_write(self, sandbox_id: str, terminal_id: str, data: str | bytes) -> dict[str, Any]:
         # The inner provider keeps the terminal's buffers; each complete line
         # runs through this provider's exec, in the room's container (B154).
+        # A PTY terminal writes raw bytes to its docker exec -it instead.
         return self._inner.terminal_write(sandbox_id, terminal_id, data, executor=self.exec)
+
+    def create_terminal(
+        self,
+        sandbox_id: str,
+        *,
+        cols: int | None = None,
+        rows: int | None = None,
+        mode: str | None = None,
+    ) -> dict[str, Any]:
+        if mode != "pty":
+            return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode)
+        guest = self._guests.get(sandbox_id)
+        if guest is None:
+            # No container (yet, or any more): the inner provider answers
+            # with its own state error, or refuses PTY for want of a room.
+            return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode)
+        # Probe the shell now, not at connect: connect holds the provider
+        # lock and the probe is a docker exec.
+        argv, overlay = self._terminal_command(guest)
+
+        def spawn(c: int, r: int, on_output, on_exit) -> PtyProcess:
+            return _spawn_room_terminal(argv, overlay, cols=c, rows=r, on_output=on_output, on_exit=on_exit)
+
+        return self._inner.create_terminal(sandbox_id, cols=cols, rows=rows, mode=mode, spawn=spawn)
+
+    def _terminal_command(self, guest: GuestRecord) -> tuple[list[str], dict[str, str]]:
+        """docker exec -it argv for an interactive login shell in the room, and the overlay it gets.
+
+        The overlay is the customer's, so it must never reach the hotel's own
+        docker client (DOCKER_HOST, DOCKER_CONFIG, HTTPS_PROXY would steer it).
+        _spawn_room_terminal hands it to the container through --env-file,
+        which keeps its values off both the client env and the process list.
+        """
+        overlay = {k: v for k, v in guest.env_overlay.items() if k != "TERM"}
+        for key, value in overlay.items():
+            # An env file is one KEY=VALUE per line, and docker drops a trailing CR.
+            if "\n" in value or "\r" in value:
+                raise SandboxOpError(
+                    "terminal_env_unsupported",
+                    422,
+                    f"the value of {key} holds a line break, which a PTY terminal cannot pass; use mode line",
+                )
+        shell = "bash" if self._has_bash(guest) else "sh"
+        argv = ["docker", "exec", "-it", "-w", "/work", "-e", "TERM=xterm-256color", guest.container_id, shell, "-l"]
+        return argv, overlay
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
         return self._with_tunables(self._inner.get(sandbox_id))
@@ -3026,6 +3526,52 @@ class DockerGuestProvider:
         self._remove_many(refs)
         self._guests.clear()
         self._inner.close()
+
+
+def _spawn_room_terminal(
+    argv: list[str],
+    overlay: Mapping[str, str],
+    *,
+    cols: int,
+    rows: int,
+    on_output: Callable[[bytes], None],
+    on_exit: Callable[[int], None],
+) -> PtyProcess:
+    """Start a room terminal's docker exec -it with the hotel's own env only.
+
+    The overlay goes in a 0600 env file in a private temp dir, named on the argv
+    by path. The docker client reads it before it calls the daemon, so the file
+    goes at the first output or at exit, whichever comes first.
+    """
+    if not overlay:
+        return PtyProcess(argv, cols=cols, rows=rows, on_output=on_output, on_exit=on_exit)
+    env_dir = tempfile.mkdtemp(prefix="cathedral-pty-env-")
+    removed = False
+
+    def remove_env_file() -> None:
+        nonlocal removed
+        if not removed:
+            removed = True
+            shutil.rmtree(env_dir, ignore_errors=True)
+
+    def output(chunk: bytes) -> None:
+        remove_env_file()
+        on_output(chunk)
+
+    def exited(code: int) -> None:
+        remove_env_file()
+        on_exit(code)
+
+    try:
+        env_file = os.path.join(env_dir, "env")
+        fd = os.open(env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.writelines(f"{key}={value}\n" for key, value in overlay.items())
+        full = [*argv[:3], "--env-file", env_file, *argv[3:]]
+        return PtyProcess(full, cols=cols, rows=rows, on_output=output, on_exit=exited)
+    except BaseException:
+        remove_env_file()
+        raise
 
 
 def shlex_quote(value: str) -> str:

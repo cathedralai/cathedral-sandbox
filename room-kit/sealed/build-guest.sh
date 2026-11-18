@@ -245,6 +245,7 @@ ROOM_ESCAPE=${SEALED_ROOM_ESCAPE:-0}
 ROOM_ESCAPE_ALLOW_PLAINTEXT=${SEALED_ROOM_ESCAPE_ALLOW_PLAINTEXT:-0}
 ROOM_SEALED_SECRETS=${SEALED_ROOM_SEALED_SECRETS:-0}
 ROOM_SEALED_EXEC=${SEALED_ROOM_SEALED_EXEC:-0}
+ROOM_GUEST_INGRESS=${SEALED_ROOM_GUEST_INGRESS:-0}
 # ROOM_HOTEL_NAME is not set here: guest-boot.sh exports it from fw_cfg (opt/cathedral/hotel-name).
 EOF
 if [ "$MINER" = 1 ]; then
@@ -294,9 +295,9 @@ printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
 python3 - "$OUT" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" \
-  "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" "$DATA_WS" <<'EOF'
+  "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" "$DATA_WS" "$SEALED_HOST_IP" "$SEALED_GUEST_IP" <<'EOF'
 import hashlib, json, os, sys
-out, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws = sys.argv[1:]
+out, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws, host_ip, guest_ip = sys.argv[1:]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.join(out, p), "rb") as f:
@@ -313,6 +314,8 @@ if miner == "1":  # a config hotel's manifest keeps its old fields only
 if data_ws:  # likewise: only a build with the persistent data volume names it
     m["data_volume"] = {"format": "luks2", "cipher": "aes-xts-plain64", "key": "snp-derived",
                         "root_key": "vcek", "guest_field_select": 9, "mixes_host_data": True, "holds": ["workspaces"]}
+if (host_ip, guest_ip) != ("10.215.0.1", "10.215.0.2"):  # a per-hotel link (AB#432): in the initrd, so name it
+    m["link"] = {"host_ip": host_ip, "guest_ip": guest_ip}
 json.dump(m, open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
 EOF
 ln -sfn "$STAMP" "$SEALED_DIR/images/current"
