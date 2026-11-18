@@ -1,0 +1,16 @@
+[Unit]
+Description=Renew the signed sealed hotel list every 6 hours (AB#800)
+
+[Timer]
+# A release is valid for 24 h and the site alerts when the served list is
+# older than 12 h, so 6 h leaves one missed run before the alert and three
+# before clients refuse the list.
+OnCalendar=*-*-* 00/6:00:00 UTC
+RandomizedDelaySec=15min
+AccuracySec=1min
+# A run missed while the host was down starts at the next boot.
+Persistent=true
+Unit=sealed-hotels-renew.service
+
+[Install]
+WantedBy=timers.target

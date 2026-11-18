@@ -4339,7 +4339,7 @@ class Server(ThreadingHTTPServer):
         """Build the health answer once a second, off the request path."""
         up = http.client.HTTPConnection("127.0.0.1", self.health_port, timeout=30)
         auth = {"Authorization": "Bearer " + self.api_key.decode()}
-        while True:
+        while not self._stop_look.is_set():  # ends when the server is closed
             try:
                 up.request("GET", "/room/health", headers=auth)
                 r = up.getresponse()
@@ -4359,7 +4359,8 @@ class Server(ThreadingHTTPServer):
             except (http.client.HTTPException, OSError, ValueError, subprocess.SubprocessError):
                 up.close()
                 up = http.client.HTTPConnection("127.0.0.1", self.health_port, timeout=30)
-            time.sleep(1)
+            self._stop_look.wait(1)
+        up.close()
 
     def sev_log(self) -> list[str]:
         """The guest kernel's own SEV lines (dmesg), read once."""
