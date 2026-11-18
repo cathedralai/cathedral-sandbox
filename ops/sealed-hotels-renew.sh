@@ -103,9 +103,61 @@ json_field() {
   "$PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1], "rb"))[sys.argv[2]])' "$1" "$2"
 }
 
+kv_url=""
+if [ "$upload" = 1 ]; then
+  kv_url="$API_BASE/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$SEALED_HOTELS_KV_NAMESPACE_ID/values/$KV_KEY"
+fi
+
+cf_curl() {
+  # The header goes to curl through a config on stdin, so the token never
+  # reaches argv (visible in ps) or this script's output.
+  local token
+  token="$(tr -d '\r\n' <"$token_file")"
+  printf 'header = "Authorization: Bearer %s"\n' "$token" |
+    curl --silent --show-error --config - --max-time 30 --retry 3 --retry-all-errors "$@"
+}
+
+kv_guard() {
+  # kv_guard RELEASE [DIGEST]: never replace a newer or conflicting list (another
+  # signer, or restored state). Without DIGEST (before signing) any stored
+  # release >= RELEASE refuses; with DIGEST (after signing) a stored release
+  # equal to RELEASE must be these exact bytes.
+  local code
+  code="$(cf_curl --output "$work/current.json" --write-out '%{http_code}' "$kv_url")" || die "KV read failed"
+  case "$code" in
+    200)
+      if ! "$PYTHON" -I -c '
+import hashlib, json, sys
+data = open(sys.argv[1], "rb").read()
+try:
+    current = json.loads(data)["release"]
+except Exception:
+    sys.exit(0)  # not a signed list; the Worker ignores it too, so replace it
+release, digest = int(sys.argv[2]), sys.argv[3]
+if not isinstance(current, int) or isinstance(current, bool):
+    sys.exit(0)
+if current > release or (
+    current == release and (not digest or "sha256:" + hashlib.sha256(data).hexdigest() != digest)
+):
+    print(f"KV holds release {current}, not replacing it with release {release}", file=sys.stderr)
+    sys.exit(1)
+' "$work/current.json" "$1" "${2:-}"; then
+        die "KV already holds a newer or conflicting release"
+      fi
+      ;;
+    404) ;;
+    *) die "KV read answered HTTP $code" ;;
+  esac
+}
+
 previous_release="$(json_field "$STATE" last_release)"
 previous_digest="$(json_field "$STATE" last_digest)"
 expected_release=$((previous_release + 1))
+
+# 0. Read KV before signing. A lasting refusal (KV already holds this or a
+# newer release, or a token that cannot read KV) must not burn a release
+# number every 6 hours. The same check runs again after signing.
+[ "$upload" = 0 ] || kv_guard "$expected_release"
 
 # 1. Sign. The publisher holds the state lock, picks recorded + 1, verifies
 # against the pin file and commits the high-water before writing the files.
@@ -136,42 +188,10 @@ if [ "$upload" = 0 ]; then
   exit 0
 fi
 
-# 3. Upload to Workers KV and read back.
-kv_url="$API_BASE/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$SEALED_HOTELS_KV_NAMESPACE_ID/values/$KV_KEY"
+# 3. Upload to Workers KV and read back. Step 0 already set kv_url and cf_curl.
 
-cf_curl() {
-  # The header goes to curl through a config on stdin, so the token never
-  # reaches argv (visible in ps) or this script's output.
-  local token
-  token="$(tr -d '\r\n' <"$token_file")"
-  printf 'header = "Authorization: Bearer %s"\n' "$token" |
-    curl --silent --show-error --config - --max-time 30 --retry 3 --retry-all-errors "$@"
-}
-
-# Never replace a newer or conflicting list (another signer, or restored state).
-code="$(cf_curl --output "$work/current.json" --write-out '%{http_code}' "$kv_url")" || die "KV read failed"
-case "$code" in
-  200)
-    if ! "$PYTHON" -I -c '
-import hashlib, json, sys
-data = open(sys.argv[1], "rb").read()
-try:
-    current = json.loads(data)["release"]
-except Exception:
-    sys.exit(0)  # not a signed list; the Worker ignores it too, so replace it
-release, digest = int(sys.argv[2]), sys.argv[3]
-if not isinstance(current, int) or isinstance(current, bool):
-    sys.exit(0)
-if current > release or (current == release and "sha256:" + hashlib.sha256(data).hexdigest() != digest):
-    print(f"KV holds release {current}, not replacing it with release {release}", file=sys.stderr)
-    sys.exit(1)
-' "$work/current.json" "$release" "$digest"; then
-      die "KV already holds a newer or conflicting release"
-    fi
-    ;;
-  404) ;;
-  *) die "KV read answered HTTP $code" ;;
-esac
+# Check again after signing: the KV value may have changed since step 0.
+kv_guard "$release" "$digest"
 
 code="$(cf_curl --request PUT --header 'Content-Type: application/json' \
   --data-binary "@$release_file" --output "$work/put.json" --write-out '%{http_code}' "$kv_url")" || die "KV write failed"
