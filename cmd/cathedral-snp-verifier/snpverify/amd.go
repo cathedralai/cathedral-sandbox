@@ -63,27 +63,26 @@ func requireP384(pub *ecdsa.PublicKey, isECDSA bool) error {
 // product mirrors product() in verify_receipts.py plus the check in verify_amd():
 // only Milan and Genoa are handled, because their TCB byte layout is the one used here.
 func product(rep Report, override string) (string, error) {
-	prod := override
-	// An override cannot contradict a product the report itself names.
-	if override != "" && rep.HasCPUID && rep.Family == 0x19 {
-		detected := "Milan"
-		if rep.Model >= 0x10 {
-			detected = "Genoa"
-		}
-		if override != detected {
-			return "", fail(CodeUnsupportedProduct, "product override %q disagrees with the report (%s)", override, detected)
-		}
+	if rep.Version < 2 || rep.Version > 5 {
+		return "", fail(CodeUnsupportedProduct, "the report is version %d, which has no layout here", rep.Version)
 	}
-	if prod == "" {
-		switch {
-		case !rep.HasCPUID:
-			return "", fail(CodeUnsupportedProduct, "report version %d has no CPUID family and model; set the product", rep.Version)
-		case rep.Family == 0x19 && rep.Model >= 0x10:
+	prod := override
+	if rep.Version == 2 {
+		// No CPUID fields: only a version 2 report takes the product from the caller.
+		if override == "" {
+			return "", fail(CodeUnsupportedProduct, "report version 2 has no CPUID family and model; set the product")
+		}
+	} else {
+		// A report that names its own product decides; the override is read only after this.
+		if rep.Family != 0x19 {
+			return "", fail(CodeUnsupportedProduct, "the report names cpuid family %d model %d, which has no layout here", rep.Family, rep.Model)
+		}
+		prod = "Milan"
+		if rep.Model >= 0x10 {
 			prod = "Genoa"
-		case rep.Family == 0x19:
-			prod = "Milan"
-		default:
-			return "", fail(CodeUnsupportedProduct, "cannot tell the product from cpuid family %d model %d; set the product", rep.Family, rep.Model)
+		}
+		if override != "" && override != prod {
+			return "", fail(CodeUnsupportedProduct, "product override %q disagrees with the report (%s)", override, prod)
 		}
 	}
 	if prod != "Genoa" && prod != "Milan" {

@@ -79,8 +79,28 @@ func TestProduct(t *testing.T) {
 		_, err := VerifyAttestation(att, goodOpts(t))
 		wantCode(t, err, CodeUnsupportedProduct)
 	})
+	// Python product(): versions 2 to 5 only; from version 3 the family must be 0x19 whatever --product says.
+	setVersion := func(v uint32, fam byte) func([]byte) {
+		return func(r []byte) { binary.LittleEndian.PutUint32(r[0:4], v); r[0x188] = fam }
+	}
+	for name, c := range map[string]struct {
+		mut     func([]byte)
+		product string
+	}{
+		"version 6, family 0x19":                {setVersion(6, 0x19), ""},
+		"version 1 with a product":              {setVersion(1, 0x19), "Milan"},
+		"version 3, family 0x1A with a product": {setVersion(3, 0x1A), "Genoa"},
+	} {
+		t.Run(name+" is refused", func(t *testing.T) {
+			att := setReport(t, loadAtt(t, "attestation-proof.json"), c.mut)
+			o := goodOpts(t)
+			o.Product = c.product
+			_, err := VerifyAttestation(att, o)
+			wantCode(t, err, CodeUnsupportedProduct)
+		})
+	}
 	t.Run("lower case product is not accepted", func(t *testing.T) {
-		_, err := product(Report{}, "genoa")
+		_, err := product(Report{Version: 2}, "genoa")
 		wantCode(t, err, CodeUnsupportedProduct)
 	})
 	t.Run("family and model map", func(t *testing.T) {
@@ -88,7 +108,7 @@ func TestProduct(t *testing.T) {
 			fam, mod uint8
 			want     string
 		}{{0x19, 0x10, "Genoa"}, {0x19, 0x11, "Genoa"}, {0x19, 0x01, "Milan"}, {0x19, 0x0f, "Milan"}} {
-			got, err := product(Report{HasCPUID: true, Family: c.fam, Model: c.mod}, "")
+			got, err := product(Report{Version: 4, HasCPUID: true, Family: c.fam, Model: c.mod}, "")
 			if err != nil || got != c.want {
 				t.Fatalf("%x/%x: %q %v", c.fam, c.mod, got, err)
 			}

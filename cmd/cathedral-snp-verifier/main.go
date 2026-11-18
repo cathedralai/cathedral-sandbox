@@ -19,8 +19,9 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
-// onceFlag takes one value; a second use is a usage error, because Python keeps
-// only the last one and a repeat must not silently widen the check.
+// onceFlag takes one value; a second use is a usage error. Python lets
+// --expected-measurement repeat and accepts any of them; here a repeat is refused so
+// it cannot be read as a different list than the caller meant.
 type onceFlag struct {
 	value string
 	set   bool
@@ -67,7 +68,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var expected onceFlag
 	fs.Var(&headers, "receipt-header", "X-Room-Receipt header value (repeatable)")
 	fs.Var(&pins, "ark-sha256", "pinned sha256 of the ARK DER (repeatable, required)")
-	fs.Var(&expected, "expected-measurement", "expected measurement hex (at most once, as in the Python tool)")
+	fs.Var(&expected, "expected-measurement", "expected measurement hex (at most once here; Python lets it repeat as any-of, use --allowed-measurement for that)")
 	fs.Var(&allowed, "allowed-measurement", "approved measurement hex, any match passes (repeatable; no Python counterpart)")
 	if err := fs.Parse(args); err != nil {
 		return 2

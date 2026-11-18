@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -174,6 +176,53 @@ func TestCLIRefusesRepeatedSequenceAndRoomHeadMismatch(t *testing.T) {
 			var f struct{ Verdict, Code string }
 			json.Unmarshal(out.Bytes(), &f)
 			if code != 1 || f.Verdict != "FAIL" || f.Code != tc.code {
+				t.Fatalf("exit %d %s", code, out.String())
+			}
+		})
+	}
+}
+
+// Python product(): report versions 2 to 5 only; from version 3 the CPUID family must be 0x19
+// even with --product. Each case below was Go PASS and Python FAIL before.
+func TestCLIReportVersionAndFamily(t *testing.T) {
+	raw, err := os.ReadFile("snpverify/testdata/attestation-proof.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	report, err := base64.StdEncoding.DecodeString(doc["report_b64"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]struct {
+		version uint32
+		family  byte
+		extra   []string
+	}{
+		"version 6":                {6, 0x19, nil},
+		"version 1 with product":   {1, 0x19, []string{"--product", "Milan"}},
+		"family 0x1A with product": {3, 0x1A, []string{"--product", "Genoa"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := append([]byte(nil), report...)
+			binary.LittleEndian.PutUint32(r[0:4], c.version)
+			r[0x188] = c.family
+			doc["report_b64"] = base64.StdEncoding.EncodeToString(r)
+			b, _ := json.Marshal(doc)
+			p := filepath.Join(t.TempDir(), "att.json")
+			if err := os.WriteFile(p, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"--attestation", p, "--ark", "snpverify/testdata/amd/ark.der", "--ask", "snpverify/testdata/amd/ask.der",
+				"--vcek", "snpverify/testdata/amd/vcek.der", "--ark-sha256", genoaPin}
+			var out, errb bytes.Buffer
+			code := run(append(args, c.extra...), &out, &errb)
+			var f struct{ Verdict, Code string }
+			json.Unmarshal(out.Bytes(), &f)
+			if code != 1 || f.Code != snpverify.CodeUnsupportedProduct {
 				t.Fatalf("exit %d %s", code, out.String())
 			}
 		})

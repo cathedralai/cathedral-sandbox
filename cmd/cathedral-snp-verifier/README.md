@@ -63,7 +63,7 @@ go run . \
   --ark-sha256 4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1
 ```
 
-Flags: `--attestation FILE`, `--receipts FILE` (list, or object with a `receipts` list), `--receipt-header B64` (repeatable), `--ark`, `--ask`, `--vcek` (DER), `--ark-sha256 HEX` (repeatable, required, no default), `--expected-measurement HEX` (at most once; a repeat exits 2), `--allowed-measurement HEX` (repeatable, any match passes, no Python counterpart; not combinable with `--expected-measurement`), `--require-measurement` (satisfied by either measurement flag), `--product Genoa|Milan`. As in the Python tool, a `head` in an unfiltered receipts object is the head, unless `--receipt-header` is given; there is no `--head` flag. Positional arguments are refused (exit 2).
+Flags: `--attestation FILE`, `--receipts FILE` (list, or object with a `receipts` list), `--receipt-header B64` (repeatable), `--ark`, `--ask`, `--vcek` (DER), `--ark-sha256 HEX` (repeatable, required, no default), `--expected-measurement HEX` (at most once here; Python lets it repeat as any-of, so a repeat exits 2 and `--allowed-measurement` is the any-of form), `--allowed-measurement HEX` (repeatable, any match passes, no Python counterpart; not combinable with `--expected-measurement`), `--require-measurement` (satisfied by either measurement flag), `--product Genoa|Milan`. As in the Python tool, a `head` in an unfiltered receipts object is the head, unless `--receipt-header` is given; there is no `--head` flag. Positional arguments are refused (exit 2).
 
 On PASS or FAIL the output is one JSON object on stdout with `verdict`, and `code` and `detail` on FAIL. Exit 0 on PASS, 1 on FAIL. A usage error prints a message on stderr, no JSON, and exits 2.
 
@@ -94,12 +94,12 @@ if errors.As(err, &ve) && ve.Code() == snpverify.CodeMeasurementNotAllowed { /* 
 - Documents are read under Python's raw-text limits (`load_json_bounded`): nesting of `[` and `{` deeper than 64, or a run of number characters (digits, signs, point, `e`) longer than 100, is refused. Also refused here: a float that overflows (Python prints `Infinity`), receipt sequences more than 10,000,000 apart (Python runs out of memory).
 - Unpaired UTF-16 surrogate escapes in JSON strings are refused; Python fails on them when it encodes.
 - `kernel_cmdline`, when present, must be a string (Python crashes or treats falsy values as empty).
-- Product: same rule as Python (CPUID family 0x19, model 0x10 or more is Genoa, else Milan; version 3 and later), but certificates are supplied, not fetched. Other products fail with `unsupported_product`. An override (`--product`) is used only when the report does not name the product; one that disagrees with the report fails.
+- Product: same rule as Python `product()`: report versions 2 to 5 only; from version 3 the CPUID family must be 0x19 (model 0x10 or more is Genoa, else Milan) whatever `--product` says, and an override that disagrees fails; only a version 2 report takes the product from `--product`. Certificates are supplied, not fetched. Everything else fails with `unsupported_product`.
 - Where Python would crash on a missing or mistyped field in the policy, tunables, link or TLS checks (for example a policy that is not an object, or a room id that is a list), this checker fails: with `receipt_malformed` when a statement field has the wrong type, otherwise with the code of that check.
 - A create receipt with a non-integer status fails, rather than being read the way Python `int()` reads it.
 - Receipts documents: a list, or an object whose `receipts` is a list; anything else fails. `head`, when present, must be a non-empty string; `filtered`, when present, must be a boolean. Each receipt needs string `receipt_sha256`, `signature_b64`, `binding_sha256`, `previous_receipt_sha256`, `action`, and an integer `sequence` of 1 or more.
 - Statement fields have fixed JSON types here, and a wrong type fails with `receipt_malformed` where Python may accept it: `sandbox_id`, `cathedral_sandbox_id`, `network_policy_sha256`, `tunables_sha256` are a string or null; `network_policy` and `tunables` are an object or null; `status` is an integer that fits int64, or null; `issued_at`, when present, is an integer that fits int64; `sequence` is an integer of 1 or more.
-- `--allowed-measurement` exists only here. There is no `--head` flag, and `--expected-measurement` may be given once.
+- `--allowed-measurement` exists only here. There is no `--head` flag, and `--expected-measurement` may be given once (Python accepts repeats).
 - Receipt headers decode only the base64url alphabet (`A-Z a-z 0-9 - _`) with optional `=` padding and no trimming. Python also takes `+` and `/` and drops other bytes.
 - `report_b64` and the receipt key are decoded strictly, as Python's shape check does (`validate=True`): standard alphabet and padding, no CR, LF, space or other byte. Receipt signatures use the same alphabet; Go's decoder ignores CR and LF there and rejects any other stray byte, where Python drops every byte outside the alphabet.
 - Positional command-line arguments are refused.
@@ -137,6 +137,7 @@ Owner and dedicated checks (`--owner-pubkey`), the peer-SPKI and `--require-tls`
 | Guest TLS fields | 513 | `checks.go` `verifyGuestTLS` | present |
 | Guest ingress key (AB#422) | 544 | `checks.go` `verifyGuestIngress` | ported |
 | Empty `head` refused (AB#484) | main | `receipt.go` `ParseReceiptsDocument` | present |
+| Report version 2 to 5, CPUID family 0x19 from version 3, override only for version 2 (343-363) | `amd.go` `product` | ported (Go took the override as given) |
 | Attestation: binding hash, REPORT_DATA, fields, debug, measurement, AMD chain | 459 | `attestation.go`, `amd.go` | present |
 | Receipts naming an earlier binding need the broker (AB#381) | 2469 | `receipt.go` `VerifyReceipts` | N/A: no broker input here; fails closed with `receipt_binding_mismatch` |
 | Genoa SNP TCB floor `--min-genoa-snp-spl` (AB#809) | 490 | none | N/A: option, no flag here; not checked, and a PASS does not claim it |
