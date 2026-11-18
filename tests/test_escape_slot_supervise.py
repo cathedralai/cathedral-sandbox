@@ -409,3 +409,42 @@ def test_config_is_rechecked_before_every_launch(rig, tmp_path):
     with pytest.raises(SystemExit, match="SEALED_DATA_GIB"):
         poll(sup, clock, times=3)
     assert "start" not in systemctl.mutating()
+
+
+def test_a_new_room_on_a_used_launch_retires_at_once(rig):
+    sup, guest, systemctl, clock, lines = rig
+    poll(sup, clock)
+    guest.chain, guest.rooms = 1, [{"id": "r1"}]
+    poll(sup, clock)
+    assert sup.launch.state == "in_use"
+    guest.rooms = []
+    poll(sup, clock)
+    assert systemctl.mutating() == []  # one empty poll is not enough
+    guest.rooms = [{"id": "r2"}]  # a second attempt lands inside the retire window
+    poll(sup, clock)
+    assert systemctl.order[0] == ("stop", True)
+    retire = [t for t in transitions(lines) if t.get("state") == "retiring"]
+    assert retire[0]["reason"] == "new_room_on_used_launch"
+
+
+def test_a_room_handed_over_between_two_polls_retires(rig):
+    sup, guest, systemctl, clock, lines = rig
+    poll(sup, clock)
+    guest.chain, guest.rooms = 1, [{"id": "r1"}]
+    poll(sup, clock)
+    guest.rooms = [{"id": "r2"}]  # r1 deleted and r2 created between polls: never empty
+    poll(sup, clock)
+    retire = [t for t in transitions(lines) if t.get("state") == "retiring"]
+    assert retire and retire[0]["reason"] == "new_room_on_used_launch"
+
+
+def test_a_room_listed_a_poll_after_the_chain_is_adopted_not_retired(rig):
+    sup, guest, systemctl, clock, _ = rig
+    poll(sup, clock)
+    guest.chain = 1  # the chain moves first; the room is listed on the next poll
+    poll(sup, clock)
+    assert sup.launch.state == "in_use"
+    guest.rooms = [{"id": "r1"}]
+    poll(sup, clock, times=5)
+    assert systemctl.mutating() == []
+    assert sup.launch.state == "in_use"

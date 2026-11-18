@@ -190,6 +190,7 @@ class Launch:
     in_use_at: float | None = None
     empty_polls: int = 0
     latest_expiry: float | None = None
+    room_ids: set = field(default_factory=set)
     alerted: set = field(default_factory=set)
 
 
@@ -353,6 +354,7 @@ class SlotSupervisor:
             launch.used = True
             self.retire("binding_changed")
             return True
+        ids = {r.get("id") if isinstance(r, dict) else None for r in rooms}
         count = receipts.get("count")
         chain_used = (isinstance(count, int) and count > 0) or bool(receipts.get("receipts"))
         if chain_used or rooms:
@@ -370,6 +372,15 @@ class SlotSupervisor:
             launch.in_use_at = now
             self.move("in_use", "chain_not_empty", rooms=len(rooms))
         if launch.state != "in_use":
+            return True
+        # One attempt per launch: the first rooms seen on a used launch are the
+        # attempt's (a chain can be non-empty a poll before its room is listed).
+        # A room id not seen before is a second attempt on a used guest, or a
+        # handover between two polls: retire at once, the safe direction.
+        if not launch.room_ids:
+            launch.room_ids = set(ids)
+        if not ids <= launch.room_ids:
+            self.retire("new_room_on_used_launch")
             return True
         expiries = [e for e in (_expiry(r) for r in rooms) if e is not None]
         if expiries:
