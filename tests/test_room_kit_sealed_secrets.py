@@ -113,7 +113,7 @@ class Api:
 
 def _front(ledger):
     api = Api()
-    server = rr.Server(("127.0.0.1", 0), ledger, api.port, 1, KEY, "/nonexistent.sock")
+    server = rr.Server(("127.0.0.1", 0), ledger, api.port, 1, KEY, "/nonexistent.sock", pool_scan=False)
     Thread(target=server.serve_forever, daemon=True).start()
     return server.server_address[1], api
 
@@ -756,7 +756,11 @@ def test_a_delete_of_an_odd_room_id_removes_nothing_outside_its_own_directory(tm
     (root / keep / "A").write_bytes(b"x")
     port, _ = _front(ledger)
     status, headers, _ = _request(port, "DELETE", f"/v1/sandboxes/{room}")
-    assert status == 200 and _receipt(headers)["statement"]["action"] == "delete"
+    if room == "%2e%2e":
+        assert status == 400  # Encoded room IDs are refused before forwarding or signing.
+        assert "X-Room-Receipt" not in headers
+    else:
+        assert status == 200 and _receipt(headers)["statement"]["action"] == "delete"
     assert (root / keep / "A").exists() and (tmp_path / "store").is_dir()
 
 
