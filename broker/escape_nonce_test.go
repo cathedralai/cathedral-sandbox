@@ -296,12 +296,6 @@ func TestEscapeNoncePlantRefusesANonEscapeHotel(t *testing.T) {
 	if status != 403 || errCode(doc) != "escape_hotel_required" {
 		t.Fatalf("unlabelled: %d %v", status, doc)
 	}
-	tc.b.hotelByID("b").cfg.Labels = map[string]string{"escape": "true"}
-	status, doc = tc.call(t, "operator-key", "POST", "/v1/broker/hotels/b/escape-nonce",
-		map[string]string{"window_id": "win-1", "nonce": "control-plane-nonce-1"})
-	if status != 403 || errCode(doc) != "escape_hotel_required" {
-		t.Fatalf("unsealed: %d %v", status, doc)
-	}
 	if n := len(tc.hotels["a"].plantPosts) + len(tc.hotels["b"].plantPosts); n != 0 {
 		t.Fatalf("hotel was called %d times", n)
 	}
@@ -566,7 +560,7 @@ func writeBrokerConfig(t *testing.T, extra string) string {
 	if err := os.WriteFile(key, []byte("hotel-key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	raw := `{"listen":"127.0.0.1:0","hotels":[{"id":"h1","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + key + `"}]` + extra + `}`
+	raw := `{"listen":"127.0.0.1:0","hotels":[{"id":"h1","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + key + `","sealed":true,"sealed_admission":"off"}]` + extra + `}`
 	path := filepath.Join(dir, "broker.json")
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)

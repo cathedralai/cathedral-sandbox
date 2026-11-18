@@ -3,20 +3,24 @@
 // A guest policy names hotels by selector instead of by a fixed id list:
 //
 //	"policy": {
-//	  "prefer": [{"class": "sealed"}],
-//	  "allow":  [{"class": "unsealed"}],
+//	  "prefer": [{"label": {"region": "eu"}}],
+//	  "allow":  [{"class": "sealed"}],
 //	  "deny":   [{"hotel": "nc-sealed"}]
 //	}
 //
-// A selector is {"class": "sealed"|"unsealed"}, {"hotel": "<id>"} or
-// {"label": {"k": "v"}} (every pair must match). Deny wins over prefer and
-// allow. A create with no hotel choice goes to the preferred hotels while one
-// of them has a free room, else to the allowed hotels. A hotel that joins at
-// runtime is matched by class and label with no policy edit.
+// A selector is {"class": "sealed"}, {"hotel": "<id>"} or {"label": {"k":
+// "v"}} (every pair must match). Every hotel is sealed (AB#776), so the class
+// selector reaches every hotel the rest of the policy allows; "sealed" is the
+// only class, and a policy naming any other class is refused so a stale
+// "unsealed" policy fails loudly instead of matching nothing. Deny wins over
+// prefer and allow. A create with no hotel choice goes to the preferred
+// hotels while one of them has a free room, else to the allowed hotels. A
+// hotel that joins at runtime is matched by class and label with no policy
+// edit.
 //
-// When a guest has a policy, the policy replaces its "hotels" list and its
-// "default_sealed" flag. Miner hotels are denied unless the guest policy
-// explicitly selects the miner=true label; broad sealed selectors do not opt in.
+// When a guest has a policy, the policy replaces its "hotels" list. Miner
+// hotels are denied unless the guest policy explicitly selects the miner=true
+// label; broad sealed selectors do not opt in.
 //
 // A hotel can be reserved for one guest (hotel field "reserved_for", in the
 // config or by PATCH /v1/broker/hotels/<id>). Every other guest treats it as
@@ -40,10 +44,9 @@ import (
 )
 
 const (
-	classSealed   = "sealed"
-	classUnsealed = "unsealed"
-	tierPrefer    = "prefer"
-	tierAllow     = "allow"
+	classSealed = "sealed"
+	tierPrefer  = "prefer"
+	tierAllow   = "allow"
 )
 
 type selector struct {
@@ -63,13 +66,13 @@ type guestPolicy struct {
 }
 
 // hotelClass is "sealed" for a hotel with the sealed label (a sealed hotel
-// always has it, see newHotel), else "unsealed". It is the same rule as the
-// "prefer" fallback class.
+// always has it, see newHotel). The loader and the join take only sealed
+// hotels (AB#776), so any other hotel is a leftover with no class: "".
 func hotelClass(h *hotel) string {
 	if h.labels()["sealed"] == "true" {
 		return classSealed
 	}
-	return classUnsealed
+	return ""
 }
 
 func (s selector) matches(h *hotel) bool {
@@ -153,8 +156,8 @@ func validSelectors(field string, list []selector) error {
 		n := 0
 		if s.Class != "" {
 			n++
-			if s.Class != classSealed && s.Class != classUnsealed {
-				return fmt.Errorf("policy.%s[%d].class must be \"sealed\" or \"unsealed\"", field, i)
+			if s.Class != classSealed {
+				return fmt.Errorf("policy.%s[%d].class must be \"sealed\" (every hotel is sealed, AB#776)", field, i)
 			}
 		}
 		if s.Hotel != "" {
@@ -282,6 +285,9 @@ type classTotals struct {
 func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.Time, mb *minerBudget) {
 	h := e.h
 	c := t[hotelClass(h)]
+	if c == nil {
+		return // a leftover hotel with no class (hotelClass)
+	}
 	c.Hotels++
 	if e.source == "join" {
 		c.Joined++
@@ -312,7 +318,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 	now := time.Now()
 	out := []map[string]any{}
 	var guest map[string]any
-	totals := map[string]*classTotals{classSealed: {}, classUnsealed: {}}
+	totals := map[string]*classTotals{classSealed: {}}
 	// docs: what one hotel can take now; sum: a budget the totals use up.
 	docs, sum := b.minerBudgetNow(), b.minerBudgetNow()
 	for _, e := range b.capacityEntries() {

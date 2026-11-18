@@ -270,7 +270,7 @@ func TestAlertWebhookPostsChatAndTextAndNeverLogsTheURL(t *testing.T) {
 
 func TestAlertChatAtJoinAndPatch(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 4, map[string]any{"alert_chat_id": "777"})
+	joinMiner(t, tc, "m1", 4, map[string]any{"alert_chat_id": "777"})
 	if got := tc.b.hotelByID("m1").alertChat(); got != "777" {
 		t.Fatalf("alert chat after join: %q", got)
 	}

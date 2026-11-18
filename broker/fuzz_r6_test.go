@@ -28,18 +28,20 @@ func liveShapeConfig(t testing.TB, hotelURL string) string {
 	if err := os.WriteFile(key, []byte("hotel-key-with-forty-eight-characters-0123456789ab\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Every hotel is sealed (AB#776). h1 to h4 use the ops escape so the fuzz
+	// target reaches placement; h5 keeps the gate.
 	hotel := func(id, name string, threads, ram, conc int, extra string) string {
-		return fmt.Sprintf(`{"id": %q, "name": %q, "threads": %d, "ram_gib": %d, "api": %q, "health": %q, "key_file": %q, "concurrency": %d, "drain": false%s}`,
+		return fmt.Sprintf(`{"id": %q, "name": %q, "threads": %d, "ram_gib": %d, "api": %q, "health": %q, "key_file": %q, "concurrency": %d, "drain": false, "sealed": true%s}`,
 			id, name, threads, ram, hotelURL, hotelURL, key, conc, extra)
 	}
 	cfg := `{
  "listen": "127.0.0.1:18100",
  "hotels": [
-  ` + hotel("h1", "Hotel 1", 256, 1001, 16, "") + `,
-  ` + hotel("h2", "Hotel 2", 192, 752, 40, `, "max_slots": 700`) + `,
-  ` + hotel("h3", "Hotel 3", 48, 187, 16, "") + `,
-  ` + hotel("h4", "Hotel 4", 32, 62, 8, "") + `,
-  ` + hotel("h5", "Hotel 5 (sealed)", 96, 384, 40, `, "sealed": true`) + `
+  ` + hotel("h1", "Hotel 1", 256, 1001, 16, `, "sealed_admission": "off"`) + `,
+  ` + hotel("h2", "Hotel 2", 192, 752, 40, `, "max_slots": 700, "sealed_admission": "off"`) + `,
+  ` + hotel("h3", "Hotel 3", 48, 187, 16, `, "sealed_admission": "off"`) + `,
+  ` + hotel("h4", "Hotel 4", 32, 62, 8, `, "sealed_admission": "off"`) + `,
+  ` + hotel("h5", "Hotel 5 (gated)", 96, 384, 40, "") + `
  ],
  "guests": [
   {"id": "ops", "key_sha256": "` + sha("ops-key") + `", "view_token_sha256": "` + sha("ops-view") + `", "max_rooms": 10000, "ops": true, "hotels": ["h1", "h2", "h3", "h4"]},
@@ -81,8 +83,8 @@ func TestLiveConfigShapeLoadsUnderTheStrictLoader(t *testing.T) {
 			t.Fatalf("max_slots not carried: %+v", h.cfg)
 		}
 	}
-	if sealed != 1 {
-		t.Fatalf("sealed hotels: %d, want 1", sealed)
+	if sealed != 5 {
+		t.Fatalf("sealed hotels: %d, want 5 (every hotel, AB#776)", sealed)
 	}
 }
 

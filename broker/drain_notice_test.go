@@ -45,7 +45,7 @@ func noticeLog(t *testing.T, dir string) []drainNoticeRecord {
 func TestSignedDrainNoticeDrainsAndIsRecorded(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	joinMiner(t, tc, "m1", true, 2, nil)
+	joinMiner(t, tc, "m1", 2, nil)
 	admitNow(t, tc, "m1")
 	if status, doc := tc.call(t, "enroller-key", "GET", "/v1/broker/hotels/m1", nil); status != 200 || doc["free_rooms"].(float64) < 1 || doc["drain_notice"] != nil {
 		t.Fatalf("before notice: %d %v", status, doc)
@@ -96,7 +96,7 @@ func TestSignedDrainNoticeDrainsAndIsRecorded(t *testing.T) {
 func TestDrainNoticeRefusals(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	future := time.Now().Add(48 * time.Hour).Unix()
 	mut := func(k string, v any) map[string]any {
 		n := testNotice("m1", future, future+3600, 3)
@@ -143,7 +143,7 @@ func TestDrainNoticeRefusals(t *testing.T) {
 func TestDrainNoticeFailedSaveLeavesNoNotice(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	if err := os.Mkdir(filepath.Join(dir, runtimeHotelsFile+".tmp"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestDrainNoticeFailedSaveLeavesNoNotice(t *testing.T) {
 
 func TestOperatorUndrainEndsTheMaintenance(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	future := time.Now().Add(48 * time.Hour).Unix()
 	if status, doc := tc.call(t, "enroller-key", "PATCH", "/v1/broker/hotels/m1", map[string]any{"drain": true, "drain_notice": testNotice("m1", future, future+60, 5)}); status != 200 {
 		t.Fatalf("notice: %d %v", status, doc)

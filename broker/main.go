@@ -487,6 +487,11 @@ func loadBroker(path string) (*broker, error) {
 	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), shares: map[string]*liveShare{}, started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
+		// AB#776: every Cathedral room is sealed, so a hotel that is not
+		// sealed has no class to serve. Refuse at load rather than run it.
+		if !hc.Sealed {
+			return nil, fmt.Errorf(`config: hotel %q: every hotel must be "sealed": true (AB#776: there is no unsealed hotel class; remove the hotel or seal it)`, hc.ID)
+		}
 		if err := validateSealedAdmission(hc); err != nil {
 			return nil, err
 		}
@@ -495,9 +500,6 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if hc.Commitment != nil {
 			return nil, fmt.Errorf("config: hotel %q: only a miner hotel declares a commitment, and miner hotels join at runtime", hc.ID)
-		}
-		if hc.RequireAttestation && !hc.Sealed {
-			return nil, fmt.Errorf("config: hotel %q: require_attestation needs \"sealed\": true", hc.ID)
 		}
 		if err := validateGuestTLS(hc, c.RequireSealedGuestTLS); err != nil {
 			return nil, err

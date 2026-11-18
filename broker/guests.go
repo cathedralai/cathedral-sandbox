@@ -4,15 +4,17 @@
 //
 //	"max_rooms": 1000              rooms running or starting at one time (0 or absent: 1,000)
 //	"max_creates_per_minute": 600  rooms the guest may ask for in any 60 s (0 or absent: no limit)
-//	"default_sealed": true         a create with no hotel choice goes to sealed hotels only
+//	"default_sealed": true         kept and echoed only; it changes no placement (below)
 //	"hotels": ["a", "b"]           the guest may use only these hotels (absent: all non-miner hotels)
-//	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" and "default_sealed" (capacity.go)
+//	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" (capacity.go)
 //	"own_hosts_only": true         never a miner hotel, whatever the policy says (reserved customers)
 //	"ops": true                    the guest may run the probe and reset the broker counters
 //
-// With "default_sealed", a create gets an unsealed room only when it says
-// "sealed": false, names hotels with "hotels", or excludes sealed hotels
-// with "exclude_hotel_labels". A fork goes to the hotel of its snapshot.
+// Every hotel is sealed (AB#776), so every room is sealed and
+// "default_sealed" no longer changes where a create goes. The field stays
+// because live configs set it and the loader refuses unknown fields, and
+// /v1/quota and the guest views still echo it for the guards that read it.
+// A fork goes to the hotel of its snapshot.
 //
 // An operator (operator key) reads and changes limits at runtime:
 //
@@ -42,8 +44,8 @@ type guestLimits struct {
 	MaxCreatesPerMinute int      `json:"max_creates_per_minute"`
 	DefaultSealed       bool     `json:"default_sealed"`
 	Hotels              []string `json:"hotels"`
-	// Policy, when set, replaces Hotels and DefaultSealed (capacity.go). It
-	// is never changed in place: a PATCH stores a new value.
+	// Policy, when set, replaces Hotels (capacity.go). It is never changed
+	// in place: a PATCH stores a new value.
 	Policy *guestPolicy `json:"policy,omitempty"`
 	// OwnHostsOnly keeps every room of the guest on Cathedral's own hotels:
 	// placement never picks a miner hotel (isMinerHotel), even when the
@@ -154,9 +156,8 @@ func writeLimitErr(w http.ResponseWriter, e *apiErr, retryAfter int) {
 	writeErr(w, e.status, e.code, e.msg)
 }
 
-// scope applies the guest's hotel set and sealed default to pl. named: the
-// create names hotels. sealedField: the create has a "sealed" field.
-func (b *broker) scope(g *guestState, pl *placement, named, sealedField bool) {
+// scope applies the guest's hotel set or policy to pl.
+func (b *broker) scope(g *guestState, pl *placement) {
 	b.mu.Lock()
 	lim := g.limits
 	b.mu.Unlock()
@@ -165,8 +166,8 @@ func (b *broker) scope(g *guestState, pl *placement, named, sealedField bool) {
 	// policy branch below returns early.
 	pl.ownHostsOnly = pl.ownHostsOnly || lim.OwnHostsOnly
 	if lim.Policy != nil {
-		// The policy replaces the hotel list and the sealed default: it
-		// names the classes the guest may use, in order (pick).
+		// The policy replaces the hotel list: it names the hotels the guest
+		// may use, in order (pick).
 		pl.policy = lim.Policy
 		return
 	}
@@ -175,13 +176,6 @@ func (b *broker) scope(g *guestState, pl *placement, named, sealedField bool) {
 		for _, id := range lim.Hotels {
 			pl.allowed[id] = true
 		}
-	}
-	if lim.DefaultSealed && !named && !sealedField && pl.match["sealed"] == "" && pl.exclude["sealed"] == "" {
-		if pl.match == nil {
-			pl.match = map[string]string{}
-		}
-		pl.match["sealed"] = "true"
-		pl.sealedByDefault = true
 	}
 }
 
@@ -333,21 +327,4 @@ func (g *guestState) tierOf(h *hotel) string {
 		return ""
 	}
 	return g.limits.tierOf(h)
-}
-
-// anyHotel reports whether some hotel matches pl, full or not.
-func (b *broker) anyHotel(pl placement) bool {
-	for _, h := range b.hotelList() {
-		if pl.allows(h) {
-			return true
-		}
-	}
-	return false
-}
-
-func (b *broker) compatImageByID(v any) *compatImage {
-	id, _ := v.(string)
-	b.compat.mu.Lock()
-	defer b.compat.mu.Unlock()
-	return b.compat.images[id]
 }
