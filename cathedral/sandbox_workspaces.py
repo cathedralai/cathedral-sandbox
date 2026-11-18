@@ -26,6 +26,11 @@ Settings:
   CATHEDRAL_WORKSPACE_ROOT          directory on the hotel; unset: no workspaces
   CATHEDRAL_WORKSPACE_MAX_PER_OWNER workspaces for each owner (default 10)
   CATHEDRAL_WORKSPACE_MAX_VERSIONS  versions for each workspace (default 20)
+  CATHEDRAL_WORKSPACE_MAX_BYTES     bytes of a workspace's data/ (what rooms
+                                    write), as an xfs project quota (AB#396);
+                                    unset or 0: no byte quota. Versions are
+                                    copies of data/, so the count limit bounds
+                                    them.
   CATHEDRAL_WORKSPACE_HELPER_IMAGE  image of the helper container
                                     (default alpine:3.20)
   CATHEDRAL_WORKSPACE_MOUNT_CHECK   "0" skips the check that the root is
@@ -38,6 +43,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -48,6 +54,7 @@ from typing import Any, Protocol
 from cathedral.sandbox_api import SandboxContractError, WORKSPACE_NAME_RE, validate_workspace_name
 from cathedral.sandbox_owner import BROKER_GUEST_LABEL, GUEST_HEADER, guest_from, owner_id
 from cathedral.sandbox_provider import SandboxOpError
+from cathedral.sandbox_quota import WORKSPACE_IDS, QuotaUnavailable, XfsProjectQuota, mount_of, pick_id
 
 NAME_RE = WORKSPACE_NAME_RE
 SAFE_MOUNT_OPTIONS = ("nosuid", "nodev", "noexec")
@@ -191,6 +198,8 @@ class WorkspaceStore:
         max_versions: int = 20,
         check_mount: bool = True,
         persistent: bool | None = None,
+        max_bytes: int = 0,
+        quota: XfsProjectQuota | None = None,
     ) -> None:
         self.root = Path(root)
         self.copier = copier
@@ -198,6 +207,11 @@ class WorkspaceStore:
         self.max_versions = max(1, max_versions)
         # Do workspaces survive a hotel restart? None: not a sealed data volume.
         self.persistent = persistent
+        # Byte quota per workspace (AB#396). 0: none.
+        self.max_bytes = max(0, int(max_bytes))
+        self.quota = quota if self.max_bytes else None
+        if self.max_bytes and self.quota is None:
+            self.quota = XfsProjectQuota()
         self._lock = threading.RLock()
         # (owner, name) -> sandbox ids that mount it now
         self._mounts: dict[tuple[str, str], set[str]] = {}
@@ -208,6 +222,12 @@ class WorkspaceStore:
             ok, why = mount_options_safe(self.root)
             if not ok:
                 self.disabled_reason = why
+            elif self.quota is not None:
+                # A cap that cannot be set would fail every create; say why up front.
+                try:
+                    mount_of(self.root)
+                except QuotaUnavailable as exc:
+                    self.disabled_reason = f"CATHEDRAL_WORKSPACE_MAX_BYTES is set but {exc}"
 
     @classmethod
     def from_env(cls, client: Any) -> "WorkspaceStore | None":
@@ -229,6 +249,7 @@ class WorkspaceStore:
             max_versions=env_int("CATHEDRAL_WORKSPACE_MAX_VERSIONS", 20),
             check_mount=os.environ.get("CATHEDRAL_WORKSPACE_MOUNT_CHECK", "1").strip() != "0",
             persistent=workspace_persistence(),
+            max_bytes=env_int("CATHEDRAL_WORKSPACE_MAX_BYTES", 0),
         )
 
     # ------------------------------------------------------------ paths
@@ -290,8 +311,71 @@ class WorkspaceStore:
             (path / "data").mkdir(mode=0o755, exist_ok=True)
             (path / "versions").mkdir(mode=0o700, exist_ok=True)
             meta = {"name": name, "created_at": _now(), "versions": [], "next_version": 1}
+            if self.quota is not None:
+                # data/ only, while it is empty and ours: what rooms write. meta.json
+                # stays outside, so a full workspace can still be versioned and listed.
+                try:
+                    meta["quota_project"] = self._assign_quota(path / "data")
+                except SandboxOpError:
+                    shutil.rmtree(path, ignore_errors=True)
+                    raise
             self._save_meta(path, meta)
             return self._doc(owner, name, meta)
+
+    # ------------------------------------------------------------ quota
+    def _quota_ids_in_use(self) -> set[int]:
+        ids: set[int] = set()
+        for meta_path in self.root.glob("*/*/meta.json"):
+            try:
+                project = json.loads(meta_path.read_text()).get("quota_project")
+            except (OSError, ValueError):
+                continue
+            if isinstance(project, int):
+                ids.add(project)
+        return ids
+
+    def _assign_quota(self, data: Path) -> int:
+        """Put a fresh, empty data/ in a new project with the byte limit. Caller holds the lock."""
+        assert self.quota is not None
+        try:
+            project = pick_id(WORKSPACE_IDS, self._quota_ids_in_use())
+            self.quota.assign(data, project, self.max_bytes)
+        except QuotaUnavailable as exc:
+            raise SandboxOpError(
+                "workspace_quota_unavailable", 503, f"the hotel could not cap this workspace: {exc}", retry_after=30
+            ) from None
+        return project
+
+    def _enforce_quota(self, path: Path, meta: dict[str, Any]) -> None:
+        """Before a mount: the workspace's limit is the current setting. Caller holds the lock.
+
+        A workspace made before the quota existed has no project. Its data/
+        holds files that rooms made as root, whose project the API cannot
+        change, so a cap set now would not hold. It mounts uncapped, as
+        before, and the hotel logs it.
+        """
+        if self.quota is None:
+            return
+        project = meta.get("quota_project")
+        if not isinstance(project, int):
+            print(f"cathedral-sandbox workspace: {path.name} predates the byte quota and mounts uncapped",
+                  file=sys.stderr, flush=True)
+            return
+        try:
+            self.quota.set_limit(path / "data", project, self.max_bytes)
+        except QuotaUnavailable as exc:
+            raise SandboxOpError(
+                "workspace_quota_unavailable", 503, f"the hotel could not cap this workspace: {exc}", retry_after=30
+            ) from None
+
+    def _clear_quota(self, path: Path, meta: dict[str, Any]) -> None:
+        project = meta.get("quota_project")
+        if self.quota is None or not isinstance(project, int):
+            return
+        try:
+            self.quota.clear(path.parent, project)
+        except QuotaUnavailable as exc:
+            print(f"cathedral-sandbox workspace: quota clear failed: {exc}", file=sys.stderr, flush=True)
 
     def _names(self, owner: str) -> list[str]:
         owner_dir = self._owner_dir(owner)
@@ -334,6 +418,8 @@ class WorkspaceStore:
         except Exception:
             shutil.rmtree(trash, ignore_errors=True)
             raise
+        finally:
+            self._clear_quota(path, meta)
 
     def _refuse_in_use(self, owner: str, name: str, what: str) -> None:
         if self._mounts.get((owner, name)):
@@ -407,11 +493,11 @@ class WorkspaceStore:
         self._require_enabled()
         path = self._dir(owner, name)
         with self._lock:
-            self._meta(path, name)
-            holders = self._mounts.setdefault((owner, name), set())
-            if "rollback" in holders:
+            meta = self._meta(path, name)
+            if "rollback" in self._mounts.get((owner, name), ()):
                 raise SandboxOpError("workspace_in_use", 409, f"workspace {name} is rolling back; retry")
-            holders.add(sandbox_id)
+            self._enforce_quota(path, meta)
+            self._mounts.setdefault((owner, name), set()).add(sandbox_id)
         return path / "data"
 
     def check(self, owner: str, name: str) -> None:
