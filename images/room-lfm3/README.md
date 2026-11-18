@@ -23,6 +23,12 @@ lfm3-timing load_ms=1203 prompt_tok_s=118.0 gen_tok_s=52.8 wall_ms=1530 threads=
 answers; the default `off` gives short answers), `LFM3_THREADS` and `LFM3_CTX`
 change the run. `llama-cli` is on `PATH` for anything else.
 
+For the sealed benchmark the image also ships `llama-server`, `llama-bench`,
+`python` (`python3`) and `curl`. The build fails unless each one runs, and
+`smoke-tools.sh` (run by the publish workflow on every pull request build and
+on the published digest) times the model with `llama-bench` and checks that
+`llama-server` answers `/health` on loopback under `--network none`.
+
 ## Pins
 
 | What | Pin |
