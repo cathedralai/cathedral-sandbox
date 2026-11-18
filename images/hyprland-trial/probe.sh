@@ -51,6 +51,10 @@ export WAYLAND_DISPLAY=$socket
 
 hyprctl monitors -j > "$evidence_dir/monitors.json" 2> "$evidence_dir/monitors.err"
 if ! grep -q HEADLESS "$evidence_dir/monitors.json"; then
+    hyprctl output create headless > "$evidence_dir/output-create.txt" 2>&1
+    hyprctl monitors -j > "$evidence_dir/monitors.json" 2> "$evidence_dir/monitors.err"
+fi
+if ! grep -q HEADLESS "$evidence_dir/monitors.json"; then
     printf '%s\n' 'NO-GO: no headless output' >&2
     exit 1
 fi
@@ -64,7 +68,7 @@ while [ "$attempt" -lt 20 ]; do
         printf '%s\n' 'NO-GO: wayvnc exited' >&2
         exit 1
     fi
-    if vncdo -s localhost::5900 capture "$evidence_dir/frame-before.png" >/dev/null 2> "$evidence_dir/vnc.err"; then break; fi
+    if vncdo --timeout 5 -s localhost::5900 capture "$evidence_dir/frame-before.png" >/dev/null 2> "$evidence_dir/vnc.err"; then break; fi
     attempt=$((attempt + 1))
     sleep 0.5
 done
@@ -75,7 +79,7 @@ foot -e sh -c 'read -r line; if [ "$line" = cathedral-probe ]; then printf "%s\n
 terminal_pid=$!
 sleep 2
 hyprctl cursorpos > "$evidence_dir/cursor-before.txt" 2>&1
-vncdo -s localhost::5900 move 123 234 click 1 type cathedral-probe key enter \
+vncdo --timeout 10 -s localhost::5900 move 123 234 click 1 type cathedral-probe key enter \
     > "$evidence_dir/input.log" 2>&1
 hyprctl cursorpos > "$evidence_dir/cursor-after.txt" 2>&1
 test -f "$marker"
@@ -86,7 +90,7 @@ if cmp -s "$evidence_dir/cursor-before.txt" "$evidence_dir/cursor-after.txt"; th
 fi
 
 # A second client invocation proves that a new connection can capture a frame.
-vncdo -s localhost::5900 capture "$evidence_dir/frame-reconnect.png" \
+vncdo --timeout 10 -s localhost::5900 capture "$evidence_dir/frame-reconnect.png" \
     > "$evidence_dir/reconnect.log" 2>&1
 test -s "$evidence_dir/frame-reconnect.png"
 ps -o pid,ppid,%cpu,rss,comm -p "$compositor_pid","$vnc_pid","$terminal_pid" \
