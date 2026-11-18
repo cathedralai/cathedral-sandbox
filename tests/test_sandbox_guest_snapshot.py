@@ -911,6 +911,39 @@ def test_a_failed_unpause_is_owed_reported_truthfully_logged_and_retried_by_the_
     assert provider.pending_reconciles() == {}
 
 
+def test_a_marked_room_whose_engine_cannot_be_read_fails_closed_on_get(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert list(provider.pending_reconciles()) == [sid]
+    real = provider._client.engine_status  # noqa: SLF001
+
+    def unreadable(cid):
+        raise SandboxOpError("docker_inspect_failed", 502, "docker inspect failed")
+
+    provider._client.engine_status = unreadable  # noqa: SLF001
+    with pytest.raises(SandboxOpError) as err:
+        provider.get(sid)
+    assert err.value.code == "reconcile_unreadable" and err.value.http_status == 503
+    provider._client.engine_status = real  # noqa: SLF001
+    assert provider.get(sid)["state"] == "frozen"
+
+
+def test_a_marked_room_reports_the_engine_now_not_a_stale_read(fake, provider) -> None:
+    sid = _source(provider)
+    fake.set(unpause_fail_times=2)
+    with pytest.raises(SandboxOpError):
+        provider.snapshot(sid)
+    assert provider.get(sid)["state"] == "frozen"
+    # The unpause took effect late: the engine runs the room while the mark is still owed.
+    provider._client.engine_status = lambda cid: "running"  # noqa: SLF001
+    assert provider.get(sid)["state"] == "running"
+    # The container exited: never reported running.
+    provider._client.engine_status = lambda cid: "exited"  # noqa: SLF001
+    assert provider.get(sid)["state"] == "failed"
+
+
 def test_an_owed_unpause_is_dropped_when_the_room_is_gone(fake, provider) -> None:
     sid = _source(provider)
     fake.set(unpause_fail_times=1)
