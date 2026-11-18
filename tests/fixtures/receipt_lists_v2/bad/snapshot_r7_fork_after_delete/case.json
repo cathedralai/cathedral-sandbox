@@ -1,0 +1,17 @@
+{
+ "args": [
+  "--attestation",
+  "{dir}/attestation_doc.json",
+  "--receipts",
+  "{dir}/receipts.json",
+  "--skip-amd",
+  "--expected-measurement",
+  "9b148da6715f6a68fd6314d9015f54413c261a0b1b25075b568e0b5106687a2b434d7661f26d036700090ca1917a9ed1"
+ ],
+ "description": "A fork whose create comes after the snapshot's delete in the same binding.",
+ "expect": {
+  "exit_code": 1,
+  "reason": "receipt 4: the fork is of snapshot snap_0123456789ab, which receipt 3 deleted before it",
+  "verdict": "FAIL"
+ }
+}

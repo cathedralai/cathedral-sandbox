@@ -318,11 +318,41 @@ hotel restores on another host.
 ## Rollout (Toby)
 
 1. Review and merge. Nothing changes on a hotel until it is rebuilt.
-2. Canary, one hotel, in an approved window: set `SEALED_DATA_GIB` (the disk
-   check counts it), rebuild, roll. The first roll needs no
-   `SEALED_DATA_ON_NEW_BUILD`: there is no `data.raw` yet. Check health
-   `workspaces_storage.state` is `new`; restart the guest; check `open` and
-   that a workspace file is still there.
+2. Canary, one hotel, in an approved window. Pick a shared config hotel (the
+   proof drives the hotel API with the host's hotel key, so not a miner hotel
+   and not a dedicated one). Steps:
+   - Set `SEALED_DATA_GIB` and `SEALED_ROOM_WORKSPACES=1` (the disk check counts
+     the data disk). Size it so the first boot fits the 15 min attestation wait
+     of `install.sh --sealed`: the first boot reads the whole blank disk.
+   - Rebuild and measure. Both settings are in the measured `room.env`, so the
+     measurement and the shared HOST_DATA change: the new measurement goes into
+     `approved-measurements.json` (cathedral-site PR) and the broker's
+     `sealed_host_data` before the roll.
+   - Cordon or drain the canary in the broker, then roll. The first roll needs
+     no `data-on-new-build` choice: there is no `data.raw` yet.
+   - Copy `scripts/sealed_data_proof.py` to the host (one file, standard
+     library only), run the restart proof and paste its output on the card:
+
+     ```
+     sudo python3 scripts/sealed_data_proof.py restart --env /srv/sealed-hotel/sealed.env
+     ```
+
+     It refuses (exit 2, nothing done) on a miner or dedicated hotel, with the
+     data volume off, when health `workspaces_storage` is not `new` or `open`,
+     or with live rooms (`--allow-live-rooms` overrides; those rooms end with
+     no delete receipt). It then writes a random marker and 20,000 marker lines
+     to a new workspace and a copy onto the room's own root file system (the
+     scratch disk), waits 45 s for writeback (a unit stop is a power cut for
+     the guest), restarts `room-sealed-<name>.service`, waits for a new
+     `boot_id`, and checks: the same measurement and HOST_DATA, health `open`,
+     `persistent` true, the same `key_id`, the workspace listed, a new room
+     reading the marker and the 20,000 lines back (sha256 of the whole file). On the host it counts the
+     marker in the allocated extents of `data.raw` and `scratch.raw` (must be
+     0), checks the LUKS2 magic and samples the entropy of the written sectors
+     after the header. It deletes its rooms and the workspace (unless
+     `--keep-workspace`). Exit 0 and `Result: PASS` only if every step passes.
+     The hotel key is never printed.
+   - Uncordon.
 3. Copy for customers: workspaces on sealed hotels last until the next
    re-seal (phase 1), not forever.
 
@@ -433,6 +463,119 @@ reset choice with the EXIT-trap restore, launch-identity ownership, the
 `persistent` field, the miner-key fsync) are covered by
 `tests/test_room_kit_sealed_data.py`. They were not re-run on c48: the next c48
 window fell inside the 15:00 to 17:00 UTC escape rehearsal on 7 Nov, which is
-off limits. The planned hardware check is a `cipher_null` header edit on a
-throwaway `data.raw`, confirming `verify_header()` reports `tampered` and does
-not mkfs or mount; it runs after 17:15 UTC or in the next free window.
+off limits. The real-kernel `cipher_null` check runs on a throwaway non-production guest
+(c48), never on a hotel that holds customer workspaces. Boot the build once so
+its volume is `open`, then:
+
+```
+sudo python3 scripts/sealed_data_proof.py null-cipher --throwaway --env sd/sealed.env \
+  --stop-cmd 'systemctl stop diskproof-guest' --start-cmd '<the systemd-run line>'
+```
+
+It refuses a guest that holds workspaces (`--allow-workspaces` overrides) or
+has live rooms. It stops the guest, saves both LUKS2 headers to
+`data.raw.luks-header-<stamp>`, sets segment 0 to `cipher_null-ecb` in both
+headers with valid checksums, hashes the allocated extents of `data.raw`,
+boots, and reads health. Verdicts:
+
+| State after the boot | Verdict |
+|---|---|
+| `tampered`, persistent false | PASS: `verify_header()` refused the header |
+| `locked`, persistent false | PASS: cryptsetup refused to activate the edited volume |
+| `broken`, persistent false | FAIL, inconclusive: `broken` can also come from a disk read or mount error before cryptsetup evaluates the header |
+| `new`, `open` or `unknown`, or persistent true | FAIL: the guest used the edited volume |
+| `absent`, `nokey` or `error` | FAIL, inconclusive: no data disk, no key, or cryptsetup below the floor, so the edited header was never tried |
+| any state, but the measurement or HOST_DATA changed | FAIL, inconclusive: another build has another key, so `locked` says nothing |
+
+It then stops the guest again and requires the hash of `data.raw` to be
+unchanged (no mkfs, no write). The paste carries the `[sealed-data]` serial
+lines, which show the branch the guest took. `--target keyslot` edits key slot
+0's area instead; that is a negative control (a null key slot area never
+decrypts the key, so `locked` is expected with or without the 2.8.1 refusal).
+There `locked` is PASS, `broken` is SAFE, and any other state is FAIL.
+Every run that got as far as saving the header ends with a `Restore:` line,
+including one whose `--start-cmd` failed or that was interrupted.
+Restore with `sealed_data_proof.py edit-header data.raw --restore <backup>`.
+`edit-header` alone edits or restores a header in place (both copies,
+checksums recomputed; it refuses anything but two equal, valid sha256 LUKS2
+headers, so cryptsetup has nothing to repair on the next open).
+
+## Volume head log, shred and prune (AB#398)
+
+`cathedral/volume_log.py` defines the append-only log of volume heads
+(Decision 6, 4 Nov) and the shred receipt. `VolumeRegistry`
+(`cathedral/volume_chain.py`) writes it: every accepted head appends a `head`
+entry, an exact resend appends nothing, and a refused commit leaves the log and
+the head unchanged. The log is in memory like the rest of the registry; nothing
+publishes it yet.
+
+- Entry `cathedral_volume_log_entry_v1`: `seq`, `prev_entry_sha256`, `kind`
+  (`head` or `shred`), `volume_id`, `generation`, `manifest_sha256`,
+  `commit_receipt_sha256` (the 395 commit receipt), `logged_at`.
+- `verify_log`: contiguous `seq`, hash chain, a volume's heads run 1, 2, 3
+  with no repeat or skip (head+1), a shred names the current head and is the
+  volume's last entry.
+- `verify_extends(old, new)`: the new log holds the old one as its exact
+  prefix. A reader who kept an older copy sees a rollback or a rewrite here.
+- `verify_extends_checkpoint(checkpoint, entries)`: the same check for a
+  reader who kept only an older signed checkpoint.
+- `check_restore`: only the latest logged head restores; a shredded volume
+  never does.
+- Checkpoint `cathedral_volume_log_checkpoint_v1` and shred receipt
+  `cathedral_volume_shred_receipt_v1`: Ed25519 over canonical JSON.
+
+Not covered by the format: a log operator showing two readers two different
+logs. Readers comparing checkpoints (`verify_extends_checkpoint`) catch it; where the
+log and checkpoints are published is still open.
+
+Registry wiring:
+
+- Head entry: `manifest_sha256` is `volume_chain.manifest_sha256(commit)`, the
+  digest of the restic repo id and snapshot id (`volume_chain.canonical`);
+  `commit_receipt_sha256` is the digest of the lease holder's signed commit.
+- Restore: a restoring guest runs `verify_chain`, then `check_restore` on the
+  log with the head commit's manifest digest. Storage still holds a shredded
+  volume's chain, so `verify_chain` alone passes; `check_restore` refuses it.
+- `VolumeRegistry.shred(volume_id, key_id=..., destroy_key=...)`, under the
+  registry lock: checks the volume has a committed head and is not shredded,
+  checks `key_id` is the volume's key (recorded by `create(..., key_id=...)` or
+  `bind_key`, set once; otherwise `key_not_bound` or `shred_key_mismatch`),
+  builds the shred entry, ends the lease and freezes the volume
+  (`shred_pending`, with the pending `key_id`: grant, accept and head refuse,
+  and a retry with another `key_id` refuses `shred_key_mismatch`), then calls
+  `destroy_key(volume_id, key_id)`. Only when that returns `True` does it log the shred and
+  return a signed `cathedral_volume_shred_receipt_v1`. When the key service
+  refuses or its answer is lost, nothing is logged and the volume stays frozen,
+  since the key may already be gone; retrying `shred` finishes it. After a
+  shred, grant, accept (including a resend) and head refuse `volume_shredded`;
+  `shred` again with the same `key_id` returns the same receipt.
+- The receipt attests that the key service confirmed destroying `key_id`.
+  `destroy_key` is the key release service's call (AB#392, not built); it must
+  raise on an unknown key and be idempotent (an already destroyed key returns
+  `True`), so a retry after a lost answer succeeds. It is given `volume_id` too
+  and must refuse a key that is not that volume's.
+- Provisional until Fred decides who holds the log key: the registry signs the
+  shred receipt with its own key, `signing_key_id` `registry:<first 16 hex of
+  sha256(public key)>`. That receipt is Ed25519 over canonical JSON with no
+  label, an exception to the registry's labelled statements above. It cannot
+  collide with them: a labelled message starts with `c`, canonical JSON with `{`.
+- Prune token `cathedral_volume_prune_token_v1`
+  (`volume_subtoken.issue_prune`, `VolumeRegistry.issue_prune_token`,
+  `authorize_prune`): its own label, never issued against a lease, bound to
+  `volumes/<volume_id>/` (built from the volume id, never taken from the
+  caller, so it cannot cover another volume), the prune runner's address and at most one hour. It is the only
+  token that carries `delete`; it also carries get, put and list, because restic
+  prune reads packs and writes index and lock files. The guest sub-token
+  (`authorize`) never allows delete, and neither token passes the other's check.
+  It is still issued after a shred, so the data can be cleaned up.
+
+A volume with no accepted commit cannot be shredded yet (`nothing_to_shred`):
+the log format has no shred entry without a head. Packs a guest uploaded before
+its first commit was accepted are left to prune.
+
+Still open for AB#398: the commit every N minutes with a receipt (needs the
+guest volume agent and pinned restic, AB#789), the customer-held root key mode
+(AB#392), the storage gateway that calls `authorize`/`authorize_prune` in front
+of the bucket (AB#394), where the log and checkpoints are published and who
+holds the log key (Fred), and a live restore-after-shred on two sealed hotels
+(Toby).

@@ -1,0 +1,33 @@
+[Unit]
+Description=Cathedral signed sealed hotel list renewal (AB#800)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/cathedral/sealed-hotels-renew.env
+
+[Service]
+Type=oneshot
+# The publisher refuses state not owned by the running user; the state and the
+# signing key belong to the key host's root.
+User=root
+Group=root
+EnvironmentFile=/etc/cathedral/sealed-hotels-renew.env
+# CATHEDRAL_SANDBOX_DIR (a reviewed checkout) is set in the environment file.
+ExecStart=/bin/bash ${CATHEDRAL_SANDBOX_DIR}/ops/sealed-hotels-renew.sh
+# Signing and verifying take seconds; the KV readback waits up to a minute.
+TimeoutStartSec=10min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# The signer config may live under /root; it is read, never written.
+ProtectHome=read-only
+ProtectSystem=strict
+# Publisher state and release outputs. Nothing else is written.
+ReadWritePaths=/var/lib/cathedral-sealed-hotels
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

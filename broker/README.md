@@ -11,7 +11,7 @@ The broker does four things:
 | Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
 | Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
-| Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. |
+| Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. Private: open with the view token or a share link (`POST /v1/live/shares`). |
 
 Room ids are `<hotel id>.<hotel room id>`. The broker adds the label
 `broker_guest=<guest>` to each room it creates, and filters on it.
@@ -742,6 +742,7 @@ Config (all optional):
 | `miner_max_rooms_per_hotkey` | Room cap per miner hotkey across all its hotels (rooms in use, creating or queued). 0 or absent: no cap. A hotkey at the cap gets no new room; its hotels show `free_rooms: 0`. |
 | `miner_pool_share` | Share of the shared pool that miner hotels may hold, between 0 and 1 (exclusive). 0 or absent: no cap. Miner rooms on unreserved hotels stay at or under `share / (1 - share)` times the slots of our own unreserved sealed hotels, so a full pool is at most that share miner. The cap is checked when a create is placed; rooms already placed are never moved. The operator capacity view shows both values under `admission_policy` and, with a share set, `miner_pool` (`own_slots`, `miner_room_cap`, `miner_rooms`). A create refused only by a cap counts the hotel as `full` and adds `miner_capped` to the reason. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. A dedicated sealed machine (one owner, `SEALED_OWNER_PUBKEY_FILE`) has its own HOST_DATA, which names the owner key: add that value (the sealed install prints it). On `POST /v1/sandboxes` the broker passes `X-Cathedral-Owner-Signature` and `X-Cathedral-Owner-Timestamp` to the hotel unchanged; the machine checks them (`room-kit/sealed/README.md`, "Dedicated machine"). Its 403 `owner_signature_*` does not rest the hotel. |
+| `min_genoa_snp_spl` | Optional Genoa SNP component floor, 0 to 255. Zero leaves it unset. When nonzero, after AMD-chain verification the broker checks current, reported, committed and launch TCB SNP bytes on every gated Genoa hotel. Missing or older values refuse admission; a sealed hotel with `sealed_admission: "off"` makes the config invalid. Set it to `30` (`0x1e`) only after a patched canary is verified and the operator approves the capacity impact. This checks the AMD-SB-3059 SNP TCB component; it does not prove the separate OEM PI or microcode mitigations in AMD-SB-3059 and AMD-SB-3061. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
 | `require_sealed_guest_tls` | Top level, default false. Every sealed hotel must be reached over its attested guest TLS key (above). Per hotel entry: `"guest_tls": true` (sealed, `https://` api and health, not with `sealed_admission: "off"`). |
 | `sealed_admission` | Top level: `"on"` or absent; `"off"` is refused. Per hotel entry: `"gate"` (default) or `"off"`, the ops escape for one operator hotel (above). |
@@ -793,6 +794,36 @@ to the page and to its data stream (`/<guest>/live/events`, server-sent
 events, 1 per second) needs that cookie. A wrong token and an unknown guest
 both get 401. The page shows hotel names, threads and RAM from the config,
 never addresses. Squares of other guests are grey. The page lists only the hotels that guest may use (the same rule as its capacity view), plus any hotel where it still owns a room. `rooms_all` and `deleting_all` are sent only for a hotel where the guest owns a room.
+
+### Share links (AB#584)
+
+No live view is public. To drop people into a run, the guest mints a share
+link for that run with its own key and sends the link instead of the view
+token. Share links are off unless the guest has `"live_shares": true` in the
+broker config; with it off the three calls answer 403 `live_shares_off` and
+no share link or cookie opens the view.
+
+```
+POST   /v1/live/shares        {"ttl_s": 14400, "label": "scale run 3"}  -> 201 {id, label, url, created_at, expires_at}
+GET    /v1/live/shares        -> {shares: [{id, label, created_at, expires_at}]}
+DELETE /v1/live/shares/<id>   -> 204
+```
+
+- `url` is a path, `/<guest>/live?share=<token>`; put the broker's public
+  host in front of it. The token is shown once, in that answer only.
+- `ttl_s` is 60 to 604800 seconds (default 4 hours). `label` is optional,
+  one line of at most 80 bytes. A guest can hold 50 unexpired links.
+- Opening the link sets an HttpOnly `bvs_<guest>` cookie that ends with
+  the link and redirects to `/<guest>/live`, so the token leaves the
+  address bar (it stays in that browser's history until the link ends).
+- The link shows the same view as the view token: that guest's hotels and
+  rooms only. A link for one guest never opens another. It works for a
+  guest with no view token.
+- Every page and stream request rechecks the link. A revoke or expiry
+  closes the page on the next request and ends an open stream within a
+  second.
+- The broker keeps only sha256 of each token, in memory. A broker restart
+  ends every link.
 
 ## Run
 

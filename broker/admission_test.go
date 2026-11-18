@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -119,9 +120,27 @@ type minerHotel struct {
 	*fakeHotel
 	slots atomic.Int64
 	cert  *x509.Certificate
+	quota atomic.Pointer[quotaGate] // set: /v1/quota calls wait until the gate opens
+}
+
+// quotaGate holds /v1/quota calls open. A sync step asks health first and
+// quota second, so a step held here has a health answer it has not stored yet.
+type quotaGate struct {
+	in   chan struct{} // gets a value when a call reaches the gate
+	open chan struct{}
 }
 
 func (m *minerHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if g := m.quota.Load(); g != nil && r.URL.Path == "/v1/quota" {
+		select {
+		case g.in <- struct{}{}:
+		default:
+		}
+		select {
+		case <-g.open:
+		case <-r.Context().Done(): // the caller gave up; httptest Close does not wait on us
+		}
+	}
 	if r.URL.Path == "/room/health" {
 		m.mu.Lock()
 		fail := m.healthFail
@@ -224,7 +243,9 @@ func chipOf(id string) byte {
 }
 
 // joinMiner joins a sealed miner, or an unsealed operator hotel used by legacy
-// placement tests, and runs one sync step.
+// placement tests, stops its background sync loop and runs one sync step. The
+// test then owns the hotel's sync: syncNow is its only sync step, so a loop
+// step cannot store a health answer after the test has aged the hotel.
 func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, extra map[string]any) *minerHotel {
 	t.Helper()
 	var att []byte
@@ -243,8 +264,37 @@ func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, e
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", body); status != 201 {
 		t.Fatalf("join %s: %d %v", id, status, doc)
 	}
+	stopSyncLoop(t, tc, id)
 	syncNow(tc, id)
 	return m
+}
+
+// stopSyncLoop stops the background sync loop that a join starts and waits
+// until it has returned, so the step it was in has stored what it read.
+func stopSyncLoop(t *testing.T, tc *testChain, id string) {
+	t.Helper()
+	h := tc.b.hotelByID(id)
+	if h == nil || h.stop == nil || h.syncDone == nil {
+		t.Fatalf("hotel %s has no sync loop to stop", id)
+	}
+	h.stop()
+	select {
+	case <-h.syncDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("sync loop of hotel %s did not return", id)
+	}
+}
+
+// healthDown makes hotel id miss health with no room call answering for a
+// minute, and runs one sync step: the hotel is down after it.
+func healthDown(tc *testChain, m *minerHotel, id string) {
+	m.setHealthFail(true)
+	h := tc.b.hotelByID(id)
+	tc.b.mu.Lock()
+	h.lastOK = time.Now().Add(-time.Minute)
+	tc.b.mu.Unlock()
+	h.lastAnswer.Store(0)
+	syncNow(tc, id)
 }
 
 // syncNow runs one sync step of hotel id now, if it is still in the set (a
@@ -451,6 +501,50 @@ func TestVerifyAttestationAllowlists(t *testing.T) {
 	}
 }
 
+func TestGenoaSnpFloorChecksEachTCBComponent(t *testing.T) {
+	const floor = 0x1e // AMD-SB-3059, CVE-2026-0462
+	report := make([]byte, snpReportMinLen)
+	offsets := []struct {
+		name   string
+		offset int
+	}{
+		{"current", 0x38}, {"reported", 0x180},
+		{"committed", 0x1E0}, {"launch", 0x1F0},
+	}
+	for _, field := range offsets {
+		report[field.offset+6] = floor
+	}
+	encoded := func() string { return base64.StdEncoding.EncodeToString(report) }
+	amd := map[string]any{"product": "Genoa"}
+	if err := checkGenoaSnpFloor(encoded(), amd, floor); err != nil {
+		t.Fatalf("patched report refused: %v", err)
+	}
+	for _, field := range offsets {
+		report[field.offset+6] = floor - 1
+		// A high microcode byte must not compensate for old SNP firmware.
+		report[field.offset+7] = 0xff
+		if err := checkGenoaSnpFloor(encoded(), amd, floor); err == nil || !strings.Contains(err.Error(), field.name) {
+			t.Fatalf("old %s SNP component passed: %v", field.name, err)
+		}
+		report[field.offset+6], report[field.offset+7] = floor, 0
+	}
+	if err := checkGenoaSnpFloor("not-base64", amd, floor); err == nil {
+		t.Fatal("malformed report passed")
+	}
+	if err := checkGenoaSnpFloor(base64.StdEncoding.EncodeToString(report[:100]), amd, floor); err == nil {
+		t.Fatal("short report passed")
+	}
+	if err := checkGenoaSnpFloor(encoded(), amd, 0); err != nil {
+		t.Fatalf("unset floor changed existing admission: %v", err)
+	}
+	if err := checkGenoaSnpFloor(encoded(), nil, floor); err == nil {
+		t.Fatal("missing AMD product passed")
+	}
+	if err := checkGenoaSnpFloor(encoded(), map[string]any{"product": "Milan"}, floor); err != nil {
+		t.Fatalf("Genoa floor applied to Milan: %v", err)
+	}
+}
+
 // A guest with sealed secrets on adds one binding key. The broker hashes the
 // binding as served and reads only the fields it compares, so admission, the
 // measurement allowlist and the receipt key are as for any sealed hotel.
@@ -517,17 +611,9 @@ func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}}
 	tc.room(t, "key1", onM1)
 	h := tc.b.hotelByID("m1")
-	goDown := func() {
-		m.setHealthFail(true)
-		tc.b.mu.Lock()
-		h.lastOK = time.Now().Add(-time.Minute)
-		tc.b.mu.Unlock()
-		h.lastAnswer.Store(0)
-		syncNow(tc, "m1")
-	}
 
 	// Health fails: out of placement, attestation cleared.
-	goDown()
+	healthDown(tc, m, "m1")
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", onM1)
 	if status != 503 || errCode(doc) != "hotels_unavailable" || reasonOf(doc)["down"] != float64(1) {
 		t.Fatalf("create on down hotel: %d %v", status, doc)
@@ -571,13 +657,7 @@ func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 	u := joinMiner(t, tc, "u1", false, 5, nil)
 	onU1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"u1"}}
 	tc.room(t, "key1", onU1)
-	u.setHealthFail(true)
-	hu := tc.b.hotelByID("u1")
-	tc.b.mu.Lock()
-	hu.lastOK = time.Now().Add(-time.Minute)
-	tc.b.mu.Unlock()
-	hu.lastAnswer.Store(0)
-	syncNow(tc, "u1")
+	healthDown(tc, u, "u1")
 	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", onU1); status != 503 {
 		t.Fatalf("down unsealed hotel took a room: %d", status)
 	}
@@ -585,6 +665,45 @@ func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 	syncNow(tc, "u1")
 	if id := tc.room(t, "key1", onU1); !strings.HasPrefix(id, "u1.") {
 		t.Fatalf("unsealed after return: %s", id)
+	}
+}
+
+// TestAStepInFlightAtStopCannotBringTheHotelBack: the join's sync loop read
+// a good health answer and is still in its step when health starts failing.
+// After stopSyncLoop that step has landed, so a minute of missed health set
+// after it takes the hotel down and keeps it down. Without the wait the step
+// landed after the test aged the hotel, set lastOK to now and kept it up
+// (TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack failed 2 in 50 in CI
+// and locally, AB#331).
+func TestAStepInFlightAtStopCannotBringTheHotelBack(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	m, url := newMinerHotel(t, 5, snpAttestation(t, attestOpts{chip: chipOf("m1")}))
+	tc.hotels["m1"] = m.fakeHotel
+	gate := &quotaGate{in: make(chan struct{}, 1), open: make(chan struct{})}
+	release := sync.OnceFunc(func() { m.quota.Store(nil); close(gate.open) })
+	t.Cleanup(release) // runs before the hotel server closes
+	m.quota.Store(gate)
+	body := map[string]any{"id": "m1", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", body); status != 201 {
+		t.Fatalf("join: %d %v", status, doc)
+	}
+	select {
+	case <-gate.in: // the loop's first step has a good health answer and waits on quota
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sync loop never reached /v1/quota")
+	}
+	m.setHealthFail(true)
+	stopSyncLoop(t, tc, "m1")
+	release()
+	healthDown(tc, m, "m1")
+	h := tc.b.hotelByID("m1")
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		tc.b.mu.Lock()
+		ok := h.ok
+		tc.b.mu.Unlock()
+		if ok {
+			t.Fatal("a sync step that read health before it failed brought the hotel back up")
+		}
 	}
 }
 

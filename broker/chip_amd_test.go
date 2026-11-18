@@ -56,6 +56,7 @@ func TestOneHotelPerChip(t *testing.T) {
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "m1", "api": url1, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}); status != 201 {
 		t.Fatalf("join m1: %d %v", status, doc)
 	}
+	stopSyncLoop(t, tc, "m1") // the test ages m1 below: no loop step may land after that
 	syncNow(tc, "m1")
 	// A second hotel on the same machine: refused at join.
 	m2, url2 := newMinerHotel(t, 5, snpAttestation(t, sameChip))
