@@ -501,6 +501,50 @@ func TestVerifyAttestationAllowlists(t *testing.T) {
 	}
 }
 
+func TestGenoaSnpFloorChecksEachTCBComponent(t *testing.T) {
+	const floor = 0x1e // AMD-SB-3059, CVE-2026-0462
+	report := make([]byte, snpReportMinLen)
+	offsets := []struct {
+		name   string
+		offset int
+	}{
+		{"current", 0x38}, {"reported", 0x180},
+		{"committed", 0x1E0}, {"launch", 0x1F0},
+	}
+	for _, field := range offsets {
+		report[field.offset+6] = floor
+	}
+	encoded := func() string { return base64.StdEncoding.EncodeToString(report) }
+	amd := map[string]any{"product": "Genoa"}
+	if err := checkGenoaSnpFloor(encoded(), amd, floor); err != nil {
+		t.Fatalf("patched report refused: %v", err)
+	}
+	for _, field := range offsets {
+		report[field.offset+6] = floor - 1
+		// A high microcode byte must not compensate for old SNP firmware.
+		report[field.offset+7] = 0xff
+		if err := checkGenoaSnpFloor(encoded(), amd, floor); err == nil || !strings.Contains(err.Error(), field.name) {
+			t.Fatalf("old %s SNP component passed: %v", field.name, err)
+		}
+		report[field.offset+6], report[field.offset+7] = floor, 0
+	}
+	if err := checkGenoaSnpFloor("not-base64", amd, floor); err == nil {
+		t.Fatal("malformed report passed")
+	}
+	if err := checkGenoaSnpFloor(base64.StdEncoding.EncodeToString(report[:100]), amd, floor); err == nil {
+		t.Fatal("short report passed")
+	}
+	if err := checkGenoaSnpFloor(encoded(), amd, 0); err != nil {
+		t.Fatalf("unset floor changed existing admission: %v", err)
+	}
+	if err := checkGenoaSnpFloor(encoded(), nil, floor); err == nil {
+		t.Fatal("missing AMD product passed")
+	}
+	if err := checkGenoaSnpFloor(encoded(), map[string]any{"product": "Milan"}, floor); err != nil {
+		t.Fatalf("Genoa floor applied to Milan: %v", err)
+	}
+}
+
 // A guest with sealed secrets on adds one binding key. The broker hashes the
 // binding as served and reads only the fields it compares, so admission, the
 // measurement allowlist and the receipt key are as for any sealed hotel.
