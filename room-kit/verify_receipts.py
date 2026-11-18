@@ -496,6 +496,8 @@ def verify_attestation(att: dict, expected_measurement: str | list[str] | None, 
                 need(report[offset + 6] >= min_genoa_snp_spl,
                      f"{name} TCB SNP component is below Genoa floor 0x{min_genoa_snp_spl:02x}")
             out["amd"]["min_genoa_snp_spl_checked"] = min_genoa_snp_spl
+        else:
+            out["amd"]["min_genoa_snp_spl_not_applied"] = "Genoa floor not applied to Milan"
     return out
 
 

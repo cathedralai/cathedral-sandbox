@@ -383,6 +383,16 @@ def test_genoa_firmware_floor_checks_all_four_tcb_fields_after_chain(tmp_path, m
     checked = vr.verify_attestation(attestation(), None, None, str(tmp_path), None, False,
                                     min_genoa_snp_spl=0x1e)
     assert checked["amd"]["min_genoa_snp_spl_checked"] == 0x1e
+    milan_att = attestation()
+    milan_report = bytearray(base64.b64decode(milan_att["report_b64"]))
+    milan_report[0x188:0x18A] = bytes((0x19, 0x01))
+    milan_att["report_b64"] = base64.b64encode(milan_report).decode()
+    monkeypatch.setattr(vr, "verify_amd", lambda *args: {"product": "Milan"})
+    milan = vr.verify_attestation(milan_att, None, None, str(tmp_path), None, False,
+                                  min_genoa_snp_spl=0x1e)
+    assert milan["amd"]["min_genoa_snp_spl_not_applied"] == "Genoa floor not applied to Milan"
+    assert "min_genoa_snp_spl_checked" not in milan["amd"]
+    monkeypatch.setattr(vr, "verify_amd", lambda *args: {"product": "Genoa"})
     for name, offset in (("current", 0x38), ("reported", 0x180),
                          ("committed", 0x1E0), ("launch", 0x1F0)):
         with pytest.raises(vr.Fail, match=name):
