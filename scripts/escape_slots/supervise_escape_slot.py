@@ -363,22 +363,21 @@ class SlotSupervisor:
             self.failed_boots = 0
             boot_seconds = round(now - launch.started_at, 3)
             if launch.used:
-                launch.in_use_at = now
+                launch.in_use_at, launch.room_ids = now, set(ids)
                 self.move("in_use", "first_answer_used", boot_seconds=boot_seconds)
             else:
                 launch.fresh_at = now
                 self.move("fresh", "first_answer_empty_chain", boot_seconds=boot_seconds)
         elif launch.state == "fresh" and launch.used:
-            launch.in_use_at = now
+            launch.in_use_at, launch.room_ids = now, set(ids)
             self.move("in_use", "chain_not_empty", rooms=len(rooms))
         if launch.state != "in_use":
             return True
-        # One attempt per launch: the first rooms seen on a used launch are the
-        # attempt's (a chain can be non-empty a poll before its room is listed).
-        # A room id not seen before is a second attempt on a used guest, or a
-        # handover between two polls: retire at once, the safe direction.
-        if not launch.room_ids:
-            launch.room_ids = set(ids)
+        # One attempt per launch: the attempt's rooms are the ones listed on the
+        # poll that found the launch used. The chain is read before the rooms and
+        # a create is signed only after the room exists, so a used chain with no
+        # room listed means the attempt already ended. Any room id not seen on
+        # that poll is a second attempt or a handover: retire at once.
         if not ids <= launch.room_ids:
             self.retire("new_room_on_used_launch")
             return True

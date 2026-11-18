@@ -438,13 +438,13 @@ def test_a_room_handed_over_between_two_polls_retires(rig):
     assert retire and retire[0]["reason"] == "new_room_on_used_launch"
 
 
-def test_a_room_listed_a_poll_after_the_chain_is_adopted_not_retired(rig):
-    sup, guest, systemctl, clock, _ = rig
+def test_a_room_after_a_used_chain_with_no_room_retires(rig):
+    sup, guest, systemctl, clock, lines = rig
     poll(sup, clock)
-    guest.chain = 1  # the chain moves first; the room is listed on the next poll
+    guest.chain = 2  # attempt A created, planted and ended between two polls
     poll(sup, clock)
     assert sup.launch.state == "in_use"
-    guest.rooms = [{"id": "r1"}]
-    poll(sup, clock, times=5)
-    assert systemctl.mutating() == []
-    assert sup.launch.state == "in_use"
+    guest.rooms = [{"id": "r2"}]  # attempt B lands before the second empty poll
+    poll(sup, clock)
+    retire = [t for t in transitions(lines) if t.get("state") == "retiring"]
+    assert retire and retire[0]["reason"] == "new_room_on_used_launch"
