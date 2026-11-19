@@ -167,7 +167,7 @@ case "$*" in
 esac
 exit 0""",
 }
-for _name in ("chown", "useradd", "apt-get", "mkfs.xfs", "xfs_info", "mountpoint", "nft", "sysctl", "conntrack",
+for _name in ("chown", "useradd", "apt-get", "mkfs.xfs", "xfs_info", "xfs_growfs", "losetup", "mountpoint", "nft", "sysctl", "conntrack",
               "dockerd", "mmdebstrap", "zstd", "cpio"):
     FAKES[_name] = "exit 0"
 
@@ -557,7 +557,7 @@ def test_a_clean_host_gets_the_units_the_key_store_and_the_daemon_config(host: F
     assert sysd.index("systemctl daemon-reload") < sysd.index("systemctl enable --now room-a-data.service")
     assert sysd.count("systemctl restart room-a.service room-a-health.service") == 1
     assert "systemctl restart room-a-receipts.service" in sysd and "systemctl restart room-a-caddy.service" in sysd
-    assert "systemctl start room-a-reaper.timer" in sysd
+    assert "systemctl start room-a-reaper.timer room-a-image-gc.timer" in sysd
 
 
 def test_the_final_check_fails_the_install_when_the_api_never_answers_200(host: FakeHost) -> None:
@@ -1230,3 +1230,56 @@ def test_build_refuses_an_incomplete_miner_config(host: FakeHost, sealed: dict, 
     proc, root = _guest_config(host, False, **sealed)
     assert proc.returncode == 1 and message in proc.stderr
     assert not (root / "etc" / "sealed-guard.nft").exists()
+
+
+# ---------------------------------------------------------------- install.sh: image store size and cleanup (AB#819)
+
+def test_a_rerun_with_a_larger_size_grows_the_image_store_in_place(host: FakeHost) -> None:
+    with open(host.data_img, "wb") as f:
+        f.truncate(1 * GIB)
+    proc = host.install(str(host.room_env(ROOM_DATA_SIZE_GB="3")))
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert host.data_img.stat().st_size == 3 * GIB
+    assert "grown from 1 to 3 GiB" in proc.stdout
+    assert not any(c.startswith("mkfs.xfs") for c in host.calls())  # kept, never formatted again
+    assert f"xfs_growfs {host.data_dir}" in host.calls("xfs_growfs")
+
+
+def test_a_smaller_size_never_shrinks_the_image_store(host: FakeHost) -> None:
+    with open(host.data_img, "wb") as f:
+        f.truncate(3 * GIB)
+    proc = host.install(str(host.room_env(ROOM_DATA_SIZE_GB="1")))
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert host.data_img.stat().st_size == 3 * GIB
+    assert "xfs cannot shrink" in proc.stderr
+
+
+def test_growth_the_host_disk_cannot_hold_is_refused(host: FakeHost) -> None:
+    with open(host.data_img, "wb") as f:
+        f.truncate(1 * GIB)
+    proc = host.install(str(host.room_env(ROOM_DATA_SIZE_GB="300")), env={"FAKE_DISK_BYTES": str(100 * GIB)})
+    assert proc.returncode == 1
+    assert "only 100 GiB is free" in proc.stderr
+    assert host.data_img.stat().st_size == 1 * GIB
+
+
+def test_the_image_cleanup_timer_runs_on_the_room_socket(host: FakeHost) -> None:
+    _clean_install(host)
+    svc = host.unit("room-a-image-gc.service")
+    assert f"--sock {host.root}/run/pool-room/docker.sock" in svc and f"--data-dir {host.data_dir}" in svc
+    assert "--keep alpine:3.20" in svc and "--high-pct 85 --low-pct 70 --min-idle-minutes 60" in svc
+    assert "User=poolroom" in svc and "--off" not in svc
+    assert "OnUnitActiveSec=300" in host.unit("room-a-image-gc.timer")
+    assert (host.opt / "bin" / "room_image_gc.py").exists()
+    sysd = host.calls("systemctl")
+    assert any("room-a-image-gc.timer" in c and c.startswith("systemctl enable") for c in sysd)
+    assert "systemctl start room-a-reaper.timer room-a-image-gc.timer" in sysd
+    state = (host.etc / "install-state").read_text().splitlines()
+    assert "unit:room-a-image-gc.timer" in state and "unit:room-a-image-gc.service" in state
+
+
+def test_image_cleanup_off_keeps_the_timer_and_does_nothing(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(ROOM_IMAGE_GC="0")))
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    exec_start = [ln for ln in host.unit("room-a-image-gc.service").splitlines() if ln.startswith("ExecStart=")]
+    assert len(exec_start) == 1 and exec_start[0].endswith(" --off")
