@@ -136,8 +136,17 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	if !e.exists && len(page.Receipts) == 0 && page.Head == "" {
 		return nil // nothing to record
 	}
-	// An unchanged page writes nothing, unless the last write failed.
-	if e.merge(binding, after, page.Head, page.Receipts) || e.failed || !e.exists {
+	changed := e.merge(binding, after, page.Head, page.Receipts)
+	if !changed && e.exists && !e.failed && !e.writing {
+		// An unchanged page writes nothing, unless the file is gone: prune (age
+		// or file cap) or a hand removal. The chain is still read, so write it
+		// back from memory rather than serve 404 and lose it at eviction.
+		if _, err := os.Stat(name); err != nil {
+			changed = true
+		}
+	}
+	// A failed last write is retried by the next page, changed or not.
+	if changed || e.failed || !e.exists {
 		e.exists, e.dirty = true, true
 		if !e.writing {
 			e.writing = true
@@ -194,28 +203,6 @@ func useChainEntry(name string) *chainEntry {
 func (e *chainEntry) unload() {
 	e.loaded, e.exists, e.failed = false, false, false
 	e.doc, e.shas, e.held = archivedChain{}, nil, nil
-}
-
-// forgetChains unloads the entries of archive files prune removed, so a later
-// page starts from what is on disk (nothing) instead of writing a pruned chain
-// back from memory. An entry with a write pending keeps its chain: that write
-// recreates the file, as any new page would.
-func forgetChains(paths []string) {
-	chainArchiveMu.Lock()
-	var entries []*chainEntry
-	for _, p := range paths {
-		if e := chainEntries[p]; e != nil {
-			entries = append(entries, e)
-		}
-	}
-	chainArchiveMu.Unlock()
-	for _, e := range entries {
-		e.mu.Lock()
-		if !e.dirty && !e.writing {
-			e.unload()
-		}
-		e.mu.Unlock()
-	}
 }
 
 // load reads the archive file into e and indexes its receipt hashes. Caller
@@ -356,17 +343,16 @@ func writeBytes(dir, name string, out []byte) error {
 		chainPruneMu.Unlock()
 		return err
 	}
-	removed := pruneChains(dir)
+	pruneChains(dir)
 	chainPruneMu.Unlock()
-	forgetChains(removed)
 	return nil
 }
 
 var chainPruneMu sync.Mutex
 
 // pruneChains drops chains older than chainMaxAge, then the oldest beyond
-// chainFilesMax, and returns the paths it removed. Caller holds chainPruneMu.
-func pruneChains(dir string) (removed []string) {
+// chainFilesMax. Caller holds chainPruneMu.
+func pruneChains(dir string) {
 	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
 	type aged struct {
 		path string
@@ -379,20 +365,15 @@ func pruneChains(dir string) (removed []string) {
 			continue
 		}
 		if time.Since(info.ModTime()) > chainMaxAge {
-			if os.Remove(f) == nil {
-				removed = append(removed, f)
-			}
+			os.Remove(f)
 			continue
 		}
 		keep = append(keep, aged{f, info.ModTime()})
 	}
 	sort.Slice(keep, func(i, j int) bool { return keep[i].mod.After(keep[j].mod) })
 	for i := chainFilesMax; i < len(keep); i++ {
-		if os.Remove(keep[i].path) == nil {
-			removed = append(removed, keep[i].path)
-		}
+		os.Remove(keep[i].path)
 	}
-	return removed
 }
 
 // archiveHotelPage is the hook for the two places the broker reads the hotel

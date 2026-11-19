@@ -659,19 +659,32 @@ func TestIdleArchivesLeaveMemoryAndReloadIntact(t *testing.T) {
 	}
 }
 
-// Bugbot on 04f01cd: a chain prune removed must not live on in memory, where
-// an unchanged page would skip the write (GET 404s) and a changed one would
-// write the pruned chain back. The next page starts from the disk, as before.
-func TestPrunedArchiveIsForgottenInMemory(t *testing.T) {
+// HOLD #464 at 04f01cd: a cached chain whose file is gone (pruned, or
+// removed by hand) must be written back by the next page, even an unchanged
+// one, not served as 404 while the broker still reads it. A failed write's
+// chain survives a prune too.
+func TestRemovedArchiveFileIsWrittenBack(t *testing.T) {
 	dir := t.TempDir()
 	b := &broker{}
 	b.cfg.StateDir = dir
 	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
-	old, other := strings.Repeat("4d", 32), strings.Repeat("5e", 32)
-	h := attestedHotel(b, old)
-	b.archiveHotelPage(h, 0, headPage(old, 0, 5, hx(5)))
+	bind, other := strings.Repeat("4d", 32), strings.Repeat("5e", 32)
+	h := attestedHotel(b, bind)
+	body := headPage(bind, 0, 5, hx(5))
+	b.archiveHotelPage(h, 0, body)
 	waitChainWrites()
-	name := filepath.Join(dir, chainsDir, old+".json")
+	name := filepath.Join(dir, chainsDir, bind+".json")
+	if err := os.Remove(name); err != nil {
+		t.Fatal(err)
+	}
+	b.archiveHotelPage(h, 0, body) // the same page again
+	waitChainWrites()
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != 5 || doc.Complete == nil || !*doc.Complete {
+		t.Fatalf("after removal: receipts=%d complete=%v", len(doc.Receipts), doc.Complete)
+	}
+
+	// Pruned by age while the chain is cached: the next page, even a shorter
+	// prefix, writes the whole cached chain back.
 	stale := time.Now().Add(-chainMaxAge - time.Hour)
 	if err := os.Chtimes(name, stale, stale); err != nil {
 		t.Fatal(err)
@@ -681,10 +694,10 @@ func TestPrunedArchiveIsForgottenInMemory(t *testing.T) {
 	if _, err := os.Stat(name); !os.IsNotExist(err) {
 		t.Fatalf("aged archive not pruned: %v", err)
 	}
-	b.archiveHotelPage(h, 0, headPage(old, 0, 3, hx(5))) // a prefix the pruned chain held
+	b.archiveHotelPage(h, 0, headPage(bind, 0, 3, hx(5)))
 	waitChainWrites()
-	if doc := getArchive(t, dir, old); len(doc.Receipts) != 3 || doc.Complete == nil || *doc.Complete || doc.Head != hx(5) {
-		t.Fatalf("after prune: receipts=%d head=%q complete=%v; want 3, head 5, incomplete",
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != 5 || doc.Complete == nil || !*doc.Complete || doc.Head != hx(5) {
+		t.Fatalf("after prune: receipts=%d head=%q complete=%v; want the cached 5, complete",
 			len(doc.Receipts), doc.Head, doc.Complete)
 	}
 }
