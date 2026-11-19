@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -96,5 +97,36 @@ func TestWorkspaceOnABusyHotelIsNeverDuplicatedOrNotFound(t *testing.T) {
 	}
 	if status, doc := tc.call(t, "key1", "POST", "/v1/workspaces", map[string]any{"name": "fresh"}); status != 201 {
 		t.Fatalf("create of a new name: %d %v", status, doc)
+	}
+}
+
+func TestSecretDeleteWithABusyHotelIsRetryNotNotFound(t *testing.T) {
+	sc := newSecretChain(t, []string{"a", "b"})
+	secretCall(t, sc.srv.URL, "key1", "PUT", "/v1/secrets/PIP_TOKEN", `{"value":"`+testSecretValue+`"}`, nil)
+	free := fillConns(gateOf(sc.testChain, "b", 1, 50*time.Millisecond))
+
+	// a clears it, b was never asked: partial, retryable.
+	status, hdr, doc := sc.rawCall(t, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", nil)
+	if status != 502 || errCode(doc) != "secrets_partial" || hdr.Get("Retry-After") != "5" {
+		t.Fatalf("delete with b busy: %d %v Retry-After %q", status, doc, hdr.Get("Retry-After"))
+	}
+	if h := doc["hotels"].(map[string]any); h["a"] != "done" || h["b"] != "busy" {
+		t.Fatalf("hotels %v", doc["hotels"])
+	}
+	// Only busy b may still hold it: retry, not 404.
+	status, hdr, doc = sc.rawCall(t, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", nil)
+	if status != 503 || errCode(doc) != "sold_out" || hdr.Get("Retry-After") != "5" {
+		t.Fatalf("second delete with b busy: %d %v Retry-After %q", status, doc, hdr.Get("Retry-After"))
+	}
+	if sc.sh["b"].values["g1"]["PIP_TOKEN"] != testSecretValue {
+		t.Fatal("busy hotel b was sent the delete")
+	}
+
+	free()
+	if status, _ := secretCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil); status != 204 {
+		t.Fatalf("delete once b is free: %d", status)
+	}
+	if status, out := secretCall(t, sc.srv.URL, "key1", "DELETE", "/v1/secrets/PIP_TOKEN", "", nil); status != 404 || !strings.Contains(out, "secret_not_found") {
+		t.Fatalf("delete of a gone secret: %d %s", status, out)
 	}
 }
