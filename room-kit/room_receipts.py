@@ -2173,9 +2173,12 @@ class Ledger:
             times.append(now)
             return 0.0
 
-    def attest(self, report_data: bytes) -> dict:
-        """A fresh SNP report over the caller's 64 bytes, tied to this boot's binding."""
-        if binding_shaped(report_data):
+    def attest(self, report_data: bytes, escape_claims: bytes | None = None) -> dict:
+        """A fresh SNP report over the caller's 64 bytes, tied to this boot's binding.
+
+        The boot binding's shape is refused unless `escape_claims` shows the head is an Escape
+        claims digest (see escape_claims_bind)."""
+        if binding_shaped(report_data) and not escape_claims_bind(report_data, escape_claims):
             raise ValueError("REPORT_DATA of the boot binding shape is reserved")
         report, chain = fresh_report(report_data)
         measurement = report_fields(report)["measurement"]
@@ -2697,6 +2700,27 @@ def binding_shaped(report_data: bytes) -> bool:
     clients would seal to them (AB#392). So that shape comes only from the boot binding.
     """
     return len(report_data) == 64 and report_data[32:] == bytes(32)
+
+
+# gt-challenge-sealed-sandbox receipt.py CLAIMS_DOMAIN. An Escape receipt v1.1 (binding
+# rd-claims-v1) puts sha256(ESCAPE_CLAIMS_DOMAIN || canonical(claims)) || 32 zero bytes in
+# REPORT_DATA, the same shape as the boot binding, and the API asks this route for it.
+ESCAPE_CLAIMS_DOMAIN = b"cathedral-challenge-receipt-v1/claims\0"
+ESCAPE_CLAIMS_MAX = 12 * 1024
+
+
+def escape_claims_bind(report_data: bytes, claims: bytes | None) -> bool:
+    """True when the caller showed the head is sha256(ESCAPE_CLAIMS_DOMAIN || claims).
+
+    That head cannot also be sha256(canonical(binding)): canonical JSON of a binding starts with
+    "{", this preimage starts with the domain, so equal heads would be a SHA-256 collision. A
+    report over it vouches for those Escape claims only, never for a binding (AB#392)."""
+    return (
+        claims is not None
+        and 0 < len(claims) <= ESCAPE_CLAIMS_MAX
+        and len(report_data) == 64
+        and hashlib.sha256(ESCAPE_CLAIMS_DOMAIN + claims).digest() == report_data[:32]
+    )
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host", "x-room-exec-handle"}
 
@@ -3422,7 +3446,7 @@ class Handler(BaseHTTPRequestHandler):
         return None, (fields if action == "create" else {})
 
     def handle_attest(self, ledger: "Ledger", body: bytes | None):
-        """POST /room/attest {"report_data_hex": <128 hex>}: a fresh SNP report.
+        """POST /room/attest {"report_data_hex": <128 hex>, "escape_claims_b64"?}: a fresh SNP report.
 
         REPORT_DATA is the caller's 64 bytes verbatim. The caller must put a
         digest of what it binds there (for example sha512 of its statement);
@@ -3441,9 +3465,22 @@ class Handler(BaseHTTPRequestHandler):
         raw = doc.get("report_data_hex") if isinstance(doc, dict) else None
         if not isinstance(raw, str) or not HEX64.fullmatch(raw):
             return self.reply(400, b'{"error":"report_data_hex must be 128 hex characters (64 bytes)"}')
-        if binding_shaped(bytes.fromhex(raw)):
+        claims_b64 = doc.get("escape_claims_b64")
+        claims = None
+        if claims_b64 is not None:
+            try:
+                if not isinstance(claims_b64, str) or len(claims_b64) > 4 * ESCAPE_CLAIMS_MAX // 3 + 4:
+                    raise ValueError
+                claims = base64.b64decode(claims_b64, validate=True)
+            except ValueError:
+                return self.reply(400, b'{"error":"escape_claims_b64 must be base64 of at most 12 KiB"}')
+            if not escape_claims_bind(bytes.fromhex(raw), claims):
+                return self.reply(400, b'{"error":"escape_claims_mismatch","message":"the first 32 bytes of '
+                                       b'report_data_hex must be sha256(escape claims domain || escape_claims)"}')
+        if binding_shaped(bytes.fromhex(raw)) and claims is None:
             return self.reply(400, b'{"error":"report_data_reserved","message":"the last 32 bytes must not all be zero: '
-                                   b'that shape is reserved for the boot binding report"}')
+                                   b'that shape is reserved for the boot binding report (an Escape rd-claims-v1 '
+                                   b'report sends its claims in escape_claims_b64)"}')
         room = doc.get("sandbox_id")
         if room is not None and (not isinstance(room, str) or not re.fullmatch(r"[^/\s]{1,200}", room)):
             return self.reply(400, b'{"error":"sandbox_id must be a room id"}')
@@ -3454,7 +3491,7 @@ class Handler(BaseHTTPRequestHandler):
         if wait:
             return self.reply(429, b'{"error":"attest_rate_limit"}', {"Retry-After": str(int(wait) + 1)})
         try:
-            out = ledger.attest(bytes.fromhex(raw))
+            out = ledger.attest(bytes.fromhex(raw), claims)
         except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's, not the caller's
             traceback.print_exc()
             return self.reply(500, canonical({"error": "attest_failed", "detail": type(exc).__name__}))
