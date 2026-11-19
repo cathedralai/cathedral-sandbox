@@ -33,8 +33,10 @@ Nothing here is live until Toby gives the go. const is live on nc-sealed: never 
 4. Restart the broker unit. Check: `journalctl -u <broker unit>` has no config error; `/v1/broker/stats` shows `conns` per hotel; one const-free test room create + exec + delete on a non-const hotel.
 5. Rollback: previous binary, restart. An older broker refuses unknown config fields, so first remove `data_conns` and `data_conn_wait_seconds` from the config.
 
-## Caddy access log (prepared, not applied)
-Proposed file: `deploy/thin-broker-caddy/Caddyfile.access-log` (the live `Caddyfile` plus one `log` block). Validated with `caddy validate` 2.6.2.
+## Caddy access log (live on Frankfurt since 19 Nov 2026 08:36Z)
+Live record: `deploy/thin-broker-caddy/Caddyfile`. Also drops `ticket`, `key`, `api_key` and `access_token` query values. The unit runs with DynamicUser, so the log directory comes from a drop-in (`/etc/systemd/system/thin-broker-caddy.service.d/access-log.conf`: `LogsDirectory=thin-broker-caddy`, `LogsDirectoryMode=0750`).
+
+The `log` block now lives in `deploy/thin-broker-caddy/Caddyfile`. Validated with `caddy validate` 2.6.2.
 - JSON lines with `duration` (s), `status`, `size`, method, uri, remote IP.
 - Request and response headers and TLS fields deleted; the `token` and `share` query values deleted.
 - Rolled: 100 MiB, 10 files, 14 days (about 1 GiB at most).
@@ -47,4 +49,4 @@ Runbook (Frankfurt, needs Toby's go; reload only, no restart, no dropped connect
 5. The Caddyfile has `admin off`, so `caddy reload` cannot reach it: check the unit's `ExecReload`. With none, a `systemctl restart thin-broker-caddy` is needed, which drops open exec requests: do it in the same quiet window as the broker roll.
 6. Check: `tail -1 /var/log/thin-broker-caddy/access.log | jq '{status, duration, uri: .request.uri}'` after one request; `grep -c Authorization` on the file is 0.
 7. Rollback: restore the backup, same reload or restart.
-8. After it is live: move the `log` block into `deploy/thin-broker-caddy/Caddyfile` (the live record) and delete `Caddyfile.access-log`.
+8. Done 19 Nov 2026: the `log` block is in `deploy/thin-broker-caddy/Caddyfile` and `Caddyfile.access-log` is deleted.
