@@ -784,7 +784,8 @@ one from that hotel. The record is replaced as a whole (TTL 60).
 
 - First missed heartbeat: the first `/room/health` call that fails after a
   hotel has answered health once sends `[OPERATOR-ALERT]` to the hotel's
-  `alert_chat_id` (the miner operator). One per miss streak; the streak ends
+  `alert_chat_id` (the miner operator), or to `alerts.hotel_chat_id` when the
+  hotel has none. One per miss streak; the streak ends
   at the next good health answer. A late health while room calls still answer
   counts as a miss.
 - Customer-affecting drop: a hotel that was up goes down while it holds guest
@@ -793,7 +794,9 @@ one from that hotel. The record is replaced as a whole (TTL 60).
 - Each audience also waits 10 minutes between two alerts about one hotel, so
   a flapping hotel does not spam.
 - Delivery: `"alerts": {"webhook_url_file": "<file with the https URL>",
-  "ops_chat_id": "<chat>"}`. The URL is a Telegram
+  "ops_chat_id": "<chat>", "hotel_chat_id": "<chat>"}`. One chat for every
+  hotel (the Core Engineering group): set `hotel_chat_id` and `ops_chat_id`
+  to the same id and leave `alert_chat_id` unset. The URL is a Telegram
   `https://api.telegram.org/bot<token>/sendMessage`; the broker POSTs
   `{"chat_id", "text"}`, never logs the URL, and logs a failed delivery by
   kind only. Without a URL or a chat the alert is a log line only.
