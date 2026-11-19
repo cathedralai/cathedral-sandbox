@@ -250,12 +250,19 @@ func writeBytes(dir, name string, out []byte) error {
 	if err := os.WriteFile(name+".tmp", out, 0o600); err != nil {
 		return err
 	}
+	// Writers of different files run at once. The rename and the prune share
+	// one lock so a prune never deletes a file on an age it read before another
+	// writer replaced that file. The large write above stays outside it.
+	chainPruneMu.Lock()
+	defer chainPruneMu.Unlock()
 	if err := os.Rename(name+".tmp", name); err != nil {
 		return err
 	}
 	pruneChains(dir)
 	return nil
 }
+
+var chainPruneMu sync.Mutex
 
 // chainHolds reports whether a receipt in chain has the hash sha.
 func chainHolds(chain []json.RawMessage, sha string) bool {
@@ -268,8 +275,7 @@ func chainHolds(chain []json.RawMessage, sha string) bool {
 }
 
 // pruneChains drops chains older than chainMaxAge, then the oldest beyond
-// chainFilesMax. Writers of different files may run it at once; a lost
-// race only removes a file twice.
+// chainFilesMax. Caller holds chainPruneMu.
 func pruneChains(dir string) {
 	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
 	type aged struct {

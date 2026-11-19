@@ -523,3 +523,43 @@ func TestConcurrentHotelArchives(t *testing.T) {
 		}
 	}
 }
+
+// Bugbot on bf6e2e0: with writers of different files running at once, a prune
+// must not delete a file another writer just replaced. Many hotels past
+// chainFilesMax write together; the newest write of each survivor must stay.
+func TestPruneKeepsFreshArchivesUnderConcurrentWrites(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	hotels := map[string]*hotel{}
+	for n := 0; n < chainFilesMax+8; n++ {
+		bind := fmt.Sprintf("%064x", 0xbee0+n)
+		hotels[bind] = attestedHotel(b, bind)
+	}
+	var wg sync.WaitGroup
+	for bind, h := range hotels {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := 0; p < 5; p++ {
+				b.archiveHotelPage(h, p, headPage(bind, p, 1, hx(p+1)))
+			}
+		}()
+	}
+	wg.Wait()
+	waitChainWrites()
+	files, _ := filepath.Glob(filepath.Join(dir, chainsDir, "*.json"))
+	if len(files) > chainFilesMax {
+		t.Fatalf("%d chain files kept, max %d", len(files), chainFilesMax)
+	}
+	// One more write per hotel, one at a time: each must be on disk at once
+	// after its own write, whatever else prune removed.
+	for bind, h := range hotels {
+		b.archiveHotelPage(h, 5, headPage(bind, 5, 1, hx(6)))
+		waitChainWrites()
+		if doc := getArchive(t, dir, bind); doc.Head != hx(6) {
+			t.Fatalf("fresh archive of %.8s missing or stale: head %q", bind, doc.Head)
+		}
+	}
+}
