@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,27 +28,35 @@ const (
 	chainArchiveGuard = "chain archive"
 )
 
-// The broker reads hotel pages on customer requests, so the archive write must
-// not sit on that path. chainArchiveMu guards only the entry map and is never
-// held for file work. Each archive file has one entry: a page is merged into the
-// entry's in-memory copy under the entry lock, and one writer goroutine per file
-// writes the newest copy outside every lock. Pages that arrive while a write is
-// running are coalesced into the next write, so a long first read writes a few
-// times, not once per page, and the file always ends at the newest merge.
+// The broker reads hotel pages on customer requests, so the archive must cost
+// that path only the page's own work. chainArchiveMu guards the entry map and
+// the recently used list, and is never held for file work. Each archive file
+// has one entry: the chain in memory with an index of its receipt hashes, so a
+// page is merged in time linear in the page, not the chain. One writer
+// goroutine per file writes the newest copy outside every lock; pages that
+// arrive while a write runs are coalesced into the next write, so the file
+// always ends at the newest merge. The chainLoadedMax most recently used
+// entries stay in memory; older idle ones are dropped and read again from the
+// file when next used.
 var (
 	chainArchiveMu sync.Mutex
 	chainEntries   = map[string]*chainEntry{}
+	chainRecent    []*chainEntry  // most recently used last; at most chainLoadedMax
 	chainWrites    sync.WaitGroup // tests wait on it; nothing in the broker does
 )
+
+const chainLoadedMax = 8
 
 type chainEntry struct {
 	mu      sync.Mutex
 	loaded  bool          // doc mirrors the file plus any merge not yet written
 	exists  bool          // the file exists or a write of it is pending
 	doc     archivedChain // shares receipt slices with snapshots; never mutated in place
-	dirty   bool          // doc has a merge the file does not have yet
-	writing bool          // a writer goroutine owns the file
-	failed  bool          // the last write failed: keep doc so the next page retries it
+	shas    []string      // receipt_sha256 of doc.Receipts, index for index
+	held    map[string]int
+	dirty   bool // doc has a merge the file does not have yet
+	writing bool // a writer goroutine owns the file
+	failed  bool // the last write failed: the next page retries it
 }
 
 // chainBeforeWrite runs in the writer before each file write, with no lock
@@ -80,7 +90,12 @@ type archivedChain struct {
 // HeadsDropped is set, so the archive can never read complete again.
 const chainUnheldMax = 16
 
+// receiptSHACalls counts receipt parses, so a test can prove a page costs
+// work in proportion to the page, not to the archived chain.
+var receiptSHACalls atomic.Int64
+
 func receiptSHA(raw json.RawMessage) string {
+	receiptSHACalls.Add(1)
 	var rc struct {
 		SHA string `json:"receipt_sha256"`
 	}
@@ -110,40 +125,153 @@ func (b *broker) archiveChainPage(binding string, after int, body []byte) error 
 	dir := filepath.Join(b.cfg.StateDir, chainsDir)
 	name := filepath.Join(dir, binding+".json")
 
+	e := useChainEntry(name)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.loaded {
+		// No write is pending for this file (an entry is dropped only when idle),
+		// so the file on disk is the newest state. Read once, then kept.
+		e.load(name)
+	}
+	if !e.exists && len(page.Receipts) == 0 && page.Head == "" {
+		return nil // nothing to record
+	}
+	// An unchanged page writes nothing, unless the last write failed.
+	if e.merge(binding, after, page.Head, page.Receipts) || e.failed || !e.exists {
+		e.exists, e.dirty = true, true
+		if !e.writing {
+			e.writing = true
+			chainWrites.Add(1)
+			go e.writeLoop(dir, name)
+		}
+	}
+	return nil
+}
+
+// useChainEntry returns the entry for an archive file, marks it most recently
+// used, and drops the in-memory chain of the least recently used idle entries
+// past chainLoadedMax. A busy entry is skipped, never waited on.
+func useChainEntry(name string) *chainEntry {
 	chainArchiveMu.Lock()
+	defer chainArchiveMu.Unlock()
 	e := chainEntries[name]
 	if e == nil {
 		e = &chainEntry{}
 		chainEntries[name] = e
 	}
-	chainArchiveMu.Unlock()
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if !e.loaded {
-		// No write is pending for this file (the writer drops doc only when it
-		// is idle), so the file on disk is the newest state.
-		e.doc, e.exists = archivedChain{}, false
-		if old, err := os.ReadFile(name); err == nil {
-			_ = json.Unmarshal(old, &e.doc)
-			e.exists = true
+	recent := chainRecent[:0:0]
+	for _, other := range chainRecent {
+		if other != e {
+			recent = append(recent, other)
 		}
-		e.loaded = true
 	}
-	if !e.exists && len(page.Receipts) == 0 && page.Head == "" {
-		return nil // nothing to record
+	recent = append(recent, e)
+	for len(recent) > chainLoadedMax {
+		old := recent[0]
+		if !old.mu.TryLock() {
+			break // in use now; try again on a later page
+		}
+		if old.dirty || old.writing || old.failed {
+			old.mu.Unlock()
+			break
+		}
+		old.loaded, old.doc, old.shas, old.held = false, archivedChain{}, nil, nil
+		old.mu.Unlock()
+		recent = recent[1:]
 	}
-	doc := mergeChainPage(e.doc, binding, after, page.Head, page.Receipts)
-	if e.exists && sameChain(doc, e.doc) {
-		return nil // nothing changed: no rewrite of a large archive per read
+	chainRecent = recent
+	return e
+}
+
+// load reads the archive file into e and indexes its receipt hashes. Caller
+// holds e.mu.
+func (e *chainEntry) load(name string) {
+	e.doc, e.exists = archivedChain{}, false
+	if old, err := os.ReadFile(name); err == nil {
+		_ = json.Unmarshal(old, &e.doc)
+		e.exists = true
 	}
-	e.doc, e.exists, e.dirty = doc, true, true
-	if !e.writing {
-		e.writing = true
-		chainWrites.Add(1)
-		go e.writeLoop(dir, name)
+	e.shas = make([]string, len(e.doc.Receipts))
+	e.held = make(map[string]int, len(e.doc.Receipts))
+	for i, rc := range e.doc.Receipts {
+		e.shas[i] = receiptSHA(rc)
+		e.held[e.shas[i]]++
 	}
-	return nil
+	e.loaded = true
+}
+
+// merge folds one page into e.doc and reports whether the archive changed.
+// It never mutates the old doc's slices: a snapshot being written may share
+// them. Caller holds e.mu.
+func (e *chainEntry) merge(binding string, after int, pageHead string, pageReceipts []json.RawMessage) bool {
+	have := e.doc
+	merged, shas := have.Receipts, e.shas
+	receiptsChanged := false
+	end := after + len(pageReceipts)
+	// Store the page only if it leaves no gap, stays under the cap, and does not
+	// shrink the archive (a short re-read must not drop receipts).
+	if len(pageReceipts) > 0 && after <= len(have.Receipts) && end <= chainReceiptsMax && end >= len(have.Receipts) {
+		same := end == len(have.Receipts)
+		for i := 0; same && i < len(pageReceipts); i++ {
+			same = bytes.Equal(pageReceipts[i], have.Receipts[after+i])
+		}
+		if !same {
+			pageSHAs := make([]string, len(pageReceipts))
+			for i, rc := range pageReceipts {
+				pageSHAs[i] = receiptSHA(rc)
+			}
+			for _, s := range e.shas[after:] {
+				if e.held[s]--; e.held[s] <= 0 {
+					delete(e.held, s)
+				}
+			}
+			for _, s := range pageSHAs {
+				e.held[s]++
+			}
+			merged = append(have.Receipts[:after:after], pageReceipts...)
+			shas = append(e.shas[:after:after], pageSHAs...)
+			receiptsChanged = true
+		}
+	}
+	if merged == nil {
+		merged = []json.RawMessage{}
+	}
+	holds := func(h string) bool { return e.held[h] > 0 }
+	doc := archivedChain{Binding: binding, Receipts: merged, HeadsDropped: have.HeadsDropped}
+	seen := map[string]bool{}
+	for _, h := range append(append(append([]string{}, have.Unheld...), have.Head), pageHead) {
+		if h != "" && !seen[h] && !holds(h) {
+			seen[h] = true
+			doc.Unheld = append(doc.Unheld, h)
+		}
+	}
+	if n := len(doc.Unheld); n > chainUnheldMax {
+		doc.Unheld = doc.Unheld[n-chainUnheldMax:]
+		doc.HeadsDropped = true
+	}
+	last := ""
+	if len(shas) > 0 {
+		last = shas[len(shas)-1]
+	}
+	switch {
+	case seen[have.Head]:
+		doc.Head = have.Head // keep the head already on record; others wait in Unheld
+	case seen[pageHead]:
+		doc.Head = pageHead
+	case len(doc.Unheld) > 0:
+		doc.Head = doc.Unheld[len(doc.Unheld)-1]
+	case last != "" && (pageHead == last || have.Head == last):
+		// A dropped head may lie past last, so the archive cannot claim it.
+		doc.Head, doc.Complete = last, !doc.HeadsDropped
+	default:
+		doc.Head = have.Head // the receipts hold every head seen, but none ends them
+	}
+	if !receiptsChanged && have.Binding == doc.Binding && have.Head == doc.Head &&
+		have.Complete == doc.Complete && have.HeadsDropped == doc.HeadsDropped && slices.Equal(have.Unheld, doc.Unheld) {
+		return false
+	}
+	e.doc, e.shas = doc, shas
+	return true
 }
 
 // writeLoop writes the newest doc until no merge is pending. It snapshots doc
@@ -155,9 +283,6 @@ func (e *chainEntry) writeLoop(dir, name string) {
 		e.mu.Lock()
 		if !e.dirty {
 			e.writing = false
-			if !e.failed {
-				e.loaded, e.doc = false, archivedChain{} // the file is current; free the memory
-			}
 			e.mu.Unlock()
 			return
 		}
@@ -177,68 +302,6 @@ func (e *chainEntry) writeLoop(dir, name string) {
 			log.Printf("%s: %s: %v", chainArchiveGuard, filepath.Base(name), err)
 		}
 	}
-}
-
-// mergeChainPage returns have with one page merged in. It never mutates have:
-// a snapshot being written may share its slices.
-func mergeChainPage(have archivedChain, binding string, after int, pageHead string, pageReceipts []json.RawMessage) archivedChain {
-	merged := have.Receipts
-	if len(pageReceipts) > 0 && after <= len(have.Receipts) && after+len(pageReceipts) <= chainReceiptsMax {
-		if m := append(have.Receipts[:after:after], pageReceipts...); len(m) >= len(have.Receipts) {
-			merged = m // a short re-read must not shrink the archive
-		}
-	}
-	if merged == nil {
-		merged = []json.RawMessage{}
-	}
-	doc := archivedChain{Binding: binding, Receipts: merged, HeadsDropped: have.HeadsDropped}
-	seen := map[string]bool{}
-	for _, h := range append(append(append([]string{}, have.Unheld...), have.Head), pageHead) {
-		if h != "" && !seen[h] && !chainHolds(merged, h) {
-			seen[h] = true
-			doc.Unheld = append(doc.Unheld, h)
-		}
-	}
-	if n := len(doc.Unheld); n > chainUnheldMax {
-		doc.Unheld = doc.Unheld[n-chainUnheldMax:]
-		doc.HeadsDropped = true
-	}
-	last := ""
-	if len(merged) > 0 {
-		last = receiptSHA(merged[len(merged)-1])
-	}
-	switch {
-	case seen[have.Head]:
-		doc.Head = have.Head // keep the head already on record; others wait in Unheld
-	case seen[pageHead]:
-		doc.Head = pageHead
-	case len(doc.Unheld) > 0:
-		doc.Head = doc.Unheld[len(doc.Unheld)-1]
-	case last != "" && (pageHead == last || have.Head == last):
-		// A dropped head may lie past last, so the archive cannot claim it.
-		doc.Head, doc.Complete = last, !doc.HeadsDropped
-	default:
-		doc.Head = have.Head // the receipts hold every head seen, but none ends them
-	}
-	return doc
-}
-
-func sameChain(a, b archivedChain) bool {
-	if a.Binding != b.Binding || a.Head != b.Head || a.Complete != b.Complete ||
-		a.HeadsDropped != b.HeadsDropped || len(a.Unheld) != len(b.Unheld) || len(a.Receipts) != len(b.Receipts) {
-		return false
-	}
-	for i := range a.Unheld {
-		if a.Unheld[i] != b.Unheld[i] {
-			return false
-		}
-	}
-	for i := range a.Receipts {
-		if !bytes.Equal(a.Receipts[i], b.Receipts[i]) {
-			return false
-		}
-	}
-	return true
 }
 
 // writeBytes replaces the archive file atomically. Only the file's writeLoop
@@ -263,16 +326,6 @@ func writeBytes(dir, name string, out []byte) error {
 }
 
 var chainPruneMu sync.Mutex
-
-// chainHolds reports whether a receipt in chain has the hash sha.
-func chainHolds(chain []json.RawMessage, sha string) bool {
-	for _, rc := range chain {
-		if receiptSHA(rc) == sha {
-			return true
-		}
-	}
-	return false
-}
 
 // pruneChains drops chains older than chainMaxAge, then the oldest beyond
 // chainFilesMax. Caller holds chainPruneMu.

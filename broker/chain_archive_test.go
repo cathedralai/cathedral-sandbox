@@ -563,3 +563,98 @@ func TestPruneKeepsFreshArchivesUnderConcurrentWrites(t *testing.T) {
 		}
 	}
 }
+
+// HOLD #464 at bf6e2e0: a page must cost work in proportion to the page, not
+// to the archived chain. A 100-page first capture parses each receipt once,
+// and re-reading the whole unchanged chain parses nothing at all.
+func TestArchiveMergeWorkIsLinearInThePage(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	bind := strings.Repeat("1a", 32)
+	h := attestedHotel(b, bind)
+	const pageSize, pages = 1000, 100
+	head := hx(pageSize * pages)
+	bodies := make([][]byte, pages)
+	for p := range bodies {
+		bodies[p] = headPage(bind, p*pageSize, pageSize, head)
+	}
+
+	before := receiptSHACalls.Load()
+	for p, body := range bodies {
+		b.archiveHotelPage(h, p*pageSize, body)
+	}
+	if n := receiptSHACalls.Load() - before; n > pageSize*pages {
+		t.Fatalf("first capture parsed %d receipts for a %d-receipt chain", n, pageSize*pages)
+	}
+	waitChainWrites()
+
+	before = receiptSHACalls.Load()
+	for p, body := range bodies {
+		b.archiveHotelPage(h, p*pageSize, body)
+	}
+	if n := receiptSHACalls.Load() - before; n != 0 {
+		t.Fatalf("re-reading an unchanged chain parsed %d receipts", n)
+	}
+	waitChainWrites()
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != pageSize*pages || doc.Complete == nil || !*doc.Complete || doc.Head != head {
+		t.Fatalf("archive: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
+	}
+}
+
+// HOLD #464 at bf6e2e0 (minor): after a failed write, the next page retries
+// it even when the page itself changes nothing.
+func TestFailedArchiveWriteIsRetriedByAnUnchangedPage(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	bind := strings.Repeat("2b", 32)
+	h := attestedHotel(b, bind)
+	blocker := filepath.Join(dir, chainsDir)
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := headPage(bind, 0, 3, fmt.Sprintf("%064x", 3))
+	b.archiveHotelPage(h, 0, body)
+	waitChainWrites()
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	b.archiveHotelPage(h, 0, body) // the same page: no change, but the file is missing
+	waitChainWrites()
+	if doc := getArchive(t, dir, bind); len(doc.Receipts) != 3 || doc.Complete == nil || !*doc.Complete {
+		t.Fatalf("retried archive: receipts=%d complete=%v", len(doc.Receipts), doc.Complete)
+	}
+}
+
+// Past chainLoadedMax recently used archives, idle ones leave memory and are
+// read back from their file, unchanged, on the next page.
+func TestIdleArchivesLeaveMemoryAndReloadIntact(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	first := strings.Repeat("3c", 32)
+	h := attestedHotel(b, first)
+	b.archiveHotelPage(h, 0, headPage(first, 0, 4, hx(4)))
+	waitChainWrites()
+	for n := 0; n < chainLoadedMax+2; n++ {
+		other := fmt.Sprintf("%064x", 0xcafe0+n)
+		b.archiveHotelPage(attestedHotel(b, other), 0, headPage(other, 0, 1, hx(1)))
+		waitChainWrites()
+	}
+	chainArchiveMu.Lock()
+	e := chainEntries[filepath.Join(dir, chainsDir, first+".json")]
+	chainArchiveMu.Unlock()
+	e.mu.Lock()
+	loaded := e.loaded
+	e.mu.Unlock()
+	if loaded {
+		t.Fatal("the least recently used idle archive stayed in memory")
+	}
+	b.archiveHotelPage(h, 4, headPage(first, 4, 1, hx(5)))
+	if doc := getArchive(t, dir, first); len(doc.Receipts) != 5 || doc.Complete == nil || !*doc.Complete || doc.Head != hx(5) {
+		t.Fatalf("reloaded archive: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
+	}
+}
