@@ -435,7 +435,9 @@ plane treats that as a new boot: drain, then a fresh join with a new key.
 `host-net.sh` (run by the unit) adds, in miner mode only:
 
 - a DNAT of `SEALED_MINER_PUBLIC_PORT` on this host's own addresses to the
-  guest's HTTPS port;
+  guest's HTTPS port, in nat PREROUTING (connections from elsewhere) and nat
+  OUTPUT (connections this host opens, such as a broker on the same host,
+  AB#822);
 - a FORWARD accept for new connections to that port;
 - the answers on those connections.
 
@@ -446,8 +448,10 @@ also do the following:
   group, a router port-forward, or an nftables forward chain with a drop
   policy.
 - Have a public IPv4 address.
-- Check from the host itself with `https://<guest ip>:<SEALED_MINER_TLS_PORT>`.
-  The host's own connections to its public address are not forwarded.
+- Check from the host itself with `https://<guest ip>:<SEALED_MINER_TLS_PORT>`
+  or the public origin; both reach the guest. A guest TLS key on the public
+  origin does not prove the port is open from outside (the cloud firewall is
+  not on this path): check that from another machine.
 
 `install-sealed.sh` cannot count rooms in a running miner guest, because the
 host has no key. A restart needs `SEALED_RESTART_WITH_ROOMS=1`, after the
@@ -524,9 +528,12 @@ addresses, the port must be open in any outer firewall, and `*.<hotel
 id>.<zone>` must point at this host. `down` removes every port forward tagged
 for this hotel, whatever `sealed.env` says now, so turning ingress off or
 editing the public port leaves no old forward behind; `up` and `check` drop
-such a leftover too, and `down` exits non-zero if it could not. A forward
-matches every local address, so `up` refuses a public port that another
-sealed hotel on this host already forwards.
+such a leftover too, and `down` (or `check` for a stopped guest) exits
+non-zero if it could not. A forward matches every local address, so `up`
+refuses a public port that another sealed hotel on this host already
+forwards, and refuses to add one when it cannot list the rules. The check and
+the add hold a host-wide lock (`/run/lock/sealed-hotel-dnat.lock`), so two
+hotels starting together cannot both take one port.
 
 Still open: the guest side (an nft accept for the ingress port, the server on
 it, the ACME client that signs its challenge with the receipt key). It is in

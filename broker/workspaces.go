@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -71,7 +72,7 @@ func (b *broker) findWorkspace(ctx context.Context, g *guestState, ref string) (
 		}
 		found, err := probe(h, name)
 		if err != nil {
-			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
+			return nil, "", hotelAPIErr(h, err)
 		}
 		if !found {
 			return nil, "", notFound
@@ -80,6 +81,7 @@ func (b *broker) findWorkspace(ctx context.Context, g *guestState, ref string) (
 	}
 	var mu sync.Mutex
 	var hits []*hotel
+	var busy []string
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
 		if !g.limitsAllow(b, h.cfg.ID) {
@@ -88,10 +90,13 @@ func (b *broker) findWorkspace(ctx context.Context, g *guestState, ref string) (
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
-			if found, _ := probe(h, ref); found {
-				mu.Lock()
+			found, err := probe(h, ref)
+			mu.Lock()
+			defer mu.Unlock()
+			if found {
 				hits = append(hits, h)
-				mu.Unlock()
+			} else if errors.Is(err, errHotelBusy) {
+				busy = append(busy, h.cfg.ID)
 			}
 		}(h)
 	}
@@ -100,6 +105,10 @@ func (b *broker) findWorkspace(ctx context.Context, g *guestState, ref string) (
 	case 1:
 		return hits[0], ref, nil
 	case 0:
+		// A busy hotel was never asked; it may hold the workspace (AB#819).
+		if len(busy) > 0 {
+			return nil, "", busyHotelsErr(busy)
+		}
 		return nil, "", notFound
 	default:
 		return nil, "", &apiErr{409, "workspace_ambiguous", "several hotels have a workspace " + ref + "; use the id <hotel>.<name>"}
@@ -173,8 +182,15 @@ func (b *broker) handleWorkspaces(w http.ResponseWriter, r *http.Request, g *gue
 	}
 	pl.noLent = true // reclaim destroys a lent hotel and its workspaces (lend.go)
 	// One name for each guest across the chain, so a bare name finds one hotel.
-	if _, _, e := b.findWorkspace(r.Context(), g, name); e == nil {
+	// Only a clean not-found makes a new one: a busy hotel may hold the name,
+	// and a second copy elsewhere would make the bare name ambiguous (AB#819).
+	_, _, e = b.findWorkspace(r.Context(), g, name)
+	if e == nil {
 		writeErr(w, 409, "workspace_exists", "workspace "+name+" exists")
+		return
+	}
+	if e.code != "workspace_not_found" {
+		writeAPIErr(w, e)
 		return
 	}
 	b.mu.Lock()
@@ -187,7 +203,7 @@ func (b *broker) handleWorkspaces(w http.ResponseWriter, r *http.Request, g *gue
 	body, _ := json.Marshal(map[string]any{"name": name})
 	status, _, out, err := h.doGuest(r.Context(), g, "POST", "/v1/workspaces", nil, body, time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	writeWorkspace(w, h, status, out)
@@ -242,7 +258,7 @@ func (b *broker) handleWorkspace(w http.ResponseWriter, r *http.Request, g *gues
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	h, name, e := b.findWorkspace(r.Context(), g, ref)
 	if e != nil {
-		writeErr(w, e.status, e.code, e.msg)
+		writeAPIErr(w, e)
 		return
 	}
 	path := "/v1/workspaces/" + url.PathEscape(name)
@@ -258,7 +274,7 @@ func (b *broker) handleWorkspace(w http.ResponseWriter, r *http.Request, g *gues
 	}
 	status, _, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, 30*time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	if status == 204 {

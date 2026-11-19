@@ -106,6 +106,15 @@ health does not say `sealed`. Verify a chain offline with
 `verify_receipts.py`: signature, link to the previous receipt, and head. A
 level 1 chain has no SNP report.
 
+For snapshots and forks, `verify_receipts.py` also reads each snapshot receipt and each fork's create receipt (in
+list mode, header mode and run mode alike; run mode adds the prefix `check 1: `). It recomputes
+`snapshot_content_sha256` from `snapshot_image_id` and `snapshot_work_archive_sha256`, and, when a fork's
+`snapshot_receipt_sha256` is in the list, checks that it names an earlier successful snapshot receipt in the same
+binding with the same snapshot id, content hash and source room, and is the first receipt to sign that snapshot. A snapshot that was deleted and made again under the same id is treated as one id, so a fork of the second one fails the first-receipt rule; the machine gives every snapshot a fresh id, so this does not happen with an honest machine. A fork whose snapshot receipt is not in the list is
+reported as `fork_source: not_in_list` in `chain.forks`, not refused. A fork after a successful delete of its
+snapshot is refused. The content hash covers the image id and the hash of the tar of `/work`; the image's layers are
+not hashed again at a fork.
+
 `verify_receipts.py --oneshot FILE` checks one one-shot run's file offline (run mode). It takes `--recipe`,
 `--context` or `--no-context`, `--run-id`, `--input-sha256`, `--input-file`, `--output-file`,
 `--expected-measurement`, `--allowed-measurements`, `--ark-sha256`, `--product` and `--require-sealed`. The other
@@ -621,9 +630,10 @@ python3 hotel_offer.py --origin https://<public ip>:<SEALED_MINER_PUBLIC_PORT> -
 python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/v1/cathedral/snp/hotel-offers
 ```
 
-- On a miner using `sealed/host-net.sh` the host cannot reach its own public address, so fetch from the guest:
+- On a miner using `sealed/host-net.sh`, fetch from the guest:
   add `--attestation-url https://<guest ip>:<SEALED_MINER_TLS_PORT>` (the offer still advertises `--origin`; the
-  TLS key check still applies). Or pass the attestation the installer saved, `--attestation <SEALED_DIR>/run/attestation.json`
+  TLS key check still applies). Since AB#822 the host also reaches its own public port (nat OUTPUT), so a broker
+  on the same host can join the hotel; with an older `host-net.sh` it cannot. Or pass the attestation the installer saved, `--attestation <SEALED_DIR>/run/attestation.json`
   (read from the guest over plain HTTP on the tap, so the TLS key check is skipped; the API checks it).
 - A refused offer (for example the 422 reason code) is printed to stderr and the command exits 1; only an accepted
   offer exits 0.
@@ -638,6 +648,8 @@ python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/
 - Without `--post` it prints the offer. The offer grants nothing: the
   API fetches the attestation itself and checks the TLS key, the AMD chain, the published measurement and the
   roster machine.
+- Re-offer after every boot without a person: `hotel-offer-refresh/` (a 5-minute systemd timer that posts a new
+  offer when `binding_sha256` changes). Install, restart and reboot steps: `docs/ANCHOR_HOTEL_RUNBOOK.md`.
 - Not covered here: the signed update channel for a miner hotel, and a miner-side view of offer status.
 
 ## What the kit installs

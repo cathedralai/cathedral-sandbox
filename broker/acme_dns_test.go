@@ -256,6 +256,30 @@ func TestACMEChallengeNeedsATrustedAdmissionNow(t *testing.T) {
 	}
 }
 
+func TestACMEChallengeRechecksTheHotelAfterWaitingForTheDNSLock(t *testing.T) {
+	steps := map[string]func(h *hotel){
+		"left while queued":            func(h *hotel) { h.leaving = true },
+		"rebooted while queued":        func(h *hotel) { h.adm.bindingSHA = strings.Repeat("4", 64) },
+		"receipt key changed (queued)": func(h *hotel) { h.adm.receiptKey = make([]byte, ed25519.PublicKeySize) },
+	}
+	for label, step := range steps {
+		a := newACMETest(t)
+		beforeACMEDNSLock = func() {
+			a.tc.b.mu.Lock()
+			step(a.tc.b.hotelByID("a"))
+			a.tc.b.mu.Unlock()
+		}
+		status, doc := a.put(t, a.priv, a.body("a", acmeVal1))
+		beforeACMEDNSLock = func() {}
+		if status != 403 || errCode(doc) != "forbidden" {
+			t.Fatalf("%s: %d %v", label, status, doc)
+		}
+		if len(a.cf.calls) != 0 {
+			t.Fatalf("%s: DNS provider called: %v", label, a.cf.calls)
+		}
+	}
+}
+
 func TestACMEChallengeRefusesReplayStaleAndBadValues(t *testing.T) {
 	a := newACMETest(t)
 	first := a.body("a", acmeVal1)

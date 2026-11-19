@@ -146,6 +146,10 @@ func (b *broker) acmeHotelKey(h *hotel) (ed25519.PublicKey, string) {
 	return append(ed25519.PublicKey(nil), h.adm.receiptKey...), bindingSHA
 }
 
+// beforeACMEDNSLock runs just before a request waits for the DNS lock; tests
+// change hotel state there to stand in for an update queued behind another.
+var beforeACMEDNSLock = func() {}
+
 // handleACMEChallenge serves PUT /v1/broker/acme-challenge.
 func (b *broker) handleACMEChallenge(w http.ResponseWriter, r *http.Request) {
 	c := b.cfg.ACMEDNS
@@ -209,8 +213,15 @@ func (b *broker) handleACMEChallenge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st := &b.acmeDNS
+	beforeACMEDNSLock()
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	// Check trust again under the DNS lock: while this request waited behind
+	// another hotel's update, its hotel may have left or lost its admission.
+	if again, againSHA := b.acmeHotelKey(h); again == nil || !again.Equal(key) || againSHA != bindingSHA {
+		refuse()
+		return
+	}
 	if st.lastTS == nil {
 		st.lastTS = map[string]int64{}
 	}

@@ -100,6 +100,9 @@ func TestProbationGraduatesAtExactlyTheMinimumUptime(t *testing.T) {
 	t0 := time.Now().Add(time.Hour) // after any sample the join's sync took
 	tc.b.mu.Lock()
 	h.prob.lastSample = time.Time{} // the next sample sets the clock
+	// The join's syncNow (#547) and any tick before stopLoops already counted
+	// real-time observed seconds, mostly not up; start the window from zero.
+	h.prob.observed, h.prob.up = 0, 0
 	tc.b.mu.Unlock()
 	// 99 s up, then down for the last second: 99.00% of 100 s.
 	if !steps(tc, h, t0, sample{0, true}, sample{99 * time.Second, true}, sample{100 * time.Second, false}) {
