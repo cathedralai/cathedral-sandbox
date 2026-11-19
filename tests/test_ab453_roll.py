@@ -769,3 +769,30 @@ def test_stage_kit_bootstrap_is_redone_after_a_failed_first_attempt(env, tmp_pat
     assert "make-dist abcdef0" in calls(fake)
     assert (n / "post_hotel.sh").exists() and (n / "post_hotel_guest.sh").exists() and (n / "kit.ready").exists()
     assert (home / "plans" / f"{HOTEL}.env").exists()
+
+
+# Bugbot on #607: a missing images/current reads empty, never the link's own name "current".
+def test_missing_images_current_reads_empty_and_is_not_proof(host):
+    e, fake, home, d, kit = host
+    (d / "images" / "current").unlink()
+    (fake / "capacity.json").write_text(capacity(CUR, drain=True))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=stuck_drained\nSTUCK_FROM=installed\nHOST_ROLLED_BACK=1\nTS=20260101T000000Z\nOLDIMG=current\n"
+        f"COMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
+    r = run(e, "apply", HOTEL)
+    assert "host reads current= booted=old" in r.stdout, r.stdout
+    assert patches(fake) == []
+    assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_preflight_reads_a_missing_images_current_as_empty(host):
+    e, fake, home, d, kit = host
+    (d / "images" / "current").unlink()
+    stage = Path((home / "plans" / f"{HOTEL}.env").read_text().split("STAGE=")[1].split("\n")[0])
+    import shutil
+    shutil.rmtree(stage / HOTEL / "images" / "20260101T000000Z")
+    e["FAKE_CHECK_EXEC"] = "1"
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "host: current= booted=old unit=active" in r.stdout, r.stdout
+    no_mutation(fake)
