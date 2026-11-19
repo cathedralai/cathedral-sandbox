@@ -412,10 +412,12 @@ def test_a_bulk_connection_does_not_keep_its_long_read_timeout_past_the_bulks_bo
     front.api.new_ids = ["sbx_x"]
     assert front.create(POOL_TEAM)[0] == 200
     held = front.api.hold(r"DELETE /v1/sandboxes")
-    threading.Timer(3, held.release.set).start()
+    release_later = threading.Timer(3, held.release.set)
+    release_later.start()
     started = time.monotonic()
     status, _headers, out = front.call("DELETE", BULK)
     took = time.monotonic() - started
+    release_later.cancel()
     held.release.set()
     assert status == 502 and code(out) == "hotel_api_no_answer" and took < 1.6, (status, took)
     assert_idle(front.ledger)

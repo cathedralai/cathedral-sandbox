@@ -54,6 +54,12 @@ type hotelConfig struct {
 	KeyFile     string `json:"key_file"`
 	Concurrency int    `json:"concurrency"` // creates in flight at this hotel
 	Drain       bool   `json:"drain"`       // true: no new rooms here; existing rooms keep working
+	// DataConns: data connections to the hotel (room calls; each exec holds
+	// one for its run). 0: concurrency + 64. DataConnWaitSeconds: how long a
+	// call waits for a free one before 503 sold_out; 0: 10 s, -1: until the
+	// call's own deadline (hotelconns.go, AB#819).
+	DataConns           int `json:"data_conns,omitempty"`
+	DataConnWaitSeconds int `json:"data_conn_wait_seconds,omitempty"`
 	// Labels describe the hotel, for example {"sealed": "true"}. A guest can
 	// ask for rooms only on hotels with (or without) some labels.
 	Labels   map[string]string `json:"labels"`
@@ -180,10 +186,13 @@ type config struct {
 	// turned off for every hotel or for joined hotels. The ops escape is
 	// "sealed_admission": "off" on one operator hotel's entry.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
-	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // a gated hotel's measurement must be one of these; empty refuses every gated hotel
-	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
-	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
-	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	SealedMeasurements []string `json:"sealed_measurements,omitempty"` // a gated hotel's measurement must be one of these; empty refuses every gated hotel
+	SealedHostData     []string `json:"sealed_host_data,omitempty"`    // non-empty: its HOST_DATA must be one of these
+	// An optional Genoa SNP firmware component floor. Zero leaves it unset
+	// until patched hosts are available. It does not prove the OEM PI fix.
+	MinGenoaSNPSPL     int     `json:"min_genoa_snp_spl,omitempty"`
+	AttestTTLSeconds   float64 `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
+	AttestEverySeconds float64 `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
 	// RequireSealedGuestTLS (AB#378): every sealed hotel is reached only over
 	// its attested guest TLS key. A sealed config hotel must set "guest_tls":
 	// true, and a sealed join must pass the keyless HTTPS bootstrap. Off by
@@ -254,6 +263,7 @@ type hotel struct {
 	guestPin atomic.Pointer[[sha256.Size]byte]
 	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem      chan struct{}
+	conns    *connGate // data connection slots (hotelconns.go)
 
 	// Guarded by broker.mu.
 	slots        int
@@ -430,6 +440,9 @@ func loadBroker(path string) (*broker, error) {
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return nil, err
 	}
+	if c.MinGenoaSNPSPL < 0 || c.MinGenoaSNPSPL > 255 {
+		return nil, errors.New("config: min_genoa_snp_spl must be an 8-bit SNP component value")
+	}
 	if c.MinerEnrollKeySHA256 != "" {
 		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
 		if err != nil || len(hash) != sha256.Size {
@@ -490,6 +503,9 @@ func loadBroker(path string) (*broker, error) {
 		if err := validateSealedAdmission(hc); err != nil {
 			return nil, err
 		}
+		if c.MinGenoaSNPSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
+			return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_snp_spl", hc.ID)
+		}
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
 		}
@@ -513,6 +529,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if !validAlertChat(hc.AlertChatID) {
 			return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
+		}
+		if err := checkDataConnConfig(hc); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
 		}
 		k, err := os.ReadFile(hc.KeyFile)
 		if err != nil {
@@ -656,6 +675,17 @@ func (h *hotel) doHeadersMax(ctx context.Context, base, method, path string, que
 	req.Header.Set("Authorization", "Bearer "+h.key)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	// Room calls (/v1/...) take a data connection slot (hotelconns.go); the
+	// /room/... calls (attestation, receipts, escape nonce) go to the Health
+	// port, which has its own connections, and are not gated. The slot is held
+	// until the body below is read and closed (defers run last in, first out).
+	if !strings.HasPrefix(path, "/room/") {
+		releaseConn, err := h.conns.acquire(ctx, h.cfg.ID)
+		if err != nil {
+			return 0, nil, nil, noop, err
+		}
+		defer releaseConn()
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -964,6 +994,16 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 
 		b.mu.Lock()
 		h.creating--
+		if errors.Is(err, errHotelBusy) {
+			// No data connection came free in time (AB#819). The create was
+			// never sent, so no room can exist there: not lost, nothing to
+			// reap, and the hotel is not resting. Try another hotel.
+			h.release(rm)
+			b.mu.Unlock()
+			last = createResult{status: 503, header: http.Header{"Retry-After": {strconv.Itoa(hotelBusyRetryAfter)}},
+				doc: errDoc("sold_out", "hotel "+h.cfg.ID+hotelBusyMessage)}
+			continue
+		}
 		var doc map[string]any
 		if err == nil {
 			_ = json.Unmarshal(out, &doc)
@@ -1250,7 +1290,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if s.Labels[batchLabel] != batchID || s.Labels[guestLabel] != guestID {
 			continue
 		}
-		st, _, _, derr := h.do(ctx, "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
+		st, _, _, derr := h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
 		if derr != nil || (st != 204 && st != 404) {
 			ok = false
 			continue
@@ -1391,7 +1431,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
-		writeErr(w, perr.status, perr.code, perr.msg)
+		writeAPIErr(w, perr)
 		return
 	}
 	pl.apply(payload)
@@ -1424,7 +1464,9 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	status := 202
 	if len(docs) == 0 {
 		status = results[0].status
-		if status == 429 {
+		if ra := results[0].header.Get("Retry-After"); status == 503 && ra != "" {
+			w.Header().Set("Retry-After", ra) // sold_out: no hotel connection (AB#819)
+		} else if status == 429 {
 			w.Header().Set("Retry-After", "5")
 		}
 	}
@@ -1589,7 +1631,13 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		bodyArg = body
 	}
 	tDispatch := time.Now()
-	status, hdr, out, err := h.do(r.Context(), r.Method, path, r.URL.Query(), bodyArg, timeout)
+	callCtx := r.Context()
+	if r.Method == "DELETE" && tail == "" {
+		// A room delete that gave up would leave the room running on a full
+		// hotel: it waits for a connection until its deadline, as before.
+		callCtx = waitForConnUntilDeadline(callCtx)
+	}
+	status, hdr, out, err := h.do(callCtx, r.Method, path, r.URL.Query(), bodyArg, timeout)
 	// AB#741: the same split as a create (X-Broker-Queue-Ms, X-Broker-Hotel-Ms) on
 	// every answer that went to the hotel, failures included, so a burst of execs
 	// can be split into broker and hotel time per request. Here the "queue" is the
@@ -1598,7 +1646,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	// before the hotel was asked.
 	setBrokerTiming(w.Header(), h.cfg.ID, tDispatch.Sub(tRecv), time.Since(tDispatch))
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	if r.Method == "DELETE" && tail == "" && (status == 204 || status == 404) {
@@ -1758,7 +1806,7 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 	}
 	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "GET", "/room/"+doc, r.URL.Query(), nil, time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	if status == 200 && doc == "receipts" {
@@ -1806,7 +1854,7 @@ func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *ho
 		http.Header{guestHeader: {g.cfg.ID}},
 	)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	for _, k := range []string{"Content-Type", "Retry-After"} {
@@ -1969,6 +2017,7 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 	b.mu.Unlock()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
 	res := map[string]int{}
+	claimBusy := false
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
@@ -1978,17 +2027,53 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
-			status, _, _, err := h.do(r.Context(), "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
-			if err != nil {
-				status = 502
-			}
+			status, busy := bulkDeleteFromHotel(r.Context(), h, q)
 			mu.Lock()
 			res[h.cfg.ID] = status
+			claimBusy = claimBusy || busy
 			mu.Unlock()
 		}(h)
 	}
 	wg.Wait()
+	if claimBusy {
+		writeJSON(w, 409, map[string]any{"error": map[string]string{
+			"code": "bulk_delete_claim_busy", "message": "bulk deletion may be incomplete after a room claim; retry it",
+		}, "hotels": res})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"hotels": res})
+}
+
+// A claim's lifetime call is bounded at the hotel. Retry only its explicit
+// refusal; another 409 can mean a permanent problem and must keep its status.
+func bulkDeleteFromHotel(ctx context.Context, h *hotel, q url.Values) (int, bool) {
+	deadline := time.Now().Add(12 * time.Second)
+	sawClaimBusy := false
+	for {
+		status, _, body, err := h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
+		if err != nil {
+			if sawClaimBusy {
+				return 409, true
+			}
+			return 502, false
+		}
+		if status != 409 || errCodeOf(body) != "bulk_delete_claim_busy" {
+			return status, sawClaimBusy && (status < 200 || status >= 300)
+		}
+		sawClaimBusy = true
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 409, true
+		}
+		wait := min(100*time.Millisecond, remaining)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 409, true
+		case <-timer.C:
+		}
+	}
 }
 
 // ---------------------------------------------------------------- stats
@@ -2013,6 +2098,8 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 	if r.Method == "POST" {
 		for _, h := range b.hotelList() {
 			h.created, h.failed, h.rejected, h.lat = 0, 0, 0, latencies{}
+			h.conns.waits.Store(0)
+			h.conns.refused.Store(0)
 		}
 		for _, x := range b.guests {
 			x.created, x.failed, x.rejected = 0, 0, 0
@@ -2035,6 +2122,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1, "mem_full": b.memFull(h),
 			"created": h.created, "failed": h.failed, "rejected_429": h.rejected,
 			"hotel_ms": pct(h.lat.hotel), "queue_ms": pct(h.lat.queue), "overhead_ms": pct(h.lat.overhead),
+			"conns": h.conns.stats(),
 		})
 	}
 	writeJSON(w, 200, map[string]any{"guest": g.cfg.ID, "created": g.created, "failed": g.failed, "rejected_429": g.rejected, "hotels": hotels})

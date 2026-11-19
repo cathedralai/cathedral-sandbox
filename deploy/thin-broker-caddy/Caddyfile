@@ -1,5 +1,3 @@
-# Live copy of /etc/thin-broker-caddy/Caddyfile on Frankfurt (unit
-# thin-broker-caddy). Hand-made, so this file is the record. No secrets in it.
 {
 	auto_https disable_redirects
 	admin off
@@ -8,6 +6,34 @@ https://live.cathedral.computer:443 {
 	tls {
 		issuer acme {
 			disable_http_challenge
+		}
+	}
+	# One JSON line per request with its duration (seconds) and status, so a
+	# stall leaves evidence (const load test, 18 Nov 2026). Headers, TLS and
+	# response headers are dropped; the live-view token and share id in the
+	# query are deleted, and so are any ticket, key, api_key or access_token
+	# values (AB#819 const-roll). Rolled at 100 MiB, 10 files, 14 days.
+	log {
+		output file /var/log/thin-broker-caddy/access.log {
+			roll_size 100MiB
+			roll_keep 10
+			roll_keep_for 336h
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				request>tls delete
+				resp_headers delete
+				request>uri query {
+					delete token
+					delete share
+					delete ticket
+					delete key
+					delete api_key
+					delete access_token
+				}
+			}
 		}
 	}
 	encode gzip

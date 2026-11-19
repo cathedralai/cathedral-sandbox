@@ -90,44 +90,7 @@ install -m 0755 "$KIT/sealed/host-net.sh" "$KIT/sealed/launch-guest.sh" -t "$SEA
 install -m 0644 "$KIT/sealed/guest-constants.sh" -t "$SEALED_DIR/"
 # A rerun may pass the installed copy itself.
 [ "$ENV_FILE" -ef "$SEALED_DIR/sealed.env" ] || install -m 0600 "$ENV_FILE" "$SEALED_DIR/sealed.env"
-# The host link rules are set by ExecStartPre only; a host firewall reload
-# (ufw) removes them and every room loses the internet while health stays
-# green. A timer checks them each minute and puts them back.
-cat > /etc/systemd/system/${UNIT%.service}-net.service <<EOF
-[Unit]
-Description=Sealed hotel $SEALED_NAME host link check
-ConditionPathExists=$SEALED_DIR/sealed.env
-[Service]
-Type=oneshot
-ExecStart=$SEALED_DIR/host-net.sh check $SEALED_DIR/sealed.env
-EOF
-cat > /etc/systemd/system/${UNIT%.service}-net.timer <<EOF
-[Unit]
-Description=Sealed hotel $SEALED_NAME host link check (every minute)
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=1min
-[Install]
-WantedBy=timers.target
-EOF
-cat > /etc/systemd/system/$UNIT <<EOF
-[Unit]
-Description=Sealed hotel $SEALED_NAME (AMD SEV-SNP guest with the room kit)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-ExecStartPre=$SEALED_DIR/host-net.sh up $SEALED_DIR/sealed.env
-ExecStart=$SEALED_DIR/launch-guest.sh $SEALED_DIR/sealed.env
-ExecStopPost=$SEALED_DIR/host-net.sh down $SEALED_DIR/sealed.env
-KillSignal=SIGTERM
-TimeoutStopSec=60
-Restart=no
-LimitMEMLOCK=infinity
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
+"$KIT/sealed/write-units.sh" "$SEALED_DIR/sealed.env"
 systemctl enable -q --now "${UNIT%.service}-net.timer"
 
 # ---------------------------------------------------------------- 5. start and check

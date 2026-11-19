@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -558,7 +559,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		}
 		list, err := b.hotelSnapshots(ctx, g, h)
 		if err != nil {
-			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
+			return nil, "", hotelAPIErr(h, err)
 		}
 		if sid := matchSnapshot(g, list, rest); sid != "" {
 			return h, sid, nil
@@ -572,6 +573,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	}
 	var mu sync.Mutex
 	var hits []hit
+	var busy []string
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
 		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
@@ -581,6 +583,12 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		go func(h *hotel) {
 			defer wg.Done()
 			list, err := b.hotelSnapshots(ctx, g, h)
+			if errors.Is(err, errHotelBusy) {
+				mu.Lock()
+				busy = append(busy, h.cfg.ID)
+				mu.Unlock()
+				return
+			}
 			if err != nil {
 				return
 			}
@@ -596,6 +604,10 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	case 1:
 		return hits[0].h, hits[0].sid, nil
 	case 0:
+		// A busy hotel was never asked; it may hold the snapshot (AB#819).
+		if len(busy) > 0 {
+			return nil, "", busyHotelsErr(busy)
+		}
 		return nil, "", notFound
 	default:
 		return nil, "", &apiErr{409, "snapshot_ambiguous", "several hotels have a snapshot " + ref + "; use the id <hotel>.<snapshot id>"}
@@ -619,11 +631,13 @@ func (b *broker) roomSnapshot(w http.ResponseWriter, r *http.Request, g *guestSt
 		payload["name"] = snapshotName(g, name)
 	}
 	out, _ := json.Marshal(payload)
-	status, _, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
+	status, hdr, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
+	// The machine's signed receipt travels in X-Room-* headers, as on every other room route.
+	copyRoomHeaders(w.Header(), hdr)
 	var doc map[string]any
 	if json.Unmarshal(resp, &doc) != nil {
 		writeRaw(w, status, resp)
@@ -682,7 +696,7 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	h, sid, e := b.findSnapshot(r.Context(), g, ref)
 	if e != nil {
-		writeErr(w, e.status, e.code, e.msg)
+		writeAPIErr(w, e)
 		return
 	}
 	path := "/v1/snapshots/" + url.PathEscape(sid)
@@ -694,11 +708,12 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 		arg = body
 	}
 	// Delete and push are owner-scoped on the hotel too (AB#650).
-	status, _, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
+	status, hdr, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
+	copyRoomHeaders(w.Header(), hdr)
 	var doc map[string]any
 	if json.Unmarshal(out, &doc) == nil && doc["error"] == nil {
 		if _, ok := doc["snapshot_id"]; ok {
@@ -820,7 +835,8 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
 	st.FinishedAt = &now
 	switch {
 	case err != nil:
-		st.State, st.Error = "failed", map[string]any{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}
+		e := hotelAPIErr(h, err)
+		st.State, st.Error = "failed", map[string]any{"code": e.code, "message": e.msg}
 	case status == 200 || status == 202:
 		st.State = "done"
 		if res, ok := doc["result"].(map[string]any); ok {
