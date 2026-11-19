@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -166,7 +168,30 @@ func compatHotelErr(w http.ResponseWriter, err error, msg string) {
 // hotelAPIErr is writeHotelErr for callers that return an *apiErr.
 func hotelAPIErr(h *hotel, err error) *apiErr {
 	if errors.Is(err, errHotelBusy) {
-		return &apiErr{503, "sold_out", "hotel " + h.cfg.ID + hotelBusyMessage}
+		return busyAPIErr("hotel " + h.cfg.ID)
 	}
 	return &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
+}
+
+func busyAPIErr(who string) *apiErr {
+	return &apiErr{503, "sold_out", who + hotelBusyMessage}
+}
+
+// busyHotelsErr answers a fan-out lookup that found nothing while some hotels
+// were busy: those were never asked, so the answer is "retry", not "not found".
+func busyHotelsErr(ids []string) *apiErr {
+	sort.Strings(ids)
+	if len(ids) == 1 {
+		return busyAPIErr("hotel " + ids[0])
+	}
+	return &apiErr{503, "sold_out", "hotels " + strings.Join(ids, ", ") + " have no free connection; nothing was sent to them, retry shortly"}
+}
+
+// writeAPIErr writes an *apiErr. A busy hotel's 503 sold_out carries
+// Retry-After, as writeHotelErr sets it on the same condition.
+func writeAPIErr(w http.ResponseWriter, e *apiErr) {
+	if e.status == 503 && e.code == "sold_out" {
+		w.Header().Set("Retry-After", fmt.Sprint(hotelBusyRetryAfter))
+	}
+	writeErr(w, e.status, e.code, e.msg)
 }
