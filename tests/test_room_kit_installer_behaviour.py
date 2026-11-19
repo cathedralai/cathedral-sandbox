@@ -148,10 +148,12 @@ case "${1:-}" in
       [ "$chain" = INPUT ] && echo "-P INPUT ${FAKE_INPUT_POLICY:-ACCEPT}"
       if [ -z "$chain" ]; then v=FAKE_IPTABLES_TAGGED_$t; [ -n "${!v:-}" ] && printf '%s\n' "${!v}"; fi
       if [ "${FAKE_IPTABLES_RULES:-}" = present ] && [ -n "$chain" ] && [ "$chain" != INPUT ]; then
-        for _ in 1 2 3 4 5; do echo "-A $chain -j DROP"; done
+        for _ in $(seq "${FAKE_IPTABLES_RULE_COUNT:-5}"); do echo "-A $chain -j DROP"; done
       fi
       exit 0 ;;
-  -C) [ "${FAKE_IPTABLES_RULES:-}" = present ]; exit ;;
+  # FAKE_IPTABLES_MISSING: chains whose rule a firewall reload took ("OUTPUT").
+  -C) case " ${FAKE_IPTABLES_MISSING:-} " in *" ${2:-} "*) exit 1 ;; esac
+      [ "${FAKE_IPTABLES_RULES:-}" = present ]; exit ;;
 esac
 exit 0""",
     "ip6tables": "exit 0",
@@ -1016,12 +1018,48 @@ def test_host_net_miner_forwards_one_public_port_to_the_guest_https_port(host: F
     assert dnat.replace(" -A ", " -D ") in host.calls("iptables")
 
 
-def test_host_net_config_hotel_adds_no_forward(host: FakeHost) -> None:
-    proc = _run_host_net(host, "up")
+def _dnat(op: str, chain: str) -> str:
+    return (f"iptables -t nat {op} {chain} -p tcp --dport 9443 -m addrtype --dst-type LOCAL -m comment "
+            "--comment sealed-hotel:sealed-1 -j DNAT --to-destination 10.215.0.2:18443")
+
+
+def test_host_net_miner_reaches_its_public_port_from_this_host_too(host: FakeHost) -> None:
+    # AB#822 R2: the broker on the hotel's own host. PREROUTING never sees packets
+    # the host sends itself, so the same DNAT sits in nat OUTPUT, on every path.
+    proc = _run_host_net(host, "up", MINER)
     assert proc.returncode == 0, proc.stderr[-3000:]
-    assert not [c for c in host.calls("iptables") if "PREROUTING" in c or "18443" in c]
-    _run_host_net(host, "down")
-    assert not [c for c in host.calls("iptables") if "PREROUTING" in c]
+    nat = [c for c in host.calls("iptables -t nat ") if "DNAT" in c]
+    assert nat == [_dnat("-C", "PREROUTING"), _dnat("-A", "PREROUTING"), _dnat("-C", "OUTPUT"), _dnat("-A", "OUTPUT")]
+
+    # Check: both rules present (and the 7 FWD rules) leaves everything alone.
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
+    proc = _run_host_net(host, "check", MINER, FAKE_IPTABLES_RULES="present", FAKE_IPTABLES_RULE_COUNT="7")
+    assert proc.returncode == 0 and "restoring" not in proc.stderr, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert _dnat("-C", "PREROUTING") in ipt and _dnat("-C", "OUTPUT") in ipt
+    assert not [c for c in ipt if " -A " in c or " -I " in c], "present rules were rewritten"
+
+    # Check: a reload that took only the OUTPUT rule restores it.
+    proc = _run_host_net(host, "check", MINER, FAKE_IPTABLES_RULES="present", FAKE_IPTABLES_RULE_COUNT="7",
+                         FAKE_IPTABLES_MISSING="OUTPUT")
+    assert proc.returncode == 0 and "were missing; restoring" in proc.stderr, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert _dnat("-A", "OUTPUT") in ipt and _dnat("-A", "PREROUTING") not in ipt
+
+    proc = _run_host_net(host, "down", MINER)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    nat = [c for c in host.calls("iptables -t nat ") if "DNAT" in c]
+    assert nat == [_dnat("-D", "PREROUTING"), _dnat("-D", "OUTPUT")]
+
+
+@pytest.mark.parametrize("action", ["up", "check", "down"])
+def test_host_net_config_hotel_adds_no_forward(host: FakeHost, action: str) -> None:
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
+    proc = _run_host_net(host, action, {"SEALED_MINER": "0"})
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert ipt, action
+    assert not [c for c in ipt if "PREROUTING" in c or "OUTPUT" in c or "DNAT" in c or "18443" in c], action
 
 
 def test_sealed_miner_restart_never_sends_a_key_and_needs_the_override(host: FakeHost) -> None:

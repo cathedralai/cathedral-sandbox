@@ -131,9 +131,10 @@ def check_origin(origin: str) -> str:
 def check_fetch_url(url: str) -> str:
     """Where to read the attestation from: https://<ip>:<port>, no path. Any address, private included.
 
-    On a miner using sealed/host-net.sh the host cannot reach its own public
-    address (the forward is PREROUTING only), so the fetch address is the guest's
-    (https://<guest ip>:<SEALED_MINER_TLS_PORT>) while the offer advertises the public origin.
+    On a miner using sealed/host-net.sh the guest address
+    (https://<guest ip>:<SEALED_MINER_TLS_PORT>) is the direct path while the offer
+    advertises the public origin. host-net.sh releases before AB#822 forwarded the
+    public port in PREROUTING only, so there the host cannot reach its own public address.
     """
     try:
         parsed = urlsplit(url)
