@@ -56,12 +56,13 @@ type catalogTemplate struct {
 	SealedOnly bool
 }
 
-// LFM3-1.7B image. llama.cpp b11960, Q4_K_M GGUF. Published from #574
-// (dd39ce17, AB#763): llama-server, llama-bench, python and curl ship next to
-// llama-cli for the sealed benchmark.
+// LFM3-1.7B image. llama.cpp b11960, Q4_K_M GGUF. Published from #488
+// (9bb0f1cc, AB#589, publish run 44324981481): #574's image (dd39ce17, AB#763:
+// llama-server, llama-bench, python and curl next to llama-cli) plus lfm3-ask
+// printing only the answer for long prompts.
 const (
 	lfm31_7bRepo   = "ghcr.io/cathedralai/room-lfm3-1.7b"
-	lfm31_7bDigest = "sha256:7d0aa94f7bf7d0356a02c65adfc2f3d08f6a26bf750d6d3127780ff8f68d54cb"
+	lfm31_7bDigest = "sha256:0c5757f472f61228e66e34555cda07f7ac5e2eb8a4edf1707b3a6810242398d2"
 )
 
 var digestPin = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
