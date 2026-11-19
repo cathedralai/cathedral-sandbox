@@ -75,8 +75,11 @@ dnat_port_clash() {
 # forwards (and released when the script exits): two hotel units starting
 # together would otherwise both pass the check and both forward one port.
 lock_dnat() {
-  local dir="${ROOM_DESTDIR:-}/run/lock"
   [ "$WANT_DNAT" -gt 0 ] || return 0
+  take_dnat_lock
+}
+take_dnat_lock() {
+  local dir="${ROOM_DESTDIR:-}/run/lock"
   mkdir -p "$dir" 2>/dev/null && exec 9>"$dir/sealed-hotel-dnat.lock" && flock -w "${SEALED_DNAT_LOCK_WAIT:-60}" 9 && return 0
   echo "sealed-hotel: could not take $dir/sealed-hotel-dnat.lock, which another sealed hotel's start holds; not adding a forward" >&2
   return 1
@@ -199,7 +202,18 @@ check)
   # drain, stop, edit sealed.env, install). Only the timer runs "check".
   if command -v systemctl >/dev/null && ! systemctl is-active -q "room-sealed-$SEALED_NAME.service"; then
     # But a public forward must not outlive its guest (a "down" that could not
-    # delete it). Fail when it still cannot, so the timer unit shows it.
+    # delete it). Only once the unit has settled stopped: while it is
+    # activating its ExecStartPre "up" is adding the forwards, while it is
+    # deactivating "down" is removing them, and an unanswered query proves
+    # nothing. Leave those to the next check.
+    state=$(systemctl show -p ActiveState --value "room-sealed-$SEALED_NAME.service" 2>/dev/null) || state=unknown
+    case "$state" in
+      inactive|failed) ;;
+      *) exit 0 ;;
+    esac
+    # Under the same lock as "up", so a start that begins now waits for this purge.
+    take_dnat_lock || exit 1
+    # Fail when it still cannot, so the timer unit shows it.
     if ! purge_dnat; then
       echo "sealed-hotel: $SEALED_NAME is stopped but its public port forwards tagged $TAG could not be listed or deleted; check 'iptables -t nat -S'" >&2
       exit 1

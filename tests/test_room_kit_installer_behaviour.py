@@ -90,6 +90,10 @@ cmd=${args[0]:-}; units=("${args[@]:1}")
 drop() { grep -vxF -- "$1" "$ACTIVE" > "$ACTIVE.tmp" || true; mv "$ACTIVE.tmp" "$ACTIVE"; }
 case "$cmd" in
   is-active) grep -qxF -- "${units[0]:-}" "$ACTIVE" && exit 0; exit 3 ;;
+  # show -p ActiveState --value <unit>. FAKE_ACTIVE_STATE: a transient state ("activating") or "fail" (query fails).
+  show) [ "${FAKE_ACTIVE_STATE:-}" = fail ] && exit 1
+        if [ -n "${FAKE_ACTIVE_STATE:-}" ]; then echo "$FAKE_ACTIVE_STATE"
+        elif grep -qxF -- "${args[-1]}" "$ACTIVE"; then echo active; else echo inactive; fi ;;
   restart|start|enable)
     [ "$cmd" = enable ] && [[ " $* " != *" --now "* ]] && exit 0
     for u in "${units[@]}"; do
@@ -1179,6 +1183,32 @@ def test_host_net_up_waits_for_the_host_wide_forward_lock(host: FakeHost) -> Non
         assert proc.returncode == 0, proc.stderr[-3000:]
     proc = _run_host_net(host, "up", INGRESS, SEALED_DNAT_LOCK_WAIT="1")
     assert proc.returncode == 0 and INGRESS_DNAT in host.calls("iptables"), proc.stderr[-3000:]
+
+
+@pytest.mark.parametrize("state", ["activating", "deactivating", "reloading", "fail"])
+def test_host_net_check_leaves_the_forwards_alone_while_the_unit_is_not_settled(host: FakeHost, state: str) -> None:
+    # Activating: the unit's own "up" is adding the forwards; deactivating: "down" removes them;
+    # an unanswered query proves nothing. None of these is a stopped guest.
+    proc = _run_host_net(host, "check", None, FAKE_ACTIVE_STATE=state, FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert not [c for c in ipt if " -D " in c or " -A " in c or " -I " in c], (state, ipt)
+
+
+@pytest.mark.parametrize("state", ["inactive", "failed"])
+def test_host_net_check_purges_a_stopped_guests_forwards_under_the_forward_lock(host: FakeHost, state: str) -> None:
+    lock_dir = host.root / "run" / "lock"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / "sealed-hotel-dnat.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # an "up" holds it: the purge waits, and gives up rather than race
+        proc = _run_host_net(host, "check", None, FAKE_ACTIVE_STATE=state, FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS,
+                             SEALED_DNAT_LOCK_WAIT="1")
+        assert proc.returncode == 1 and "sealed-hotel-dnat.lock" in proc.stderr, proc.stderr[-3000:]
+        assert STALE_INGRESS_DELETE not in host.calls("iptables")
+    proc = _run_host_net(host, "check", None, FAKE_ACTIVE_STATE=state, FAKE_IPTABLES_TAGGED_nat=STALE_INGRESS,
+                         SEALED_DNAT_LOCK_WAIT="1")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert STALE_INGRESS_DELETE in host.calls("iptables")
 
 
 def test_host_net_down_fails_loudly_when_it_cannot_list_the_forwards(host: FakeHost) -> None:

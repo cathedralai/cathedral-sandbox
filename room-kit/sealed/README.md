@@ -528,8 +528,9 @@ addresses, the port must be open in any outer firewall, and `*.<hotel
 id>.<zone>` must point at this host. `down` removes every port forward tagged
 for this hotel, whatever `sealed.env` says now, so turning ingress off or
 editing the public port leaves no old forward behind; `up` and `check` drop
-such a leftover too, and `down` (or `check` for a stopped guest) exits
-non-zero if it could not. A forward matches every local address, so `up`
+such a leftover too (`check` only once the guest unit is inactive or failed,
+never while it is activating or deactivating), and `down` (or `check` for a
+stopped guest) exits non-zero if it could not. A forward matches every local address, so `up`
 refuses a public port that another sealed hotel on this host already
 forwards, and refuses to add one when it cannot list the rules. The check and
 the add hold a host-wide lock (`/run/lock/sealed-hotel-dnat.lock`), so two
