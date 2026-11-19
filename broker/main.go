@@ -253,10 +253,6 @@ type room struct {
 	since    time.Time
 	vanished time.Time
 	diskGiB  int // resources.disk_gib; 0: unknown, the hotel default (disk.go)
-	// syncBatch: the broker_batch label of a room the sync loop adopted. While
-	// a create of that batch is in flight here its disk is in diskPending,
-	// so the room does not count twice (disk.go).
-	syncBatch string
 	// deleteSent: the guest asked for the delete. A room marked deleting by
 	// the sync loop alone may be listed again (a late list) and come back.
 	deleteSent bool
@@ -283,8 +279,7 @@ type hotel struct {
 	rooms        map[string]*room // by hotel room id
 	queued       int
 	creating     int
-	diskPending  int            // extra disk GiB of the creates in queued and creating (disk.go)
-	diskBatches  map[string]int // those creates per broker_batch (disk.go)
+	diskPending  int // extra disk GiB of the creates in queued and creating (disk.go)
 	backoffUntil time.Time
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
 	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
@@ -1191,7 +1186,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 	labels[batchLabel] = batchID
 	payload["labels"] = labels
 	delete(payload, "count")
-	pl.diskGiB, pl.diskBatch = diskGiBOf(payload["resources"]), batchID
+	pl.diskGiB = diskGiBOf(payload["resources"])
 	body, _ := json.Marshal(payload)
 	results := make([]createResult, count)
 	if count == 1 {
@@ -2318,7 +2313,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			}
 			continue
 		}
-		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now, diskGiB: diskGiBOf(s.Resources), syncBatch: s.Labels[batchLabel]}
+		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now, diskGiB: diskGiBOf(s.Resources)}
 		h.rooms[s.ID] = rm
 		b.register(rm)
 		h.place(rm)

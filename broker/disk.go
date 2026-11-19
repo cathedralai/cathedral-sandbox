@@ -68,24 +68,17 @@ func (h *hotel) holdDisk(pl placement, sign int) {
 		return
 	}
 	h.diskPending += sign * extra
-	if h.diskBatches == nil {
-		h.diskBatches = map[string]int{}
-	}
-	if h.diskBatches[pl.diskBatch] += sign; h.diskBatches[pl.diskBatch] <= 0 {
-		delete(h.diskBatches, pl.diskBatch)
-	}
 }
 
 // diskExtraUsed is the extra disk of h's rooms plus the creates queued or
-// creating there. A room the sync loop adopted while a create of its batch
-// is still in flight here is that create's room: its disk is already held
-// in diskPending, so it counts once. Caller holds b.mu.
+// creating there. A room the sync loop adopts while its create is still in
+// flight counts twice until the create returns: on purpose, as the error is
+// a short false disk_sold_out, never a hotel filled over budget (skipping
+// such rooms undercounted a started room of a failed create until its batch
+// ended). Caller holds b.mu.
 func (h *hotel) diskExtraUsed() int {
 	n := h.diskPending
 	for _, rm := range h.rooms {
-		if rm.syncBatch != "" && h.diskBatches[rm.syncBatch] > 0 {
-			continue
-		}
 		n += diskExtra(rm.diskGiB)
 	}
 	return n

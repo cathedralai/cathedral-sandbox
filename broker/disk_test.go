@@ -338,7 +338,7 @@ func TestConcurrentBigCreatesCannotShareTheLastDisk(t *testing.T) {
 	}
 }
 
-func TestSyncAdoptedRoomOfAnInFlightCreateCountsOnce(t *testing.T) {
+func TestSyncAdoptedRoomOfAnInFlightCreateCountsTwiceUntilItReturns(t *testing.T) {
 	tc := newChain(t)
 	setDiskBudget(tc, "b", intp(50))
 	tc.hotels["b"].answerDelay = 600 * time.Millisecond
@@ -368,23 +368,23 @@ func TestSyncAdoptedRoomOfAnInFlightCreateCountsOnce(t *testing.T) {
 	if !adopted {
 		t.Fatal("the sync loop did not adopt the room while its create was in flight")
 	}
-	if used, pending := diskUsed(tc, "b"); used != 40 || pending != 40 {
-		t.Fatalf("in flight and adopted: used %d pending %d, want 40 and 40 (counted once)", used, pending)
+	// Counted in both places while in flight: the safe direction (a short
+	// false disk_sold_out, never a hotel over budget).
+	if used, pending := diskUsed(tc, "b"); used != 80 || pending != 40 {
+		t.Fatalf("in flight and adopted: used %d pending %d, want 80 and 40", used, pending)
 	}
-	// 10 extra still fits the 50 budget: the room is not counted twice.
+	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", diskBody(20, onB)); status != 429 {
+		t.Fatalf("a big create while the count is doubled: %d, want 429 disk_sold_out", status)
+	}
 	tc.hotels["b"].mu.Lock()
 	tc.hotels["b"].answerDelay = 0
 	tc.hotels["b"].mu.Unlock()
-	tc.room(t, "key1", diskBody(20, onB))
 	if status := <-done; status != 202 {
 		t.Fatalf("in-flight create: %d", status)
 	}
-	if used, pending := diskUsed(tc, "b"); used != 50 || pending != 0 {
-		t.Fatalf("after both: used %d pending %d, want 50 and 0", used, pending)
+	if used, pending := diskUsed(tc, "b"); used != 40 || pending != 0 {
+		t.Fatalf("after the create returned: used %d pending %d, want 40 and 0 (counted once)", used, pending)
 	}
-	setHotel(tc, "b", func(h *hotel) {
-		if len(h.diskBatches) != 0 {
-			t.Fatalf("diskBatches left: %v", h.diskBatches)
-		}
-	})
+	// Now 10 extra fits the 50 budget again.
+	tc.room(t, "key1", diskBody(20, onB))
 }

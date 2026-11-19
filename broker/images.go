@@ -80,8 +80,7 @@ type placement struct {
 	ownHostsOnly bool
 	// diskGiB: the create's resources.disk_gib (0: the hotel default). Above
 	// the base disk it must fit a hotel's disk budget (disk.go).
-	diskGiB   int
-	diskBatch string // the create's broker_batch label, for holdDisk
+	diskGiB int
 }
 
 func (pl placement) selects(h *hotel) bool {
