@@ -158,8 +158,10 @@ host_check() {
   ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" <<'REMOTE' 2>&1
 D=$1 S=$2 NEWIMG=$3 KIT=$4 UNIT=$5
 # Both as the image directory name: images/current can be relative or absolute (install-sealed.sh
-# writes an absolute path when it puts the previous image back).
-echo "current=$(basename "$(readlink -f "$D/images/current")") booted=$(basename "$(readlink -f "$D/run/booted-image")") unit=$(systemctl is-active "$UNIT")"
+# writes an absolute path when it puts the previous image back). readlink -e: a missing link or
+# image reads empty, never the link's own name.
+img() { local p; p=$(readlink -e "$1") && basename "$p"; }
+echo "current=$(img "$D/images/current") booted=$(img "$D/run/booted-image") unit=$(systemctl is-active "$UNIT")"
 I=$S/images/$NEWIMG
 [ -d "$I" ] || { echo "STAGED_MISSING"; exit 0; }
 python3 -I - "$I" <<'PY'
@@ -252,7 +254,7 @@ REMOTE
 host_image() {
   local q; q=$(printf %q "$D")
   # shellcheck disable=SC2029  # D comes from the local hotel table, quoted with printf %q
-  ssh -n "${SSHO[@]}" "root@$HOST" "echo roll-host-image current=\$(basename \"\$(readlink -f $q/images/current 2>/dev/null)\" 2>/dev/null) booted=\$(basename \"\$(readlink -f $q/run/booted-image 2>/dev/null)\" 2>/dev/null)" 2>/dev/null | sed -n 's/^roll-host-image //p' | tail -1
+  ssh -n "${SSHO[@]}" "root@$HOST" "img() { p=\$(readlink -e \"\$1\") && basename \"\$p\"; }; echo roll-host-image current=\$(img $q/images/current) booted=\$(img $q/run/booted-image)" 2>/dev/null | sed -n 's/^roll-host-image //p' | tail -1
 }
 # host_on <image>: 0 only when the host both points at and booted that image.
 host_on() {
