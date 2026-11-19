@@ -71,7 +71,7 @@ func (b *broker) findWorkspace(ctx context.Context, g *guestState, ref string) (
 		}
 		found, err := probe(h, name)
 		if err != nil {
-			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
+			return nil, "", hotelAPIErr(h, err)
 		}
 		if !found {
 			return nil, "", notFound
@@ -187,7 +187,7 @@ func (b *broker) handleWorkspaces(w http.ResponseWriter, r *http.Request, g *gue
 	body, _ := json.Marshal(map[string]any{"name": name})
 	status, _, out, err := h.doGuest(r.Context(), g, "POST", "/v1/workspaces", nil, body, time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	writeWorkspace(w, h, status, out)
@@ -258,7 +258,7 @@ func (b *broker) handleWorkspace(w http.ResponseWriter, r *http.Request, g *gues
 	}
 	status, _, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, 30*time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	if status == 204 {

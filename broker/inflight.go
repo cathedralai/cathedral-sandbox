@@ -106,7 +106,7 @@ func (b *broker) reapRoom(h *hotel, rm *room) {
 	b.mu.Unlock()
 	path := "/v1/sandboxes/" + url.PathEscape(rm.hid)
 	for attempt := 0; attempt < 3; attempt++ {
-		status, _, _, err := h.do(context.Background(), "DELETE", path, nil, nil, 2*time.Minute)
+		status, _, _, err := h.do(waitForConnUntilDeadline(context.Background()), "DELETE", path, nil, nil, 2*time.Minute)
 		if err == nil && (status == 204 || status == 200 || status == 404) {
 			return
 		}
