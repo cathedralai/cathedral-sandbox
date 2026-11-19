@@ -2422,10 +2422,21 @@ class DockerGuestProvider:
                 self._inner._touch(self._inner._sandboxes[sandbox_id])  # noqa: SLF001
         return self._enrich_doc(doc, self._guests[sandbox_id])
 
+    def _refuse_without_guest(self, sandbox_id: str) -> SandboxOpError:
+        """The refusal for a command on a room that has no started container.
+
+        The inner provider runs a command as a host process, so this provider never hands one to it: a room
+        that is still being made (or has no container for any other reason) is 409, and the inner record's
+        own state answer (404, deleting, frozen, stopped) comes first.
+        """
+        with self._inner._lock:  # noqa: SLF001
+            sandbox = self._inner._require_running(sandbox_id)  # noqa: SLF001
+        return SandboxOpError("sandbox_not_running", 409, f"sandbox {sandbox_id} is {sandbox.state}; it has no started room yet")
+
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         guest = self._guests.get(sandbox_id)
         if guest is None:
-            return self._inner.exec(sandbox_id, request)
+            raise self._refuse_without_guest(sandbox_id)
         cwd = request.cwd or "/work"
         argv = list(request.argv)
         # Portable shell: ExecRequest maps string cmds to bash -c; many customer images
@@ -2715,7 +2726,7 @@ class DockerGuestProvider:
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         guest = self._guests.get(sandbox_id)
         if guest is None:
-            return self._inner.start_process(sandbox_id, request)
+            raise self._refuse_without_guest(sandbox_id)
         pid = "proc_" + uuid.uuid4().hex[:10]
         log_guest = f"/work/.process-{pid}.log"
         log_host = guest.work_mount / f".process-{pid}.log"
