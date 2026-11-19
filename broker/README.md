@@ -47,6 +47,18 @@ Creates in flight:
   full memory limit. Such a hotel shows 0 free rooms, and the operator stats
   show `mem_full: true`. When every eligible hotel is full this way, a
   create gets 429 `no_free_rooms`.
+- Disk budget (AB#831, `disk.go`). A room's disk is its
+  `resources.disk_gib` (hotel default 10 GiB). A hotel with
+  `"disk_extra_gib": N` in its config entry takes a room above 10 GiB only
+  while the extra of its rooms (`disk_gib - 10` each, rooms queued and
+  creating included) plus the new room's extra is at most N, and while its
+  last health `live.room_data_used_pct` is under 80 (no reading yet passes).
+  `0`: rooms of 10 GiB or less only. Absent: no disk limit and no
+  `room_data_used_pct` check (the behaviour before AB#831). Rooms of 10 GiB
+  or less are never affected. The broker learns each room's disk from the
+  create and from the hotel room list, so a restart keeps the count. When a
+  hotel would take the room but none has the disk, the create gets 429
+  `disk_sold_out` with `Retry-After: 60` (native and compat).
 
 ## Hotel choice
 
@@ -240,8 +252,9 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 `GET /v1/broker/capacity`:
 
 - Operator key: every hotel with `id`, `class`, `labels`, `up`, `drain`,
-  `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`
-  and `admission`, plus `classes`: per class (`sealed`, `unsealed`) the totals
+  `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`,
+  `admission`, `disk_extra_gib` (null: no disk limit), `disk_extra_used_gib`
+  and `room_data_used_pct` (null: no reading yet), plus `classes`: per class (`sealed`, `unsealed`) the totals
   `hotels`, `joined`, `up`, `placeable`, `pending_admission`, `draining`,
   `slots` and `free_rooms`.
 - Guest key: only the hotels the guest can reach, each with `tier`
@@ -571,7 +584,7 @@ receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested) and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
 

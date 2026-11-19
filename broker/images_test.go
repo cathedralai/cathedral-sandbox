@@ -41,6 +41,7 @@ type fakeHotel struct {
 	createDelay   time.Duration
 	healthFail    bool
 	healthRuntime string           // "runtime" in the /room/health answer; empty: omitted
+	healthLive    map[string]any   // "live" in the /room/health answer; nil: omitted (disk_test.go)
 	rooms         []map[string]any // id + labels, for the room list
 	networks      []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts      []byte           // body of GET /room/receipts
@@ -163,7 +164,7 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
-		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"], "resources": req["resources"]})
 		if f.createFail != 0 {
 			writeErr(w, f.createFail, "create_failed", "the room started but the answer is an error")
 			return
@@ -311,6 +312,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(f.attestation)
 	case p == "/room/health" && f.healthFail:
 		writeErr(w, 503, "busy", "health did not answer")
+	case p == "/room/health" && f.healthLive != nil:
+		writeJSON(w, 200, map[string]any{"live": f.healthLive})
 	case p == "/room/health" && f.healthRuntime != "":
 		writeJSON(w, 200, map[string]any{"runtime": f.healthRuntime, "kernel_isolation": true})
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":

@@ -78,6 +78,9 @@ type placement struct {
 	// matches, whatever the guest policy says, so no retry, fallback or
 	// queue move can reach one either.
 	ownHostsOnly bool
+	// diskGiB: the create's resources.disk_gib (0: the hotel default). Above
+	// the base disk it must fit a hotel's disk budget (disk.go).
+	diskGiB int
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -139,6 +142,9 @@ func (pl placement) selects(h *hotel) bool {
 	}
 	return true
 }
+
+// withoutDisk is pl with no disk need: the hotels pl allows by room alone.
+func (pl placement) withoutDisk() placement { pl.diskGiB = 0; return pl }
 
 func (pl placement) allows(h *hotel) bool {
 	return (pl.only == nil || pl.only == h) && pl.selects(h)

@@ -1,0 +1,105 @@
+// Disk budget of a hotel (AB#831).
+//
+// A room's disk is its resources.disk_gib (the hotel default is 10 GiB). The
+// hotel enforces it (rootfs size and the /work quota), but its slots assume
+// 10 GiB per room and scratch is thin, so nothing refused a room the scratch
+// could not hold: a full scratch showed up as ENOSPC in the middle of a job.
+//
+// A hotel with "disk_extra_gib" set takes rooms above the base disk only
+// while the extra of its rooms (disk_gib - 10 for each room above 10 GiB,
+// counting rooms queued and creating) plus the new room's extra fits the
+// budget, and while its last health reading of room_data_used_pct is under
+// diskFullPct. Rooms of 10 GiB or less are never affected. A hotel without
+// disk_extra_gib has no disk admission at all (the behaviour before AB#831).
+//
+// The check runs in pickIn, under b.mu, with the queue and slot counts, so
+// two big creates can never both take the last of one hotel's budget.
+// When no hotel fits only because of disk, the create answers 429
+// disk_sold_out with Retry-After.
+package main
+
+import (
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
+)
+
+const (
+	baseRoomDiskGiB       = 10   // the disk every hotel slot assumes; rooms at or under it never count
+	diskFullPct           = 80.0 // room_data_used_pct at which a hotel takes no more big-disk rooms
+	diskSoldOutRetryAfter = 60   // seconds; disk frees only as rooms end
+)
+
+// diskExtra is how much of a room's disk counts against a hotel budget.
+func diskExtra(diskGiB int) int { return max(diskGiB-baseRoomDiskGiB, 0) }
+
+// diskGiBOf reads resources.disk_gib from a create body or a hotel room
+// document. 0: absent or not a number (the hotel default, 10 GiB).
+func diskGiBOf(resources any) int {
+	m, ok := resources.(map[string]any)
+	if !ok {
+		return 0
+	}
+	switch v := m["disk_gib"].(type) {
+	case float64:
+		if v > 0 && v < math.MaxInt32 {
+			return int(math.Ceil(v))
+		}
+	case int:
+		return max(v, 0)
+	}
+	return 0
+}
+
+// checkDiskConfig validates disk_extra_gib of a config file hotel or a join.
+func checkDiskConfig(hc hotelConfig) error {
+	if hc.DiskExtraGiB != nil && *hc.DiskExtraGiB < 0 {
+		return fmt.Errorf("disk_extra_gib must be absent (no disk limit), 0 (rooms of %d GiB or less only) or more", baseRoomDiskGiB)
+	}
+	return nil
+}
+
+// diskExtraUsed is the extra disk of h's rooms plus the creates queued or
+// creating there. Caller holds b.mu.
+func (h *hotel) diskExtraUsed() int {
+	n := h.diskPending
+	for _, rm := range h.rooms {
+		n += diskExtra(rm.diskGiB)
+	}
+	return n
+}
+
+// diskFits reports whether h may take a room with extra GiB above the base
+// disk now. Caller holds b.mu.
+func (b *broker) diskFits(h *hotel, extra int) bool {
+	budget := h.cfg.DiskExtraGiB
+	if extra <= 0 || budget == nil {
+		return true
+	}
+	if h.roomDataPct != nil && *h.roomDataPct >= diskFullPct {
+		return false
+	}
+	return h.diskExtraUsed()+extra <= *budget
+}
+
+// diskSoldOut is the answer when a hotel would take the create but none has
+// the disk for it.
+func diskSoldOut(diskGiB int) createResult {
+	return createResult{status: 429, header: http.Header{"Retry-After": {strconv.Itoa(diskSoldOutRetryAfter)}},
+		doc: errDoc("disk_sold_out", fmt.Sprintf("no hotel has %d GiB of disk free; try a smaller disk_gib or retry later", diskGiB))}
+}
+
+// diskDoc is the operator readback of h's disk budget. Caller holds b.mu.
+func diskDoc(h *hotel, d map[string]any) {
+	var budget, pct any
+	if h.cfg.DiskExtraGiB != nil {
+		budget = *h.cfg.DiskExtraGiB
+	}
+	if h.roomDataPct != nil {
+		pct = *h.roomDataPct
+	}
+	d["disk_extra_gib"] = budget // null: no disk limit
+	d["disk_extra_used_gib"] = h.diskExtraUsed()
+	d["room_data_used_pct"] = pct // null: no reading yet
+}

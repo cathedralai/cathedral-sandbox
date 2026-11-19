@@ -326,6 +326,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 				lent = l
 			}
 			d["lent_from"] = lent
+			diskDoc(e.h, d) // disk budget (disk.go, AB#831)
 			out = append(out, d)
 			b.addTotals(totals, e, now, sum)
 			continue

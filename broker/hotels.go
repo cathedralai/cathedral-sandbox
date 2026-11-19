@@ -429,6 +429,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case checkDataConnConfig(hc) != nil:
 		writeErr(w, 400, "invalid_hotel", checkDataConnConfig(hc).Error())
 		return
+	case checkDiskConfig(hc) != nil:
+		writeErr(w, 400, "invalid_hotel", checkDiskConfig(hc).Error())
+		return
 	case !validAlertChat(hc.AlertChatID):
 		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
 		return
@@ -885,6 +888,7 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
 		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice()}
+	diskDoc(h, d)
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
 	}
