@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,6 +22,7 @@ func chainPage(binding string, from, n int) []byte {
 
 func readChain(t *testing.T, dir, binding string) []json.RawMessage {
 	t.Helper()
+	waitChainWrites()
 	raw, err := os.ReadFile(filepath.Join(dir, chainsDir, binding+".json"))
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +77,7 @@ func TestChainArchiveIsBounded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	waitChainWrites()
 	files, _ := filepath.Glob(filepath.Join(dir, chainsDir, "*.json"))
 	if len(files) > chainFilesMax {
 		t.Fatalf("%d chain files kept, max %d", len(files), chainFilesMax)
@@ -94,6 +97,7 @@ func TestChainRouteOperatorOnlyAndSurvivesRestart(t *testing.T) {
 	if err := tc.b.archiveChainPage(bind, 0, chainPage(bind, 0, 2)); err != nil {
 		t.Fatal(err)
 	}
+	waitChainWrites()
 	tc.start(t) // a new broker over the same state_dir
 	status, raw := tc.getRaw(t, "operator-key", "/v1/broker/bindings/"+bind+"/receipts")
 	if status != 200 || !strings.Contains(string(raw), `"s1"`) {
@@ -130,6 +134,7 @@ func TestHotelPageArchivesOnlyUnderAttestedBinding(t *testing.T) {
 	if err := b.archiveChainPage(victim, 0, chainPage(victim, 0, 3)); err != nil {
 		t.Fatal(err)
 	}
+	waitChainWrites()
 	victimPath := filepath.Join(dir, chainsDir, victim+".json")
 	before, err := os.ReadFile(victimPath)
 	if err != nil {
@@ -140,6 +145,7 @@ func TestHotelPageArchivesOnlyUnderAttestedBinding(t *testing.T) {
 	// An admitted hotel names another binding: no write anywhere.
 	forged := []byte(strings.Replace(string(chainPage(victim, 0, 4)), `"r0"`, `"forged"`, 1))
 	b.archiveHotelPage(h, 0, forged)
+	waitChainWrites()
 	if after, _ := os.ReadFile(victimPath); string(after) != string(before) {
 		t.Fatalf("a hotel attested as %s rewrote the archive of %s", own[:8], victim[:8])
 	}
@@ -148,6 +154,7 @@ func TestHotelPageArchivesOnlyUnderAttestedBinding(t *testing.T) {
 		other := fmt.Sprintf("%064x", 1000+i)
 		b.archiveHotelPage(h, 0, chainPage(other, 0, 1))
 	}
+	waitChainWrites()
 	files, _ := filepath.Glob(filepath.Join(dir, chainsDir, "*.json"))
 	if len(files) != 1 {
 		t.Fatalf("mismatched pages wrote %d archive files, want only the victim's", len(files))
@@ -170,6 +177,7 @@ func TestHotelPageArchivesOnlyUnderAttestedBinding(t *testing.T) {
 	h3 := &hotel{}
 	h3.cfg.ID = "c"
 	b.archiveHotelPage(h3, 0, chainPage(fresh, 0, 1))
+	waitChainWrites()
 	if _, err := os.Stat(filepath.Join(dir, chainsDir, fresh+".json")); err == nil {
 		t.Fatal("a hotel with no attested binding was archived")
 	}
@@ -194,6 +202,7 @@ type servedChain struct {
 
 func getArchive(t *testing.T, dir, binding string) servedChain {
 	t.Helper()
+	waitChainWrites()
 	b := &broker{} // a new broker over the same state_dir: a restart
 	b.cfg.StateDir = dir
 	rec := httptest.NewRecorder()
@@ -356,7 +365,161 @@ func TestEveryPageHeadIsRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	b.archiveHotelPage(attestedHotel(b, strings.Repeat("6", 64)), 0, headPage(strings.Repeat("6", 64), 0, 3, hx(7)))
+	waitChainWrites()
 	if info, err := os.Stat(name); err != nil || !info.ModTime().Equal(old) {
 		t.Fatalf("unchanged archive was rewritten: %v %v", info.ModTime(), err)
+	}
+}
+
+// HOLD #464 at 957ce73, finding 1: with more than chainUnheldMax heads the
+// oldest are dropped. A dropped head the receipts never reach must not let a
+// later page mark the archive complete.
+func TestDroppedHeadKeepsArchiveIncomplete(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	bind := strings.Repeat("4", 64)
+	h := attestedHotel(b, bind)
+	b.archiveHotelPage(h, 0, headPage(bind, 0, 5, hx(5)))
+
+	// Gap pages name 7, then 1000 (a head past every receipt we will hold),
+	// then 8..25: 20 unheld heads, more than chainUnheldMax.
+	heads := []int{7, 1000}
+	for i := 8; i <= 25; i++ {
+		heads = append(heads, i)
+	}
+	if len(heads) <= chainUnheldMax {
+		t.Fatalf("test needs more than %d heads, has %d", chainUnheldMax, len(heads))
+	}
+	for _, n := range heads {
+		b.archiveHotelPage(h, 50, headPage(bind, 50, 1, hx(n)))
+	}
+	doc := getArchive(t, dir, bind)
+	if doc.Complete == nil || *doc.Complete {
+		t.Fatalf("archive with unheld heads reads complete")
+	}
+
+	// Receipts 6..25 arrive: they hold every head still on record, but not
+	// 1000, which was dropped. The archive must stay incomplete.
+	b.archiveHotelPage(h, 5, headPage(bind, 5, 20, hx(25)))
+	doc = getArchive(t, dir, bind)
+	if len(doc.Receipts) != 25 {
+		t.Fatalf("want 25 receipts, got %d", len(doc.Receipts))
+	}
+	if doc.Complete == nil || *doc.Complete {
+		t.Fatalf("a head was dropped, yet the archive reads complete (head %q)", doc.Head)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, chainsDir, bind+".json"))
+	if err != nil || !strings.Contains(string(raw), `"unheld_heads_dropped":true`) {
+		t.Fatalf("archive does not say heads were dropped: %v %s", err, raw[:min(len(raw), 200)])
+	}
+	// Later pages cannot clear it either.
+	b.archiveHotelPage(h, 25, headPage(bind, 25, 1, hx(26)))
+	if doc = getArchive(t, dir, bind); doc.Complete == nil || *doc.Complete || len(doc.Receipts) != 26 {
+		t.Fatalf("after one more page: receipts=%d complete=%v", len(doc.Receipts), doc.Complete)
+	}
+}
+
+// HOLD #464 at 957ce73, finding 2: the archive write runs outside every lock
+// the receipts read path takes. A stalled write of one hotel's archive must
+// block neither another hotel's page nor the next page of the same hotel, and
+// pages merged while a write runs must all reach the file, in order.
+func TestArchiveWriteDoesNotBlockReads(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	slow, other := strings.Repeat("3", 64), strings.Repeat("2", 64)
+	release := make(chan struct{})
+	stalled := make(chan struct{}, 1)
+	chainBeforeWrite = func(name string) {
+		if strings.Contains(name, slow) {
+			select {
+			case stalled <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+	}
+	defer func() { chainBeforeWrite = func(string) {} }()
+
+	hs, ho := attestedHotel(b, slow), attestedHotel(b, other)
+	b.archiveHotelPage(hs, 0, headPage(slow, 0, 1000, hx(1000)))
+	select {
+	case <-stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the slow hotel's write never started")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { // the same hotel keeps paging while its write is stalled
+			defer wg.Done()
+			for p := 1; p < 5; p++ {
+				b.archiveHotelPage(hs, p*1000, headPage(slow, p*1000, 1000, hx((p+1)*1000)))
+			}
+		}()
+		go func() { // another hotel's read is not held up either
+			defer wg.Done()
+			b.archiveHotelPage(ho, 0, headPage(other, 0, 3, hx(3)))
+		}()
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("a page waited on another archive write")
+	}
+	close(release)
+	waitChainWrites()
+
+	doc := getArchive(t, dir, slow)
+	if len(doc.Receipts) != 5000 || doc.Head != hx(5000) || doc.Complete == nil || !*doc.Complete {
+		t.Fatalf("slow archive: receipts=%d head=%q complete=%v; want 5000, head 5000, complete",
+			len(doc.Receipts), doc.Head, doc.Complete)
+	}
+	for i, rc := range doc.Receipts {
+		if receiptSHA(rc) != hx(i+1) {
+			t.Fatalf("receipt %d out of order: %s", i, receiptSHA(rc))
+		}
+	}
+	if doc := getArchive(t, dir, other); len(doc.Receipts) != 3 || doc.Complete == nil || !*doc.Complete {
+		t.Fatalf("other archive: receipts=%d complete=%v", len(doc.Receipts), doc.Complete)
+	}
+}
+
+// Many hotels page at once (run with -race): every archive ends complete.
+func TestConcurrentHotelArchives(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	hotels := map[string]*hotel{}
+	for n := 0; n < 8; n++ { // set up every hotel before any read runs
+		bind := fmt.Sprintf("%064x", 0xabc0+n)
+		hotels[bind] = attestedHotel(b, bind)
+	}
+	var wg sync.WaitGroup
+	for bind, h := range hotels {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := 0; p < 10; p++ {
+				b.archiveHotelPage(h, p*10, headPage(bind, p*10, 10, hx((p+1)*10)))
+			}
+		}()
+	}
+	wg.Wait()
+	waitChainWrites()
+	for n := 0; n < 8; n++ {
+		doc := getArchive(t, dir, fmt.Sprintf("%064x", 0xabc0+n))
+		if len(doc.Receipts) != 100 || doc.Complete == nil || !*doc.Complete || doc.Head != hx(100) {
+			t.Fatalf("hotel %d: receipts=%d head=%q complete=%v", n, len(doc.Receipts), doc.Head, doc.Complete)
+		}
 	}
 }
