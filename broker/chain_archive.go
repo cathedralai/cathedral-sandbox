@@ -166,21 +166,56 @@ func useChainEntry(name string) *chainEntry {
 		}
 	}
 	recent = append(recent, e)
-	for len(recent) > chainLoadedMax {
-		old := recent[0]
-		if !old.mu.TryLock() {
-			break // in use now; try again on a later page
-		}
-		if old.dirty || old.writing || old.failed {
+	// Drop the oldest idle chains past the bound. A busy one (locked, or with a
+	// write pending or failed) is skipped and stays listed, so it is tried again
+	// on a later page and never pins the idle ones behind it.
+	excess := len(recent) - chainLoadedMax
+	kept := recent[:0:0]
+	for i, old := range recent {
+		if excess > 0 && i < len(recent)-1 && old.mu.TryLock() {
+			idle := !old.dirty && !old.writing && !old.failed
+			if idle {
+				old.unload()
+			}
 			old.mu.Unlock()
-			break
+			if idle {
+				excess--
+				continue
+			}
 		}
-		old.loaded, old.doc, old.shas, old.held = false, archivedChain{}, nil, nil
-		old.mu.Unlock()
-		recent = recent[1:]
+		kept = append(kept, old)
 	}
-	chainRecent = recent
+	chainRecent = kept
 	return e
+}
+
+// unload drops the in-memory chain; the next page reads the file again.
+// Caller holds e.mu.
+func (e *chainEntry) unload() {
+	e.loaded, e.exists, e.failed = false, false, false
+	e.doc, e.shas, e.held = archivedChain{}, nil, nil
+}
+
+// forgetChains unloads the entries of archive files prune removed, so a later
+// page starts from what is on disk (nothing) instead of writing a pruned chain
+// back from memory. An entry with a write pending keeps its chain: that write
+// recreates the file, as any new page would.
+func forgetChains(paths []string) {
+	chainArchiveMu.Lock()
+	var entries []*chainEntry
+	for _, p := range paths {
+		if e := chainEntries[p]; e != nil {
+			entries = append(entries, e)
+		}
+	}
+	chainArchiveMu.Unlock()
+	for _, e := range entries {
+		e.mu.Lock()
+		if !e.dirty && !e.writing {
+			e.unload()
+		}
+		e.mu.Unlock()
+	}
 }
 
 // load reads the archive file into e and indexes its receipt hashes. Caller
@@ -317,19 +352,21 @@ func writeBytes(dir, name string, out []byte) error {
 	// one lock so a prune never deletes a file on an age it read before another
 	// writer replaced that file. The large write above stays outside it.
 	chainPruneMu.Lock()
-	defer chainPruneMu.Unlock()
 	if err := os.Rename(name+".tmp", name); err != nil {
+		chainPruneMu.Unlock()
 		return err
 	}
-	pruneChains(dir)
+	removed := pruneChains(dir)
+	chainPruneMu.Unlock()
+	forgetChains(removed)
 	return nil
 }
 
 var chainPruneMu sync.Mutex
 
 // pruneChains drops chains older than chainMaxAge, then the oldest beyond
-// chainFilesMax. Caller holds chainPruneMu.
-func pruneChains(dir string) {
+// chainFilesMax, and returns the paths it removed. Caller holds chainPruneMu.
+func pruneChains(dir string) (removed []string) {
 	files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
 	type aged struct {
 		path string
@@ -342,15 +379,20 @@ func pruneChains(dir string) {
 			continue
 		}
 		if time.Since(info.ModTime()) > chainMaxAge {
-			os.Remove(f)
+			if os.Remove(f) == nil {
+				removed = append(removed, f)
+			}
 			continue
 		}
 		keep = append(keep, aged{f, info.ModTime()})
 	}
 	sort.Slice(keep, func(i, j int) bool { return keep[i].mod.After(keep[j].mod) })
 	for i := chainFilesMax; i < len(keep); i++ {
-		os.Remove(keep[i].path)
+		if os.Remove(keep[i].path) == nil {
+			removed = append(removed, keep[i].path)
+		}
 	}
+	return removed
 }
 
 // archiveHotelPage is the hook for the two places the broker reads the hotel

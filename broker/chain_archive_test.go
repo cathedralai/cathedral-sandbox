@@ -658,3 +658,71 @@ func TestIdleArchivesLeaveMemoryAndReloadIntact(t *testing.T) {
 		t.Fatalf("reloaded archive: receipts=%d head=%q complete=%v", len(doc.Receipts), doc.Head, doc.Complete)
 	}
 }
+
+// Bugbot on 04f01cd: a chain prune removed must not live on in memory, where
+// an unchanged page would skip the write (GET 404s) and a changed one would
+// write the pruned chain back. The next page starts from the disk, as before.
+func TestPrunedArchiveIsForgottenInMemory(t *testing.T) {
+	dir := t.TempDir()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	old, other := strings.Repeat("4d", 32), strings.Repeat("5e", 32)
+	h := attestedHotel(b, old)
+	b.archiveHotelPage(h, 0, headPage(old, 0, 5, hx(5)))
+	waitChainWrites()
+	name := filepath.Join(dir, chainsDir, old+".json")
+	stale := time.Now().Add(-chainMaxAge - time.Hour)
+	if err := os.Chtimes(name, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	b.archiveHotelPage(attestedHotel(b, other), 0, headPage(other, 0, 1, hx(1))) // its write prunes by age
+	waitChainWrites()
+	if _, err := os.Stat(name); !os.IsNotExist(err) {
+		t.Fatalf("aged archive not pruned: %v", err)
+	}
+	b.archiveHotelPage(h, 0, headPage(old, 0, 3, hx(5))) // a prefix the pruned chain held
+	waitChainWrites()
+	if doc := getArchive(t, dir, old); len(doc.Receipts) != 3 || doc.Complete == nil || *doc.Complete || doc.Head != hx(5) {
+		t.Fatalf("after prune: receipts=%d head=%q complete=%v; want 3, head 5, incomplete",
+			len(doc.Receipts), doc.Head, doc.Complete)
+	}
+}
+
+// Bugbot on 04f01cd: one busy entry at the old end of the list must not keep
+// every idle chain behind it in memory.
+func TestBusyArchiveDoesNotPinIdleOnes(t *testing.T) {
+	stuckDir, dir := t.TempDir(), t.TempDir()
+	hx := func(i int) string { return fmt.Sprintf("%064x", i) }
+	bs := &broker{}
+	bs.cfg.StateDir = stuckDir
+	if err := os.WriteFile(filepath.Join(stuckDir, chainsDir), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stuck := strings.Repeat("6f", 32)
+	bs.archiveHotelPage(attestedHotel(bs, stuck), 0, headPage(stuck, 0, 1, hx(1))) // every write fails
+	waitChainWrites()
+	b := &broker{}
+	b.cfg.StateDir = dir
+	var names []string
+	for n := 0; n < chainLoadedMax+4; n++ {
+		bind := fmt.Sprintf("%064x", 0xd00d0+n)
+		b.archiveHotelPage(attestedHotel(b, bind), 0, headPage(bind, 0, 1, hx(1)))
+		waitChainWrites()
+		names = append(names, filepath.Join(dir, chainsDir, bind+".json"))
+	}
+	loaded := 0
+	for _, name := range append(names, filepath.Join(stuckDir, chainsDir, stuck+".json")) {
+		chainArchiveMu.Lock()
+		e := chainEntries[name]
+		chainArchiveMu.Unlock()
+		e.mu.Lock()
+		if e.loaded {
+			loaded++
+		}
+		e.mu.Unlock()
+	}
+	if loaded > chainLoadedMax {
+		t.Fatalf("%d chains in memory behind a failed one, max %d", loaded, chainLoadedMax)
+	}
+}
