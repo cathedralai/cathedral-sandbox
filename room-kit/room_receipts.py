@@ -23,6 +23,8 @@ Routes it adds:
   GET /room/attestation            binding, binding_sha256, report (base64)
   POST /room/attest                a fresh SNP report over caller REPORT_DATA (sealed only);
                                    with "sandbox_id", also that room's signed create receipt
+  POST /room/release-proof         sealed-secrets guests only: a receipt over a release
+                                   challenge and the current live room incarnation
   GET /room/receipts?after=&limit= the chain of this boot, in order
   GET /v1/sandboxes/<id>/receipts  the receipts of one room
   GET /room/escape-plant-key       sealed Escape hotels only: the guest X25519 public
@@ -196,6 +198,17 @@ INSTALL_MAX_SIGNERS = 4
 HOTEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")  # the broker's hotel key rule, bounded
 BROKER_HOTEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 KEY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# AB#392: receipt-key liveness proof for a future separate release service.
+# This route never authenticates the service's HMAC or releases a secret.
+RELEASE_CHALLENGE_SCHEMA = "cathedral_vault_release_challenge_v1"
+RELEASE_PROOF_PURPOSE = "cathedral.vault-release.v1"
+RELEASE_PROOF_MAX_BYTES = 4096
+RELEASE_PROOF_MAX_AGE = 60
+RELEASE_PROOF_LOOKUP_SECONDS = 3
+RELEASE_CHALLENGE_FIELDS = frozenset({
+    "schema", "nonce_b64", "issued_at", "secret_id", "sandbox_id",
+    "binding_sha256", "room_create_receipt_sha256", "hmac_b64",
+})
 # Dedicated sealed machines (one owner). fw_cfg files are host-given and not
 # measured; HOST_DATA (chip-signed, fixed at launch) is what makes them count.
 OWNER_FW_CFG = "/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral"
@@ -344,6 +357,59 @@ def sha(data: bytes) -> str:
 
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
+
+
+class ReleaseProofRefused(Exception):
+    def __init__(self, status: int, code: str):
+        self.status, self.code = status, code
+        super().__init__(code)
+
+
+def release_proof_request(body: bytes) -> tuple[str, dict]:
+    """Strict, bounded challenge framing. The guest cannot authenticate the RS HMAC.
+
+    The separate release service must authenticate it and enforce expiry again
+    when consuming the proof. No caller field becomes a receipt field directly.
+    """
+    def unique(pairs):
+        doc = {}
+        for key, value in pairs:
+            if key in doc:
+                raise ValueError("duplicate member")
+            doc[key] = value
+        return doc
+
+    try:
+        if not body or len(body) > RELEASE_PROOF_MAX_BYTES:
+            raise ValueError
+        doc = json.loads(body, object_pairs_hook=unique)
+        if not isinstance(doc, dict) or set(doc) != {"sandbox_id", "challenge"}:
+            raise ValueError
+        room, challenge = doc["sandbox_id"], doc["challenge"]
+        if not isinstance(room, str) or not SECRETS_ROOM_RE.fullmatch(room):
+            raise ValueError
+        if not isinstance(challenge, dict) or set(challenge) != RELEASE_CHALLENGE_FIELDS:
+            raise ValueError
+        if challenge["schema"] != RELEASE_CHALLENGE_SCHEMA:
+            raise ValueError
+        for name in ("secret_id", "sandbox_id"):
+            if not isinstance(challenge[name], str) or not SANDBOX_LINK_RE.fullmatch(challenge[name]):
+                raise ValueError
+        for name in ("binding_sha256", "room_create_receipt_sha256"):
+            if not isinstance(challenge[name], str) or not KEY_SHA256_RE.fullmatch(challenge[name]):
+                raise ValueError
+        for name in ("nonce_b64", "hmac_b64"):
+            raw = challenge[name]
+            if not isinstance(raw, str) or len(raw) != 44:
+                raise ValueError
+            decoded = base64.b64decode(raw, validate=True)
+            if len(decoded) != 32 or b64(decoded) != raw:
+                raise ValueError
+        if type(challenge["issued_at"]) is not int or challenge["issued_at"] < 0:
+            raise ValueError
+        return room, challenge
+    except (ValueError, TypeError, RecursionError):
+        raise ReleaseProofRefused(400, "release_proof_request_invalid") from None
 
 
 # ---------------------------------------------------------------- attestation
@@ -2491,6 +2557,54 @@ class Ledger:
         with self.lock:
             return self._sign_locked(fields, create)
 
+    def release_proof(self, room: str, challenge: dict, lookup) -> dict:
+        """Sign a domain-specific freshness proof while this incarnation is current.
+
+        Handler holds an admitted room turn. Lookup is a bounded, read-only call
+        to the guest-local room API, outside the ledger lock. Recheck after it.
+        This is not permission to release a secret and does not call SNP/KMS.
+        """
+        def check() -> None:  # caller holds self.lock
+            if not self.sealed or self.secrets is None:
+                raise ReleaseProofRefused(503, "release_proof_disabled")
+            if not 0 <= time.time() - challenge["issued_at"] <= RELEASE_PROOF_MAX_AGE:
+                raise ReleaseProofRefused(409, "release_proof_expired")
+            if challenge["binding_sha256"] != self.binding_sha256:
+                raise ReleaseProofRefused(409, "release_proof_wrong_binding")
+            incarnation = self.incarnations.get(room)
+            if incarnation is None or incarnation != challenge["room_create_receipt_sha256"]:
+                raise ReleaseProofRefused(409, "release_proof_wrong_incarnation")
+            if (room in self.broken or room in self.pool or room in self.pool_stale
+                    or room in self.unknown or self.bulk_pending or self.in_flight.get(room) != 1):
+                raise ReleaseProofRefused(409, "release_proof_room_busy")
+            claim = self.claimed.get(room)
+            if claim is not None:
+                st = claim[2]["statement"]
+                linked = claim[0] if st.get("pooled_from") == incarnation else None
+            else:
+                create = next((self.chain[i] for i in reversed(self.by_room.get(room, []))
+                               if self.chain[i]["receipt_sha256"] == incarnation), None)
+                linked = create["statement"].get("cathedral_sandbox_id") if create else None
+            if linked != challenge["sandbox_id"]:
+                raise ReleaseProofRefused(409, "release_proof_wrong_sandbox")
+
+        with self.lock:
+            check()
+        got = lookup()
+        try:
+            live = json.loads(got[1]) if got is not None and got[0] == 200 else None
+        except (ValueError, TypeError, RecursionError):
+            live = None
+        if not isinstance(live, dict) or live.get("id") != room:
+            raise ReleaseProofRefused(409, "release_proof_room_unconfirmed")
+        with self.lock:
+            check()
+            return self._sign_locked({
+                "action": "release_proof", "purpose": RELEASE_PROOF_PURPOSE,
+                "challenge_sha256": sha(canonical(challenge)), "sandbox_id": room,
+                "room_create_receipt_sha256": self.incarnations[room], "status": 200,
+            })
+
     def _sign_locked(self, fields: dict, create: dict | None = None) -> dict:
         """Sign and append one receipt. The caller holds self.lock.
 
@@ -3142,11 +3256,31 @@ class Handler(BaseHTTPRequestHandler):
             # would be signed as empty and its bytes left on the connection.
             self.close_connection = True
             return self.reply(411, b'{"error":"length_required"}')
+        path, forward_path = api_request_path(self.path)
+        if path == "/room/release-proof":
+            if self.command != "POST":
+                self.close_connection = True
+                return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+            if not self.authorized():
+                self.close_connection = True
+                return self.reply(401, b'{"error":"unauthorized"}')
+            # Bound before reading, including a malformed/negative length. This
+            # route never forwards an unrecognized body to the room API.
+            try:
+                lengths = self.headers.get_all("Content-Length", [])
+                if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
+                    raise ValueError
+                length = int(lengths[0])
+            except ValueError:
+                self.close_connection = True
+                return self.reply(411, b'{"error":"length_required"}')
+            if length > RELEASE_PROOF_MAX_BYTES:
+                self.close_connection = True
+                return self.reply(413, b'{"error":"release_proof_too_large"}')
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else (b"" if self.command in ("POST", "PUT", "PATCH") else None)
         # Same path form as cathedral/sandbox_server.dispatch (urlparse): a
         # ";alias" suffix must not bypass the serial gate or mis-name a receipt.
-        path, forward_path = api_request_path(self.path)
         room = room_of(path)
         if room is not None and unquote(room) != room:
             # The room API decodes route parameters after matching. A different spelling would miss this
@@ -3157,6 +3291,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, canonical(ledger.attestation()))
         if path == "/room/attest":
             return self.handle_attest(ledger, body)
+        if path == "/room/release-proof":
+            return self.handle_release_proof(ledger, body)
         if self.command == "GET" and path == "/room/receipts":
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
@@ -3444,6 +3580,27 @@ class Handler(BaseHTTPRequestHandler):
         if code:
             return canonical({"error": {"code": code, "message": msg}}), {}
         return None, (fields if action == "create" else {})
+
+    def handle_release_proof(self, ledger: "Ledger", body: bytes | None):
+        """POST /room/release-proof: sign only the fixed release-proof statement."""
+        if self.command != "POST":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if not self.server.pool_scan_ready:
+            return self.reply(503, b'{"error":"pool_state_unknown"}')
+        try:
+            room, challenge = release_proof_request(body or b"")
+            self.turn, refusal = ledger.enter(room, "signed")
+            if refusal is not None:
+                raise ReleaseProofRefused(refusal[0], refusal[1])
+            receipt = ledger.release_proof(room, challenge, lambda: self.server.api_get(
+                f"/v1/sandboxes/{room}", RELEASE_PROOF_LOOKUP_SECONDS, total=RELEASE_PROOF_LOOKUP_SECONDS))
+        except ReleaseProofRefused as exc:
+            return self.reply(exc.status, canonical({"error": {"code": exc.code}}))
+        except Exception:  # noqa: BLE001 signing failure never returns a successful proof
+            return self.reply(503, b'{"error":"release_proof_failed"}')
+        return self.reply(200, canonical({"receipt": receipt}))
 
     def handle_attest(self, ledger: "Ledger", body: bytes | None):
         """POST /room/attest {"report_data_hex": <128 hex>, "escape_claims_b64"?}: a fresh SNP report.
