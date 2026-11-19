@@ -630,9 +630,10 @@ python3 hotel_offer.py --origin https://<public ip>:<SEALED_MINER_PUBLIC_PORT> -
 python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/v1/cathedral/snp/hotel-offers
 ```
 
-- On a miner using `sealed/host-net.sh` the host cannot reach its own public address, so fetch from the guest:
+- On a miner using `sealed/host-net.sh`, fetch from the guest:
   add `--attestation-url https://<guest ip>:<SEALED_MINER_TLS_PORT>` (the offer still advertises `--origin`; the
-  TLS key check still applies). Or pass the attestation the installer saved, `--attestation <SEALED_DIR>/run/attestation.json`
+  TLS key check still applies). Since AB#822 the host also reaches its own public port (nat OUTPUT), so a broker
+  on the same host can join the hotel; with an older `host-net.sh` it cannot. Or pass the attestation the installer saved, `--attestation <SEALED_DIR>/run/attestation.json`
   (read from the guest over plain HTTP on the tap, so the TLS key check is skipped; the API checks it).
 - A refused offer (for example the 422 reason code) is printed to stderr and the command exits 1; only an accepted
   offer exits 0.
