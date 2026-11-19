@@ -106,6 +106,12 @@ LABEL_OWNER = "cathedral.sandbox.owner"
 LABEL_SANDBOX_ID = "cathedral.sandbox.id"
 # Customer-sealed secrets inside a room (AB#417); room-kit room_receipts.SECRETS_IN_ROOM.
 SECRETS_IN_ROOM = "/run/secrets"
+# -v also removes the room's anonymous volumes. An image that declares VOLUME
+# (docker:dind has VOLUME /var/lib/docker) gets one per room on the hotel data
+# disk, outside the room's quota. Without -v every deleted DinD room left its
+# whole image store behind until the next boot (c46-sealed-2, 19 Nov 2026:
+# 99 of 100 GiB). Named volumes are never removed by -v; rooms get none.
+ROOM_RM_FLAGS = ("-f", "-v")
 SECRETS_DROP_TRIES = 5  # rmtree again while a write of the receipts front races a retire
 
 
@@ -1025,7 +1031,7 @@ class DockerClient:
 
     def remove(self, container_id: str) -> None:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
-        self.run(["docker", "rm", "-f", container_id], timeout=60.0)
+        self.run(["docker", "rm", *ROOM_RM_FLAGS, container_id], timeout=60.0)
 
     def remove_confirmed(self, container_ref: str, *, timeout: float = 60.0) -> bool:
         """Remove a container. Return True only when it is gone.
@@ -1034,7 +1040,7 @@ class DockerClient:
         "No such container" counts as gone.
         """
         try:
-            result = self.run(["docker", "rm", "-f", container_ref], timeout=timeout)
+            result = self.run(["docker", "rm", *ROOM_RM_FLAGS, container_ref], timeout=timeout)
         except SandboxOpError:
             return False
         if result.returncode == 0:
