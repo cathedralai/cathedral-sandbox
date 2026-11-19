@@ -648,6 +648,8 @@ python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/
 - Without `--post` it prints the offer. The offer grants nothing: the
   API fetches the attestation itself and checks the TLS key, the AMD chain, the published measurement and the
   roster machine.
+- Re-offer after every boot without a person: `hotel-offer-refresh/` (a 5-minute systemd timer that posts a new
+  offer when `binding_sha256` changes). Install, restart and reboot steps: `docs/ANCHOR_HOTEL_RUNBOOK.md`.
 - Not covered here: the signed update channel for a miner hotel, and a miner-side view of offer status.
 
 ## What the kit installs
