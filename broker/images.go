@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -572,6 +573,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	}
 	var mu sync.Mutex
 	var hits []hit
+	var busy []string
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
 		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
@@ -581,6 +583,12 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		go func(h *hotel) {
 			defer wg.Done()
 			list, err := b.hotelSnapshots(ctx, g, h)
+			if errors.Is(err, errHotelBusy) {
+				mu.Lock()
+				busy = append(busy, h.cfg.ID)
+				mu.Unlock()
+				return
+			}
 			if err != nil {
 				return
 			}
@@ -596,6 +604,10 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	case 1:
 		return hits[0].h, hits[0].sid, nil
 	case 0:
+		// A busy hotel was never asked; it may hold the snapshot (AB#819).
+		if len(busy) > 0 {
+			return nil, "", busyHotelsErr(busy)
+		}
 		return nil, "", notFound
 	default:
 		return nil, "", &apiErr{409, "snapshot_ambiguous", "several hotels have a snapshot " + ref + "; use the id <hotel>.<snapshot id>"}
@@ -684,7 +696,7 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	h, sid, e := b.findSnapshot(r.Context(), g, ref)
 	if e != nil {
-		writeErr(w, e.status, e.code, e.msg)
+		writeAPIErr(w, e)
 		return
 	}
 	path := "/v1/snapshots/" + url.PathEscape(sid)

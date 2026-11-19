@@ -14,6 +14,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -27,7 +29,8 @@ import (
 var secretNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 // secretFanout runs one call on every hotel the guest may use and returns
-// the status of each hotel (0: the hotel did not answer).
+// the status of each hotel (0: the hotel did not answer; secretBusy: it had
+// no free connection and was not asked).
 func (b *broker) secretFanout(ctx context.Context, g *guestState, method, path string, body []byte) (map[string]int, map[string][]byte) {
 	statuses := map[string]int{}
 	bodies := map[string][]byte{}
@@ -43,6 +46,10 @@ func (b *broker) secretFanout(ctx context.Context, g *guestState, method, path s
 			status, _, out, err := h.doGuest(ctx, g, method, path, nil, body, 30*time.Second)
 			mu.Lock()
 			defer mu.Unlock()
+			if errors.Is(err, errHotelBusy) {
+				statuses[h.cfg.ID] = secretBusy
+				return
+			}
 			if err != nil {
 				statuses[h.cfg.ID] = 0
 				return
@@ -55,6 +62,8 @@ func (b *broker) secretFanout(ctx context.Context, g *guestState, method, path s
 	return statuses, bodies
 }
 
+const secretBusy = -1
+
 // secretState names the result on one hotel. It never echoes a hotel body,
 // so no part of a request reaches the answer.
 func secretState(status int) string {
@@ -65,6 +74,8 @@ func secretState(status int) string {
 		return "not_found"
 	case status == 501:
 		return "no_secrets"
+	case status == secretBusy:
+		return "busy"
 	case status == 0:
 		return "unreachable"
 	case status >= 400 && status < 500:
@@ -111,7 +122,7 @@ func (b *broker) handleSecrets(w http.ResponseWriter, r *http.Request, g *guestS
 
 func (b *broker) secretAnswer(w http.ResponseWriter, name string, statuses map[string]int, okStatus int) {
 	hotels := map[string]string{}
-	done, notFound, refused, bad := 0, 0, 0, 0
+	done, notFound, refused, bad, busy := 0, 0, 0, 0, 0
 	for id, s := range statuses {
 		st := secretState(s)
 		hotels[id] = st
@@ -122,22 +133,32 @@ func (b *broker) secretAnswer(w http.ResponseWriter, name string, statuses map[s
 			notFound++
 		case "refused":
 			refused++
+		case "busy":
+			busy++
 		default:
 			bad++ // unreachable or failed
 		}
 	}
+	if busy > 0 {
+		w.Header().Set("Retry-After", fmt.Sprint(hotelBusyRetryAfter))
+	}
 	switch {
 	// DELETE must not return 204 when any hotel failed: the guest would think
 	// every hotel cleared the secret (Bugbot P1).
-	case done > 0 && okStatus == 204 && bad == 0:
+	case done > 0 && okStatus == 204 && bad == 0 && busy == 0:
+		w.Header().Del("Retry-After")
 		w.WriteHeader(204)
-	case done > 0 && bad > 0 && okStatus == 204:
+	case done > 0 && (bad > 0 || busy > 0) && okStatus == 204:
 		writeJSON(w, 502, map[string]any{
 			"error":  map[string]string{"code": "secrets_partial", "message": "some hotels did not delete the secret"},
 			"hotels": hotels,
 		})
 	case done > 0:
 		writeJSON(w, 200, map[string]any{"name": name, "hotels": hotels})
+	// A busy hotel was never asked; it may hold the secret, so a miss
+	// elsewhere is "retry", not "not found" (AB#819).
+	case busy > 0:
+		writeJSON(w, 503, map[string]any{"error": map[string]string{"code": "sold_out", "message": "a hotel has no free connection; nothing was sent to it, retry shortly"}, "hotels": hotels})
 	case notFound > 0:
 		writeJSON(w, 404, map[string]any{"error": map[string]string{"code": "secret_not_found", "message": "no secret " + name}, "hotels": hotels})
 	case refused > 0:

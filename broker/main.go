@@ -1431,7 +1431,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
-		writeErr(w, perr.status, perr.code, perr.msg)
+		writeAPIErr(w, perr)
 		return
 	}
 	pl.apply(payload)
