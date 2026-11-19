@@ -72,13 +72,15 @@ case "$args" in
     echo "{\"status\": 200, \"body_b64\": \"$body\"}"; exit 0 ;;
 esac
 case "$stdin" in
-  *run-build-*) echo "ssh stage-setup" >> "$F/calls.log"; echo "kit=1234567 clean=yes"; echo "build started detached" ;;
+  *run-build-*) [ "${FAKE_STAGE_EXEC:-0}" = 1 ] && host_exec stage-setup
+    echo "ssh stage-setup" >> "$F/calls.log"; echo "kit=1234567 clean=yes"; echo "build started detached" ;;
   *'NEWIMG=$(basename'*) echo "ssh collect" >> "$F/calls.log"; cat "$F/collect.out" ;;
   *SEALED_SKIP_BUILD*) [ "${FAKE_HOST_EXEC:-0}" = 1 ] && host_exec install
     echo "ssh install" >> "$F/calls.log"; cat "$F/install.out" ;;
   *'ln -sfn "$OLDIMG"'*) [ "${FAKE_HOST_EXEC:-0}" = 1 ] && host_exec rollback
     echo "ssh rollback" >> "$F/calls.log"; echo "RESULT=rolledback unit=active current=old" ;;
-  *STAGED_MISSING*) echo "ssh check" >> "$F/calls.log"; cat "$F/check.out" ;;
+  *STAGED_MISSING*) [ "${FAKE_CHECK_EXEC:-0}" = 1 ] && host_exec check
+    echo "ssh check" >> "$F/calls.log"; cat "$F/check.out" ;;
 esac
 """
 
@@ -560,3 +562,210 @@ def test_pin_patch_keeps_every_new_build_for_a_shared_current(env, tmp_path):
     assert out.returncode == 0, out.stderr
     pins = json.loads(cfg.read_text())["sealed_measurements"]
     assert sorted(pins) == sorted([CUR, NEW, other]), pins
+
+
+# ---- #472 Bugbot round (fixed after merge) -----------------------------------------------------------
+# A systemd-run that, like the real one, starts the child with only the -E variables it was given.
+FAKE_SYSTEMD_RUN = r"""#!/bin/bash
+echo "systemd-run $*" >> "$FAKE_DIR/calls.log"
+envs=(); while [ $# -gt 0 ]; do
+  case "$1" in -E) envs+=("$2"); shift 2 ;; --unit=*|--collect) shift ;; *) break ;; esac
+done
+exec env -i PATH="$PATH" FAKE_DIR="$FAKE_DIR" "${envs[@]}" "$@"
+"""
+
+
+# Bugbot "Detached runs drop endpoint overrides": the detached child must use the caller's endpoints.
+def test_detached_apply_keeps_every_endpoint_override(env, tmp_path):
+    e, fake, home = env
+    p = tmp_path / "bin" / "systemd-run"
+    p.write_text(FAKE_SYSTEMD_RUN)
+    p.chmod(0o755)
+    del e["ROLL_FOREGROUND"]
+    e.update({"ROLL_BROKER_URL": "https://broker.test", "ROLL_BROKER_HOST": "192.0.2.10",
+              "ROLL_SITE_URL": "https://site.test/approved-measurements.json",
+              "ROLL_ATTEST_URL_BASE": "https://site.test/v1/hotels", "ROLL_ESCAPE_OPEN_URL": "https://api.test/v1/escape/open"})
+    serve_capacity(fake, [capacity(CUR), capacity(CUR), capacity(NEW, drain=True)])
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    sd = [x for x in calls(fake) if x.startswith("systemd-run")]
+    assert len(sd) == 1
+    for kv in ("ROLL_BROKER_URL=https://broker.test", "ROLL_BROKER_HOST=192.0.2.10", "ROLL_ADMIT_TIMEOUT=1",
+               "ROLL_SITE_URL=https://site.test/approved-measurements.json", "ROLL_POLL_SLEEP=0",
+               "ROLL_ATTEST_URL_BASE=https://site.test/v1/hotels", "ROLL_ESCAPE_OPEN_URL=https://api.test/v1/escape/open"):
+        assert kv in sd[0], sd[0]
+    assert patches(fake) == ["true}", "false}"]
+    assert all("https://broker.test/v1/broker/hotels/" in x for x in calls(fake) if x.startswith("PATCH"))
+    assert "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_detached_stage_keeps_every_endpoint_override(env, tmp_path):
+    e, fake, home = env
+    p = tmp_path / "bin" / "systemd-run"
+    p.write_text('#!/bin/bash\necho "systemd-run $*" >> "$FAKE_DIR/calls.log"\n')
+    p.chmod(0o755)
+    del e["ROLL_FOREGROUND"]
+    e.update({"ROLL_BROKER_URL": "https://broker.test", "ROLL_STAGE_TIMEOUT": "7"})
+    r = run(e, "stage", "1234567", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    sd = [x for x in calls(fake) if x.startswith("systemd-run")]
+    assert "ROLL_BROKER_URL=https://broker.test" in sd[0] and "ROLL_STAGE_TIMEOUT=7" in sd[0], sd
+
+
+# Bugbot "Happy-path undrain ignores broker readback": an undrain that applies and then errors is done.
+def test_undrain_that_applied_then_errored_finishes_done(env):
+    e, fake, home = env
+    (fake / "patch_codes").write_text("200\n503\n")
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True), capacity(NEW, drain=False)])
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert patches(fake) == ["true}", "false}"]
+    state = (home / "state" / f"{HOTEL}.env").read_text()
+    assert "PHASE=done" in state and "stuck" not in state
+
+
+def test_undrain_that_did_not_apply_is_not_done(env):
+    e, fake, home = env
+    (fake / "patch_codes").write_text("200\n503\n503\n")
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "PHASE=done" not in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# Bugbot "Refused install can leave guest stopped": a guest the installer stopped is restarted on OLDIMG.
+HOST_SYSTEMCTL = """#!/bin/bash
+F=$FAKE_DIR
+case "$1" in
+  is-active) cat "$F/unit_state" 2>/dev/null || echo active; exit 0 ;;
+  show) cat "$F/unit_inv" 2>/dev/null || echo inv0; exit 0 ;;
+  stop) echo inactive > "$F/unit_state" ;;
+  restart) ln -sfn "$(readlink -f {d}/images/current)" {d}/run/booted-image
+    echo active > "$F/unit_state"; echo "inv-$(date +%s%N)" > "$F/unit_inv" ;;
+esac
+echo "systemctl $* data=$(cat {d}/data.raw 2>/dev/null)" >> "$F/calls.log"
+"""
+
+# install-sealed.sh under set -e: the reset roll's EXIT trap stopped the guest before "guest starting".
+INSTALL_STOPPED_BEFORE_LOG = """#!/bin/bash
+echo "[sealed] expected measurement x"
+systemctl stop room-sealed-hotel-x.service
+echo "sealed: could not start the guest" >&2
+exit 1
+"""
+
+
+def host_systemctl(e, d):
+    p = Path(e["PATH"].split(":")[0]) / "systemctl"
+    p.write_text(HOST_SYSTEMCTL.replace("{d}", str(d)))
+    p.chmod(0o755)
+
+
+def test_installer_that_stopped_the_guest_before_logging_is_restarted_on_old(host):
+    e, fake, home, d, kit = host
+    host_systemctl(e, d)
+    (kit / "install.sh").write_text(INSTALL_STOPPED_BEFORE_LOG)
+    (kit / "install.sh").chmod(0o755)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "RESULT=refused" not in r.stdout and "RESULT=rolledback" in r.stdout, r.stdout
+    c = calls(fake)
+    assert any(x.startswith("systemctl restart") for x in c), c
+    assert (fake / "unit_state").read_text().strip() == "active"
+    assert os.readlink(d / "images" / "current") == "old"
+    assert patches(fake) == ["true}", "false}"]
+    assert "PHASE=rolled_back" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_live_room_refusal_with_same_invocation_still_does_not_restart(host):
+    e, fake, home, d, kit = host
+    host_systemctl(e, d)
+    (kit / "install.sh").write_text(INSTALL_LIVE_ROOM)
+    (kit / "install.sh").chmod(0o755)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "RESULT=refused" in r.stdout
+    assert not any(x.startswith("systemctl restart") for x in calls(fake))
+
+
+# Bugbot "Host proof mixes path and basename": an absolute images/current still proves OLDIMG.
+@pytest.mark.parametrize("saved_oldimg", ["old", "abs"])
+def test_rollback_proof_accepts_an_absolute_images_current(host, saved_oldimg):
+    e, fake, home, d, kit = host
+    (d / "images" / "current").unlink()
+    (d / "images" / "current").symlink_to(d / "images" / "old")
+    old = str(d / "images" / "old") if saved_oldimg == "abs" else "old"
+    (fake / "capacity.json").write_text(capacity(CUR, drain=True))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=stuck_drained\nSTUCK_FROM=installed\nHOST_ROLLED_BACK=1\nTS=20260101T000000Z\nOLDIMG={old}\n"
+        f"COMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
+    r = run(e, "apply", HOTEL)
+    assert "current=old booted=old" in r.stdout, r.stdout
+    assert patches(fake) == ["false}"], r.stdout
+    assert "PHASE=rolled_back" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_preflight_reads_an_absolute_images_current_as_the_image_name(host):
+    e, fake, home, d, kit = host
+    (d / "images" / "current").unlink()
+    (d / "images" / "current").symlink_to(d / "images" / "old")
+    stage = Path((home / "plans" / f"{HOTEL}.env").read_text().split("STAGE=")[1].split("\n")[0])
+    import shutil
+    shutil.rmtree(stage / HOTEL / "images" / "20260101T000000Z")
+    e["FAKE_CHECK_EXEC"] = "1"
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1 and "staged image" in r.stdout
+    assert "host: current=old booted=old unit=active" in r.stdout, r.stdout
+    no_mutation(fake)
+
+
+# Bugbot "Stage kit setup is not retryable": a failed bootstrap is redone, not skipped, on retry.
+def test_stage_kit_bootstrap_is_redone_after_a_failed_first_attempt(env, tmp_path):
+    e, fake, home = env
+    repo = tmp_path / "fake-repo"
+    (repo / "room-kit").mkdir(parents=True)
+    (repo / "room-kit" / "versions.lock").write_text("CATHEDRAL_COMMIT=abcdef0\n")
+    md = repo / "room-kit" / "make-dist.sh"
+    md.write_text('#!/bin/bash\n[ -f "$FAKE_DIR/make-dist-fail" ] && { rm -f "$FAKE_DIR/make-dist-fail"; exit 1; }\n'
+                  'echo "make-dist $1" >> "$FAKE_DIR/calls.log"\n')
+    md.chmod(0o755)
+    g = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(g + ["add", "-A"], check=True)
+    subprocess.run(g + ["commit", "-q", "-m", "kit"], check=True)
+    commit = subprocess.run(g + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    c7 = commit[:7]
+    bin_dir = tmp_path / "bin"
+    (bin_dir / "gh").write_text(f'#!/bin/bash\nexec git clone -q "{repo}" "$4"\n')
+    (bin_dir / "scp").write_text('#!/bin/bash\nsrc="${@: -2:1}"; dst="${@: -1}"; cp "$src" "${dst#*:}"\n')
+    (bin_dir / "systemd-run").write_text('#!/bin/bash\necho "systemd-run $*" >> "$FAKE_DIR/calls.log"\n')
+    for n in ("gh", "scp", "systemd-run"):
+        (bin_dir / n).chmod(0o755)
+    sroot = tmp_path / "hostroot"
+    (sroot / "stage-older").mkdir(parents=True)
+    for n in ("post_hotel.sh", "post_hotel_guest.sh"):
+        (sroot / "stage-older" / n).write_text("#!/bin/bash\n")
+    live = tmp_path / "live-x"
+    (live / "build").mkdir(parents=True)
+    (live / "build" / "base-x").write_text("base\n")
+    (live / "sealed.env").write_text(f"SEALED_DIR={live}\nSEALED_NAME={HOTEL}\n")
+    (tmp_path / "hotels.conf").write_text(f"{HOTEL} 10.0.0.1 {live} -\n")
+    (fake / "build-status.txt").write_text(f"{HOTEL} build exit 0\n")
+    (fake / "collect.out").write_text(
+        f"{HOTEL} NEWIMG=20261113T000000Z NEW={NEW} LIVE={CUR} | vmlinuz=DIFF OVMF.amdsev.fd=same cmdline=same"
+        f" | kit={c7} initrd_kit={c7} api=CATHEDRAL_COMMIT=abcdef0 debug=False\n")
+    (home / "plans" / f"{HOTEL}.env").unlink()
+    e.update({"FAKE_STAGE_EXEC": "1", "ROLL_STAGE_ROOT": str(sroot)})
+    n = sroot / f"stage-{commit}"
+
+    (fake / "make-dist-fail").write_text("1")
+    r = run(e, "stage", commit, HOTEL)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert (n / "kit").is_dir() and not (n / "post_hotel.sh").exists() and not (n / "kit.ready").exists()
+    assert not (home / "plans" / f"{HOTEL}.env").exists()
+
+    r = run(e, "stage", commit, HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "make-dist abcdef0" in calls(fake)
+    assert (n / "post_hotel.sh").exists() and (n / "post_hotel_guest.sh").exists() and (n / "kit.ready").exists()
+    assert (home / "plans" / f"{HOTEL}.env").exists()

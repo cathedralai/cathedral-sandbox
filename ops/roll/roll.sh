@@ -41,6 +41,7 @@ POLL=${ROLL_POLL_SLEEP:-15}
 DRAIN_SETTLE=${ROLL_DRAIN_SETTLE:-5}
 UNDRAIN_SETTLE=${ROLL_UNDRAIN_SETTLE:-20}
 STAGE_TIMEOUT=${ROLL_STAGE_TIMEOUT:-2400}
+STAGE_ROOT=${ROLL_STAGE_ROOT:-/root}   # on the hotel host: stage dirs and kit bundles
 PLANS=$ROLL_HOME/plans
 STATE=$ROLL_HOME/state
 LOG=$ROLL_HOME/roll.log
@@ -49,6 +50,19 @@ mkdir -p "$PLANS" "$STATE" "$EVID"
 
 CTX=roll
 TS=$(date -u +%Y%m%dT%H%M%SZ)
+# systemd-run does not pass the caller's environment: hand the detached child every resolved setting,
+# so an override (a test broker, another site list, a timeout) is the one the mutating run uses.
+detach_env() {
+  DETACH_ENV=(-E HOME="$HOME" -E ROLL_DETACHED=1 -E HOLD_DRAINED="${HOLD_DRAINED:-0}"
+    -E ROLL_HOME="$ROLL_HOME" -E ROLL_HOTELS_CONF="$HOTELS_CONF" -E ROLL_BROKER_URL="$BROKER"
+    -E ROLL_BROKER_HOST="$BROKER_HOST" -E ROLL_SITE_URL="$SITE_URL" -E ROLL_ESCAPE_OPEN_URL="$OPEN_URL"
+    -E ROLL_ATTEST_URL_BASE="$ATTEST_BASE" -E ROLL_OPERATOR_KEY_FILE="$OPKEY_FILE" -E ROLL_SSH_KEY="$SSH_KEY"
+    -E ROLL_GUARD="$GUARD" -E ROLL_REPO="$REPO" -E ROLL_ADMIT_TIMEOUT="$ADMIT_TIMEOUT" -E ROLL_POLL_SLEEP="$POLL"
+    -E ROLL_DRAIN_SETTLE="$DRAIN_SETTLE" -E ROLL_UNDRAIN_SETTLE="$UNDRAIN_SETTLE" -E ROLL_STAGE_TIMEOUT="$STAGE_TIMEOUT"
+    -E ROLL_STAGE_ROOT="$STAGE_ROOT")
+  [ -n "${ROLL_REMOTE_LOGDIR:-}" ] && DETACH_ENV+=(-E ROLL_REMOTE_LOGDIR="$ROLL_REMOTE_LOGDIR")
+  return 0
+}
 SSHO=(-F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -i "$SSH_KEY")
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$CTX] $*" | tee -a "$LOG"; }
@@ -143,7 +157,9 @@ except Exception:
 host_check() {
   ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" <<'REMOTE' 2>&1
 D=$1 S=$2 NEWIMG=$3 KIT=$4 UNIT=$5
-echo "current=$(readlink "$D/images/current") booted=$(readlink -f "$D/run/booted-image" | xargs basename) unit=$(systemctl is-active "$UNIT")"
+# Both as the image directory name: images/current can be relative or absolute (install-sealed.sh
+# writes an absolute path when it puts the previous image back).
+echo "current=$(basename "$(readlink -f "$D/images/current")") booted=$(basename "$(readlink -f "$D/run/booted-image")") unit=$(systemctl is-active "$UNIT")"
 I=$S/images/$NEWIMG
 [ -d "$I" ] || { echo "STAGED_MISSING"; exit 0; }
 python3 -I - "$I" <<'PY'
@@ -182,6 +198,10 @@ echo "current now $(readlink "$D/images/current")"
 # rollback to OLDIMG puts that volume back: the old build cannot open the new empty one.
 prev_ino() { stat -c %i "$D/data.raw.prev" 2>/dev/null || echo none; }
 PREV0=$(prev_ino)
+# The guest's systemd invocation before the installer: a refusal counts as "guest untouched" only if
+# the same invocation is still running afterwards (install-sealed.sh restarts before it logs).
+unit_run() { echo "$(systemctl is-active "$UNIT" 2>/dev/null) $(systemctl show -p InvocationID --value "$UNIT" 2>/dev/null)"; }
+RUN0=$(unit_run)
 LOGF=${ROLL_REMOTE_LOGDIR:-/root}/sealed-roll-$(basename "$D")-$TS.log
 ( cd "$KIT" && SEALED_SKIP_BUILD=1 ./install.sh --sealed "$D/sealed.env" ) > "$LOGF" 2>&1
 rc=$?
@@ -193,9 +213,12 @@ fi
 echo "install exit $rc: rolling back to $OLDIMG"
 ln -sfn "$OLDIMG" "$D/images/current"
 cp -a "$D/sealed.env.bak-$TS" "$D/sealed.env"
-# install-sealed.sh logs "guest starting" right after it restarts the guest. Before that line the old
-# guest was never touched (a live-room refusal, a disk check): a restart here would end live rooms.
-if ! grep -q "guest starting" "$LOGF"; then
+# install-sealed.sh logs "guest starting" right after it restarts the guest. Without that line and with
+# the same guest invocation still active, the old guest was never touched (a live-room refusal, a disk
+# check): a restart here would end live rooms. A restart that failed before the log line, or the reset
+# roll's EXIT trap stopping the unit, changes the invocation: that guest is restarted on OLDIMG below.
+RUN1=$(unit_run)
+if ! grep -q "guest starting" "$LOGF" && [ "${RUN1%% *}" = active ] && [ "$RUN1" = "$RUN0" ]; then
   echo "RESULT=refused installer stopped before the guest restart; guest untouched unit=$(systemctl is-active "$UNIT") current=$(readlink "$D/images/current")"
   exit 0
 fi
@@ -224,16 +247,18 @@ echo "RESULT=rolledback unit=$(systemctl is-active "$UNIT") current=$(readlink "
 REMOTE
 }
 
-# "current=<image> booted=<image>": images/current and the image launch-guest.sh last booted. Read only.
+# "current=<image> booted=<image>": images/current and the image launch-guest.sh last booted, both as
+# the image directory name (images/current may be relative or absolute). Read only.
 host_image() {
   local q; q=$(printf %q "$D")
   # shellcheck disable=SC2029  # D comes from the local hotel table, quoted with printf %q
-  ssh -n "${SSHO[@]}" "root@$HOST" "echo roll-host-image current=\$(readlink $q/images/current) booted=\$(basename \"\$(readlink -f $q/run/booted-image 2>/dev/null)\" 2>/dev/null)" 2>/dev/null | sed -n 's/^roll-host-image //p' | tail -1
+  ssh -n "${SSHO[@]}" "root@$HOST" "echo roll-host-image current=\$(basename \"\$(readlink -f $q/images/current 2>/dev/null)\" 2>/dev/null) booted=\$(basename \"\$(readlink -f $q/run/booted-image 2>/dev/null)\" 2>/dev/null)" 2>/dev/null | sed -n 's/^roll-host-image //p' | tail -1
 }
 # host_on <image>: 0 only when the host both points at and booted that image.
 host_on() {
   HOST_IMAGE=$(host_image)
-  [ -n "$1" ] && [ "$HOST_IMAGE" = "current=$1 booted=$1" ]
+  local want; want=$(basename -- "${1:-}")  # an OLDIMG saved by an older run may be an absolute path
+  [ -n "$1" ] && [ "$HOST_IMAGE" = "current=$want booted=$want" ]
 }
 
 # ---- recovery: never leave a hotel drained when a known build is admitted ------------------------
@@ -431,7 +456,7 @@ PY
     exit 0
   fi
   if [ "$phase" = admitted ]; then
-    [ "$(drain false)" = 200 ] || die "undrain PATCH did not answer 200"
+    undrain || die "undrain did not apply (PATCH code and broker readback)"
     st_set PHASE undrained; log "undrained"; sleep "$UNDRAIN_SETTLE"
     guard || { log "STOP: const guard not GREEN after the roll; hotel is undrained on the new build"; exit 1; }
     st_set PHASE "done"; log "DONE $HOTEL on ${NEW:0:16}"
@@ -449,10 +474,8 @@ cmd_apply() {
     # turn cannot strand a drained hotel.
     local ph; ph=$(st_get PHASE)
     case "$ph" in ""|done|aborted|rolled_back|preflight|preflight_ok) CTX="apply $HOTEL"; preflight ;; *) require_bound_plan || exit 1 ;; esac
-    systemd-run --unit="roll-apply-$HOTEL-$TS" --collect -E HOME="$HOME" -E ROLL_DETACHED=1 \
-      -E ROLL_HOME="$ROLL_HOME" -E ROLL_HOTELS_CONF="$HOTELS_CONF" -E ROLL_GUARD="$GUARD" \
-      -E ROLL_OPERATOR_KEY_FILE="$OPKEY_FILE" -E ROLL_SSH_KEY="$SSH_KEY" -E HOLD_DRAINED="${HOLD_DRAINED:-0}" \
-      "$SELF" apply "$HOTEL" || exit 1
+    detach_env
+    systemd-run --unit="roll-apply-$HOTEL-$TS" --collect "${DETACH_ENV[@]}" "$SELF" apply "$HOTEL" || exit 1
     echo "detached as roll-apply-$HOTEL-$TS; follow: tail -f $LOG ; state: $SELF status"
     exit 0
   fi
@@ -490,20 +513,26 @@ PY
 # ---- stage ---------------------------------------------------------------------------------------
 stage_hotel() {  # HOTEL, COMMIT, API, BUNDLE set; hotel_conf done
   CTX="stage $HOTEL"
-  local N=/root/stage-$COMMIT UNIT=room-sealed-$HOTEL.service
-  scp "${SSHO[@]}" -q "$BUNDLE" "root@$HOST:/root/kit-$COMMIT.bundle" || { log "scp failed"; return 1; }
-  ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$N" "$HOTEL" "$D" "$COMMIT" "$API" <<'REMOTE' 2>&1 | while read -r l; do log "host: $l"; done
-N=$1 H=$2 L=$3 C=$4 API=$5
+  local N=$STAGE_ROOT/stage-$COMMIT UNIT=room-sealed-$HOTEL.service
+  scp "${SSHO[@]}" -q "$BUNDLE" "root@$HOST:$STAGE_ROOT/kit-$COMMIT.bundle" || { log "scp failed"; return 1; }
+  ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$N" "$HOTEL" "$D" "$COMMIT" "$API" "$STAGE_ROOT" <<'REMOTE' 2>&1 | while read -r l; do log "host: $l"; done
+N=$1 H=$2 L=$3 C=$4 API=$5 R=$6
 set -euo pipefail
-if [ ! -d "$N/kit" ]; then
+# kit.ready is written only after the whole bootstrap: a failed first attempt is redone from scratch,
+# so a retry cannot write a plan for a stage dir without make-dist output or post_hotel.sh.
+# Legacy stage dirs (before the marker) count as ready when the last bootstrap step, the copy, is there.
+if [ ! -f "$N/kit.ready" ] && [ -d "$N/kit" ] && [ -f "$N/post_hotel.sh" ] && [ -f "$N/post_hotel_guest.sh" ]; then touch "$N/kit.ready"; fi
+if [ ! -f "$N/kit.ready" ]; then
+  rm -rf "$N/kit" "$N/post_hotel.sh" "$N/post_hotel_guest.sh"
   mkdir -p "$N"
-  git clone -q "/root/kit-$C.bundle" "$N/kit" -b main
+  git clone -q "$R/kit-$C.bundle" "$N/kit" -b main
   git -C "$N/kit" checkout -q --detach "$C"
   git -C "$N/kit" remote set-url origin https://github.com/cathedralai/cathedral-sandbox
   ( cd "$N/kit/room-kit" && ./make-dist.sh "$API" )
-  P=$(ls -dt /root/stage-*/post_hotel.sh 2>/dev/null | grep -v "^$N/" | head -1 || true)
+  P=$(ls -dt "$R"/stage-*/post_hotel.sh 2>/dev/null | grep -v "^$N/" | head -1 || true)
   [ -n "$P" ] || { echo "no earlier stage dir with post_hotel.sh to copy from"; exit 1; }
   cp -a "$P" "$(dirname "$P")/post_hotel_guest.sh" "$N/"
+  touch "$N/kit.ready"
 fi
 echo "kit=$(git -C "$N/kit" rev-parse --short=7 HEAD) clean=$([ -z "$(git -C "$N/kit" status --porcelain)" ] && echo yes || echo no)"
 [ -e "$N/$H" ] && { echo "refuse: $N/$H exists"; exit 1; }
@@ -571,9 +600,8 @@ cmd_stage() {
     if ! { valid_hotel "$h" && hotel_conf "$h"; }; then echo "unknown hotel: $h" >&2; exit 2; fi
   done
   if [ "${ROLL_FOREGROUND:-0}" != 1 ] && [ "${ROLL_DETACHED:-0}" != 1 ]; then
-    systemd-run --unit="roll-stage-${COMMIT:0:7}-$TS" --collect -E HOME="$HOME" -E ROLL_DETACHED=1 \
-      -E ROLL_HOME="$ROLL_HOME" -E ROLL_HOTELS_CONF="$HOTELS_CONF" -E ROLL_OPERATOR_KEY_FILE="$OPKEY_FILE" \
-      -E ROLL_SSH_KEY="$SSH_KEY" "$SELF" stage "$COMMIT" "$@" || exit 1
+    detach_env
+    systemd-run --unit="roll-stage-${COMMIT:0:7}-$TS" --collect "${DETACH_ENV[@]}" "$SELF" stage "$COMMIT" "$@" || exit 1
     echo "detached as roll-stage-${COMMIT:0:7}-$TS; follow: tail -f $LOG"; exit 0
   fi
   CTX="stage ${COMMIT:0:7}"
