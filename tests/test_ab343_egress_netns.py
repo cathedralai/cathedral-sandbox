@@ -484,6 +484,10 @@ def test_miner_host_link_admits_only_the_attested_port(net):
     assert {k: v for k, v in got.items() if k != "public"} == {"api": "timeout", "proxy": "timeout"}, got
     got = net.probe("lan", [tcp("api", GUEST_IP, API_PORT)])
     assert got == {"api": "timeout"}, got
+    # AB#822 R2: a broker on the miner host itself reaches the same public port
+    # (nat OUTPUT; PREROUTING never sees packets the host sends).
+    got = net.probe("host", [tcp("public", HOST_PUBLIC, PUBLIC_PORT)])
+    assert who(got["public"]) == "guest-attested", got
     # From the guest itself: the miner LAN and the host's services are closed.
     got = net.probe("guest", [tcp("lan", LAN_HOST, 80), tcp("host-link", HOST_IP, 2222), tcp("web", WEB, 443)])
     assert {k: who(v) for k, v in got.items()} == {"lan": "timeout", "host-link": "timeout", "web": "inet"}, got

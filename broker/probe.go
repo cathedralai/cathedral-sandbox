@@ -72,7 +72,7 @@ func (b *broker) probeHotel(ctx context.Context, h *hotel, g *guestState, dind b
 		res.Error = err.Error()
 		return res
 	}
-	defer h.do(context.Background(), "DELETE", "/v1/sandboxes/"+url.PathEscape(id), nil, nil, 2*time.Minute)
+	defer h.do(waitForConnUntilDeadline(context.Background()), "DELETE", "/v1/sandboxes/"+url.PathEscape(id), nil, nil, 2*time.Minute)
 	if doc, err := b.probeExec(ctx, h, id, "uname -r; dmesg 2>/dev/null | grep -c gVisor", 30); err == nil {
 		lines := strings.Fields(fmt.Sprint(doc["stdout"]))
 		if len(lines) > 0 {
@@ -122,7 +122,7 @@ func (b *broker) probeDind(ctx context.Context, h *hotel, g *guestState) (string
 	if err != nil {
 		return "not yet", "Docker-in-Docker room did not start: " + err.Error()
 	}
-	defer h.do(context.Background(), "DELETE", "/v1/sandboxes/"+url.PathEscape(id), nil, nil, 2*time.Minute)
+	defer h.do(waitForConnUntilDeadline(context.Background()), "DELETE", "/v1/sandboxes/"+url.PathEscape(id), nil, nil, 2*time.Minute)
 	doc, err := b.probeExec(ctx, h, id, "docker run --rm --network host alpine:3.20 echo dind-ok 2>&1 | tail -3", 240)
 	if err == nil && strings.Contains(fmt.Sprint(doc["stdout"]), "dind-ok") {
 		return "yes", "docker run inside the room works (host network for inner containers)"

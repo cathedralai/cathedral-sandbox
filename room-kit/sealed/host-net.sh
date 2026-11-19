@@ -7,7 +7,10 @@
 # Own chains only (SEALED-<TAP>-FWD, SEALED-<TAP>-IN, one MASQUERADE rule).
 # Miner hotel (SEALED_MINER=1): one more way in, SEALED_MINER_PUBLIC_PORT on
 # this host forwarded (DNAT) to the guest's attested HTTPS port, and nothing
-# else. TLS ends inside the guest; this host only moves the bytes.
+# else. TLS ends inside the guest; this host only moves the bytes. The same
+# DNAT sits in nat OUTPUT too (AB#822): Linux runs PREROUTING only for packets
+# that arrive, so a broker on this host would never reach its own miner hotel's
+# public address:port without it.
 set -euo pipefail
 # shellcheck disable=SC1090
 source "${2:?sealed.env}"
@@ -23,8 +26,15 @@ PRIVATE="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16"
 MINER=${SEALED_MINER:-0}
 TLS_PORT=${SEALED_MINER_TLS_PORT:-18443}
 PUBLIC_PORT=${SEALED_MINER_PUBLIC_PORT:-9443}
-DNAT=(-p tcp --dport "$PUBLIC_PORT" -m addrtype --dst-type LOCAL -m comment --comment "$TAG" -j DNAT --to-destination "$SEALED_GUEST_IP:$TLS_PORT")
 RULES=5; [ "$MINER" = 1 ] && RULES=7
+
+# The miner hotel's public port: dnat -A|-C|-D PREROUTING|OUTPUT. PREROUTING
+# takes connections from other hosts, OUTPUT the ones this host opens itself.
+DNAT_CHAINS="PREROUTING OUTPUT"
+dnat() {
+  iptables -t nat "$1" "$2" -p tcp --dport "$PUBLIC_PORT" -m addrtype --dst-type LOCAL -m comment --comment "$TAG" \
+    -j DNAT --to-destination "$SEALED_GUEST_IP:$TLS_PORT"
+}
 
 # Several guests on one host (AB#432). Refuse, before anything changes:
 # - a /30 another interface holds or overlaps (two guests on one connected
@@ -98,7 +108,9 @@ up)
   iptables -t nat -C POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null \
     || iptables -t nat -A POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE
   if [ "$MINER" = 1 ]; then
-    iptables -t nat -C PREROUTING "${DNAT[@]}" 2>/dev/null || iptables -t nat -A PREROUTING "${DNAT[@]}"
+    for chain in $DNAT_CHAINS; do
+      dnat -C "$chain" 2>/dev/null || dnat -A "$chain"
+    done
   fi
   ;;
 check)
@@ -111,7 +123,7 @@ check)
   if iptables -C FORWARD -m comment --comment "$TAG" -j "$FWD" 2>/dev/null \
      && iptables -C INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null \
      && iptables -t nat -C POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null \
-     && { [ "$MINER" != 1 ] || iptables -t nat -C PREROUTING "${DNAT[@]}" 2>/dev/null; } \
+     && { [ "$MINER" != 1 ] || { dnat -C PREROUTING 2>/dev/null && dnat -C OUTPUT 2>/dev/null; }; } \
      && [ "$(iptables -S "$FWD" 2>/dev/null | grep -c -- '-A')" -ge "$RULES" ]; then
     exit 0
   fi
@@ -123,7 +135,9 @@ down)
   iptables -D INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null || true
   iptables -t nat -D POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null || true
   if [ "$MINER" = 1 ]; then
-    iptables -t nat -D PREROUTING "${DNAT[@]}" 2>/dev/null || true
+    for chain in $DNAT_CHAINS; do
+      dnat -D "$chain" 2>/dev/null || true
+    done
   fi
   iptables -F "$FWD" 2>/dev/null && iptables -X "$FWD" 2>/dev/null || true
   iptables -F "$IN" 2>/dev/null && iptables -X "$IN" 2>/dev/null || true

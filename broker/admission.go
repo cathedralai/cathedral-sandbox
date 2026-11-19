@@ -314,12 +314,18 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	known := h.adm.amd != nil && h.adm.amdBinding == res.bindingSHA
 	prev := h.adm.amd
 	b.mu.Unlock()
-	if !known {
+	// With a firmware floor, the check reads TCB bytes from this exact report.
+	// A binding can stay unchanged across reports, so the binding-keyed AMD
+	// cache cannot authenticate those bytes or the report signature.
+	if !known || b.cfg.MinGenoaSNPSPL > 0 {
 		if prev, err = b.verifyAMDChain(ctx, raw); err != nil {
 			return admission{}, err
 		}
 	}
 	res.amd, res.amdBinding = prev, res.bindingSHA
+	if err := checkGenoaSnpFloor(att.Report, prev, b.cfg.MinGenoaSNPSPL); err != nil {
+		return admission{}, err
+	}
 	// Archive only after the AMD chain passed: a binding the chip did not vouch
 	// for must not be able to fill state_dir.
 	b.archiveAttested(h, att.Binding, att.BindingSHA)
@@ -375,8 +381,46 @@ func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI 
 	if b.cfg.AMDVerifier == nil {
 		return errors.New("a guest TLS hotel needs the AMD chain check")
 	}
-	_, err := b.verifyAMDChain(ctx, raw)
-	return err
+	amd, err := b.verifyAMDChain(ctx, raw)
+	if err != nil {
+		return err
+	}
+	return checkGenoaSnpFloor(att.Report, amd, b.cfg.MinGenoaSNPSPL)
+}
+
+// checkGenoaSnpFloor compares the SNP component in all four TCBs. A scalar
+// comparison of the packed TCB can accept a newer unrelated component while
+// leaving SNP firmware below the required floor.
+func checkGenoaSnpFloor(reportB64 string, amd map[string]any, floor int) error {
+	if floor == 0 {
+		return nil
+	}
+	product, ok := amd["product"].(string)
+	if !ok {
+		return errors.New("SNP firmware floor: AMD verifier did not identify the processor generation")
+	}
+	if product == "Milan" {
+		return nil // this floor is specific to the Genoa guidance in AMD-SB-3059
+	}
+	if product != "Genoa" {
+		return errors.New("SNP firmware floor: unsupported AMD processor generation")
+	}
+	report, err := base64.StdEncoding.DecodeString(reportB64)
+	if err != nil || len(report) < snpReportMinLen {
+		return errors.New("SNP firmware floor: malformed attestation report")
+	}
+	for _, field := range []struct {
+		name   string
+		offset int
+	}{
+		{"current", 0x38}, {"reported", 0x180},
+		{"committed", 0x1E0}, {"launch", 0x1F0},
+	} {
+		if int(report[field.offset+6]) < floor {
+			return fmt.Errorf("SNP firmware floor: %s TCB SNP component below %02x", field.name, floor)
+		}
+	}
+	return nil
 }
 
 // verifyAttestation is the check of the package comment. rawBinding is the

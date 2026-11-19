@@ -42,6 +42,10 @@ class FakeKV:
         # GETs after a PUT that still answer the previous value (KV staleness).
         self.stale_gets = 0
         self._previous: bytes | None = None
+        # Value stored right after the first GET is answered (a list that
+        # appears between the pre-sign check and the upload).
+        self.after_first_get: bytes | None = None
+        self.gets = 0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -76,6 +80,14 @@ class FakeKV:
             def do_GET(self) -> None:
                 if not self._authorized():
                     return
+                kv.gets += 1
+                try:
+                    self._get()
+                finally:
+                    if kv.gets == 1 and kv.after_first_get is not None:
+                        kv.value = kv.after_first_get
+
+            def _get(self) -> None:
                 if kv.stale_gets > 0 and self.command == "GET" and kv._previous is not kv.value:
                     kv.stale_gets -= 1
                     if kv._previous is None:
@@ -227,7 +239,7 @@ def test_renews_verifies_and_uploads_exact_bytes(renew) -> None:
     assert "PASS release 2" in result.stderr
     assert _last_release(renew["state"]) == 2
     methods = [method for method, _, _ in renew["kv"].requests]
-    assert methods == ["GET", "PUT", "GET"]
+    assert methods == ["GET", "GET", "PUT", "GET"]  # pre-sign check, post-sign check
     assert all(auth == f"Bearer {TOKEN}" for _, _, auth in renew["kv"].requests)
 
     again = _run(renew["env"])
@@ -285,16 +297,44 @@ def test_verifier_failure_blocks_upload(renew) -> None:
     env = {**renew["env"], "SEALED_HOTELS_VERIFY_PINS": str(other)}
     result = _run(env)
     assert result.returncode != 0 and "failed the standalone verifier" in result.stderr
-    assert renew["kv"].requests == []
+    assert [method for method, _, _ in renew["kv"].requests] == ["GET"]  # pre-sign check only
+    assert renew["kv"].value is None
 
 
-def test_newer_release_in_kv_is_not_replaced(renew) -> None:
-    renew["kv"].value = json.dumps({"release": 99}).encode()
+@pytest.mark.parametrize("stored", [99, 2])
+def test_newer_release_in_kv_refuses_before_signing(renew, stored: int) -> None:
+    # A lasting refusal must not burn a release number on every 6-hourly run.
+    renew["kv"].value = json.dumps({"release": stored}).encode()
+    for _ in range(2):
+        result = _run(renew["env"])
+        assert result.returncode != 0 and "newer or conflicting" in result.stderr
+        _no_token(result)
+    assert _last_release(renew["state"]) == 1
+    assert not (renew["out"] / "release-2.json").exists()
+    assert renew["kv"].value == json.dumps({"release": stored}).encode()
+    assert [method for method, _, _ in renew["kv"].requests] == ["GET", "GET"]
+
+
+def test_unreadable_kv_refuses_before_signing(renew) -> None:
+    # A token that cannot use KV (HTTP 401) is a lasting refusal too.
+    renew["token"].write_bytes(b"wrong-token\n")
+    result = _run(renew["env"])
+    assert result.returncode != 0 and "KV read answered HTTP 401" in result.stderr
+    _no_token(result)
+    assert _last_release(renew["state"]) == 1
+    assert not (renew["out"] / "release-2.json").exists()
+    assert [method for method, _, _ in renew["kv"].requests] == ["GET"]
+
+
+def test_newer_release_after_signing_is_not_replaced(renew) -> None:
+    # The post-sign check still guards a list that lands while this run signs.
+    renew["kv"].after_first_get = json.dumps({"release": 99}).encode()
     result = _run(renew["env"])
     assert result.returncode != 0 and "newer or conflicting" in result.stderr
     _no_token(result)
+    assert _last_release(renew["state"]) == 2
     assert renew["kv"].value == json.dumps({"release": 99}).encode()
-    assert [method for method, _, _ in renew["kv"].requests] == ["GET"]
+    assert [method for method, _, _ in renew["kv"].requests] == ["GET", "GET"]
 
 
 def test_failed_kv_write_fails_the_run(renew) -> None:
@@ -330,7 +370,7 @@ def test_delayed_kv_visibility_is_waited_out(renew) -> None:
     result = _run(renew["env"])
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["uploaded"] is True
-    assert [m for m, _, _ in renew["kv"].requests].count("GET") == 1 + 6
+    assert [m for m, _, _ in renew["kv"].requests].count("GET") == 2 + 6
 
 
 def test_readback_gives_up_after_configured_tries(renew) -> None:
@@ -338,7 +378,7 @@ def test_readback_gives_up_after_configured_tries(renew) -> None:
     env = dict(renew["env"], SEALED_HOTELS_READBACK_TRIES="3")
     result = _run(env)
     assert result.returncode != 0 and "KV readback does not match" in result.stderr
-    assert [m for m, _, _ in renew["kv"].requests].count("GET") == 1 + 3
+    assert [m for m, _, _ in renew["kv"].requests].count("GET") == 2 + 3
 
 
 def _directives(path: Path) -> dict[str, list[str]]:

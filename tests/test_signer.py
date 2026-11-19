@@ -162,16 +162,17 @@ class FakeKms:
         self.calls: list[tuple[str, dict]] = []
         self.signature_override: bytes | None = None
 
-    def GetPublicKey(self, **kwargs):  # noqa: N802 - boto3 method name
-        self.calls.append(("GetPublicKey", kwargs))
+    # boto3 clients expose snake_case methods only; a PascalCase call must fail here.
+    def get_public_key(self, **kwargs):
+        self.calls.append(("get_public_key", kwargs))
         return {
             "KeySpec": self.spec,
             "KeyUsage": "SIGN_VERIFY",
             "PublicKey": SPKI_PREFIX + _raw(self.key),
         }
 
-    def Sign(self, **kwargs):  # noqa: N802 - boto3 method name
-        self.calls.append(("Sign", kwargs))
+    def sign(self, **kwargs):
+        self.calls.append(("sign", kwargs))
         if self.signature_override is not None:
             return {"Signature": self.signature_override}
         return {"Signature": self.key.sign(kwargs["Message"])}
@@ -195,7 +196,8 @@ def test_kms_signer_signs_with_raw_ed25519_and_checks_pin() -> None:
     signature = signer.sign(b"msg")
     key.public_key().verify(signature, b"msg")
     assert regions == ["us-east-1"]
-    assert [name for name, _ in fake.calls] == ["GetPublicKey", "Sign"]
+    assert [name for name, _ in fake.calls] == ["get_public_key", "sign"]
+    assert fake.calls[0][1] == {"KeyId": ARN}
     sign_args = fake.calls[1][1]
     assert sign_args == {
         "KeyId": ARN,
@@ -204,7 +206,36 @@ def test_kms_signer_signs_with_raw_ed25519_and_checks_pin() -> None:
         "SigningAlgorithm": "ED25519_SHA_512",
     }
     signer.sign(b"again")
-    assert [name for name, _ in fake.calls].count("GetPublicKey") == 1
+    assert [name for name, _ in fake.calls].count("get_public_key") == 1
+
+
+def test_kms_signer_drives_a_real_botocore_kms_client() -> None:
+    """The calls must match botocore's KMS service model, not just our fake.
+
+    A Stubber on a real client raises if a method name, parameter name or enum
+    value is wrong, so a PascalCase call or a misspelled algorithm cannot pass.
+    """
+    botocore_session = pytest.importorskip("botocore.session")
+    stub_module = pytest.importorskip("botocore.stub")
+    key = Ed25519PrivateKey.generate()
+    client = botocore_session.get_session().create_client(
+        "kms", region_name="us-east-1", aws_access_key_id="test", aws_secret_access_key="test"
+    )
+    stubber = stub_module.Stubber(client)
+    stubber.add_response(
+        "get_public_key",
+        {"KeySpec": "ECC_NIST_EDWARDS25519", "KeyUsage": "SIGN_VERIFY", "PublicKey": SPKI_PREFIX + _raw(key)},
+        {"KeyId": ARN},
+    )
+    stubber.add_response(
+        "sign",
+        {"Signature": key.sign(b"msg"), "SigningAlgorithm": "ED25519_SHA_512", "KeyId": ARN},
+        {"KeyId": ARN, "Message": b"msg", "MessageType": "RAW", "SigningAlgorithm": "ED25519_SHA_512"},
+    )
+    signer = AwsKmsSigner("kms-1", ARN, "us-east-1", pinned_public_key=_raw(key), client_factory=lambda _: client)
+    with stubber:
+        key.public_key().verify(signer.sign(b"msg"), b"msg")
+    stubber.assert_no_pending_responses()
 
 
 def test_kms_signer_refuses_public_key_mismatch_before_signing() -> None:
@@ -213,7 +244,7 @@ def test_kms_signer_refuses_public_key_mismatch_before_signing() -> None:
     signer = AwsKmsSigner("kms-1", ARN, "us-east-1", pinned_public_key=other, client_factory=lambda _: fake)
     with pytest.raises(SignerError, match="pinned"):
         signer.sign(b"msg")
-    assert all(name != "Sign" for name, _ in fake.calls)
+    assert all(name != "sign" for name, _ in fake.calls)
 
 
 def test_kms_signer_refuses_without_pin() -> None:

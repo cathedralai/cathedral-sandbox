@@ -477,7 +477,9 @@ plane treats that as a new boot: drain, then a fresh join with a new key.
 `host-net.sh` (run by the unit) adds, in miner mode only:
 
 - a DNAT of `SEALED_MINER_PUBLIC_PORT` on this host's own addresses to the
-  guest's HTTPS port;
+  guest's HTTPS port, in nat PREROUTING (connections from elsewhere) and nat
+  OUTPUT (connections this host opens, such as a broker on the same host,
+  AB#822);
 - a FORWARD accept for new connections to that port;
 - the answers on those connections.
 
@@ -488,8 +490,10 @@ also do the following:
   group, a router port-forward, or an nftables forward chain with a drop
   policy.
 - Have a public IPv4 address.
-- Check from the host itself with `https://<guest ip>:<SEALED_MINER_TLS_PORT>`.
-  The host's own connections to its public address are not forwarded.
+- Check from the host itself with `https://<guest ip>:<SEALED_MINER_TLS_PORT>`
+  or the public origin; both reach the guest. A guest TLS key on the public
+  origin does not prove the port is open from outside (the cloud firewall is
+  not on this path): check that from another machine.
 
 `install-sealed.sh` cannot count rooms in a running miner guest, because the
 host has no key. A restart needs `SEALED_RESTART_WITH_ROOMS=1`, after the

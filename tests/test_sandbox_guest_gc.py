@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cathedral.sandbox_api import CreateSandboxRequest, ImageSource, Resources
+from cathedral.sandbox_api import CreateSandboxRequest, ExecRequest, ImageSource, Resources
 from cathedral.sandbox_guest import LABEL_OWNER, LABEL_SANDBOX_ID, DockerGuestProvider
 from cathedral.sandbox_provider import SandboxOpError
 from tests.fake_docker_cli import FakeDocker, install
@@ -194,6 +194,11 @@ def test_delete_without_guest_map_still_removes_labeled_container(fake: FakeDock
         # Lose the in-memory guest entry the way a bad restart / desync does.
         lost = provider._guests.pop(sid)  # noqa: SLF001
         assert lost.container_id == cid
+        # Without a guest, exec and process start are refused, never run on the hotel (AB#812).
+        for call in (provider.exec, provider.start_process):
+            with pytest.raises(SandboxOpError) as refused:
+                call(sid, ExecRequest(cmd=["true"]))
+            assert (refused.value.code, refused.value.http_status) == ("sandbox_not_running", 409)
         provider.delete(sid)
         assert cid not in fake.containers
         assert provider.pending_removals() == {}
