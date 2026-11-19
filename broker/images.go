@@ -558,7 +558,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		}
 		list, err := b.hotelSnapshots(ctx, g, h)
 		if err != nil {
-			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
+			return nil, "", hotelAPIErr(h, err)
 		}
 		if sid := matchSnapshot(g, list, rest); sid != "" {
 			return h, sid, nil
@@ -621,7 +621,7 @@ func (b *broker) roomSnapshot(w http.ResponseWriter, r *http.Request, g *guestSt
 	out, _ := json.Marshal(payload)
 	status, hdr, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	// The machine's signed receipt travels in X-Room-* headers, as on every other room route.
@@ -698,7 +698,7 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 	// Delete and push are owner-scoped on the hotel too (AB#650).
 	status, hdr, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	copyRoomHeaders(w.Header(), hdr)
@@ -823,7 +823,8 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
 	st.FinishedAt = &now
 	switch {
 	case err != nil:
-		st.State, st.Error = "failed", map[string]any{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}
+		e := hotelAPIErr(h, err)
+		st.State, st.Error = "failed", map[string]any{"code": e.code, "message": e.msg}
 	case status == 200 || status == 202:
 		st.State = "done"
 		if res, ok := doc["result"].(map[string]any); ok {

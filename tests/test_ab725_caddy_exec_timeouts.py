@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 FILES = [
     ROOT / "deploy" / "thin-broker-caddy" / "Caddyfile",
+    ROOT / "deploy" / "thin-broker-caddy" / "Caddyfile.access-log",
     ROOT / "room-kit" / "install.sh",
 ]
 MIN_SECONDS = 14400 + 120

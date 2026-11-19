@@ -587,7 +587,7 @@ func (b *broker) compatSetNetwork(w http.ResponseWriter, r *http.Request, rm *ro
 	body, _ := json.Marshal(net)
 	status, hdr, out, err := rm.h.do(r.Context(), "PUT", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/network", nil, body, 2*time.Minute)
 	if err != nil {
-		compatErr(w, 502, "hotel_unreachable", "the hotel did not answer", 5)
+		compatHotelErr(w, err, "the hotel did not answer")
 		return
 	}
 	copyRoomHeaders(w.Header(), hdr)
@@ -676,7 +676,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	case tail == "" && r.Method == "GET":
 		status, _, out, err := rm.h.do(r.Context(), "GET", "/v1/sandboxes/"+url.PathEscape(rm.hid), nil, nil, 30*time.Second)
 		if err != nil {
-			compatErr(w, 502, "hotel_unreachable", "the hotel did not answer", 5)
+			compatHotelErr(w, err, "the hotel did not answer")
 			return
 		}
 		if status == 404 {
@@ -721,7 +721,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			}
 			status, hdr, doc, herr := b.hotelExecH(r.Context(), rm, body, timeout)
 			if herr != nil {
-				compatErr(w, 502, "hotel_unreachable", "the hotel did not answer", 5)
+				compatHotelErr(w, herr, "the hotel did not answer")
 				return
 			}
 			copyRoomHeaders(w.Header(), hdr)
@@ -780,7 +780,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		hb, _ := json.Marshal(map[string]any{"ttl_seconds": int(ttl)})
 		status, hdr, out, err := rm.h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/heartbeat", nil, hb, 30*time.Second)
 		if err != nil {
-			compatErr(w, 502, "hotel_unreachable", "the hotel did not answer", 5)
+			compatHotelErr(w, err, "the hotel did not answer")
 			return
 		}
 		b.writeHotelCompat(w, status, hdr, out, rm, id)
@@ -921,6 +921,8 @@ func (b *broker) compatExecStart(w http.ResponseWriter, g *guestState, rm *room,
 		case ex.state == "killed":
 		case errors.Is(herr, errAnswerTooLarge):
 			ex.state, ex.result = "lost", map[string]any{"message": "the hotel answer was over the size the broker reads"}
+		case errors.Is(herr, errHotelBusy):
+			ex.state, ex.result = "lost", map[string]any{"message": "the hotel had no free connection, so the command did not start; run it again", "reason": "sold_out"}
 		case herr != nil:
 			ex.state, ex.result = "lost", map[string]any{"message": "the hotel did not answer"}
 		case status != 200:
@@ -983,6 +985,9 @@ func (b *broker) runScript(ctx context.Context, rm *room, script string, stdin s
 		body["stdin"] = stdin
 	}
 	status, doc, err := b.hotelExec(ctx, rm, body, timeout)
+	if errors.Is(err, errHotelBusy) {
+		return nil, err
+	}
 	if err != nil {
 		// A transport error names the hotel's private API URL; guests see the hotel id only.
 		return nil, fmt.Errorf("hotel %s did not answer", rm.h.cfg.ID)
@@ -1022,6 +1027,10 @@ func (b *broker) compatPutFile(w http.ResponseWriter, r *http.Request, rm *room)
 		script += "; chmod " + mode + " " + shq(p)
 	}
 	doc, err := b.runScript(r.Context(), rm, script, base64.StdEncoding.EncodeToString(data), 900)
+	if errors.Is(err, errHotelBusy) {
+		compatHotelErr(w, err, "")
+		return
+	}
 	if err != nil || exitCode(doc) != 0 {
 		compatErr(w, 500, "file_write_failed", fmt.Sprint(err, doc["stderr"]), 0)
 		return
@@ -1033,7 +1042,7 @@ func (b *broker) compatGetFile(w http.ResponseWriter, r *http.Request, rm *room)
 	p := r.URL.Query().Get("path")
 	doc, err := b.runScript(r.Context(), rm, "test -f "+shq(p)+" || exit 44; base64 "+shq(p), "", 900)
 	if err != nil {
-		compatErr(w, 502, "hotel_unreachable", err.Error(), 5)
+		compatHotelErr(w, err, err.Error())
 		return
 	}
 	if exitCode(doc) == 44 {
@@ -1072,6 +1081,10 @@ func (b *broker) compatPutTar(w http.ResponseWriter, r *http.Request, rm *room) 
 	}
 	script := "set -e; mkdir -p " + shq(p) + "; base64 -d | tar --no-same-owner " + flag + " - -C " + shq(p)
 	doc, err := b.runScript(r.Context(), rm, script, base64.StdEncoding.EncodeToString(data), 900)
+	if errors.Is(err, errHotelBusy) {
+		compatHotelErr(w, err, "")
+		return
+	}
 	if err != nil || exitCode(doc) != 0 {
 		compatErr(w, 500, "tar_extract_failed", fmt.Sprint(err, doc["stderr"]), 0)
 		return
@@ -1087,7 +1100,7 @@ func (b *broker) compatGetTar(w http.ResponseWriter, r *http.Request, rm *room) 
 	}
 	doc, err := b.runScript(r.Context(), rm, "test -d "+shq(p)+" || exit 44; tar -czf -"+ex+" -C "+shq(p)+" . | base64", "", 900)
 	if err != nil {
-		compatErr(w, 502, "hotel_unreachable", err.Error(), 5)
+		compatHotelErr(w, err, err.Error())
 		return
 	}
 	if exitCode(doc) == 44 {
@@ -1117,7 +1130,7 @@ func (b *broker) compatStat(w http.ResponseWriter, r *http.Request, rm *room) {
 	p := r.URL.Query().Get("path")
 	doc, err := b.runScript(r.Context(), rm, "if [ -d "+shq(p)+" ]; then echo dir; elif [ -f "+shq(p)+" ]; then echo file; elif [ -e "+shq(p)+" ]; then echo other; else exit 44; fi", "", 30)
 	if err != nil {
-		compatErr(w, 502, "hotel_unreachable", err.Error(), 5)
+		compatHotelErr(w, err, err.Error())
 		return
 	}
 	if exitCode(doc) == 44 {

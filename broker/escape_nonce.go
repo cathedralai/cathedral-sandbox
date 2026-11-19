@@ -111,7 +111,7 @@ func (b *broker) handleEscapeNoncePlant(w http.ResponseWriter, r *http.Request, 
 	}
 	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "POST", "/room/escape-nonce", nil, hotelBody, plantHotelTimeout)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	if v := hdr.Get("Content-Type"); v != "" {

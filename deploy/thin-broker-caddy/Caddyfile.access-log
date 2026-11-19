@@ -1,0 +1,49 @@
+# PROPOSED (AB#819), NOT LIVE: /etc/thin-broker-caddy/Caddyfile on Frankfurt
+# with an access log. Apply only with Toby's go, by the runbook in
+# docs/AB819_CONST_LOAD_FIXES.md. The live record stays Caddyfile until then.
+{
+	auto_https disable_redirects
+	admin off
+}
+https://live.cathedral.computer:443 {
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	# One JSON line per request with its duration (seconds) and status, so a
+	# stall leaves evidence (const load test, 18 Nov 2026). Headers, TLS and
+	# response headers are dropped; the live-view token and share id in the
+	# query are deleted. Rolled at 100 MiB, 10 files, 14 days.
+	log {
+		output file /var/log/thin-broker-caddy/access.log {
+			roll_size 100MiB
+			roll_keep 10
+			roll_keep_for 336h
+		}
+		format filter {
+			wrap json
+			fields {
+				request>headers delete
+				request>tls delete
+				resp_headers delete
+				request>uri query {
+					delete token
+					delete share
+				}
+			}
+		}
+	}
+	encode gzip
+	reverse_proxy 127.0.0.1:18100 {
+		flush_interval -1
+		transport http {
+			# Why 4h15m: the broker caps one exec at 14400 s (4 h) and holds the request
+	# open for that long, plus a 120 s margin. A transport read_timeout or
+	# write_timeout below 14400 + 120 s = 14520 s cuts long held exec requests.
+	# 4h15m = 15300 s covers the cap and the margin. (AB#725)
+			read_timeout 4h15m
+			write_timeout 4h15m
+		}
+	}
+}
