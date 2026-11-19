@@ -105,6 +105,10 @@ type hotelConfig struct {
 	// AlertChatID: the miner operator's Telegram chat for the first missed
 	// heartbeat of this hotel (alerts.go). Empty: a log line only.
 	AlertChatID string `json:"alert_chat_id,omitempty"`
+	// DiskExtraGiB: the disk this hotel may give rooms above the base 10 GiB
+	// each, summed over its rooms (disk.go, AB#831). Nil: no disk limit.
+	// 0: rooms of 10 GiB or less only.
+	DiskExtraGiB *int `json:"disk_extra_gib,omitempty"`
 }
 
 type guestConfig struct {
@@ -248,6 +252,7 @@ type room struct {
 	slot     int // index in the hotel grid, -1 if not drawn
 	since    time.Time
 	vanished time.Time
+	diskGiB  int // resources.disk_gib; 0: unknown, the hotel default (disk.go)
 	// deleteSent: the guest asked for the delete. A room marked deleting by
 	// the sync loop alone may be listed again (a late list) and come back.
 	deleteSent bool
@@ -274,6 +279,7 @@ type hotel struct {
 	rooms        map[string]*room // by hotel room id
 	queued       int
 	creating     int
+	diskPending  int // extra disk GiB of the creates in queued and creating (disk.go)
 	backoffUntil time.Time
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
 	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
@@ -297,6 +303,7 @@ type hotel struct {
 	cpuPct          float64
 	memPct          float64
 	memGiB          float64
+	roomDataPct     *float64 // live.room_data_used_pct of the last good health; nil: no reading (disk.go)
 	load1           float64
 	containers      int
 	apiRunning      int
@@ -535,6 +542,9 @@ func loadBroker(path string) (*broker, error) {
 			return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
 		}
 		if err := checkDataConnConfig(hc); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
+		}
+		if err := checkDiskConfig(hc); err != nil {
 			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
 		}
 		k, err := os.ReadFile(hc.KeyFile)
@@ -835,8 +845,9 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) 
 	hotels := b.hotelList()
 	total := 0.0
 	weight := make([]float64, len(hotels))
+	extra := diskExtra(pl.diskGiB)
 	for i, h := range hotels {
-		if exclude[h] || !pl.allows(h) {
+		if exclude[h] || !pl.allows(h) || !b.diskFits(h, extra) {
 			continue
 		}
 		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
@@ -928,6 +939,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	finish := func(r createResult) createResult { r.lost = lost; return r }
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
+	extra := diskExtra(pl.diskGiB) // held on the hotel (holdDisk) from pick until the room is known or the create ends (disk.go)
 	for attempt := 0; attempt < 3; attempt++ {
 		b.mu.Lock()
 		h := b.pick(tried, pl)
@@ -942,15 +954,22 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			if last.status >= 500 {
 				g.failed++
 			}
+			// A hotel would take the room but for its disk: sold out of disk,
+			// not of rooms.
+			diskOnly := last.status == 0 && extra > 0 && b.pick(tried, pl.withoutDisk()) != nil
 			b.mu.Unlock()
 			if last.status != 0 {
 				return finish(last)
+			}
+			if diskOnly {
+				return finish(diskSoldOut(pl.diskGiB))
 			}
 			return finish(b.noRoom(asked))
 		}
 		tried[h] = true
 		h.queued++
 		g.queued++
+		h.holdDisk(pl, 1)
 		b.mu.Unlock()
 
 		// Wait for a create slot. A create that waits too long moves to
@@ -966,6 +985,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		if h.leaving || !b.admitted(h, time.Now()) {
 			h.queued--
 			g.queued--
+			h.holdDisk(pl, -1)
 			b.mu.Unlock()
 			<-h.sem
 			continue
@@ -976,6 +996,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// waited for a slot: start no room.
 			h.queued--
 			g.queued--
+			h.holdDisk(pl, -1)
 			b.mu.Unlock()
 			<-h.sem
 			if gone {
@@ -985,7 +1006,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		}
 		b.mu.Unlock()
 		tDispatch := time.Now()
-		rm := &room{h: h, guest: g.cfg.ID, state: stCreating, since: tDispatch}
+		rm := &room{h: h, guest: g.cfg.ID, state: stCreating, since: tDispatch, diskGiB: pl.diskGiB}
 		b.mu.Lock()
 		h.queued--
 		g.queued--
@@ -1001,6 +1022,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 
 		b.mu.Lock()
 		h.creating--
+		h.holdDisk(pl, -1) // a started room counts in h.rooms from here (same b.mu hold)
 		if errors.Is(err, errHotelBusy) {
 			// No data connection came free in time (AB#819). The create was
 			// never sent, so no room can exist there: not lost, nothing to
@@ -1164,6 +1186,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 	labels[batchLabel] = batchID
 	payload["labels"] = labels
 	delete(payload, "count")
+	pl.diskGiB = diskGiBOf(payload["resources"])
 	body, _ := json.Marshal(payload)
 	results := make([]createResult, count)
 	if count == 1 {
@@ -1473,6 +1496,8 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		status = results[0].status
 		if ra := results[0].header.Get("Retry-After"); status == 503 && ra != "" {
 			w.Header().Set("Retry-After", ra) // sold_out: no hotel connection (AB#819)
+		} else if e, _ := results[0].doc["error"].(map[string]string); status == 429 && e["code"] == "disk_sold_out" {
+			w.Header().Set("Retry-After", strconv.Itoa(diskSoldOutRetryAfter))
 		} else if status == 429 {
 			w.Header().Set("Retry-After", "5")
 		}
@@ -2148,6 +2173,8 @@ type healthDoc struct {
 		MemPct float64  `json:"host_mem_used_pct"`
 		MemGiB float64  `json:"host_mem_used_gib"`
 		Load1  float64  `json:"load1"`
+		// RoomDataPct: use of the scratch that holds the room disks (disk.go).
+		RoomDataPct *float64 `json:"room_data_used_pct"`
 	} `json:"live"`
 }
 
@@ -2166,6 +2193,8 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			ID     string            `json:"id"`
 			State  string            `json:"state"`
 			Labels map[string]string `json:"labels"`
+			// A map, so a hotel that sends an odd field does not fail the list.
+			Resources map[string]any `json:"resources"`
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
@@ -2237,6 +2266,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			h.cpuPct = *hd.Live.CPU
 		}
 		h.memPct, h.memGiB, h.load1 = hd.Live.MemPct, hd.Live.MemGiB, hd.Live.Load1
+		h.roomDataPct = hd.Live.RoomDataPct
 		if hd.SandboxesRunning != nil {
 			h.containers = *hd.SandboxesRunning
 		}
@@ -2270,6 +2300,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			continue
 		}
 		if rm := h.rooms[s.ID]; rm != nil {
+			if d := diskGiBOf(s.Resources); d > 0 {
+				rm.diskGiB = d
+			}
 			if rm.state == stDeleting && !rm.deleteSent {
 				// A list that missed the room (built before its create landed)
 				// marked it deleting; the hotel lists it, so it runs.
@@ -2280,7 +2313,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			}
 			continue
 		}
-		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now}
+		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now, diskGiB: diskGiBOf(s.Resources)}
 		h.rooms[s.ID] = rm
 		b.register(rm)
 		h.place(rm)

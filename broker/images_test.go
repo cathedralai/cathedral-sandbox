@@ -41,6 +41,9 @@ type fakeHotel struct {
 	createDelay   time.Duration
 	healthFail    bool
 	healthRuntime string           // "runtime" in the /room/health answer; empty: omitted
+	healthLive    map[string]any   // "live" in the /room/health answer; nil: omitted (disk_test.go)
+	answerDelay   time.Duration    // wait between starting a room and answering its create (disk_test.go)
+	listFail      bool             // answer every room list 503 (disk_test.go)
 	rooms         []map[string]any // id + labels, for the room list
 	networks      []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts      []byte           // body of GET /room/receipts
@@ -163,7 +166,12 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
-		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"], "resources": req["resources"]})
+		if d := f.answerDelay; d > 0 { // the room is listed before the create answers (disk_test.go)
+			f.mu.Unlock()
+			time.Sleep(d)
+			f.mu.Lock()
+		}
 		if f.createFail != 0 {
 			writeErr(w, f.createFail, "create_failed", "the room started but the answer is an error")
 			return
@@ -175,6 +183,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			out["tunables"] = map[string]any{"status": "applied", "sha256": sha(string(raw)), "values": t}
 		}
 		writeJSON(w, 202, out)
+	case p == "/v1/sandboxes" && r.Method == "GET" && f.listFail:
+		writeErr(w, 503, "list_failed", "the hotel could not list its rooms")
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		if f.labelListFail != 0 && len(r.URL.Query()["label"]) > 0 {
 			writeErr(w, f.labelListFail, "list_failed", "the hotel could not list its rooms")
@@ -311,6 +321,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(f.attestation)
 	case p == "/room/health" && f.healthFail:
 		writeErr(w, 503, "busy", "health did not answer")
+	case p == "/room/health" && f.healthLive != nil:
+		writeJSON(w, 200, map[string]any{"live": f.healthLive})
 	case p == "/room/health" && f.healthRuntime != "":
 		writeJSON(w, 200, map[string]any{"runtime": f.healthRuntime, "kernel_isolation": true})
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":
