@@ -59,6 +59,8 @@ ExecStart=$SEALED_DIR/launch-guest.sh $SEALED_DIR/sealed.env
 ExecStopPost=$SEALED_DIR/host-net.sh down $SEALED_DIR/sealed.env
 KillSignal=SIGTERM
 TimeoutStopSec=60
+# The /dev/kvm wait alone may take 120 s; the default 90 s start timeout would cut it short.
+TimeoutStartSec=180
 Restart=on-failure
 RestartSec=15
 LimitMEMLOCK=infinity

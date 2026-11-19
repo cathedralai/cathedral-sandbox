@@ -87,7 +87,7 @@ def test_sealed_guest_restarts_after_a_failed_start(tmp_path: Path) -> None:
     # AB#824: 19 Nov 2026 the hotels stayed down after a host reboot (Restart=no, KVM late).
     unit = _write_units(tmp_path)
     assert "Restart=on-failure" in unit and "Restart=no" not in unit
-    assert "RestartSec=15" in unit
+    assert "RestartSec=15" in unit and "TimeoutStartSec=180" in unit
     head = unit.split("[Service]")[0]
     assert "StartLimitIntervalSec=900" in head and "StartLimitBurst=5" in head
     assert "After=network-online.target systemd-modules-load.service" in unit
