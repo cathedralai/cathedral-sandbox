@@ -262,7 +262,7 @@ def test_an_aws_kms_signer_is_pinned_to_the_trust_root_key(world, monkeypatch):
         builder, "signer_from_config", partial(signer_module.signer_from_config, kms_client_factory=lambda region: kms)
     )
     assert builder.main(["canary", "--signer-config", str(_kms_config(world)), *_canary_arguments(world, out="kms.json")]) == 0
-    assert any(call == "Sign" for call, _ in kms.calls)
+    assert any(call == "sign" for call, _ in kms.calls)
     raw = (world["tmp"] / "kms.json").read_bytes()
     parse_miner_release(
         raw,
@@ -280,7 +280,7 @@ def test_an_aws_kms_key_that_is_not_the_trusted_key_never_signs(world, monkeypat
     )
     with pytest.raises(SystemExit, match="does not equal the pinned public key"):
         builder.main(["canary", "--signer-config", str(_kms_config(world)), *_canary_arguments(world, out="kms.json")])
-    assert not any(call == "Sign" for call, _ in kms.calls)
+    assert not any(call == "sign" for call, _ in kms.calls)
     assert not (world["tmp"] / "kms.json").exists()
 
 

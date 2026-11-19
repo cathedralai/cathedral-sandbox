@@ -180,10 +180,13 @@ type config struct {
 	// turned off for every hotel or for joined hotels. The ops escape is
 	// "sealed_admission": "off" on one operator hotel's entry.
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
-	SealedMeasurements []string `json:"sealed_measurements,omitempty"`  // a gated hotel's measurement must be one of these; empty refuses every gated hotel
-	SealedHostData     []string `json:"sealed_host_data,omitempty"`     // non-empty: its HOST_DATA must be one of these
-	AttestTTLSeconds   float64  `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
-	AttestEverySeconds float64  `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	SealedMeasurements []string `json:"sealed_measurements,omitempty"` // a gated hotel's measurement must be one of these; empty refuses every gated hotel
+	SealedHostData     []string `json:"sealed_host_data,omitempty"`    // non-empty: its HOST_DATA must be one of these
+	// An optional Genoa SNP firmware component floor. Zero leaves it unset
+	// until patched hosts are available. It does not prove the OEM PI fix.
+	MinGenoaSNPSPL     int     `json:"min_genoa_snp_spl,omitempty"`
+	AttestTTLSeconds   float64 `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
+	AttestEverySeconds float64 `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
 	// RequireSealedGuestTLS (AB#378): every sealed hotel is reached only over
 	// its attested guest TLS key. A sealed config hotel must set "guest_tls":
 	// true, and a sealed join must pass the keyless HTTPS bootstrap. Off by
@@ -430,6 +433,9 @@ func loadBroker(path string) (*broker, error) {
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return nil, err
 	}
+	if c.MinGenoaSNPSPL < 0 || c.MinGenoaSNPSPL > 255 {
+		return nil, errors.New("config: min_genoa_snp_spl must be an 8-bit SNP component value")
+	}
 	if c.MinerEnrollKeySHA256 != "" {
 		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
 		if err != nil || len(hash) != sha256.Size {
@@ -494,6 +500,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if err := validateSealedAdmission(hc); err != nil {
 			return nil, err
+		}
+		if c.MinGenoaSNPSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
+			return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_snp_spl", hc.ID)
 		}
 		if hc.MinerHotkey != "" {
 			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)

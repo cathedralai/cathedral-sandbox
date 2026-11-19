@@ -55,7 +55,7 @@ func probationTC(t *testing.T) *testChain {
 // testTrafficPolicy is the test-traffic guest: miner opt-in plus miner_probation.
 var testTrafficPolicy = map[string]any{
 	"prefer":          []any{map[string]any{"label": map[string]string{"miner": "true"}}},
-	"allow":           []any{map[string]any{"class": "sealed"}},
+	"allow":           []any{map[string]any{"class": "sealed"}, map[string]any{"class": "unsealed"}},
 	"miner_probation": true,
 }
 
@@ -91,7 +91,7 @@ func probationOf(t *testing.T, tc *testChain, id string) map[string]any {
 
 func TestProbationGraduatesAtExactlyTheMinimumUptime(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	if tc.b.probationWindow() != 100*time.Second || tc.b.probationMinBP() != 9900 || !h.inProbation() {
@@ -99,10 +99,10 @@ func TestProbationGraduatesAtExactlyTheMinimumUptime(t *testing.T) {
 	}
 	t0 := time.Now().Add(time.Hour) // after any sample the join's sync took
 	tc.b.mu.Lock()
-	// The next sample sets the clock. The join's sync loop may already have
-	// observed a few ms (down before the first admission); drop them so the
-	// window is exactly the samples below.
-	h.prob.lastSample, h.prob.observed, h.prob.up = time.Time{}, 0, 0
+	h.prob.lastSample = time.Time{} // the next sample sets the clock
+	// The join's syncNow (#547) and any tick before stopLoops already counted
+	// real-time observed seconds, mostly not up; start the window from zero.
+	h.prob.observed, h.prob.up = 0, 0
 	tc.b.mu.Unlock()
 	// 99 s up, then down for the last second: 99.00% of 100 s.
 	if !steps(tc, h, t0, sample{0, true}, sample{99 * time.Second, true}, sample{100 * time.Second, false}) {
@@ -118,7 +118,7 @@ func TestProbationGraduatesAtExactlyTheMinimumUptime(t *testing.T) {
 
 func TestProbationRefusesJustUnderTheMinimumAndStartsANewWindow(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	t0 := time.Now().Add(time.Hour)
@@ -151,7 +151,7 @@ func TestProbationRefusesJustUnderTheMinimumAndStartsANewWindow(t *testing.T) {
 
 func TestProbationNeedsTheWholeWindowEvenAtFullUptime(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	t0 := time.Now().Add(time.Hour)
@@ -182,7 +182,7 @@ func TestProbationMinimumComesFromConfig(t *testing.T) {
 	if tc.b.probationWindow() != 500*time.Millisecond || tc.b.probationMinBP() != 9550 {
 		t.Fatalf("window %s min %d", tc.b.probationWindow(), tc.b.probationMinBP())
 	}
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	t0 := time.Now().Add(time.Hour)
@@ -204,7 +204,7 @@ func TestProbationMinimumComesFromConfig(t *testing.T) {
 
 func TestProbationHotelTakesTestTrafficOnlyUntilItGraduates(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	optInMiner(t, tc, "g1") // the shared pool: miner opt-in without miner_probation
 	setPolicy(t, tc, "g2", testTrafficPolicy)
@@ -261,7 +261,7 @@ func TestProbationHotelTakesTestTrafficOnlyUntilItGraduates(t *testing.T) {
 
 func TestGraduatedLabelFollowsProbation(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, map[string]any{"labels": map[string]string{"graduated": "true"}})
+	joinMiner(t, tc, "m1", true, 5, map[string]any{"labels": map[string]string{"graduated": "true"}})
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	if h.labels()["graduated"] != "" || h.labels()["miner"] != "true" {
@@ -270,7 +270,7 @@ func TestGraduatedLabelFollowsProbation(t *testing.T) {
 	// A shared policy that selects graduated miners by label does not reach it.
 	setPolicy(t, tc, "g1", map[string]any{
 		"prefer": []any{map[string]any{"label": map[string]string{"miner": "true", "graduated": "true"}}},
-		"allow":  []any{map[string]any{"class": "sealed"}}, // a class selector never opts into a miner
+		"allow":  []any{map[string]any{"class": "unsealed"}},
 	})
 	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}, "sealed": true}
 	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", onM1); status != 409 {
@@ -289,7 +289,7 @@ func TestGraduatedLabelFollowsProbation(t *testing.T) {
 	}
 	// With probation off every miner is graduated; an operator hotel never is.
 	tc2 := newChainState(t, t.TempDir())
-	joinMiner(t, tc2, "m1", 5, nil)
+	joinMiner(t, tc2, "m1", true, 5, nil)
 	if tc2.b.hotelByID("m1").labels()["graduated"] != "true" || tc2.b.hotelByID("a").labels()["graduated"] != "" {
 		t.Fatal("labels with probation off")
 	}
@@ -297,7 +297,7 @@ func TestGraduatedLabelFollowsProbation(t *testing.T) {
 
 func TestProbationCountsDownDrainedAndUnattestedAsDown(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	up := func() bool {
@@ -340,9 +340,9 @@ func TestProbationCountsDownDrainedAndUnattestedAsDown(t *testing.T) {
 
 func TestProbationSurvivesRestartAndARejoinStartsFresh(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
-	joinMiner(t, tc, "m2", 5, nil)
+	joinMiner(t, tc, "m2", true, 5, nil)
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	t0 := time.Now().Add(time.Hour)
@@ -372,7 +372,7 @@ func TestProbationSurvivesRestartAndARejoinStartsFresh(t *testing.T) {
 	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1", nil); status != 204 {
 		t.Fatalf("leave: %d %v", status, doc)
 	}
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	if !tc.b.hotelByID("m1").inProbation() {
 		t.Fatal("rejoin inherited graduation")
@@ -394,7 +394,7 @@ func TestProbationSurvivesRestartAndARejoinStartsFresh(t *testing.T) {
 
 func TestProbationRestoreNeedsTheSameMachine(t *testing.T) {
 	tc := probationTC(t)
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	h := tc.b.hotelByID("m1")
 	t0 := time.Now().Add(time.Hour)
@@ -427,7 +427,7 @@ func TestProbationRestoreNeedsTheSameMachine(t *testing.T) {
 func TestTurningProbationOnGrandfathersServingMiners(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	joinMiner(t, tc, "m1", 5, nil) // probation off: serving the pool
+	joinMiner(t, tc, "m1", true, 5, nil) // probation off: serving the pool
 	stopLoops(tc)
 	if tc.b.hotelByID("m1").inProbation() {
 		t.Fatal("probation off but the miner is on probation")
@@ -449,7 +449,7 @@ func TestTurningProbationOnGrandfathersServingMiners(t *testing.T) {
 		t.Fatalf("running room unreachable after enable: %d %v", status, doc)
 	}
 	// A miner that joins after that starts on probation.
-	joinMiner(t, tc, "m2", 5, nil)
+	joinMiner(t, tc, "m2", true, 5, nil)
 	stopLoops(tc)
 	if !tc.b.hotelByID("m2").inProbation() {
 		t.Fatal("new miner skipped probation")
@@ -463,7 +463,7 @@ func TestTurningProbationOnGrandfathersServingMiners(t *testing.T) {
 
 func TestProbationOffLeavesMinersInThePool(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", 5, nil)
+	joinMiner(t, tc, "m1", true, 5, nil)
 	stopLoops(tc)
 	optInMiner(t, tc, "g1")
 	if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}, "sealed": true}); !strings.HasPrefix(id, "m1.") {

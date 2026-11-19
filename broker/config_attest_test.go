@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -75,6 +76,74 @@ func recheckNow(tc *testChain, id string) {
 	tc.b.hotelByID(id).adm.checkedAt = time.Time{}
 	tc.b.mu.Unlock()
 	syncNow(tc, id)
+}
+
+// The binding commits only to a subset of the report. In particular, changing
+// the signature does not change the binding hash used by the AMD result cache.
+func floorTestReport(t *testing.T, raw []byte, corruptSignature bool) []byte {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	report, err := base64.StdEncoding.DecodeString(doc["report_b64"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int{0x38, 0x1E0, 0x1F0} {
+		report[offset+6] = 1
+	}
+	if corruptSignature {
+		report[0x2A0] ^= 1
+	}
+	doc["report_b64"] = base64.StdEncoding.EncodeToString(report)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestGenoaFloorRechecksAMDSignatureWhenBindingIsUnchanged(t *testing.T) {
+	tc, guests := newConfigHotelChain(t, []configHotel{{id: "s1", att: attestOpts{chip: 46}, optIn: true}},
+		func(c *config) { c.MinGenoaSNPSPL = 1 })
+	good := floorTestReport(t, snpAttestation(t, attestOpts{chip: 46}), false)
+	guests["s1"].setAttestation(good)
+	admitNow(t, tc, "s1")
+	if calls := amdCalls(tc.amdDir); len(calls) != 1 {
+		t.Fatalf("initial AMD checks: %v", calls)
+	}
+	bad := floorTestReport(t, snpAttestation(t, attestOpts{chip: 46}), true)
+	guests["s1"].setAttestation(bad)
+	setAMDVerdict(t, tc.amdDir, `{"verdict":"FAIL","reason":"report signature is invalid"}`)
+	recheckNow(tc, "s1")
+	if calls := amdCalls(tc.amdDir); len(calls) != 2 {
+		t.Fatalf("changed report reused binding-keyed AMD result: %v", calls)
+	}
+	a := admissionOf(t, tc, "s1")
+	if a["state"] != "refused" || !strings.Contains(fmt.Sprint(a["reason"]), "report signature is invalid") {
+		t.Fatalf("changed report was admitted: %v", a)
+	}
+}
+
+func TestGenoaFloorGatesMinerTLSBootstrap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MinGenoaSNPSPL = 1
+	join := func(id string, att []byte) (int, map[string]any) {
+		m, url := newMinerHotel(t, 5, att)
+		tc.hotels[id] = m.fakeHotel
+		return tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+			"id": id, "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+		})
+	}
+	old := snpAttestation(t, attestOpts{chip: 91})
+	if status, doc := join("old-miner", old); status != 422 || !strings.Contains(fmt.Sprint(doc), "current TCB SNP component below") {
+		t.Fatalf("old SNP miner passed bootstrap: %d %v", status, doc)
+	}
+	patched := floorTestReport(t, snpAttestation(t, attestOpts{chip: 92}), false)
+	if status, doc := join("patched-miner", patched); status != 201 {
+		t.Fatalf("SNP floor-compliant miner refused bootstrap: %d %v", status, doc)
+	}
 }
 
 func TestConfigHotelOptInTakesRoomsOnlyAfterAttestation(t *testing.T) {

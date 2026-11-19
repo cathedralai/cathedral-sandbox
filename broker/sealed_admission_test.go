@@ -254,6 +254,14 @@ func TestSealedAdmissionOffIsRefusedForMinersJoinsAndContradictions(t *testing.T
 	mustNotLoad(t, base(hotelConfig{ID: "u", SealedAdmission: "off"}), `every hotel must be "sealed": true`) // AB#776
 	mustNotLoad(t, base(hotelConfig{ID: "r", Sealed: true, RequireAttestation: true, SealedAdmission: "off"}), "contradict")
 	mustNotLoad(t, base(hotelConfig{ID: "t", Sealed: true, SealedAdmission: "of"}), `use "gate" (the default) or "off"`)
+	floorWithEscape := base(hotelConfig{ID: "s", Sealed: true, SealedAdmission: "off"})
+	floorWithEscape.MinGenoaSNPSPL = 0x1e
+	mustNotLoad(t, floorWithEscape, "sealed_admission off bypasses min_genoa_snp_spl")
+	for _, bad := range []int{-1, 256} {
+		cfg := base(hotelConfig{ID: "s", Sealed: true})
+		cfg.MinGenoaSNPSPL = bad
+		mustNotLoad(t, cfg, "min_genoa_snp_spl must be an 8-bit")
+	}
 	top := base(hotelConfig{ID: "s", Sealed: true})
 	top.SealedAdmission = "off"
 	mustNotLoad(t, top, `top-level "sealed_admission": "off" is refused`)
