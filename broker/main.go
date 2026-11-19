@@ -1821,9 +1821,10 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 	_, _ = w.Write(out)
 }
 
-// hotelAttestBodyMax caps POST /v1/hotels/<id>/attest. The body is one
-// field of 128 hex characters.
-const hotelAttestBodyMax = 4096
+// hotelAttestBodyMax caps POST /v1/hotels/<id>/attest. The body is 128 hex
+// characters, plus for an Escape rd-claims-v1 report the receipt claims in
+// escape_claims_b64 (the hotel takes up to 12 KiB of claims, about 2 KiB today).
+const hotelAttestBodyMax = 20480
 
 // handleHotelAttest passes POST /v1/hotels/<id>/attest to the hotel's
 // POST /room/attest: a fresh SEV-SNP report whose REPORT_DATA is the 64
@@ -1837,7 +1838,7 @@ func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *ho
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hotelAttestBodyMax))
 	if err != nil {
-		writeErr(w, 413, "body_too_large", "attest body over 4096 bytes")
+		writeErr(w, 413, "body_too_large", "attest body over 20480 bytes")
 		return
 	}
 	// "sandbox_id" asks for that room's signed create receipt too. Only a
