@@ -1,0 +1,20 @@
+[Unit]
+Description=Re-offer the anchor miner hotel after a new binding (AB#822)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/cathedral-anchor/refresh.env
+
+[Service]
+Type=oneshot
+# Paths and URLs only; the hotkey seed stays in /etc/cathedral-anchor/hotkey (root, 0600).
+EnvironmentFile=/etc/cathedral-anchor/refresh.env
+ExecStart=/opt/cathedral-anchor/venv/bin/python3 /opt/cathedral-anchor/room-kit/hotel-offer-refresh/hotel_offer_refresh.py
+StateDirectory=cathedral-anchor
+StateDirectoryMode=0700
+UMask=0077
+SyslogIdentifier=hotel-offer-refresh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+TimeoutStartSec=4min

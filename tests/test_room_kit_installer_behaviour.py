@@ -148,10 +148,12 @@ case "${1:-}" in
       [ "$chain" = INPUT ] && echo "-P INPUT ${FAKE_INPUT_POLICY:-ACCEPT}"
       if [ -z "$chain" ]; then v=FAKE_IPTABLES_TAGGED_$t; [ -n "${!v:-}" ] && printf '%s\n' "${!v}"; fi
       if [ "${FAKE_IPTABLES_RULES:-}" = present ] && [ -n "$chain" ] && [ "$chain" != INPUT ]; then
-        for _ in 1 2 3 4 5; do echo "-A $chain -j DROP"; done
+        for _ in $(seq "${FAKE_IPTABLES_RULE_COUNT:-5}"); do echo "-A $chain -j DROP"; done
       fi
       exit 0 ;;
-  -C) [ "${FAKE_IPTABLES_RULES:-}" = present ]; exit ;;
+  # FAKE_IPTABLES_MISSING: chains whose rule a firewall reload took ("OUTPUT").
+  -C) case " ${FAKE_IPTABLES_MISSING:-} " in *" ${2:-} "*) exit 1 ;; esac
+      [ "${FAKE_IPTABLES_RULES:-}" = present ]; exit ;;
 esac
 exit 0""",
     "ip6tables": "exit 0",
@@ -167,7 +169,7 @@ case "$*" in
 esac
 exit 0""",
 }
-for _name in ("chown", "useradd", "apt-get", "mkfs.xfs", "xfs_info", "mountpoint", "nft", "sysctl", "conntrack",
+for _name in ("chown", "useradd", "apt-get", "mkfs.xfs", "xfs_info", "xfs_growfs", "losetup", "mountpoint", "nft", "sysctl", "conntrack",
               "dockerd", "mmdebstrap", "zstd", "cpio"):
     FAKES[_name] = "exit 0"
 
@@ -557,7 +559,7 @@ def test_a_clean_host_gets_the_units_the_key_store_and_the_daemon_config(host: F
     assert sysd.index("systemctl daemon-reload") < sysd.index("systemctl enable --now room-a-data.service")
     assert sysd.count("systemctl restart room-a.service room-a-health.service") == 1
     assert "systemctl restart room-a-receipts.service" in sysd and "systemctl restart room-a-caddy.service" in sysd
-    assert "systemctl start room-a-reaper.timer" in sysd
+    assert "systemctl start room-a-reaper.timer room-a-image-gc.timer" in sysd
 
 
 def test_the_final_check_fails_the_install_when_the_api_never_answers_200(host: FakeHost) -> None:
@@ -1016,12 +1018,48 @@ def test_host_net_miner_forwards_one_public_port_to_the_guest_https_port(host: F
     assert dnat.replace(" -A ", " -D ") in host.calls("iptables")
 
 
-def test_host_net_config_hotel_adds_no_forward(host: FakeHost) -> None:
-    proc = _run_host_net(host, "up")
+def _dnat(op: str, chain: str) -> str:
+    return (f"iptables -t nat {op} {chain} -p tcp --dport 9443 -m addrtype --dst-type LOCAL -m comment "
+            "--comment sealed-hotel:sealed-1 -j DNAT --to-destination 10.215.0.2:18443")
+
+
+def test_host_net_miner_reaches_its_public_port_from_this_host_too(host: FakeHost) -> None:
+    # AB#822 R2: the broker on the hotel's own host. PREROUTING never sees packets
+    # the host sends itself, so the same DNAT sits in nat OUTPUT, on every path.
+    proc = _run_host_net(host, "up", MINER)
     assert proc.returncode == 0, proc.stderr[-3000:]
-    assert not [c for c in host.calls("iptables") if "PREROUTING" in c or "18443" in c]
-    _run_host_net(host, "down")
-    assert not [c for c in host.calls("iptables") if "PREROUTING" in c]
+    nat = [c for c in host.calls("iptables -t nat ") if "DNAT" in c]
+    assert nat == [_dnat("-C", "PREROUTING"), _dnat("-A", "PREROUTING"), _dnat("-C", "OUTPUT"), _dnat("-A", "OUTPUT")]
+
+    # Check: both rules present (and the 7 FWD rules) leaves everything alone.
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
+    proc = _run_host_net(host, "check", MINER, FAKE_IPTABLES_RULES="present", FAKE_IPTABLES_RULE_COUNT="7")
+    assert proc.returncode == 0 and "restoring" not in proc.stderr, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert _dnat("-C", "PREROUTING") in ipt and _dnat("-C", "OUTPUT") in ipt
+    assert not [c for c in ipt if " -A " in c or " -I " in c], "present rules were rewritten"
+
+    # Check: a reload that took only the OUTPUT rule restores it.
+    proc = _run_host_net(host, "check", MINER, FAKE_IPTABLES_RULES="present", FAKE_IPTABLES_RULE_COUNT="7",
+                         FAKE_IPTABLES_MISSING="OUTPUT")
+    assert proc.returncode == 0 and "were missing; restoring" in proc.stderr, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert _dnat("-A", "OUTPUT") in ipt and _dnat("-A", "PREROUTING") not in ipt
+
+    proc = _run_host_net(host, "down", MINER)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    nat = [c for c in host.calls("iptables -t nat ") if "DNAT" in c]
+    assert nat == [_dnat("-D", "PREROUTING"), _dnat("-D", "OUTPUT")]
+
+
+@pytest.mark.parametrize("action", ["up", "check", "down"])
+def test_host_net_config_hotel_adds_no_forward(host: FakeHost, action: str) -> None:
+    (host.state / "active-units").write_text("room-sealed-sealed-1.service\n")
+    proc = _run_host_net(host, action, {"SEALED_MINER": "0"})
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    ipt = host.calls("iptables")
+    assert ipt, action
+    assert not [c for c in ipt if "PREROUTING" in c or "OUTPUT" in c or "DNAT" in c or "18443" in c], action
 
 
 def test_sealed_miner_restart_never_sends_a_key_and_needs_the_override(host: FakeHost) -> None:
@@ -1230,3 +1268,56 @@ def test_build_refuses_an_incomplete_miner_config(host: FakeHost, sealed: dict, 
     proc, root = _guest_config(host, False, **sealed)
     assert proc.returncode == 1 and message in proc.stderr
     assert not (root / "etc" / "sealed-guard.nft").exists()
+
+
+# ---------------------------------------------------------------- install.sh: image store size and cleanup (AB#819)
+
+def test_a_rerun_with_a_larger_size_grows_the_image_store_in_place(host: FakeHost) -> None:
+    with open(host.data_img, "wb") as f:
+        f.truncate(1 * GIB)
+    proc = host.install(str(host.room_env(ROOM_DATA_SIZE_GB="3")))
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert host.data_img.stat().st_size == 3 * GIB
+    assert "grown from 1 to 3 GiB" in proc.stdout
+    assert not any(c.startswith("mkfs.xfs") for c in host.calls())  # kept, never formatted again
+    assert f"xfs_growfs {host.data_dir}" in host.calls("xfs_growfs")
+
+
+def test_a_smaller_size_never_shrinks_the_image_store(host: FakeHost) -> None:
+    with open(host.data_img, "wb") as f:
+        f.truncate(3 * GIB)
+    proc = host.install(str(host.room_env(ROOM_DATA_SIZE_GB="1")))
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert host.data_img.stat().st_size == 3 * GIB
+    assert "xfs cannot shrink" in proc.stderr
+
+
+def test_growth_the_host_disk_cannot_hold_is_refused(host: FakeHost) -> None:
+    with open(host.data_img, "wb") as f:
+        f.truncate(1 * GIB)
+    proc = host.install(str(host.room_env(ROOM_DATA_SIZE_GB="300")), env={"FAKE_DISK_BYTES": str(100 * GIB)})
+    assert proc.returncode == 1
+    assert "only 100 GiB is free" in proc.stderr
+    assert host.data_img.stat().st_size == 1 * GIB
+
+
+def test_the_image_cleanup_timer_runs_on_the_room_socket(host: FakeHost) -> None:
+    _clean_install(host)
+    svc = host.unit("room-a-image-gc.service")
+    assert f"--sock {host.root}/run/pool-room/docker.sock" in svc and f"--data-dir {host.data_dir}" in svc
+    assert "--keep alpine:3.20" in svc and "--high-pct 85 --low-pct 70 --min-idle-minutes 60" in svc
+    assert "User=poolroom" in svc and "--off" not in svc
+    assert "OnUnitActiveSec=300" in host.unit("room-a-image-gc.timer")
+    assert (host.opt / "bin" / "room_image_gc.py").exists()
+    sysd = host.calls("systemctl")
+    assert any("room-a-image-gc.timer" in c and c.startswith("systemctl enable") for c in sysd)
+    assert "systemctl start room-a-reaper.timer room-a-image-gc.timer" in sysd
+    state = (host.etc / "install-state").read_text().splitlines()
+    assert "unit:room-a-image-gc.timer" in state and "unit:room-a-image-gc.service" in state
+
+
+def test_image_cleanup_off_keeps_the_timer_and_does_nothing(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(ROOM_IMAGE_GC="0")))
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    exec_start = [ln for ln in host.unit("room-a-image-gc.service").splitlines() if ln.startswith("ExecStart=")]
+    assert len(exec_start) == 1 and exec_start[0].endswith(" --off")

@@ -530,6 +530,8 @@ func finishNativeExecLocked(ex *nativeExec, status int, hdr http.Header, doc map
 	}
 	ex.DoneAt = time.Now()
 	switch {
+	case errors.Is(herr, errHotelBusy):
+		ex.State, ex.Result = "lost", map[string]any{"message": "the hotel had no free connection, so the command did not start; run it again", "reason": "sold_out"}
 	case herr != nil:
 		ex.State, ex.Result = "lost", map[string]any{"message": "the hotel did not answer", "reason": "hotel_unreachable"}
 	case status != 200:

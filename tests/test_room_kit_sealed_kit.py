@@ -51,8 +51,11 @@ def test_a_verified_guest_boots_again_at_the_next_host_start() -> None:
 
 
 def test_host_link_rules_are_checked_every_minute() -> None:
-    text = (SEALED / "install-sealed.sh").read_text()
+    text = (SEALED / "write-units.sh").read_text()
     assert "-net.timer" in text and "OnUnitActiveSec=1min" in text and "host-net.sh check" in text
+    install = (SEALED / "install-sealed.sh").read_text()
+    assert '"$KIT/sealed/write-units.sh" "$SEALED_DIR/sealed.env"' in install
+    assert 'systemctl enable -q --now "${UNIT%.service}-net.timer"' in install
     net = (SEALED / "host-net.sh").read_text()
     assert "check)" in net and 'exec "$0" up "$2"' in net
 
@@ -66,3 +69,41 @@ def test_the_measured_initrd_takes_tracked_kit_files_only() -> None:
     text = (SEALED / "build-guest.sh").read_text()
     assert "git -C \"$KIT\" ls-files -z" in text
     assert 'install -m 0644 "$KIT/$CATHEDRAL_TARBALL" "$R/opt/room-kit/dist/"' in text
+
+
+def _write_units(tmp_path: Path) -> str:
+    import subprocess
+    env = tmp_path / "sealed.env"
+    env.write_text("SEALED_NAME=nc-sealed-9\nSEALED_DIR=/srv/sealed-hotel-9\n")
+    dest = tmp_path / "root"
+    proc = subprocess.run(["bash", str(SEALED / "write-units.sh"), str(env)], capture_output=True, text=True,
+                          env={"ROOM_DESTDIR": str(dest), "PATH": "/usr/bin:/bin"})
+    assert proc.returncode == 0, proc.stderr
+    assert "no restart" in proc.stdout
+    return (dest / "etc/systemd/system/room-sealed-nc-sealed-9.service").read_text()
+
+
+def test_sealed_guest_restarts_after_a_failed_start(tmp_path: Path) -> None:
+    # AB#824: 19 Nov 2026 the hotels stayed down after a host reboot (Restart=no, KVM late).
+    unit = _write_units(tmp_path)
+    assert "Restart=on-failure" in unit and "Restart=no" not in unit
+    assert "RestartSec=15" in unit and "TimeoutStartSec=180" in unit
+    head = unit.split("[Service]")[0]
+    assert "StartLimitIntervalSec=900" in head and "StartLimitBurst=5" in head
+    assert "After=network-online.target systemd-modules-load.service" in unit
+
+
+def test_sealed_guest_waits_for_kvm_before_the_host_link_and_qemu(tmp_path: Path) -> None:
+    unit = _write_units(tmp_path)
+    pre = [line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("ExecStartPre=")]
+    assert pre[0] == "-/sbin/modprobe -q kvm_amd"
+    # systemd turns $$ into a literal $ for the shell.
+    assert "[ -c /dev/kvm ]" in pre[1] and "$$(seq 1 120)" in pre[1]
+    assert pre[2] == "/srv/sealed-hotel-9/host-net.sh up /srv/sealed-hotel-9/sealed.env"
+    assert "ExecStart=/srv/sealed-hotel-9/launch-guest.sh /srv/sealed-hotel-9/sealed.env" in unit
+
+
+def test_write_units_never_starts_or_restarts_a_guest() -> None:
+    text = (SEALED / "write-units.sh").read_text()
+    for verb in ("restart", "start", "stop", "enable", "kill"):
+        assert f"systemctl {verb}" not in text
