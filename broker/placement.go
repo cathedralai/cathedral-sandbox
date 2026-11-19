@@ -233,7 +233,7 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 			b.mu.Lock()
 			h.queued--
 			g.queued--
-			h.diskPending -= diskExtra(pl.diskGiB)
+			h.holdDisk(pl, -1)
 			b.mu.Unlock()
 			return nil
 		case <-timer:
@@ -256,9 +256,8 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 			h.queued--
 			if alt := b.pick(map[*hotel]bool{h: true}, mpl); alt != nil && alt.expectedWait(1) < waitHere/2 {
 				alt.queued++
-				extra := diskExtra(pl.diskGiB) // the disk reservation moves with the create (disk.go)
-				h.diskPending -= extra
-				alt.diskPending += extra
+				h.holdDisk(pl, -1) // the disk reservation moves with the create (disk.go)
+				alt.holdDisk(pl, 1)
 				h.moved++
 				tried[alt] = true
 				h = alt

@@ -16,8 +16,10 @@ import (
 
 func intp(n int) *int { return &n }
 
+// setDiskBudget sets h's budget and marks its room list as read, as the
+// sync loop does on its first good list (the chain runs no sync loop).
 func setDiskBudget(tc *testChain, id string, gib *int) {
-	setHotel(tc, id, func(h *hotel) { h.cfg.DiskExtraGiB = gib })
+	setHotel(tc, id, func(h *hotel) { h.cfg.DiskExtraGiB, h.roomsUnchecked = gib, false })
 }
 
 func diskBody(diskGiB int, more map[string]any) map[string]any {
@@ -222,15 +224,29 @@ func TestSyncLoopRelearnsRoomDiskAfterRestart(t *testing.T) {
 	tc.room(t, "key1", diskBody(30, map[string]any{"hotels": []string{"b"}}))
 	tc.room(t, "key1", diskBody(10, map[string]any{"hotels": []string{"b"}}))
 	tc.start(t) // a new broker: it knows no room until the list answers
-	setDiskBudget(tc, "b", intp(40))
-	if used, _ := diskUsed(tc, "b"); used != 0 {
-		t.Fatalf("before the list: used %d", used)
-	}
+	setHotel(tc, "b", func(h *hotel) { h.cfg.DiskExtraGiB = intp(40) })
+	onB := map[string]any{"hotels": []string{"b"}}
+	// Health answers but the room list fails: the empty room map must not
+	// read as a free budget. Big rooms wait; small rooms are unchanged.
+	tc.hotels["b"].mu.Lock()
+	tc.hotels["b"].listFail = true
+	tc.hotels["b"].mu.Unlock()
+	tc.b.syncHotel(context.Background(), tc.b.hotelByID("b"))
+	setHotel(tc, "b", func(h *hotel) {
+		if !h.roomsUnchecked || h.listOK {
+			t.Fatalf("list failed but roomsUnchecked=%v listOK=%v", h.roomsUnchecked, h.listOK)
+		}
+		h.ok = true
+	})
+	wantDiskRefused(t, tc, diskBody(20, onB))
+	tc.room(t, "key1", diskBody(10, onB))
+	tc.hotels["b"].mu.Lock()
+	tc.hotels["b"].listFail = false
+	tc.hotels["b"].mu.Unlock()
 	tc.b.syncHotel(context.Background(), tc.b.hotelByID("b"))
 	if used, _ := diskUsed(tc, "b"); used != 20 {
 		t.Fatalf("after the list: used %d, want 20", used)
 	}
-	onB := map[string]any{"hotels": []string{"b"}}
 	wantDiskRefused(t, tc, diskBody(40, onB))
 	tc.room(t, "key1", diskBody(30, onB)) // exactly fills it
 }
@@ -320,4 +336,55 @@ func TestConcurrentBigCreatesCannotShareTheLastDisk(t *testing.T) {
 	if used, pending := diskUsed(tc, "b"); used != 40 || pending != 0 {
 		t.Fatalf("used %d pending %d", used, pending)
 	}
+}
+
+func TestSyncAdoptedRoomOfAnInFlightCreateCountsOnce(t *testing.T) {
+	tc := newChain(t)
+	setDiskBudget(tc, "b", intp(50))
+	tc.hotels["b"].answerDelay = 600 * time.Millisecond
+	onB := map[string]any{"hotels": []string{"b"}}
+	done := make(chan int, 1)
+	go func() {
+		status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", diskBody(50, onB))
+		done <- status
+	}()
+	// Wait until the hotel lists the room while its create has not answered.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		tc.hotels["b"].mu.Lock()
+		n := len(tc.hotels["b"].rooms)
+		tc.hotels["b"].mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the room never listed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	tc.b.syncHotel(context.Background(), tc.b.hotelByID("b"))
+	var adopted bool
+	setHotel(tc, "b", func(h *hotel) { adopted = len(h.rooms) == 1 && h.creating == 1 })
+	if !adopted {
+		t.Fatal("the sync loop did not adopt the room while its create was in flight")
+	}
+	if used, pending := diskUsed(tc, "b"); used != 40 || pending != 40 {
+		t.Fatalf("in flight and adopted: used %d pending %d, want 40 and 40 (counted once)", used, pending)
+	}
+	// 10 extra still fits the 50 budget: the room is not counted twice.
+	tc.hotels["b"].mu.Lock()
+	tc.hotels["b"].answerDelay = 0
+	tc.hotels["b"].mu.Unlock()
+	tc.room(t, "key1", diskBody(20, onB))
+	if status := <-done; status != 202 {
+		t.Fatalf("in-flight create: %d", status)
+	}
+	if used, pending := diskUsed(tc, "b"); used != 50 || pending != 0 {
+		t.Fatalf("after both: used %d pending %d, want 50 and 0", used, pending)
+	}
+	setHotel(tc, "b", func(h *hotel) {
+		if len(h.diskBatches) != 0 {
+			t.Fatalf("diskBatches left: %v", h.diskBatches)
+		}
+	})
 }

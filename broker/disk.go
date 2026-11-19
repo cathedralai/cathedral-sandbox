@@ -60,11 +60,32 @@ func checkDiskConfig(hc hotelConfig) error {
 	return nil
 }
 
+// holdDisk takes (sign 1) or gives back (sign -1) the extra disk of a create
+// of pl on h while it is queued or creating. Caller holds b.mu.
+func (h *hotel) holdDisk(pl placement, sign int) {
+	extra := diskExtra(pl.diskGiB)
+	if extra == 0 {
+		return
+	}
+	h.diskPending += sign * extra
+	if h.diskBatches == nil {
+		h.diskBatches = map[string]int{}
+	}
+	if h.diskBatches[pl.diskBatch] += sign; h.diskBatches[pl.diskBatch] <= 0 {
+		delete(h.diskBatches, pl.diskBatch)
+	}
+}
+
 // diskExtraUsed is the extra disk of h's rooms plus the creates queued or
-// creating there. Caller holds b.mu.
+// creating there. A room the sync loop adopted while a create of its batch
+// is still in flight here is that create's room: its disk is already held
+// in diskPending, so it counts once. Caller holds b.mu.
 func (h *hotel) diskExtraUsed() int {
 	n := h.diskPending
 	for _, rm := range h.rooms {
+		if rm.syncBatch != "" && h.diskBatches[rm.syncBatch] > 0 {
+			continue
+		}
 		n += diskExtra(rm.diskGiB)
 	}
 	return n
@@ -76,6 +97,11 @@ func (b *broker) diskFits(h *hotel, extra int) bool {
 	budget := h.cfg.DiskExtraGiB
 	if extra <= 0 || budget == nil {
 		return true
+	}
+	if h.roomsUnchecked {
+		// Loaded at start and no room list has answered yet: h.rooms is
+		// empty, so the whole budget would look free.
+		return false
 	}
 	if h.roomDataPct != nil && *h.roomDataPct >= diskFullPct {
 		return false

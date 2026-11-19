@@ -56,7 +56,9 @@ Creates in flight:
   `0`: rooms of 10 GiB or less only. Absent: no disk limit and no
   `room_data_used_pct` check (the behaviour before AB#831). Rooms of 10 GiB
   or less are never affected. The broker learns each room's disk from the
-  create and from the hotel room list, so a restart keeps the count. When a
+  create and from the hotel room list, so a restart keeps the count; until
+  a hotel's first room list answers after a start, it takes no room above
+  10 GiB. When a
   hotel would take the room but none has the disk, the create gets 429
   `disk_sold_out` with `Retry-After: 60` (native and compat).
 
