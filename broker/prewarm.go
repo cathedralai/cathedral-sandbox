@@ -40,7 +40,7 @@ func (b *broker) prewarmHotel(h *hotel) {
 	b.mu.Unlock()
 	seen := map[string]bool{}
 	for _, t := range catalogTemplates {
-		if !t.Live || t.Image == "" || seen[t.Image] {
+		if !t.Live || t.Image == "" || seen[t.Image] || !prewarmsTemplate(h, t) {
 			continue
 		}
 		seen[t.Image] = true
@@ -58,6 +58,15 @@ func (b *broker) prewarmHotel(h *hotel) {
 		}
 		b.mu.Unlock()
 	}
+}
+
+// prewarmsTemplate reports whether h may ever run a create of t. A sealed-only
+// template (the LFM images, about 1.3 GB each) never lands on an unsealed
+// hotel, so pulling it there only fills the hotel's disk. 20 Nov 2026: every
+// broker restart pulled them onto c46, whose 60 GB room volume was 99% full,
+// and a polaris create on c46 failed with ENOSPC during the pull.
+func prewarmsTemplate(h *hotel, t catalogTemplate) bool {
+	return !t.SealedOnly || hotelClass(h) == classSealed
 }
 
 // preferWarm zeroes the weight of cold hotels when at least one candidate that
