@@ -291,6 +291,7 @@ still omit commands, files, and outputs. One room's own receipts are
 | Route (guest key) | What it does |
 |---|---|
 | `POST /v1/hotels/<id>/attest` `{"report_data_hex": "<128 hex>"}` | Passes the body to the hotel's `POST /room/attest` and returns the hotel's status, JSON and `Retry-After` unchanged: a fresh SEV-SNP report whose REPORT_DATA is those 64 bytes verbatim (see room-kit README). A hotel outside the guest's hotel list answers 404, as for receipts. Body cap 4096 bytes (413). An optional `"sandbox_id"` must name a room of this guest on that hotel (404 `room_not_found` otherwise) and goes to the hotel as the hotel's room id. |
+| `POST /v1/sandboxes/<hotel>.<room>/release-proof` | For an owned room on an allowed hotel, wraps the JSON challenge body as `{"sandbox_id":"<local-room>","challenge":...}` and sends it to the hotel's Health front at `/room/release-proof`. The local room comes only from the owned URL. Request cap 2048 bytes, reply cap 8192 bytes, 10-second guest deadline. Exact route and POST only. No redirects or application retries. Existing hotel credential and attested-TLS gate apply. The response is unverified guest evidence for the release service, not delivery or command permission. Requires a guest image implementing this endpoint. |
 
 A hotel signs receipts only for calls that pass through its receipt front
 (room kit, `127.0.0.1:18092` on a shared hotel; `:18090` in a sealed
