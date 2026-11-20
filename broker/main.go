@@ -663,9 +663,10 @@ var errAnswerTooLarge = errors.New("the hotel answer is over its size limit")
 // answerRead bounds one answer read (AB#752): at most maxBytes (0: no limit),
 // and, with a pool, only once the answer's size is reserved in it for owner.
 type answerRead struct {
-	maxBytes int64
-	pool     *answerPool
-	owner    string
+	noRedirect bool // one destination only; no redirect or cookie replay
+	maxBytes   int64
+	pool       *answerPool
+	owner      string
 }
 
 // doHeadersMax is doHeaders under an answerRead. A longer answer is an error,
@@ -704,7 +705,14 @@ func (h *hotel) doHeadersMax(ctx context.Context, base, method, path string, que
 		}
 		defer releaseConn()
 	}
-	resp, err := h.client.Do(req)
+	client := h.client
+	if lim.noRedirect {
+		copy := *client
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		copy.Jar = nil
+		client = &copy
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, noop, err
 	}
@@ -1611,6 +1619,12 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	b.mu.Unlock()
 	if !owned {
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
+		return
+	}
+	// The proof lives on the guest's receipts front, not its sandbox API.
+	// Resolve the route's room under this guest before selecting that endpoint.
+	if gate == "release-proof" {
+		b.handleRoomReleaseProof(w, r, g, h, hid, tail)
 		return
 	}
 	// A terminal WebSocket goes to the hotel as a raw byte pump (terminal_ws.go),
