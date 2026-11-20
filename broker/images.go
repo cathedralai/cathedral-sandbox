@@ -81,6 +81,11 @@ type placement struct {
 	// diskGiB: the create's resources.disk_gib (0: the hotel default). Above
 	// the base disk it must fit a hotel's disk budget (disk.go).
 	diskGiB int
+	// registryAuth: the create carries the guest's own registry login
+	// (image.registry_auth, AB#817). Only a hotel whose create leg is
+	// encrypted to the room runtime matches (encryptedCreateLeg), on every
+	// retry, fallback and queue move too.
+	registryAuth bool
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -88,6 +93,9 @@ func (pl placement) selects(h *hotel) bool {
 		return false
 	}
 	if pl.ownHostsOnly && isMinerHotel(h) {
+		return false
+	}
+	if pl.registryAuth && !encryptedCreateLeg(h) {
 		return false
 	}
 	if len(pl.allowed) > 0 && !pl.allowed[h.cfg.ID] {
@@ -258,6 +266,59 @@ type apiErr struct {
 
 func (e *apiErr) Error() string { return e.code + ": " + e.msg }
 
+// encryptedCreateLeg reports whether a create body sent to h is encrypted all
+// the way to the room runtime that reads it. A guest TLS hotel terminates TLS
+// inside the sealed guest on a key its SNP attestation names (miner_tls.go),
+// so the host never sees the body. A sealed hotel without it may terminate TLS
+// on the host. An unsealed hotel runs Docker on the host anyway, so https to
+// it is the whole leg.
+func encryptedCreateLeg(h *hotel) bool {
+	if h.guestTLS() {
+		return true
+	}
+	if h.cfg.Sealed || h.labels()["sealed"] == "true" {
+		return false
+	}
+	return strings.HasPrefix(h.cfg.API, "https://")
+}
+
+// createImageRef is the image reference of a create: the string form, or the
+// "image" of the object form {"image", "registry_auth"} (AB#817). "" for none.
+func createImageRef(payload map[string]any) string {
+	switch v := payload["image"].(type) {
+	case string:
+		return v
+	case map[string]any:
+		ref, _ := v["image"].(string)
+		return ref
+	}
+	return ""
+}
+
+// createRegistryAuth checks the registry login of an object form image. It
+// reports whether the create carries one. The login goes to the hotel in the
+// create bytes and nowhere else: no message here names a value.
+func createRegistryAuth(payload map[string]any) (*apiErr, bool) {
+	img, ok := payload["image"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	raw, ok := img["registry_auth"]
+	if !ok || raw == nil {
+		return nil, false
+	}
+	auth, ok := raw.(map[string]any)
+	if !ok || len(auth) != 2 {
+		return &apiErr{400, "invalid_registry_auth", "registry_auth needs exactly username and password"}, true
+	}
+	for _, k := range []string{"username", "password"} {
+		if s, _ := auth[k].(string); s == "" {
+			return &apiErr{400, "invalid_registry_auth", "registry_auth needs non-empty username and password"}, true
+		}
+	}
+	return nil, true
+}
+
 // localImageRefusal refuses an image reference a guest sends that names a
 // hotel-local artifact instead of a registry image. A hotel keeps every
 // guest's snapshot images (cathedral-snap-<id>) in its one Docker image
@@ -392,12 +453,22 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 		pl.ownHostsOnly = own
 	}
+	_, pl.registryAuth = createRegistryAuth(payload)
 	_, named := payload["hotels"]
 	_, sealedField := payload["sealed"]
 	b.scope(g, &pl, named && payload["hotels"] != nil, sealedField && payload["sealed"] != nil)
 	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			return pl, nil
+		}
+	}
+	if pl.registryAuth {
+		open := pl
+		open.registryAuth = false
+		for _, h := range b.hotelList() {
+			if open.selects(h) {
+				return pl, &apiErr{409, "registry_auth_needs_encrypted_hotel", "a create with registry_auth goes only to a sealed hotel with attested guest TLS or an unsealed hotel with an https API; none matches the hotel selection"}
+			}
 		}
 	}
 	if b.lentAway(pl) {

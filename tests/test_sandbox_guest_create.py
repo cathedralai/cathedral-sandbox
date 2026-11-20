@@ -446,3 +446,99 @@ def test_a_failed_pull_is_not_shared(fake: FakeDocker) -> None:
         assert len(fake.calls_of("pull")) == 3
     finally:
         provider.close()
+
+
+# ---------------------------------------------------------------- AB#817: own Docker Hub login
+HUB_LOGIN = {"username": "const", "password": "dckr_pat_test"}
+
+
+def _create_with_login(provider, image: str, digest: str = "1"):
+    request = CreateSandboxRequest(
+        image=ImageSource(image=image, registry_auth=HUB_LOGIN),
+        resources=Resources(vcpu=1, memory_gib=1, disk_gib=5),
+    )
+    return provider.create(request, api_key="k", idempotency=None, body_digest=digest)
+
+
+@pytest.mark.parametrize(
+    ("image", "direct"),
+    [
+        ("acme/private:1", "registry-1.docker.io/acme/private:1"),
+        ("alpine:3.20", "registry-1.docker.io/library/alpine:3.20"),
+        ("docker.io/acme/private:1", "registry-1.docker.io/acme/private:1"),
+    ],
+)
+def test_hub_login_pulls_from_hub_not_a_mirror(fake: FakeDocker, monkeypatch, image: str, direct: str) -> None:
+    # dockerd would offer the login to its registry-mirrors first; the
+    # registry-1.docker.io name skips them, and the client mirror is skipped too.
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_REGISTRY_MIRROR", "mirror.gcr.io")
+    provider = DockerGuestProvider()
+    try:
+        _create_with_login(provider, image)
+        assert fake.calls_of("pull") == [["pull", direct]]
+        assert fake.calls_of("tag") == [["tag", direct, image]]
+        (seen,) = fake.state["pull_auth"]
+        assert seen["auth"] == {"auths": {"registry-1.docker.io": HUB_LOGIN}}
+    finally:
+        provider.close()
+
+
+def test_hub_login_config_is_removed_after_a_failed_pull(fake: FakeDocker, tmp_path) -> None:
+    import os
+
+    fake.set(pull_fail=["registry-1.docker.io/acme/private:1"])
+    provider = DockerGuestProvider()
+    try:
+        with pytest.raises(SandboxOpError) as err:
+            _create_with_login(provider, "acme/private:1")
+        assert err.value.code == "image_pull_failed"
+        assert HUB_LOGIN["password"] not in str(err.value)
+        (seen,) = fake.state["pull_auth"]
+        assert not os.path.exists(seen["config_dir"])
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize(
+    ("image", "key"),
+    [
+        ("ghcr.io/acme/private:1", "ghcr.io"),
+        ("acme/private@sha256:" + "a" * 64, "https://index.docker.io/v1/"),
+        ("docker.io/acme/private@sha256:" + "a" * 64, "https://index.docker.io/v1/"),
+    ],
+)
+def test_login_for_other_registries_and_digests_pulls_the_reference(fake: FakeDocker, image: str, key: str) -> None:
+    # A digest cannot be tagged, so a pinned Hub image keeps the plain pull.
+    provider = DockerGuestProvider()
+    try:
+        _create_with_login(provider, image)
+        assert fake.calls_of("pull") == [["pull", image]]
+        assert fake.state["pull_auth"][0]["auth"] == {"auths": {key: HUB_LOGIN}}
+    finally:
+        provider.close()
+
+
+def test_no_login_keeps_the_mirror(fake: FakeDocker, monkeypatch) -> None:
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_REGISTRY_MIRROR", "mirror.gcr.io")
+    provider = DockerGuestProvider()
+    try:
+        _create(provider, image="acme/tool:1")
+        assert fake.calls_of("pull") == [["pull", "mirror.gcr.io/acme/tool:1"]]
+    finally:
+        provider.close()
+
+
+def test_another_owner_cannot_start_the_hub_alias_from_cache(fake: FakeDocker) -> None:
+    # The alias tag stays after a login pull; the per-owner grant still needs a
+    # pull of its own, so an anonymous create of the alias name pulls (and fails here).
+    provider = DockerGuestProvider()
+    try:
+        _create_with_login(provider, "acme/private:1")
+        fake.set(pull_fail=["registry-1.docker.io/acme/private:1"])
+        request = _req("registry-1.docker.io/acme/private:1")
+        with pytest.raises(SandboxOpError) as err:
+            provider.create(request, api_key="other", idempotency=None, body_digest="2")
+        assert err.value.code in ("image_not_owned", "image_pull_failed")
+        assert fake.calls_of("pull")[-1] == ["pull", "registry-1.docker.io/acme/private:1"]
+    finally:
+        provider.close()

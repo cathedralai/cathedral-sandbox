@@ -681,6 +681,23 @@ class DockerClient:
         """
         if not refresh and self.image_exists(image):
             return False
+        direct = hub_direct_ref(image) if registry_auth is not None else None
+        if direct is not None:
+            # The guest's own Docker Hub login (AB#817): pull from Hub itself.
+            # dockerd sends a login to every endpoint it tries, its
+            # registry-mirrors (ROOM_REGISTRY_MIRRORS) first, and applies them
+            # to docker.io only, so the registry-1.docker.io name skips them.
+            # The alias tag stays: removing it would race a parallel create of
+            # the same image, and the per-owner grant covers it.
+            self.pull(direct, registry_auth=registry_auth)
+            tagged = self.run(["docker", "tag", direct, image], timeout=30.0)
+            if tagged.returncode != 0:
+                raise SandboxOpError(
+                    "image_pull_failed",
+                    502,
+                    f"docker tag failed for {image}: {(tagged.stderr or '').strip()[:300]}",
+                )
+            return True
         mirrored = mirror_ref(mirror, image) if mirror and registry_auth is None else None
         if mirrored is not None:
             try:
@@ -1158,8 +1175,25 @@ def mirror_ref(mirror: str, image: str) -> str | None:
     return f"{mirror}/{name}"
 
 
+HUB_REGISTRY_HOST = "registry-1.docker.io"
+
+
+def hub_direct_ref(image: str) -> str | None:
+    """Return the registry-1.docker.io name of a tagged Docker Hub *image*, else None.
+
+    "alpine:3.20" -> "registry-1.docker.io/library/alpine:3.20". Images on
+    another registry are not Hub images. Digest references are left alone:
+    docker tag cannot make a digest reference, so the requested reference
+    would not resolve after an alias pull.
+    """
+    return mirror_ref(HUB_REGISTRY_HOST, image)
+
+
 def _registry_host(image: str) -> str:
     first = image.split("/", 1)[0]
+    if "/" in image and first in ("docker.io", "index.docker.io"):
+        # The docker CLI looks a Hub login up under the index key, never "docker.io".
+        return "https://index.docker.io/v1/"
     if "." in first or ":" in first or first == "localhost":
         return first
     return "https://index.docker.io/v1/"
