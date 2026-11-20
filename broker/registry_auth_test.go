@@ -180,7 +180,7 @@ func TestEncryptedCreateLeg(t *testing.T) {
 		hc   hotelConfig
 		want bool
 	}{
-		{"unsealed https", hotelConfig{API: "https://h:8443"}, true},
+		{"unsealed https", hotelConfig{API: "https://h:8443"}, false},
 		{"unsealed http", hotelConfig{API: "http://h:8080"}, false},
 		{"sealed config, host TLS", hotelConfig{API: "https://h:8443", Sealed: true}, false},
 		{"sealed label, host TLS", hotelConfig{API: "https://h:8443", Labels: map[string]string{"sealed": "true"}}, false},

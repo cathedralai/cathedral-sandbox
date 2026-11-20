@@ -267,19 +267,13 @@ type apiErr struct {
 func (e *apiErr) Error() string { return e.code + ": " + e.msg }
 
 // encryptedCreateLeg reports whether a create body sent to h is encrypted all
-// the way to the room runtime that reads it. A guest TLS hotel terminates TLS
-// inside the sealed guest on a key its SNP attestation names (miner_tls.go),
-// so the host never sees the body. A sealed hotel without it may terminate TLS
-// on the host. An unsealed hotel runs Docker on the host anyway, so https to
-// it is the whole leg.
+// the way to the room runtime that reads it. Only guest TLS qualifies: TLS
+// terminates inside the sealed guest on a key its SNP attestation names
+// (miner_tls.go), so the host never sees registry_auth. Sealed hotels without
+// guest TLS may terminate on the host; unsealed https still exposes the body
+// to the hotel process. AB#817: sealed-only — no unsealed create leg.
 func encryptedCreateLeg(h *hotel) bool {
-	if h.guestTLS() {
-		return true
-	}
-	if h.cfg.Sealed || h.labels()["sealed"] == "true" {
-		return false
-	}
-	return strings.HasPrefix(h.cfg.API, "https://")
+	return h.guestTLS()
 }
 
 // createImageRef is the image reference of a create: the string form, or the
@@ -467,7 +461,7 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		open.registryAuth = false
 		for _, h := range b.hotelList() {
 			if open.selects(h) {
-				return pl, &apiErr{409, "registry_auth_needs_encrypted_hotel", "a create with registry_auth goes only to a sealed hotel with attested guest TLS or an unsealed hotel with an https API; none matches the hotel selection"}
+				return pl, &apiErr{409, "registry_auth_needs_encrypted_hotel", "a create with registry_auth goes only to a sealed hotel with attested guest TLS; none matches the hotel selection"}
 			}
 		}
 	}
