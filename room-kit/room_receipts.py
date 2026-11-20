@@ -204,6 +204,9 @@ RELEASE_CHALLENGE_SCHEMA = "cathedral_vault_release_challenge_v1"
 RELEASE_PROOF_PURPOSE = "cathedral.vault-release.v1"
 RELEASE_PROOF_MAX_BYTES = 4096
 RELEASE_PROOF_MAX_AGE = 60
+# Cross-host allowance only. The RS still authenticates and expires its MAC
+# against its own clock before decrypting; the guest has no MAC key.
+RELEASE_PROOF_CLOCK_SKEW = 5
 RELEASE_PROOF_LOOKUP_SECONDS = 3
 RELEASE_CHALLENGE_FIELDS = frozenset({
     "schema", "nonce_b64", "issued_at", "secret_id", "sandbox_id",
@@ -405,7 +408,7 @@ def release_proof_request(body: bytes) -> tuple[str, dict]:
             decoded = base64.b64decode(raw, validate=True)
             if len(decoded) != 32 or b64(decoded) != raw:
                 raise ValueError
-        if type(challenge["issued_at"]) is not int or challenge["issued_at"] < 0:
+        if type(challenge["issued_at"]) is not int or not 0 <= challenge["issued_at"] < 2**53:
             raise ValueError
         return room, challenge
     except (ValueError, TypeError, RecursionError):
@@ -2567,7 +2570,7 @@ class Ledger:
         def check() -> None:  # caller holds self.lock
             if not self.sealed or self.secrets is None:
                 raise ReleaseProofRefused(503, "release_proof_disabled")
-            if not 0 <= time.time() - challenge["issued_at"] <= RELEASE_PROOF_MAX_AGE:
+            if not -RELEASE_PROOF_CLOCK_SKEW <= time.time() - challenge["issued_at"] <= RELEASE_PROOF_MAX_AGE:
                 raise ReleaseProofRefused(409, "release_proof_expired")
             if challenge["binding_sha256"] != self.binding_sha256:
                 raise ReleaseProofRefused(409, "release_proof_wrong_binding")

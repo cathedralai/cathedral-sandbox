@@ -287,3 +287,51 @@ def test_slow_liveness_lookup_has_total_deadline(front, monkeypatch):
     assert time.monotonic() - started < 2
     assert len(front.ledger.chain) == 1
     assert_idle(front.ledger)
+
+
+@pytest.mark.parametrize("age,status", [(-5, 200), (-5.001, 409), (-6, 409),
+                                       (0, 200), (60, 200), (60.001, 409)])
+def test_bounded_cross_host_clock_skew(front, monkeypatch, age, status):
+    from types import SimpleNamespace
+    room = create(front)
+    doc = request(front, room)
+    monkeypatch.setattr(rr, "time", SimpleNamespace(
+        time=lambda: doc["challenge"]["issued_at"] + age, monotonic=time.monotonic))
+    code, _, raw = post(front, doc)
+    assert code == status, raw
+    assert len(front.ledger.chain) == (2 if status == 200 else 1)
+    if status == 200:
+        receipt = json.loads(raw)["receipt"]
+        public = Ed25519PublicKey.from_public_bytes(base64.b64decode(
+            front.ledger.binding["receipt_key_ed25519_b64"]))
+        public.verify(base64.b64decode(receipt["signature_b64"]), canonical(receipt["statement"]))
+    assert_idle(front.ledger)
+
+
+@pytest.mark.parametrize("issued", [10**400, -(10**400), 2**53, -1])
+def test_bounded_challenge_timestamp_has_safe_bad_request(front, issued):
+    doc = request(front, create(front))
+    doc["challenge"]["issued_at"] = issued
+    status, _, raw = post(front, doc)
+    assert status == 400
+    assert json.loads(raw)["error"] == {"code": "release_proof_request_invalid"}
+    assert len(front.ledger.chain) == 1
+    assert_idle(front.ledger)
+
+
+def test_clock_allowance_does_not_skip_second_expiry_check(front, monkeypatch):
+    from types import SimpleNamespace
+    doc = request(front, create(front))
+    moment = [doc["challenge"]["issued_at"] - 5]
+    monkeypatch.setattr(rr, "time", SimpleNamespace(time=lambda: moment[0], monotonic=time.monotonic))
+    original = front.server.api_get
+
+    def slow(*args, **kw):
+        reply = original(*args, **kw)
+        moment[0] = doc["challenge"]["issued_at"] + 60.001
+        return reply
+
+    monkeypatch.setattr(front.server, "api_get", slow)
+    assert post(front, doc)[0] == 409
+    assert len(front.ledger.chain) == 1
+    assert_idle(front.ledger)

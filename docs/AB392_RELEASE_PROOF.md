@@ -17,7 +17,7 @@ guest's room ID. `challenge` has exactly these fields:
 | --- | --- |
 | `schema` | `cathedral_vault_release_challenge_v1` |
 | `nonce_b64` | Canonical standard base64 of 32 random bytes |
-| `issued_at` | Integer Unix seconds, no future time, at most 60 seconds old |
+| `issued_at` | Integer Unix seconds below 2^53, up to 5 seconds ahead, at most 60 seconds old |
 | `secret_id` | Canonical lowercase UUID of the secret |
 | `sandbox_id` | Cathedral sandbox UUID from the signed create or pool claim |
 | `binding_sha256` | Current guest boot binding digest |
@@ -74,3 +74,12 @@ their branches or authorize a rollout. Future release-service allowlists must
 require a build containing both the reserved-report-data guard and this route.
 No API relay, release service, AWS provisioning or live hardware acceptance is
 included. The tests use synthetic SNP evidence and real receipt signatures.
+
+
+The five-second allowance applies only to a challenge issued by another host.
+It does not extend the maximum guest-local age or skip the second expiry check.
+The release service still authenticates the MAC and enforces its own 60-second
+age without this allowance. Clock synchronization remains a rollout prerequisite.
+The matching API/service clock patch must ship before claiming drift tolerance
+across the whole release flow. This guest change requires a new measured image,
+approved-list update and owner-controlled rollout; a merge is not live evidence.
