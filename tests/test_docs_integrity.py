@@ -36,7 +36,7 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
         # not keep a historical-SN39 identity or UID-specific admission story.
         "SN94 admission remains unverified",
         "Founding miners",
-        "there is no application",
+        "Bring your compute",
         "Registration alone does not admit a machine to the sealed customer pool",
         "7f32aaa75cf2feecde572ff8c9d9985bb9601871b99d68a25a9148bbc3746b4b",
         "3e1cb9144417e1e0d526445a43245e305e772cae0568202a332183071ef0c584",
@@ -51,7 +51,8 @@ def test_mining_guide_is_the_single_current_operator_path() -> None:
 
     assert "single current mining guide" in mining
     assert "only active operator guide" in " ".join(map_text.split())
-    assert "mining is closed to new miners" in mining.lower()
+    assert "mining is open to amd sev-snp boxes" in mining.lower()
+    assert "docs/BRING_YOUR_COMPUTE.md" in mining
     assert len(mining.splitlines()) <= 8
 
 

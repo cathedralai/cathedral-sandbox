@@ -4,9 +4,9 @@
 <p align="center"><sub>12 November 2026</sub></p>
 
 > [!IMPORTANT]
-> **Compute mining is closed to new miners right now.** Only approved operators
-> earn; any other machine earns nothing, even if it passes every check. There is
-> no application. Cathedral will post an announcement when mining opens.
+> **Miner compute is open to AMD SEV-SNP bare metal.** Check your box and apply:
+> [Bring your compute](docs/BRING_YOUR_COMPUTE.md). Only approved hotkeys earn,
+> and only while their box's chip-signed attestation verifies.
 > **Earn today with no hardware:** the [Cathedral Escape Room](https://github.com/cathedralai/cathedral-escape)
 > is open to any hotkey registered on SN94.
 
@@ -126,7 +126,7 @@ Reuse the signer, not a second hotkey or a second signing key.
 
 ## Founding miners
 
-Compute mining is gated and there is no application right now. Cathedral will post an announcement when mining opens.
+Miner compute is open: bring an AMD SEV-SNP bare-metal box. Check it and apply with [Bring your compute](docs/BRING_YOUR_COMPUTE.md).
 Registration alone does not admit a machine to the sealed customer pool
 or place customer jobs. See the [mining guide](docs/MINING.md#founding-miners).
 
