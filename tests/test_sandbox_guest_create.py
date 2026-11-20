@@ -499,21 +499,35 @@ def test_hub_login_config_is_removed_after_a_failed_pull(fake: FakeDocker, tmp_p
         provider.close()
 
 
+def test_login_for_other_registries_pulls_the_reference(fake: FakeDocker) -> None:
+    provider = DockerGuestProvider()
+    try:
+        _create_with_login(provider, "ghcr.io/acme/private:1")
+        assert fake.calls_of("pull") == [["pull", "ghcr.io/acme/private:1"]]
+        assert fake.state["pull_auth"][0]["auth"] == {"auths": {"ghcr.io": HUB_LOGIN}}
+    finally:
+        provider.close()
+
+
 @pytest.mark.parametrize(
-    ("image", "key"),
+    ("image", "direct"),
     [
-        ("ghcr.io/acme/private:1", "ghcr.io"),
-        ("acme/private@sha256:" + "a" * 64, "https://index.docker.io/v1/"),
-        ("docker.io/acme/private@sha256:" + "a" * 64, "https://index.docker.io/v1/"),
+        ("acme/private@sha256:" + "a" * 64, "registry-1.docker.io/acme/private@sha256:" + "a" * 64),
+        ("docker.io/acme/private@sha256:" + "a" * 64, "registry-1.docker.io/acme/private@sha256:" + "a" * 64),
     ],
 )
-def test_login_for_other_registries_and_digests_pulls_the_reference(fake: FakeDocker, image: str, key: str) -> None:
-    # A digest cannot be tagged, so a pinned Hub image keeps the plain pull.
+def test_hub_login_digest_pulls_from_hub_not_a_mirror(
+    fake: FakeDocker, monkeypatch, image: str, direct: str
+) -> None:
+    # Digest refs must use registry-1.docker.io too: a plain Hub digest would
+    # still hit dockerd's registry-mirrors and send the customer login there.
+    monkeypatch.setenv("CATHEDRAL_SANDBOX_REGISTRY_MIRROR", "mirror.gcr.io")
     provider = DockerGuestProvider()
     try:
         _create_with_login(provider, image)
-        assert fake.calls_of("pull") == [["pull", image]]
-        assert fake.state["pull_auth"][0]["auth"] == {"auths": {key: HUB_LOGIN}}
+        assert fake.calls_of("pull") == [["pull", direct]]
+        assert fake.calls_of("tag") == []
+        assert fake.state["pull_auth"][0]["auth"] == {"auths": {"registry-1.docker.io": HUB_LOGIN}}
     finally:
         provider.close()
 

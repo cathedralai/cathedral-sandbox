@@ -687,9 +687,15 @@ class DockerClient:
             # dockerd sends a login to every endpoint it tries, its
             # registry-mirrors (ROOM_REGISTRY_MIRRORS) first, and applies them
             # to docker.io only, so the registry-1.docker.io name skips them.
+            # Digest refs use the same rewrite: a plain Hub digest would still
+            # hit the mirror and hand the customer credential to Google.
+            self.pull(direct, registry_auth=registry_auth)
+            if "@" in image:
+                # docker tag cannot target a digest reference; the pull already
+                # made the content local under the registry-1.docker.io name.
+                return True
             # The alias tag stays: removing it would race a parallel create of
             # the same image, and the per-owner grant covers it.
-            self.pull(direct, registry_auth=registry_auth)
             tagged = self.run(["docker", "tag", direct, image], timeout=30.0)
             if tagged.returncode != 0:
                 raise SandboxOpError(
@@ -1179,14 +1185,24 @@ HUB_REGISTRY_HOST = "registry-1.docker.io"
 
 
 def hub_direct_ref(image: str) -> str | None:
-    """Return the registry-1.docker.io name of a tagged Docker Hub *image*, else None.
+    """Return the registry-1.docker.io name of a Docker Hub *image*, else None.
 
-    "alpine:3.20" -> "registry-1.docker.io/library/alpine:3.20". Images on
-    another registry are not Hub images. Digest references are left alone:
-    docker tag cannot make a digest reference, so the requested reference
-    would not resolve after an alias pull.
+    "alpine:3.20" -> "registry-1.docker.io/library/alpine:3.20".
+    "acme/private@sha256:…" -> "registry-1.docker.io/acme/private@sha256:…".
+    Images on another registry are not Hub images. Digest refs are rewritten
+    too: a plain Hub digest pull would still use dockerd's registry-mirrors
+    and send the guest login there (AB#817 Fred HOLD).
     """
-    return mirror_ref(HUB_REGISTRY_HOST, image)
+    name, digest = image, ""
+    if "@" in image:
+        name, digest_part = image.split("@", 1)
+        if not digest_part.startswith("sha256:") or len(digest_part) != len("sha256:") + 64:
+            return None
+        digest = "@" + digest_part
+    mirrored = mirror_ref(HUB_REGISTRY_HOST, name)
+    if mirrored is None:
+        return None
+    return mirrored + digest
 
 
 def _registry_host(image: str) -> str:
