@@ -107,7 +107,7 @@ approved list. Then:
   `cathedral_thin/independent_runtime/approved_miners.py`).
 - The lane is about 10% of the weight vector; the rest is burned. Today it is
   split by the count of distinct verified machines of approved hotkeys
-  (`direct_contract.py`, `docs/GATED_COMPUTE.md`), so a 128 GB box and a
+  (`direct_contract.py` and `GATED_COMPUTE.md` in cathedral-validator), so a 128 GB box and a
   1 TB box earn the same.
 - Pay by delivered room-seconds on attested hotels (AB#822) runs in shadow
   mode: it is computed, not paid. Running the hotel now means the switch
