@@ -36,8 +36,8 @@ order.
 
 ## Founding miners
 
-Compute mining is closed to new miners and there is no application right now.
-Cathedral will post an announcement when mining opens.
+Miner compute is open: bring an AMD SEV-SNP bare-metal box. Check it and
+apply with [Bring your compute](BRING_YOUR_COMPUTE.md).
 See [Founding miners](MINING.md#founding-miners). Registration alone does
 not admit a machine to the sealed customer pool or place customer jobs.
 

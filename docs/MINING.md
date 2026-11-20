@@ -613,9 +613,10 @@ zero for the round.
 
 ## Founding miners
 
-Compute mining is gated. Cathedral is not adding compute right now and there
-is no application. Cathedral will post an announcement when mining opens, and
-it will admit a small group of operators first.
+Cathedral is open to miner compute on AMD SEV-SNP bare metal (Fred, 20 Nov
+2026). Check your box and apply: [Bring your compute](BRING_YOUR_COMPUTE.md).
+Founding miners are reviewed by hand, and a box takes rooms and weight only
+while its chip-signed attestation verifies.
 
 Registration alone does not admit a machine to the sealed customer pool
 or place customer jobs. After Cathedral accepts you, follow this guide
