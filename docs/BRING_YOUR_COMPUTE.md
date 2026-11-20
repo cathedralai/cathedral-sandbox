@@ -29,9 +29,14 @@ On the bare-metal host, as root:
 
 ```
 curl -fsSLO https://raw.githubusercontent.com/cathedralai/cathedral-sandbox/main/scripts/snp_host_check.py
+sha256sum snp_host_check.py # must equal the value on https://cathedral.computer/bring-your-compute/
 less snp_host_check.py      # read it first: read-only, no network, no writes
 sudo python3 snp_host_check.py
 ```
+
+The page and <https://cathedral.computer/miners.md> carry the sha256 of the
+reviewed script and a one-line command that runs it only on a match. Prefer
+that command; do not run a copy whose hash differs.
 
 Each line is PASS, WARN, FAIL, UNKNOWN or INFO; a JSON summary follows. Exit 0
 means ready, 1 means a FAIL to fix, 2 means something could not be read. A
