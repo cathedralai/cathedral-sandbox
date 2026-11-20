@@ -506,8 +506,8 @@ headers, so cryptsetup has nothing to repair on the next open).
 (Decision 6, 4 Nov) and the shred receipt. `VolumeRegistry`
 (`cathedral/volume_chain.py`) writes it: every accepted head appends a `head`
 entry, an exact resend appends nothing, and a refused commit leaves the log and
-the head unchanged. The log is in memory like the rest of the registry; nothing
-publishes it yet.
+the head unchanged. The log is in memory like the rest of the registry and is
+not published.
 
 - Entry `cathedral_volume_log_entry_v1`: `seq`, `prev_entry_sha256`, `kind`
   (`head` or `shred`), `volume_id`, `generation`, `manifest_sha256`,
@@ -525,8 +525,8 @@ publishes it yet.
   `cathedral_volume_shred_receipt_v1`: Ed25519 over canonical JSON.
 
 Not covered by the format: a log operator showing two readers two different
-logs. Readers comparing checkpoints (`verify_extends_checkpoint`) catch it; where the
-log and checkpoints are published is still open.
+logs. Readers comparing checkpoints (`verify_extends_checkpoint`) catch it. The log
+is not published (19 Nov), so today no outside reader holds a checkpoint.
 
 Registry wiring:
 
@@ -536,24 +536,75 @@ Registry wiring:
 - Restore: a restoring guest runs `verify_chain`, then `check_restore` on the
   log with the head commit's manifest digest. Storage still holds a shredded
   volume's chain, so `verify_chain` alone passes; `check_restore` refuses it.
-- `VolumeRegistry.shred(volume_id, key_id=..., destroy_key=...)`, under the
-  registry lock: checks the volume has a committed head and is not shredded,
-  checks `key_id` is the volume's key (recorded by `create(..., key_id=...)` or
-  `bind_key`, set once; otherwise `key_not_bound` or `shred_key_mismatch`),
-  builds the shred entry, ends the lease and freezes the volume
+- `VolumeRegistry.shred(volume_id, owner=..., key_id=..., destroy_key=...,
+  timeout_seconds=10)`: under the registry lock it checks, in order, the
+  timeout (0.1 to 60 seconds, else `bad_timeout`), that the volume exists
+  (`volume_unknown`), that `owner` is the owner given to `create` (`not_owner`),
+  then answers a shredded volume (same `key_id`: the stored receipt; another:
+  `volume_shredded`), refuses a second shred while one is waiting on the key
+  service (`shred_in_progress`), checks the volume has a committed head
+  (`nothing_to_shred`) and that `key_id` is the volume's key (recorded by
+  `create(..., key_id=...)` or `bind_key`, set once; otherwise `key_not_bound`
+  or `shred_key_mismatch`). It then ends the lease and freezes the volume
   (`shred_pending`, with the pending `key_id`: grant, accept and head refuse,
-  and a retry with another `key_id` refuses `shred_key_mismatch`), then calls
-  `destroy_key(volume_id, key_id)`. Only when that returns `True` does it log the shred and
-  return a signed `cathedral_volume_shred_receipt_v1`. When the key service
-  refuses or its answer is lost, nothing is logged and the volume stays frozen,
-  since the key may already be gone; retrying `shred` finishes it. After a
-  shred, grant, accept (including a resend) and head refuse `volume_shredded`;
-  `shred` again with the same `key_id` returns the same receipt.
+  and a retry with another `key_id` refuses `shred_key_mismatch`), releases the
+  lock and calls `destroy_key(volume_id, key_id)` on a worker thread, waiting at
+  most `timeout_seconds` (`key_service_timeout`). Only when that returns `True`
+  does it take the lock again, build and log the shred entry and return a signed
+  `cathedral_volume_shred_receipt_v1`. When the key service refuses, times out
+  or its answer is lost, nothing is logged and the volume stays frozen, since
+  the key may already be gone; retrying `shred` finishes it. After a shred,
+  grant, accept (including a resend) and head refuse `volume_shredded`; `shred`
+  again by the owner with the same `key_id` returns the same receipt.
 - The receipt attests that the key service confirmed destroying `key_id`.
   `destroy_key` is the key release service's call (AB#392, not built); it must
   raise on an unknown key and be idempotent (an already destroyed key returns
   `True`), so a retry after a lost answer succeeds. It is given `volume_id` too
   and must refuse a key that is not that volume's.
+- Shred rules (AB#825):
+  - One key, one volume: `create` and `bind_key` refuse a key id already bound
+    to another volume (`key_bound_elsewhere`), live or shredded. The registry
+    never frees a key id, so a receipt's `key_id` names one volume forever. This
+    relies on key ids coming from the key service, never from a customer
+    request (relevant to a customer-held key mode later).
+  - Owner first: `not_owner` comes before every other check on the volume,
+    including the resend of a finished shred, so a non-owner gets no receipt and
+    learns nothing about the shred state. The registry does not authenticate;
+    the host passes the owner it authenticated.
+  - Bounded wait, lock not held: a hung key service no longer holds the single
+    registry lock, so grant, accept, head and shred on other volumes go on.
+    One worker per volume: the worker clears `shred_in_progress` before it wakes
+    the caller, so an immediate retry after `key_not_destroyed` is never refused
+    as in progress. `destroy_key` must carry its own bounded network timeout; a
+    call that never returns pins the volume in `shred_in_progress`.
+  - Guarantee change: the shred entry used to be built before the key was
+    touched. It is now built after the key is destroyed, against the log as it
+    is then (other volumes may have appended while the lock was free). A
+    `log_refused` there is practically unreachable (the volume is frozen, only
+    other volumes append) and leaves the volume `shred_pending`.
+- Shred request handler (`cathedral/volume_shred.py`, AB#825): framework free,
+  mounted nowhere yet. A registry host will mount it at
+  `POST /v1/sealed-volumes/{volume_id}/shred`; it takes `enabled` from the host
+  and answers 404 when false. Body, exact fields: `schema`
+  (`cathedral_volume_shred_request_v1`), `key_id`, `confirm_volume_id` (must
+  equal the path `volume_id`). 200 is `{"status": "shredded", "receipt": ...}`,
+  the same on every resend; a refusal is `{"status": "refused", "code": ...,
+  "retryable": ...}` and never carries the key service's error text. Checks run
+  in this order:
+
+  | Condition | HTTP | code | retryable |
+  |---|---|---|---|
+  | `enabled` false | 404 | `not_found` | false |
+  | caller owner missing or empty | 401 | `unauthenticated` | false |
+  | body not exactly the fields above, wrong schema, bad key id, confirm mismatch, bad path volume id | 400 | `bad_request` | false |
+  | `volume_unknown` or `not_owner` (same body, no existence oracle) | 404 | `volume_not_found` | false |
+  | `nothing_to_shred`, `key_not_bound`, `shred_key_mismatch`, `key_bound_elsewhere` | 409 | the registry code | false |
+  | `shred_in_progress` | 409 | `shred_in_progress` | true |
+  | `volume_shredded` (another key) | 410 | `volume_shredded` | false |
+  | `key_not_destroyed` | 502 | `key_not_destroyed` | true |
+  | `key_service_timeout` | 504 | `key_service_timeout` | true |
+  | `log_refused`, any other refusal | 500 | `internal` | true |
+
 - Provisional until Fred decides who holds the log key: the registry signs the
   shred receipt with its own key, `signing_key_id` `registry:<first 16 hex of
   sha256(public key)>`. That receipt is Ed25519 over canonical JSON with no
@@ -573,9 +624,22 @@ A volume with no accepted commit cannot be shredded yet (`nothing_to_shred`):
 the log format has no shred entry without a head. Packs a guest uploaded before
 its first commit was accepted are left to prune.
 
-Still open for AB#398: the commit every N minutes with a receipt (needs the
-guest volume agent and pinned restic, AB#789), the customer-held root key mode
-(AB#392), the storage gateway that calls `authorize`/`authorize_prune` in front
-of the bucket (AB#394), where the log and checkpoints are published and who
-holds the log key (Fred), and a live restore-after-shred on two sealed hotels
-(Toby).
+Still open for AB#825:
+
+- The mounted shred route on a registry host: needs the persistent registry
+  and its host (AB#395) and a decision on where the registry runs (control
+  plane or broker).
+- A real `destroy_key`: AB#392 volume key install and destroy in the release
+  service.
+- A live restore-after-shred on two sealed hotels: needs the AB#789 agent in a
+  re-seal and a Toby window.
+- The commit every N minutes with a receipt: needs the guest volume agent and
+  pinned restic (AB#789), the registry host (AB#395) and the storage gateway
+  (AB#394). Its receipt is the registry-signed head `accept` returns plus its
+  log entry, not a new schema.
+- The customer-held root key mode: needs a product decision (what the
+  customer holds, how it reaches the guest, what a shred receipt attests in
+  that mode, recovery when the key is lost), then AB#392 and AB#789.
+- The prune runner and the storage gateway that calls
+  `authorize`/`authorize_prune` in front of the bucket (AB#394).
+- Who holds the log key (Fred).
