@@ -36,14 +36,17 @@ func serveOverTLS(t *testing.T, tc *testChain, id string) {
 }
 
 // serveGuestTLS is an https hotel with attested guest TLS — the only create
-// leg allowed to carry registry_auth (AB#817).
+// leg allowed to carry registry_auth (AB#817). GuestTLS alone makes
+// encryptedCreateLeg true; do not set cfg.Sealed here — that would require
+// every create to ask for sealed (images.go placement). A dummy guest pin
+// satisfies admitted() without wrapping the test client in pinTransport.
 func serveGuestTLS(t *testing.T, tc *testChain, id string) {
 	t.Helper()
 	serveOverTLS(t, tc, id)
 	h := tc.b.hotelByID(id)
 	tc.b.mu.Lock()
-	h.cfg.Sealed = true
 	h.cfg.GuestTLS = true
+	h.guestPin.Store(&[32]byte{1})
 	tc.b.mu.Unlock()
 }
 
