@@ -491,7 +491,7 @@ def test_snapshot_store_full_returns_429() -> None:
         p.snapshot(sid, ttl_seconds=60)
         with pytest.raises(SandboxOpError) as ei:
             p.snapshot(sid, ttl_seconds=60)
-        assert ei.value.http_status == 429 and ei.value.code == "snapshot_quota"
+        assert ei.value.http_status == 429 and ei.value.code == "snapshot_store_sold_out"
     finally:
         p.close()
 
@@ -630,3 +630,25 @@ def test_list_skips_a_room_deleted_during_the_walk(provider: InMemorySandboxProv
 
     monkeypatch.setattr(provider, "_disk_bytes", delete_b_mid_walk)
     assert [d["id"] for d in provider.list(labels=[], state=None)] == [a]
+
+
+def test_a_fork_by_an_id_shaped_reference_never_falls_back_to_a_snapshot_named_that_id(provider: InMemorySandboxProvider) -> None:
+    # AB#604 review: A (ttl 1) is snapshotted, C is snapshotted under the NAME of A's id, A expires and is swept.
+    # A fork of A's id must not start from C: the receipts front signed it as A.
+    import dataclasses
+
+    a = provider.get_operation(provider.snapshot(_sid(provider), ttl_seconds=1))["result"]["snapshot_id"]
+    c = provider.get_operation(provider.snapshot(_sid(provider), name=a))["result"]["snapshot_id"]
+    assert c != a
+    path, rec = provider._snapshots[a]  # noqa: SLF001
+    provider._snapshots[a] = (path, dataclasses.replace(rec, created_at=datetime.now(timezone.utc) - timedelta(seconds=5)))  # noqa: SLF001
+    provider.list_snapshots()  # the sweep drops A
+    with pytest.raises(SandboxOpError) as err:
+        provider.create(_req(image=None, snapshot_id=a), api_key="k1", idempotency=None, body_digest="f")
+    assert err.value.code == "snapshot_not_found"
+
+
+def test_a_fork_by_a_plain_name_still_resolves_the_name(provider: InMemorySandboxProvider) -> None:
+    provider.get_operation(provider.snapshot(_sid(provider), name="warm"))
+    doc = provider.create(_req(image=None, snapshot_id="warm"), api_key="k1", idempotency=None, body_digest="f")
+    assert doc["state"] == "running"

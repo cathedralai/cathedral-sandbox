@@ -98,6 +98,9 @@ def main(argv):
     if cmd == "image" and argv[1] == "inspect":
         ref = argv[-1]
         with Locked() as st:
+            if ref not in st["images"] and ref.startswith("sha256:"):
+                # An image id names the image whose id it is (docker resolves ids as well as names).
+                ref = next((r for r in st["images"] if image_id_for(r, b) == ref), ref)
             present = ref in st["images"]
             # Distinct immutable ids per ref so ownership tests can prove an
             # ID-based boundary (AB#650). Operators may override via behaviour.
@@ -123,17 +126,33 @@ def main(argv):
 
     if cmd == "image" and argv[1] == "rm":
         with Locked() as st:
+            # image_rm_fail_times: the next N removals fail (an image a running room still uses).
+            left = st["behaviour"].get("image_rm_fail_times", 0)
+            if left:
+                st["behaviour"]["image_rm_fail_times"] = left - 1
+                print(f"Error response from daemon: conflict: unable to delete {argv[-1]} (image is being used)", file=sys.stderr)
+                return 1
             if argv[-1] in st["images"]:
                 st["images"].remove(argv[-1])
         return 0
 
     if cmd == "commit":
+        if b.get("commit_fail"):
+            print("Error response from daemon: commit failed", file=sys.stderr)
+            return 1
         with Locked() as st:
             if find(st, argv[-2]) is None:
                 print(f"Error response from daemon: No such container: {argv[-2]}", file=sys.stderr)
                 return 1
             if argv[-1] not in st["images"]:
                 st["images"].append(argv[-1])
+            # The image keeps the container's environment; each --change "ENV NAME=" sets NAME to empty.
+            env = dict(st["containers"][find(st, argv[-2])].get("env") or {})
+            for i, part in enumerate(argv):
+                if part == "--change" and argv[i + 1].startswith("ENV "):
+                    name, _, value = argv[i + 1][4:].partition("=")
+                    env[name] = value
+            st.setdefault("image_env", {})[argv[-1]] = env
         return 0
 
     if cmd == "push":
@@ -291,7 +310,18 @@ def main(argv):
             # exit_at_once: {argv token: exit code}. The container starts and
             # its entrypoint ends at once; docker run -d still prints the id.
             exited = next((code for tok, code in b.get("exit_at_once", {}).items() if tok in argv), None)
+            # The environment a process in the container sees: the image's own, then each -e over it.
+            image_env = st.get("image_env", {})
+            env = {}
+            for ref, kept in image_env.items():
+                if ref in argv or image_id_for(ref, b) in argv:
+                    env = dict(kept)
+            for i, part in enumerate(argv):
+                if part == "-e":
+                    name, _, value = argv[i + 1].partition("=")
+                    env[name] = value
             st["containers"][cid] = {
+                "env": env,
                 "name": name,
                 "labels": labels,
                 "status": "created" if fail else ("exited" if exited is not None else "running"),
@@ -349,6 +379,16 @@ def main(argv):
                 if c["labels"].get(k) == v:
                     print(f"{cid} {c['labels'].get('cathedral.sandbox.id', '')}")
         return 0
+
+    if cmd == "exec":
+        # Docker refuses to exec into a paused container. Match by exact id or name only.
+        with Locked() as st:
+            hit = next((c for cid, c in st["containers"].items() for a in argv[1:] if a == cid or a == c["name"]), None)
+            paused = hit is not None and hit["status"] == "paused"
+            cid_hit = next((cid for cid, c in st["containers"].items() if c is hit), "")
+        if paused:
+            print(f"Error response from daemon: Container {cid_hit} is paused, unpause the container before exec", file=sys.stderr)
+            return 1
 
     if cmd == "exec" and b.get("exec_model"):
         # The guest command is everything after the container id.
@@ -417,6 +457,16 @@ def main(argv):
         print("27.0.0-fake")  # inner dockerd of a DinD guest is ready
         return 0
 
+    if cmd == "inspect" and "--format" in argv and "{{.State.Status}}" == argv[argv.index("--format") + 1]:
+        with Locked() as st:
+            cid = find(st, argv[-1])
+            status = st["containers"][cid]["status"] if cid else None
+        if status is None:
+            print(f"Error: No such object: {argv[-1]}", file=sys.stderr)
+            return 1
+        print(status)
+        return 0
+
     if cmd == "inspect" and "--format" in argv and ".State.Running" in argv[argv.index("--format") + 1]:
         # The state probe of exit_code_if_stopped: "true 0" while the
         # container runs, "false <code>" once its entrypoint ended.
@@ -474,7 +524,37 @@ def main(argv):
             return 1
         return 0
 
-    if cmd in ("exec", "inspect", "network", "pause", "unpause"):
+    if cmd in ("pause", "unpause"):
+        # Answers as docker does: pause of a container that is paused or not running fails, so does
+        # unpause of one that is not paused, and a container that is gone fails.
+        left = b.get(cmd + "_fail_times", 0)
+        if left:
+            with Locked() as st:
+                st["behaviour"][cmd + "_fail_times"] = left - 1
+            print(f"Error response from daemon: {cmd} failed", file=sys.stderr)
+            return 1
+        if b.get(cmd + "_fail"):
+            print(f"Error response from daemon: {cmd} failed", file=sys.stderr)
+            return 1
+        with Locked() as st:
+            cid = find(st, argv[-1])
+            if cid is None:
+                print(f"Error response from daemon: No such container: {argv[-1]}", file=sys.stderr)
+                return 1
+            status = st["containers"][cid]["status"]
+            if cmd == "pause" and status == "paused":
+                print(f"Error response from daemon: Container {cid} is already paused", file=sys.stderr)
+                return 1
+            if cmd == "pause" and status != "running":
+                print(f"Error response from daemon: Container {cid} is not running", file=sys.stderr)
+                return 1
+            if cmd == "unpause" and status != "paused":
+                print(f"Error response from daemon: Container {cid} is not paused", file=sys.stderr)
+                return 1
+            st["containers"][cid]["status"] = "paused" if cmd == "pause" else "running"
+        return 0
+
+    if cmd in ("exec", "inspect", "network"):
         return 0
 
     print(f"fake docker: unsupported command {argv}", file=sys.stderr)
@@ -566,6 +646,19 @@ class FakeDocker:
     @property
     def calls(self) -> list[list[str]]:
         return self._load()["calls"]
+
+    def mark(self, name: str) -> None:
+        """Put a marker in the call log, so a test can order its own steps (for example a tar) among docker calls."""
+        state = self._load()
+        state["calls"].append([name])
+        self._save(state)
+
+    def status_of(self, sandbox_id: str) -> str | None:
+        """The engine status ("running", "paused", "exited") of a room's container, None when gone."""
+        for c in self._load()["containers"].values():
+            if c["labels"].get("cathedral.sandbox.id") == sandbox_id:
+                return c["status"]
+        return None
 
     def calls_of(self, *prefix: str) -> list[list[str]]:
         return [c for c in self.calls if c[: len(prefix)] == list(prefix)]
