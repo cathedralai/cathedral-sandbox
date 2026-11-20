@@ -221,6 +221,10 @@ type config struct {
 	// Alerts: where the missed heartbeat and customer drop alerts go
 	// (alerts.go). Absent: log lines only.
 	Alerts *alertsConfig `json:"alerts,omitempty"`
+	// UsageMeterEverySeconds: a running room gets a usage reading this
+	// often while hotel lists show it (usage_meter.go). 0: 60. The meter
+	// needs state_dir; without one it is off.
+	UsageMeterEverySeconds int `json:"usage_meter_every_seconds,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -401,6 +405,10 @@ type broker struct {
 	// shares is sha256(share token) -> live view share link (live_share.go).
 	// In memory only. Guarded by b.mu.
 	shares map[string]*liveShare
+
+	// meter writes the usage readings of every room (usage_meter.go). nil:
+	// no state_dir, metering is off.
+	meter *usageMeter
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -636,6 +644,9 @@ func loadBroker(path string) (*broker, error) {
 	// The lend state in state_dir wins over reserved_for in the config file.
 	if err := b.loadConfigLends(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
+	}
+	if err := b.openMeter(); err != nil {
+		return nil, fmt.Errorf("usage meter: %w", err)
 	}
 	return b, nil
 }
@@ -1079,6 +1090,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			}
 			h.rooms[hid] = rm
 			b.register(rm)
+			b.meter.seen(usageSightingOf(h, rm, createdResources(doc, body)), tDone) // the run's first reading (usage_meter.go)
 			h.created++
 			g.created++
 			g.recent = append(g.recent, tDone)
@@ -1701,6 +1713,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			rm.state, rm.vanished = stDeleting, time.Now()
 		}
 		rm.deleteSent = true
+		b.meter.end(rm.id, time.Now(), status == 204) // the run's ended reading (usage_meter.go)
 		b.mu.Unlock()
 	}
 	for _, k := range []string{"Content-Type", "Content-Range", "Content-Length", "Retry-After", "Accept-Ranges"} {
@@ -2212,6 +2225,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
+	listedAt := time.Now()
 	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
 	defer b.fillLentBaseline(ctx, h, herr == nil)
 	defer b.syncAdmission(ctx, h, herr == nil) // after the health state below is stored
@@ -2224,6 +2238,11 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// The usage meter sees the rooms this list showed, then ends the runs
+	// the room map no longer holds. Deferred after the lock, so it runs
+	// under b.mu once every change below is made (usage_meter.go).
+	var listed []usageSighting
+	defer func() { b.meterHotel(h, listed, listedAt, lerr == nil) }()
 	now := time.Now()
 	h.lastErr = ""
 	if err := errors.Join(herr, qerr, lerr); err != nil {
@@ -2331,6 +2350,12 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.rooms[s.ID] = rm
 		b.register(rm)
 		h.place(rm)
+	}
+	for _, s := range list.Sandboxes {
+		// A registered room is a guest's; a room the broker is reaping is not.
+		if rm := h.rooms[s.ID]; rm != nil && rm.uuid != "" {
+			listed = append(listed, usageSightingOf(h, rm, s.Resources))
+		}
 	}
 	for batchID, ub := range h.unreaped {
 		switch {
@@ -2681,6 +2706,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.handleMinerExits(w, r) // miner hotels that went down with customer rooms
 		return
 	}
+	if p == "/v1/broker/usage-meter" {
+		b.handleUsageMeter(w, r) // operator key only
+		return
+	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
 		b.handleGuestAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/guests"), "/"))
 		return
@@ -2849,6 +2878,7 @@ func main() {
 		close(saved)
 	}()
 	go b.alerts.run(ctx)
+	go b.meter.run(ctx)
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
@@ -2871,6 +2901,10 @@ func main() {
 		b.drainNativeExecs(nativeExecDrain) // background execs get time to finish and be saved
 		stopLoops()
 		<-saved // saveLoop writes dirty state on its way out
+		b.meter.checkpoint(time.Now())
+		if err := b.meter.flush(); err != nil {
+			log.Printf("usage meter: readings not written at stop: %v", err)
+		}
 		os.Exit(0)
 	}()
 	log.Printf("central booking on %s: %d hotels, %d guests", b.cfg.Listen, len(b.hotelList()), len(b.guests))

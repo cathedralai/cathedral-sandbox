@@ -114,6 +114,24 @@ limits without a restart:
 
 A runtime change stays in memory. A restart goes back to the config file.
 
+## Usage meter
+
+With `state_dir` set, the broker writes a numbered usage reading log for
+every room of every guest (`usage_meter.go`): one JSON line per reading in
+`state_dir/usage/<first seq>.jsonl`, schema `cathedral_usage_reading_v1`,
+fields `seq`, `run` (the broker room id), `guest`, `hotel`, `miner_hotkey`,
+`vcpu`, `memory_gib`, `started_at`, `seconds`, `state` (`running` or
+`ended`) and `at`. A run gets a reading at first sight (the broker's create
+answer, or the first room list that shows it), every
+`usage_meter_every_seconds` (default 60) while lists show it, and once
+`ended` when it leaves. `seconds` is observed time: a gap over 30 s between
+two sightings (a hotel that stops answering, a broker restart) adds nothing.
+Readings are cumulative, so a reader keeps the largest per run.
+
+| Route (operator key) | What it does |
+|---|---|
+| `GET /v1/broker/usage-meter?after=<seq>&limit=<n>` | Readings after `after` (default 0) in seq order, at most `limit` (default 500, at most 1,000): `{"readings", "next", "head", "observed_at", "write_errors"}`. `next` is the seq of the last reading returned (or `after`), so a reader never skips one. `head` is the highest seq written. `observed_at` is the oldest last answered room list among hotels with live rooms (now if none). The highest `after` is the acknowledged cursor: a file whose seqs are all at or below it and that is older than 7 days is deleted. Without `state_dir`: 404 `usage_meter_off`. |
+
 ## Guest policy and capacity catalog
 
 A guest `policy` chooses hotels by selector, not by a fixed id list
