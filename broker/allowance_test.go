@@ -70,6 +70,12 @@ func (l *lifeHotel) gotCount() int {
 	return len(l.got)
 }
 
+func (l *lifeHotel) seenCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.seen)
+}
+
 func (l *lifeHotel) last() lifeCall {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -701,9 +707,9 @@ func TestNonMeteredGuestIsUnaffected(t *testing.T) {
 	if status, _ := tc.call(t, "key2", "POST", "/v1/sandboxes/"+bid+"/heartbeat", map[string]any{"ttl_seconds": 172800}); status != 200 || l.last().body["ttl_seconds"] != 172800.0 {
 		t.Fatalf("g2 heartbeat changed: %d %v", status, l.last().body)
 	}
-	seen := len(l.seen)
-	if status, _ := tc.call(t, "key2", "POST", "/v1/sandboxes/"+bid+"/heartbeat", nil); status != 200 || l.last().body != nil || len(l.seen) != seen+1 {
-		t.Fatalf("g2 empty heartbeat changed: %d %v, %d hotel calls", status, l.last().body, len(l.seen)-seen)
+	seen := l.seenCount()
+	if status, _ := tc.call(t, "key2", "POST", "/v1/sandboxes/"+bid+"/heartbeat", nil); status != 200 || l.last().body != nil || l.seenCount() != seen+1 {
+		t.Fatalf("g2 empty heartbeat changed: %d %v, %d hotel calls", status, l.last().body, l.seenCount()-seen)
 	}
 	// Restarted with no room list yet: a guest that is not metered creates at once.
 	tc.start(t)
