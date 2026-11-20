@@ -365,6 +365,7 @@ type broker struct {
 	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order (hotels.json and hotel-lends.json)
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
+	allow            allowances                // metered guests (allowance.go)
 	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
 	probationFileMu  sync.Mutex                // serializes miner-probation.json writes (probation.go)
 	probationSavedAt time.Time                 // guarded by mu
@@ -635,6 +636,9 @@ func loadBroker(path string) (*broker, error) {
 	}
 	// The lend state in state_dir wins over reserved_for in the config file.
 	if err := b.loadConfigLends(); err != nil {
+		return nil, fmt.Errorf("state: %w", err)
+	}
+	if err := b.loadAllowances(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
 	}
 	return b, nil
@@ -1467,6 +1471,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "create_request_batch_unsupported", "the create bytes can be returned for a single create only (count 1)")
 		return
 	}
+	// A metered guest: allowance, size and lifetime before any hotel call (allowance.go).
+	if e, retry := b.meteredCreate(g, payload, count); e != nil {
+		writeLimitErr(w, e, retry)
+		return
+	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
 		writeAPIErr(w, perr)
@@ -1638,6 +1647,11 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	if len(body) > 256<<20 {
 		// Forwarding the first 256 MiB would write a short file and answer 200.
 		writeErr(w, 413, "request_too_large", "the body is over 256 MiB")
+		return
+	}
+	// A metered guest: a lifetime route is a new admission (allowance.go).
+	body, pass := b.meteredRoomRoute(w, r, g, h, hid, gate, tail, body)
+	if !pass {
 		return
 	}
 	if r.Method == "POST" && tail == "snapshot" {

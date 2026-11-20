@@ -457,6 +457,11 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ttl = 48 * 3600
 	}
 	native["ttl_seconds"] = ttl
+	// A metered guest: allowance, size and lifetime before any hotel call (allowance.go).
+	if e, retry := b.meteredCreate(g, native, 1); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
 	// Hotel choice: the guest's hotel set and sealed default apply; "sealed"
 	// true or false in the request chooses explicitly.
 	sealed, sealedField := req["sealed"].(bool)
@@ -756,6 +761,12 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	case tail == "stat" && r.Method == "GET":
 		b.compatStat(w, r, rm)
 	case tail == "lifetime" && (r.Method == "POST" || r.Method == "PATCH"):
+		// A metered guest: the extension is a new admission (allowance.go).
+		maxTTL, e, retry := b.meteredExtension(g)
+		if e != nil {
+			compatErr(w, e.status, e.code, e.msg, retry)
+			return
+		}
 		raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 		var req map[string]any
 		_ = json.Unmarshal(raw, &req)
@@ -776,6 +787,9 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		}
 		if ttl > 48*3600 {
 			ttl = 48 * 3600
+		}
+		if maxTTL > 0 && ttl > float64(maxTTL) {
+			ttl = float64(maxTTL)
 		}
 		hb, _ := json.Marshal(map[string]any{"ttl_seconds": int(ttl)})
 		status, hdr, out, err := rm.h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/heartbeat", nil, hb, 30*time.Second)

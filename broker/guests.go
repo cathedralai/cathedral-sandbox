@@ -9,6 +9,7 @@
 //	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" and "default_sealed" (capacity.go)
 //	"own_hosts_only": true         never a miner hotel, whatever the policy says (reserved customers)
 //	"ops": true                    the guest may run the probe and reset the broker counters
+//	"metered": true                admitted only on the ledger's allowance; closed until one comes (allowance.go)
 //
 // With "default_sealed", a create gets an unsealed room only when it says
 // "sealed": false, names hotels with "hotels", or excludes sealed hotels
@@ -50,6 +51,10 @@ type guestLimits struct {
 	// policy opts into miner hotels. For reserved customers (const). It is
 	// the guest-wide form of the create flag "own_hosts_only" (images.go).
 	OwnHostsOnly bool `json:"own_hosts_only,omitempty"`
+	// Metered: the guest is admitted only on the ledger's allowance
+	// (allowance.go). It starts closed: cap 0 and no lease. A PUT of an
+	// allowance also makes a guest metered.
+	Metered bool `json:"metered,omitempty"`
 }
 
 func (l guestLimits) maxRooms() int {
@@ -109,6 +114,9 @@ func (b *broker) activeRooms(g *guestState) int {
 func (b *broker) admit(g *guestState, n int) (*apiErr, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if e, retry := b.allowanceRefusalLocked(g, n, time.Now()); e != nil {
+		return e, retry // a metered guest outside its allowance (allowance.go)
+	}
 	lim := g.limits
 	if used := b.activeRooms(g); used+n > lim.maxRooms() {
 		return &apiErr{429, "room_limit", fmt.Sprintf("this key may have %d rooms at one time; %d are running or starting. Delete rooms, or ask Cathedral for a higher limit", lim.maxRooms(), used)}, 10
@@ -203,6 +211,10 @@ func (b *broker) guestView(g *guestState) map[string]any {
 func (b *broker) handleGuestAdmin(w http.ResponseWriter, r *http.Request, id string) {
 	if !b.isOperator(r) {
 		writeErr(w, 401, "unauthorized", "operator key required")
+		return
+	}
+	if gid, ok := allowancePath(id); ok {
+		b.handleAllowance(w, r, gid) // allowance.go
 		return
 	}
 	switch {
