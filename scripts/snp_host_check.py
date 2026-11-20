@@ -162,7 +162,7 @@ def run_checks(
     if cpu["vendor"] != "AuthenticAMD" or not gen:
         add("cpu", FAIL, f"{cpu['model_name'] or 'unknown CPU'}: needs AMD EPYC 7003, 9004 or 9005")
     elif gen == "genoa":
-        add("cpu", PASS, f"{cpu['model_name']} (Genoa family): admitted today")
+        add("cpu", PASS, f"{cpu['model_name']} (Genoa family): the generation Cathedral admits")
     elif gen == "milan":
         add("cpu", WARN, f"{cpu['model_name']} (Milan): apply; not admitted yet (no published Milan measurement)")
     else:

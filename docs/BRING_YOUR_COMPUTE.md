@@ -4,9 +4,12 @@ For SN94 miners with an AMD SEV-SNP bare-metal server. You keep root and the
 hardware; the AMD chip proves what runs in the guests, so Cathedral does not
 have to trust your host. Tracking: AB#844 (epic AB#317).
 
-The rule: a box takes rooms only after its sealed hotel's chip-signed
-attestation verifies at the broker, and earns weight only while it does. No
-valid report: no rooms and no weight.
+The rule: no valid chip-signed report, no rooms and no weight. A box takes
+rooms only while its miner hotel's attestation verifies at the broker. It
+earns weight only while its SN94 miner guest verifies at the validator, and
+Cathedral keeps a hotkey on the approved list only while its hotel is live
+(checked by Cathedral ops at least weekly; a hotkey with no live hotel comes
+off at the next signed validator release).
 
 ## Status (20 Nov 2026)
 
@@ -63,7 +66,10 @@ Both run on the same chip, as on Cathedral's own hosts:
 
 - The SN94 SNP miner guest, which the validator scores: follow
   [Run an SNP miner on your own server](SNP_OWN_SERVER_ONBOARDING.md). This is
-  what earns weight.
+  what earns weight. That page warns that a second guest costs the first its
+  weight: that is about two scored guests on one chip. The hotel is not
+  scored by the validator, so the validator still sees one machine per chip,
+  as on Cathedral's own hosts.
 - The miner hotel, which hosts rooms. You install it; Cathedral never needs
   your root password. Follow
 `room-kit/sealed/README.md`, "Miner hotel": `SEALED_MINER=1` in `sealed.env`
@@ -73,6 +79,10 @@ key slot and receipt key inside SNP memory; your host never holds them.
 
 One miner hotel per chip: a second hotel on the same CHIP_ID is refused
 (`chip_in_use`).
+
+After a BIOS or SEV firmware update, make sure the new TCB is committed
+(`snphost commit`, or your BIOS vendor's equivalent) and relaunch both guests.
+Validators check committed and launch TCB, which the host check cannot see.
 
 ## 4. Check the guest and sign the offer
 
@@ -85,11 +95,13 @@ One miner hotel per chip: a second hotel on the same CHIP_ID is refused
 ## 5. Admission
 
 Cathedral adds your hotkey to the broker's per-hotkey cap list
-(`miner_hotkey_caps`; a hotkey not on it is refused) and to the validator's
-approved list. Then:
+(`miner_hotkey_caps`; a hotkey not on it is refused), to the control plane's
+per-hotkey cap for offers, and to the validator's approved list. Your miner
+guest must be on the validator roster (the offer names a roster machine).
+Then:
 
 - The control plane fetches your attestation over the pinned TLS key, checks
-  the AMD chain, the published measurement and the firmware floor, installs
+  the AMD chain and the published measurement, installs
   the hotel key into the guest, and joins it to the broker.
 - The broker checks again every 60 s; a pass lasts 600 s. A failed check or a
   reboot takes the hotel out of placement until it passes again.
