@@ -1,0 +1,26 @@
+{
+  "channel": "canary",
+  "expires_unix": 1795768959,
+  "issued_unix": 1795164159,
+  "netuid": 94,
+  "network": "finney",
+  "product": "snp-miner",
+  "release": {
+    "bundle": {
+      "archive_sha256": "803d72f4baab6a355feaa508d9afd553ccf2e5ab65ca84fd6fd2d38cf53d271b",
+      "tree_sha256": "e5c7fdf74b6464deffa52ec210a389c948d6225a5f423be836e83cb7fc1b0f9a",
+      "url": "https://raw.githubusercontent.com/cathedralai/cathedral-sandbox/release-channel/snp-miner/bundles/cathedral-miner-bundle-snp-miner-e5c7fdf74b6464deffa52ec210a389c948d6225a5f423be836e83cb7fc1b0f9a.tar.gz"
+    },
+    "image": "ghcr.io/cathedralai/cathedral-sn39-snp-miner@sha256:1527f51fa9b0c0c0bb2e11fc05d4f4ff03d1ca85ee4bf3ba1102413b60628919",
+    "runtime_contract": "snp-signed-validator-fleet-v1",
+    "state_schema": 2,
+    "version": "2026.11.20-baabca4-finney94"
+  },
+  "schema": "cathedral_miner_release_v1",
+  "sequence": 1,
+  "signature": {
+    "algorithm": "ed25519",
+    "value_base64": "sH5yugK4igly5umnzwblQqs0oGbqcH2axw7DcAwdlZ9e8h8Udj3ujbGlVK4hIkrWpKh0Sou4Y66zRBjvWVe1Cw=="
+  },
+  "signing_key_id": "miner-canary-local-1"
+}
