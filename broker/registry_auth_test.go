@@ -22,7 +22,8 @@ func authImage(ref string) map[string]any {
 }
 
 // serveOverTLS moves hotel id's API to an https test server and makes the
-// broker's client trust it, as an unsealed operator hotel behind TLS.
+// broker's client trust it. Alone this is not an encrypted create leg
+// (AB#817 sealed-only): use serveGuestTLS for registry_auth success paths.
 func serveOverTLS(t *testing.T, tc *testChain, id string) {
 	t.Helper()
 	ts := httptest.NewTLSServer(tc.hotels[id])
@@ -34,16 +35,28 @@ func serveOverTLS(t *testing.T, tc *testChain, id string) {
 	tc.b.mu.Unlock()
 }
 
+// serveGuestTLS is an https hotel with attested guest TLS — the only create
+// leg allowed to carry registry_auth (AB#817).
+func serveGuestTLS(t *testing.T, tc *testChain, id string) {
+	t.Helper()
+	serveOverTLS(t, tc, id)
+	h := tc.b.hotelByID(id)
+	tc.b.mu.Lock()
+	h.cfg.Sealed = true
+	h.cfg.GuestTLS = true
+	tc.b.mu.Unlock()
+}
+
 func TestRegistryAuthCreateReachesAnEncryptedHotelUnchanged(t *testing.T) {
 	tc := r6Chain(t, "", nil)
-	serveOverTLS(t, tc, "c")
+	serveGuestTLS(t, tc, "c")
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": authImage("acme/private:1")})
 	if status != 202 || doc["hotel"] != "c" {
 		t.Fatalf("create with registry_auth: %d %v", status, doc)
 	}
 	for _, id := range []string{"a", "b"} {
 		if n := len(tc.hotels[id].creates); n != 0 {
-			t.Fatalf("hotel %s (plain http) got %d creates carrying a login", id, n)
+			t.Fatalf("hotel %s (no guest TLS) got %d creates carrying a login", id, n)
 		}
 	}
 	f := tc.hotels["c"]
@@ -139,8 +152,8 @@ func TestRegistryAuthCreateBytesNotReturned(t *testing.T) {
 // quota: the create stops on the first hotel and rests none.
 func TestRegistryAuthRateLimitIsTheGuestsFault(t *testing.T) {
 	tc := r6Chain(t, "", nil)
-	serveOverTLS(t, tc, "b")
-	serveOverTLS(t, tc, "c")
+	serveGuestTLS(t, tc, "b")
+	serveGuestTLS(t, tc, "c")
 	tc.hotels["b"].pullLimited = true
 	tc.hotels["c"].pullLimited = true
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": authImage("acme/private:1")})
