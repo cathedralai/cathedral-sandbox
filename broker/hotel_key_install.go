@@ -56,7 +56,7 @@ type keyInstall struct {
 }
 
 // loadInstallSigner reads hotel_key_install_signing_key_file: base64 of a
-// 32-byte Ed25519 seed, readable by the owner only.
+// 32-byte Ed25519 seed, never readable by others.
 func loadInstallSigner(hc hotelConfig) (ed25519.PrivateKey, error) {
 	if hc.HotelKeyInstallSigningKeyFile == "" {
 		return nil, nil
@@ -68,8 +68,10 @@ func loadInstallSigner(hc hotelConfig) (ed25519.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: hotel %q: hotel key install signer: %w", hc.ID, err)
 	}
-	if st.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("config: hotel %q: hotel_key_install_signing_key_file must be mode 600", hc.ID)
+	// 600, or 640 root:<broker group> as the hotel key files are: never
+	// readable by others, never writable by the group.
+	if st.Mode().Perm()&0o027 != 0 {
+		return nil, fmt.Errorf("config: hotel %q: hotel_key_install_signing_key_file must be mode 600 or 640", hc.ID)
 	}
 	raw, err := os.ReadFile(hc.HotelKeyInstallSigningKeyFile)
 	if err != nil {

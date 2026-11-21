@@ -780,7 +780,7 @@ binding (`tls_spki_sha256`), with the hotel key installed inside the guest
   guest keeps it in memory). Until then the hotel is down (401).
 - `"hotel_key_install_signing_key_file"` (AB#817, needs `"guest_tls": true`)
   makes the broker do that install. The file holds base64 of a 32-byte
-  Ed25519 seed, mode 600, one per broker host; its public key (logged at
+  Ed25519 seed, mode 600 or 640 (root:<broker group>, as the hotel key files), one per broker host; its public key (logged at
   start, and `admission.hotel_key_install.signer_ed25519_b64` in the hotel
   documents) must be in the guest build's `SEALED_HOTEL_KEY_INSTALL_SIGNERS`.
   Right after the broker pins a new guest key it reads
@@ -792,7 +792,7 @@ binding (`tls_spki_sha256`), with the hotel key installed inside the guest
   done. Anything else (a refusal code, a lost answer) is logged once by code
   and tried again on the 5 s pin recheck. The hotel is not admitted until an
   install on its current pin succeeded. No log line names the key or the seed.
-  Make a seed: `head -c 32 /dev/urandom | base64 > <file>; chmod 600 <file>`.
+  Make a seed: `head -c 32 /dev/urandom | base64 > <file>; chmod 640 <file>; chgrp <broker group> <file>`.
 - `"require_sealed_guest_tls": true` (top level, default off) makes this
   every sealed hotel: a sealed config entry without `"guest_tls": true`
   stops the config from loading, and a sealed join must pass the same

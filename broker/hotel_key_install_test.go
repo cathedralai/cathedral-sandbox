@@ -320,7 +320,7 @@ func installErr(tc *testChain, h *hotel) string {
 
 func TestConfigHotelKeyInstalledOnFirstPinAndAfterEachReboot(t *testing.T) {
 	logs := captureLogs(t)
-	signerFile, signer, seedB64 := installSeedFile(t, 0o600)
+	signerFile, signer, seedB64 := installSeedFile(t, 0o640) // as the broker host keeps it: root:<broker group>
 	tc := newChainState(t, t.TempDir())
 	g := newInstallGuest(t, "ct", signer)
 	h := installHotel(t, tc, signerFile, g)
@@ -468,11 +468,13 @@ func TestConfigHotelKeyInstallLoadRules(t *testing.T) {
 	_ = os.WriteFile(keyFile, []byte(installHotelKeyValue), 0o600)
 	good, _, _ := installSeedFile(t, 0o600)
 	open, _, _ := installSeedFile(t, 0o644)
+	groupWrite, _, _ := installSeedFile(t, 0o660)
 	bad := filepath.Join(t.TempDir(), "bad.seed")
 	_ = os.WriteFile(bad, []byte("bm90IGEgc2VlZA==\n"), 0o600)
 	for name, hc := range map[string]hotelConfig{
 		"without guest_tls": {ID: "x", API: "https://127.0.0.1:1", Health: "https://127.0.0.1:1", KeyFile: keyFile, Sealed: true, HotelKeyInstallSigningKeyFile: good},
 		"group readable":    {ID: "x", API: "https://127.0.0.1:1", Health: "https://127.0.0.1:1", KeyFile: keyFile, Sealed: true, GuestTLS: true, HotelKeyInstallSigningKeyFile: open},
+		"group writable":    {ID: "x", API: "https://127.0.0.1:1", Health: "https://127.0.0.1:1", KeyFile: keyFile, Sealed: true, GuestTLS: true, HotelKeyInstallSigningKeyFile: groupWrite},
 		"not a seed":        {ID: "x", API: "https://127.0.0.1:1", Health: "https://127.0.0.1:1", KeyFile: keyFile, Sealed: true, GuestTLS: true, HotelKeyInstallSigningKeyFile: bad},
 		"missing":           {ID: "x", API: "https://127.0.0.1:1", Health: "https://127.0.0.1:1", KeyFile: keyFile, Sealed: true, GuestTLS: true, HotelKeyInstallSigningKeyFile: bad + ".none"},
 	} {
