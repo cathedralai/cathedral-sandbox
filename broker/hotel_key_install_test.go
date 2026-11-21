@@ -529,3 +529,14 @@ func readAllLimit(r *http.Request) ([]byte, error) {
 	_, err := buf.ReadFrom(http.MaxBytesReader(nil, r.Body, 64<<10))
 	return buf.Bytes(), err
 }
+
+func TestHotelDocCountsRoomsInUse(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	h := tc.b.hotelByID("a")
+	tc.b.mu.Lock()
+	h.queued, h.creating = 2, 1
+	tc.b.mu.Unlock()
+	if n, _ := tc.b.hotelDoc(h)["rooms_in_use"].(int); n != 3 {
+		t.Fatalf("rooms_in_use %v, want 3", tc.b.hotelDoc(h)["rooms_in_use"])
+	}
+}
