@@ -1484,21 +1484,29 @@ func TestClaimJournalNewFileWaitsForDirSync(t *testing.T) {
 		base = t.TempDir()
 		state = filepath.Join(base, "a", "b")
 		var synced []string
-		var early bool
+		early := map[string]bool{} // first synced while claims/ already held a file
 		o.disk.syncDir = func(d string) error {
-			if len(synced) < 3 {
-				if entries, _ := os.ReadDir(filepath.Join(state, claimJournalDirName)); len(entries) != 0 {
-					early = true
-				}
+			if _, seen := early[d]; !seen {
+				entries, _ := os.ReadDir(filepath.Join(state, claimJournalDirName))
+				early[d] = len(entries) != 0
 			}
 			synced = append(synced, d)
 			return claimJournalSyncDir(d)
 		}
 		j := openTestClaimJournal(t, state, o)
 		_ = j.close()
+		at := map[string]int{}
+		for i, d := range synced {
+			if _, ok := at[d]; !ok {
+				at[d] = i
+			}
+		}
 		want := []string{base, filepath.Join(base, "a"), state}
-		if len(synced) < 3 || !claimSame(synced[:3], want) || early {
-			t.Fatalf("synced %v (a file before them: %v), want %v first", synced, early, want)
+		for i, d := range want {
+			n, ok := at[d]
+			if !ok || early[d] || (i > 0 && n < at[want[i-1]]) {
+				t.Fatalf("synced %v (with a file already in claims/: %v), want %v top down before any file", synced, early, want)
+			}
 		}
 	})
 }
@@ -1752,4 +1760,226 @@ func TestClaimJournalTimingOnThisDisk(t *testing.T) {
 	mu.Unlock()
 	t.Logf("claim journal timing, %s: compaction to a new generation of 1,000 records (%d bytes, replacing 1,200 records): %v",
 		label, j.size(), c.Total.Round(time.Microsecond))
+}
+
+// Codex review finding 1 on #655: once CURRENT names generation N+1, no
+// record is ever acknowledged in generation N. A failure at each step of
+// adopting the new generation around the CURRENT rename: appends after it
+// either fail or go into the generation CURRENT names, and a reopen replays
+// every acknowledged record once.
+func TestClaimJournalNoAckInOldGenerationAfterCommit(t *testing.T) {
+	type outcome int
+	const (
+		oldGen  outcome = iota // CURRENT still names gen-1; appends go there
+		newGen                 // CURRENT names gen-2; appends go there
+		stopped                // CURRENT cannot be read back; every append fails
+	)
+	injected := errors.New("injected: input/output error")
+	cases := []struct {
+		name string
+		set  func(o *claimJournalOptions, state string, armed *atomic.Bool, release <-chan struct{})
+		want outcome
+		// blocked: appends fail until release is closed, then go to the new generation
+		blocked bool
+	}{
+		{name: "the new generation's ack-head-a cannot be opened", want: oldGen, set: func(o *claimJournalOptions, state string, armed *atomic.Bool, _ <-chan struct{}) {
+			o.disk.open = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+				if armed.Load() && strings.HasSuffix(path, claimGenName(2)+"/"+claimHeadNames[0]) {
+					return nil, injected
+				}
+				return os.OpenFile(path, flag, perm)
+			}
+		}},
+		{name: "the new generation's ack-head-b cannot be opened", want: oldGen, set: func(o *claimJournalOptions, state string, armed *atomic.Bool, _ <-chan struct{}) {
+			o.disk.open = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+				if armed.Load() && strings.HasSuffix(path, claimGenName(2)+"/"+claimHeadNames[1]) {
+					return nil, injected
+				}
+				return os.OpenFile(path, flag, perm)
+			}
+		}},
+		{name: "the CURRENT rename fails", want: oldGen, set: func(o *claimJournalOptions, state string, armed *atomic.Bool, _ <-chan struct{}) {
+			o.disk.rename = func(oldpath, newpath string) error {
+				if armed.Load() && filepath.Base(newpath) == claimCurrentName {
+					return injected
+				}
+				return os.Rename(oldpath, newpath)
+			}
+		}},
+		{name: "the CURRENT rename happens but reports an error", want: newGen, set: func(o *claimJournalOptions, state string, armed *atomic.Bool, _ <-chan struct{}) {
+			o.disk.rename = func(oldpath, newpath string) error {
+				if err := os.Rename(oldpath, newpath); err != nil {
+					return err
+				}
+				if armed.Load() && filepath.Base(newpath) == claimCurrentName {
+					return injected
+				}
+				return nil
+			}
+		}},
+		{name: "claims/ cannot be synced once after the rename", want: newGen, set: func(o *claimJournalOptions, state string, armed *atomic.Bool, _ <-chan struct{}) {
+			claims := filepath.Join(state, claimJournalDirName)
+			var failedOnce atomic.Bool
+			o.disk.syncDir = func(d string) error {
+				if armed.Load() && d == claims && !failedOnce.Load() {
+					if _, err := readClaimText(filepath.Join(claims, claimCurrentName)); err == nil {
+						if cur, _ := readClaimText(filepath.Join(claims, claimCurrentName)); cur == claimGenName(2) {
+							failedOnce.Store(true)
+							return injected
+						}
+					}
+				}
+				return claimJournalSyncDir(d)
+			}
+		}},
+		{name: "claims/ cannot be synced after the rename until it heals", want: newGen, blocked: true, set: func(o *claimJournalOptions, state string, armed *atomic.Bool, release <-chan struct{}) {
+			claims := filepath.Join(state, claimJournalDirName)
+			o.disk.syncDir = func(d string) error {
+				if armed.Load() && d == claims {
+					if cur, _ := readClaimText(filepath.Join(claims, claimCurrentName)); cur == claimGenName(2) {
+						select {
+						case <-release:
+						default:
+							return injected
+						}
+					}
+				}
+				return claimJournalSyncDir(d)
+			}
+		}},
+		{name: "the rename reports an error and CURRENT cannot be read back", want: stopped, set: func(o *claimJournalOptions, state string, armed *atomic.Bool, _ <-chan struct{}) {
+			o.disk.rename = func(oldpath, newpath string) error {
+				if err := os.Rename(oldpath, newpath); err != nil {
+					return err
+				}
+				if armed.Load() && filepath.Base(newpath) == claimCurrentName {
+					_ = os.Chmod(newpath, 0)
+					return injected
+				}
+				return nil
+			}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			state := t.TempDir()
+			current := filepath.Join(state, claimJournalDirName, claimCurrentName)
+			t.Cleanup(func() { _ = os.Chmod(current, 0o600) })
+			var armed atomic.Bool
+			release := make(chan struct{})
+			var o claimJournalOptions
+			c.set(&o, state, &armed, release)
+			j, _, err := openClaimJournalWith(state, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := claimIDRange("o", 5)
+			mustClaimAppend(t, j, old...)
+			armed.Store(true)
+			if err := claimAck(t, j.compact([]claimRecord{testClaimRec("s0"), testClaimRec("s1")})); err == nil {
+				t.Fatal("the compaction reported success")
+			}
+			var acked []string
+			for i := 0; i < 3; i++ {
+				id := fmt.Sprintf("x%02d", i)
+				err := claimAck(t, j.append(testClaimRec(id)))
+				switch {
+				case err == nil && (c.want == stopped || c.blocked):
+					t.Fatalf("%s was acknowledged although the writer may not know the live generation", id)
+				case err == nil:
+					acked = append(acked, id)
+				case c.want != stopped && !c.blocked:
+					t.Fatalf("%s: %v", id, err)
+				}
+			}
+			if c.blocked {
+				close(release)
+				mustClaimAppend(t, j, "x10")
+				acked = append(acked, "x10")
+			}
+			_ = j.close()
+			_ = os.Chmod(current, 0o600)
+			cur, _ := readClaimText(current)
+			var want []string
+			switch c.want {
+			case oldGen:
+				if cur != claimGenName(1) {
+					t.Fatalf("CURRENT names %s, want gen-1", cur)
+				}
+				want = append(append([]string(nil), old...), acked...)
+			default:
+				if cur != claimGenName(2) {
+					t.Fatalf("CURRENT names %s, want gen-2", cur)
+				}
+				want = append([]string{"s0", "s1"}, acked...)
+			}
+			if len(acked) > 0 {
+				var onDisk []byte
+				segs, _ := filepath.Glob(filepath.Join(state, claimJournalDirName, cur, "*.jsonl"))
+				for _, s := range segs {
+					raw, _ := os.ReadFile(s)
+					onDisk = append(onDisk, raw...)
+				}
+				for _, id := range acked {
+					if !bytes.Contains(onDisk, []byte(`"id":"`+id+`"`)) {
+						t.Fatalf("acknowledged %s is not in %s, the generation CURRENT names", id, cur)
+					}
+				}
+			}
+			if got := claimReplayIDs(t, state); !claimSame(got, want) {
+				t.Fatalf("replay %v\nwant   %v", got, want)
+			}
+			requireClaimTidy(t, state)
+		})
+	}
+}
+
+// Codex review finding 2 on #655: an initialization whose ancestor sync
+// failed leaves the directories in place; the next open must sync that
+// ancestor again before it accepts a record.
+func TestClaimJournalInitRetrySyncsAncestors(t *testing.T) {
+	base := t.TempDir()
+	a := filepath.Join(base, "a")
+	state := filepath.Join(a, "b")
+	o := claimJournalOptions{}
+	o.disk.syncDir = func(d string) error {
+		if d == a {
+			return errors.New("sync a: input/output error")
+		}
+		return claimJournalSyncDir(d)
+	}
+	if _, _, err := openClaimJournalWith(state, o); err == nil {
+		t.Fatal("the first open succeeded with an ancestor not durable")
+	}
+	if _, err := os.Stat(filepath.Join(state, claimJournalDirName)); err != nil {
+		t.Fatalf("the first attempt should have left its directories: %v", err)
+	}
+	var mu sync.Mutex
+	var synced []string
+	o.disk.syncDir = func(d string) error {
+		mu.Lock()
+		synced = append(synced, d)
+		mu.Unlock()
+		return claimJournalSyncDir(d)
+	}
+	j, _, err := openClaimJournalWith(state, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	before := append([]string(nil), synced...)
+	mu.Unlock()
+	mustClaimAppend(t, j, "first")
+	_ = j.close()
+	at := func(d string) int {
+		for i, s := range before {
+			if s == d {
+				return i
+			}
+		}
+		return -1
+	}
+	if at(a) < 0 || at(base) < 0 || at(state) < 0 || !(at(base) < at(a) && at(a) < at(state)) {
+		t.Fatalf("the second open synced %v before its first acknowledgement; want %s, %s, %s top down", before, base, a, state)
+	}
 }

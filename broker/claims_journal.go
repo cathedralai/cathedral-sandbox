@@ -2,9 +2,10 @@
 // append-only record the broker will write before a ready-room create's
 // answer leaves, so that a crash never leaves a customer holding a room whose
 // claim the broker cannot prove. Nothing calls it yet: PR 5 of the phase 2
-// work order writes the records (won, cold_attempt, outcome, revoked, cancel,
-// abandoned, extended, removed), PR 2 reads completeness before its pool
-// manager may act, and the usage receipts lane sets the peer head.
+// work order writes the records (won, outcome, revoked, cancel, abandoned,
+// granted, removed; the caller's kinds, opaque here), PR 2 reads completeness
+// before its pool manager may act, and the usage receipts lane sets the peer
+// head.
 //
 // Files, all under state_dir:
 //
@@ -46,7 +47,10 @@
 // (temporary file, fsync, rename, directory fsync) lists it, and only then
 // does it take a record; a directory the journal makes (claims/ and each
 // generation, and state_dir and its ancestors when missing) is synced into its
-// parent, top down, before anything trusts it; at replay a torn last line is
+// parent, top down, before anything trusts it, and at initialization every
+// ancestor of claims/ the journal can open is synced again, existing or not,
+// because an earlier attempt may have made it and failed before its entry
+// was durable; at replay a torn last line is
 // skipped and logged, and the segment holding it never takes another record
 // (each open starts a new segment).
 //
@@ -100,12 +104,17 @@
 // (each fsynced, then the directory), then CURRENT, then claims.id last, the
 // same atomic way; the journal accepts no record before claims.id is durable.
 // A compaction writes gen-N+1/ whole the same way (the snapshot segment,
-// manifest, both head files and journal-id), commits CURRENT, and only then
-// deletes gen-N/. The caller builds the snapshot (the complete live state,
-// design 2.1); the journal only guarantees it is committed whole. The
-// snapshot replaces every record appended before compact was called; every
-// record appended after it goes into the new generation. No record is written
-// while a compaction runs.
+// manifest, both head files and journal-id), opens what the writer needs for
+// it, commits CURRENT, and only then deletes gen-N/. Rule: once CURRENT names
+// generation N+1, no record is ever acknowledged in generation N. The writer
+// acquires everything first so adopting N+1 cannot fail; a rename that
+// reports an error is checked by reading CURRENT back, and when that cannot
+// be read the journal refuses every further write until a restart. The
+// caller builds the snapshot (the complete live state, design 2.1); the
+// journal only guarantees it is committed whole. The snapshot replaces every
+// record appended before compact was called; every record appended after it
+// goes into the new generation. No record is written while a compaction
+// runs.
 //
 // open removes, without reporting anything: a generation newer than CURRENT
 // (unfinished) or older (obsolete), an empty unlisted segment, leftover
@@ -145,6 +154,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -206,7 +216,9 @@ type claimJournalDisk struct {
 	syncHead func(f *os.File) error             // the written head file's fsync, once per batch
 	syncFile func(f *os.File) error             // any other file: manifest, ids, CURRENT, a generation's files, a closing segment
 	syncDir  func(dir string) error
-	step     func(point string) // nil: nothing; names a point a crash may hit
+	open     func(path string, flag int, perm os.FileMode) (*os.File, error) // a head file
+	rename   func(oldpath, newpath string) error                             // a temporary file into place
+	step     func(point string)                                              // nil: nothing; names a point a crash may hit
 }
 
 func (d claimJournalDisk) withDefaults() claimJournalDisk {
@@ -227,6 +239,12 @@ func (d claimJournalDisk) withDefaults() claimJournalDisk {
 	}
 	if d.syncDir == nil {
 		d.syncDir = claimJournalSyncDir
+	}
+	if d.open == nil {
+		d.open = os.OpenFile
+	}
+	if d.rename == nil {
+		d.rename = os.Rename
 	}
 	if d.step == nil {
 		d.step = func(string) {}
@@ -349,6 +367,7 @@ type claimJournal struct {
 	head           [2]*os.File // ack-head-a and ack-head-b, each written in place
 	headSeq        [2]int64    // what each head file durably holds; -1: not known to be durable
 	currentPending bool        // CURRENT renamed, claims/ not yet synced: no record until it is
+	halted         error       // the writer cannot tell which generation CURRENT names: every batch fails
 	errLog         time.Time
 	errCount       int64
 }
@@ -466,14 +485,10 @@ func claimDirHoldsRecords(dir string) (bool, error) {
 	return false, nil
 }
 
-// claimJournalNewParents is, top down, the parent of every directory from dir
-// up to the first that exists: the directories whose entries MkdirAll adds.
-func claimJournalNewParents(dir string) []string {
+// claimJournalAncestors is, top down, every ancestor of dir up to the root.
+func claimJournalAncestors(dir string) []string {
 	var out []string
 	for d := filepath.Clean(dir); ; {
-		if _, err := os.Stat(d); err == nil {
-			return out
-		}
 		p := filepath.Dir(d)
 		if p == d {
 			return out
@@ -483,19 +498,39 @@ func claimJournalNewParents(dir string) []string {
 	}
 }
 
-// create makes a new journal in the initialization order: claims/ (its new
-// ancestors synced top down), gen-1/ and its files, CURRENT, then claims.id
+// syncInitChain syncs, top down, every ancestor of claims/ the journal can
+// open, whether or not it existed before this open. Until claims.id is
+// durable nothing tells which of them an earlier attempt created: its
+// MkdirAll may have made them and then failed to sync one, and they exist
+// now. A directory the journal cannot open it did not create (it makes its
+// directories 0700 for itself), and a read-only one holds no entry it added.
+func (j *claimJournal) syncInitChain() error {
+	for _, d := range claimJournalAncestors(j.dir) {
+		f, err := os.Open(d)
+		if errors.Is(err, fs.ErrPermission) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("claim journal: open of %s to sync it: %w", d, err)
+		}
+		_ = f.Close()
+		if err := j.disk.syncDir(d); err != nil && !errors.Is(err, syscall.EROFS) {
+			return fmt.Errorf("claim journal: sync of %s before initialization: %w", d, err)
+		}
+	}
+	return nil
+}
+
+// create makes a new journal in the initialization order: claims/ and every
+// ancestor synced top down, gen-1/ and its files, CURRENT, then claims.id
 // last. A crash part way leaves no claims.id and no record: the next open
-// discards it and starts again.
+// discards it and starts again, syncing the ancestors again.
 func (j *claimJournal) create() error {
-	newParents := claimJournalNewParents(j.dir)
 	if err := os.MkdirAll(j.dir, 0o700); err != nil {
 		return err
 	}
-	for _, d := range newParents {
-		if err := j.disk.syncDir(d); err != nil {
-			return fmt.Errorf("claim journal: sync of %s after creating a directory in it: %w", d, err)
-		}
+	if err := j.syncInitChain(); err != nil {
+		return err
 	}
 	entries, err := os.ReadDir(j.dir)
 	if err != nil {
@@ -532,49 +567,62 @@ func (j *claimJournal) create() error {
 	if _, err := j.writeDurable(j.stateDir, claimJournalIDName, []byte(j.id+"\n"), "init-claims-id"); err != nil {
 		return err
 	}
-	if err := j.useGeneration(1, man, claimGenesis, [2]int64{0, 0}); err != nil {
+	files, err := j.openHeads(1)
+	if err != nil {
 		return err
 	}
+	j.adoptGeneration(1, man, claimGenesis, [2]int64{0, 0}, files)
 	j.nextSeq = 1
 	log.Printf("claim journal: created %s (id %s)", j.dir, j.id)
 	return nil
 }
 
-// useGeneration makes generation n the writer's. A head file that is gone
-// (the other one is valid, or open would not get here) is made again empty:
-// it counts as the lower one and the next batch writes it.
-func (j *claimJournal) useGeneration(n int64, man claimManifest, chain string, headSeq [2]int64) error {
+// openHeads opens generation n's two head files for writing: everything the
+// writer needs to adopt it. A head file that is gone (the other one is
+// valid, or open would not get here) is made again empty: it counts as the
+// lower one and the next batch writes it.
+func (j *claimJournal) openHeads(n int64) ([2]*os.File, error) {
 	dir := filepath.Join(j.dir, claimGenName(n))
 	var files [2]*os.File
+	closeAll := func() {
+		for _, g := range files {
+			if g != nil {
+				_ = g.Close()
+			}
+		}
+	}
 	made := false
 	for i, name := range claimHeadNames {
 		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 			made = true
 		}
-		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+		f, err := j.disk.open(path, os.O_RDWR|os.O_CREATE, 0o600)
 		if err != nil {
-			for _, g := range files {
-				if g != nil {
-					_ = g.Close()
-				}
-			}
-			return err
+			closeAll()
+			return [2]*os.File{}, fmt.Errorf("claim journal: open of %s/%s: %w", claimGenName(n), name, err)
 		}
 		files[i] = f
 	}
 	if made {
 		if err := j.disk.syncDir(dir); err != nil {
-			return fmt.Errorf("claim journal: sync of %s after making a head file again: %w", claimGenName(n), err)
+			closeAll()
+			return [2]*os.File{}, fmt.Errorf("claim journal: sync of %s after making a head file again: %w", claimGenName(n), err)
 		}
 	}
+	return files, nil
+}
+
+// adoptGeneration makes generation n the writer's, with head files opened by
+// openHeads. It cannot fail, so a compaction acquires everything first and
+// adopts right after CURRENT names the new generation.
+func (j *claimJournal) adoptGeneration(n int64, man claimManifest, chain string, headSeq [2]int64, files [2]*os.File) {
 	for _, f := range j.head {
 		if f != nil {
 			_ = f.Close()
 		}
 	}
-	j.gen, j.genDir, j.man, j.chain, j.head, j.headSeq = n, dir, man, chain, files, headSeq
-	return nil
+	j.gen, j.genDir, j.man, j.chain, j.head, j.headSeq = n, filepath.Join(j.dir, claimGenName(n)), man, chain, files, headSeq
 }
 
 // writeGeneration writes gen-n whole before anything names it: the snapshot
@@ -675,7 +723,7 @@ func (j *claimJournal) writeDurable(dir, name string, data []byte, steps string)
 		return false, err
 	}
 	step("-synced")
-	if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
+	if err := j.disk.rename(tmp, filepath.Join(dir, name)); err != nil {
 		return false, err
 	}
 	step("-renamed")
@@ -876,9 +924,11 @@ func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
 	for _, d := range debris {
 		log.Printf("claim journal: removed %s, left by a crash (not part of %s)", d, cur)
 	}
-	if err := j.useGeneration(gen, man, chain, headSeq); err != nil {
+	files, err := j.openHeads(gen)
+	if err != nil {
 		return nil, err
 	}
+	j.adoptGeneration(gen, man, chain, headSeq, files)
 	j.peer = head.Peer
 	j.atOpen = records
 	j.nextSeq = max(man.NextSeq, top+1)
@@ -1243,6 +1293,17 @@ func (j *claimJournal) take() (batch []*claimJournalEntry, ok bool) {
 	return batch, true
 }
 
+// halt stops every later write: appends are refused at once, and whatever is
+// queued fails. It is for a writer that cannot tell which generation CURRENT
+// names, so that it never acknowledges a record a restart would drop.
+func (j *claimJournal) halt(err error) {
+	j.halted = err
+	j.mu.Lock()
+	j.refuse = err
+	j.mu.Unlock()
+	log.Printf("claim journal: ALARM %v", err)
+}
+
 func (j *claimJournal) run() {
 	defer close(j.done)
 	for {
@@ -1250,6 +1311,10 @@ func (j *claimJournal) run() {
 		if !ok {
 			j.shut()
 			return
+		}
+		if j.halted != nil {
+			j.finish(batch, j.halted)
+			continue
 		}
 		taken := time.Now()
 		if batch[0].compact {
@@ -1575,15 +1640,40 @@ func (j *claimJournal) compactNow(snap []claimRecord) error {
 		_ = os.RemoveAll(nextDir)
 		return fmt.Errorf("claim journal: compaction %s: %w", claimGenName(next), err)
 	}
+	// Everything the writer needs for the new generation is acquired before
+	// CURRENT names it: once it does, no record is ever acknowledged in the
+	// old one.
+	files, err := j.openHeads(next)
+	if err != nil {
+		_ = os.RemoveAll(nextDir)
+		return fmt.Errorf("claim journal: compaction %s: %w", claimGenName(next), err)
+	}
 	renamed, err := j.writeDurable(j.dir, claimCurrentName, []byte(claimGenName(next)+"\n"), "compact-current")
 	if err != nil && !renamed {
-		_ = os.RemoveAll(nextDir)
-		return fmt.Errorf("claim journal: compaction commit: %w", err)
+		// The rename reported failure. Read CURRENT back rather than trust
+		// that: adopt whichever generation it names, or, when it cannot be
+		// read, stop writing altogether.
+		cur, rerr := readClaimText(filepath.Join(j.dir, claimCurrentName))
+		switch {
+		case rerr == nil && cur == claimGenName(j.gen):
+			for _, f := range files {
+				_ = f.Close()
+			}
+			_ = os.RemoveAll(nextDir)
+			return fmt.Errorf("claim journal: compaction commit: %w", err)
+		case rerr == nil && cur == claimGenName(next):
+			// It happened after all; go on as for a rename whose directory
+			// sync failed.
+		default:
+			for _, f := range files {
+				_ = f.Close()
+			}
+			j.halt(fmt.Errorf("claim journal: compaction commit failed (%v) and CURRENT cannot be read back (%v, %q): writes stop until a restart", err, rerr, cur))
+			return j.halted
+		}
 	}
 	oldDir, oldGen := j.genDir, j.gen
-	if uerr := j.useGeneration(next, man, chain, [2]int64{head.Seq, head.Seq}); uerr != nil {
-		return fmt.Errorf("claim journal: compaction %s committed but not opened: %w", claimGenName(next), uerr)
-	}
+	j.adoptGeneration(next, man, chain, [2]int64{head.Seq, head.Seq}, files)
 	j.voids = nil // the withdrawn seqs were all in the replaced generation
 	j.setBytes(int64(len(buf)))
 	if err != nil {
