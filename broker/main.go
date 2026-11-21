@@ -2756,6 +2756,10 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleQuota(w, r, g)
 		case p == "/v1/usage" && r.Method == "GET":
 			b.handleUsage(w, r, g)
+		case p == "/v1/images" && r.Method == "GET":
+			b.handleImageList(w, r, g) // guest_images.go
+		case p == "/v1/images/pins" && r.Method == "DELETE":
+			b.handleUnpin(w, r, g)
 		case p == "/v1/images/prefetch" && r.Method == "POST":
 			b.handlePrefetch(w, r, g)
 		case strings.HasPrefix(p, "/v1/images/prefetch/") && r.Method == "GET":

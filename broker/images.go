@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -800,16 +801,22 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 // ---------------------------------------------------------------- prefetch
 
 type prefetchHotel struct {
-	State      string           `json:"state"` // pulling, done, failed
-	Images     []map[string]any `json:"images,omitempty"`
-	Error      map[string]any   `json:"error,omitempty"`
-	StartedAt  time.Time        `json:"started_at"`
-	FinishedAt *time.Time       `json:"finished_at,omitempty"`
+	State  string           `json:"state"` // pulling, done, failed
+	Images []map[string]any `json:"images,omitempty"`
+	Error  map[string]any   `json:"error,omitempty"`
+	// Pin is "pinned" when the hotel kept the images from its GC, or
+	// "not_supported" when it pulled them but has no pins (an older room
+	// kit); empty for a prefetch without pin (AB#860).
+	Pin        string     `json:"pin,omitempty"`
+	Pinned     []any      `json:"pinned,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }
 
 type prefetchJob struct {
 	ID      string                    `json:"prefetch_id"`
 	guest   string                    // not shown
+	pin     int64                     // the pin cap sent with a pin prefetch; 0: no pin
 	Images  []string                  `json:"images"`
 	Created time.Time                 `json:"created_at"`
 	Hotels  map[string]*prefetchHotel `json:"hotels"`
@@ -828,7 +835,7 @@ func newID(prefix string) string {
 	return prefix + hex.EncodeToString(b[:])
 }
 
-// POST /v1/images/prefetch {images, registry_auth?, hotels?, hotel_labels?, exclude_hotel_labels?}
+// POST /v1/images/prefetch {images, registry_auth?, pin?, hotels?, hotel_labels?, exclude_hotel_labels?}
 func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guestState) {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var req map[string]any
@@ -847,18 +854,40 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 		writeErr(w, 400, "invalid_prefetch", "images must be a non-empty list of image references")
 		return
 	}
+	pin, _ := req["pin"].(bool)
+	if v, ok := req["pin"]; ok && v != nil {
+		if _, isBool := v.(bool); !isBool {
+			writeErr(w, 400, "invalid_prefetch", "pin must be true or false")
+			return
+		}
+	}
+	var pinMax int64
+	if pin {
+		b.mu.Lock()
+		pinMax = g.limits.pinMaxBytes()
+		b.mu.Unlock()
+		if pinMax == 0 {
+			writeErr(w, 403, "pins_not_enabled", "this key may not pin images; ask Cathedral for a pin limit")
+			return
+		}
+	}
 	pl, e := b.parseSelection(g, req)
 	if e != nil {
 		writeErr(w, e.status, e.code, e.msg)
 		return
 	}
 	hotelBody := map[string]any{"images": images}
+	if pin {
+		// Set explicitly: the body is rebuilt, so a field the broker does not
+		// name never reaches the hotel.
+		hotelBody["pin"] = true
+	}
 	if auth, ok := req["registry_auth"]; ok && auth != nil {
 		hotelBody["registry_auth"] = auth // passed to the hotels, never stored
 	}
 	body, _ := json.Marshal(hotelBody)
 
-	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
+	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, pin: pinMax, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
 	var targets []*hotel
 	for _, h := range b.hotelList() {
 		if pl.selects(h) {
@@ -894,7 +923,11 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
 	var out []byte
 	var err error
 	if g != nil {
-		status, _, out, err = h.doGuest(context.Background(), g, "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+		hdr := http.Header{guestHeader: {g.cfg.ID}}
+		if job.pin > 0 {
+			hdr.Set(pinMaxHeader, strconv.FormatInt(job.pin, 10))
+		}
+		status, _, out, err = h.doHeaders(context.Background(), h.cfg.API, "POST", "/v1/images/prefetch", nil, body, 30*time.Minute, hdr)
 	} else {
 		status, _, out, err = h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
 	}
@@ -911,13 +944,21 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
 		st.State, st.Error = "failed", map[string]any{"code": e.code, "message": e.msg}
 	case status == 200 || status == 202:
 		st.State = "done"
-		if res, ok := doc["result"].(map[string]any); ok {
-			if imgs, ok := res["images"].([]any); ok {
-				for _, x := range imgs {
-					if m, ok := x.(map[string]any); ok {
-						st.Images = append(st.Images, m)
-					}
+		res, _ := doc["result"].(map[string]any)
+		if imgs, ok := res["images"].([]any); ok {
+			for _, x := range imgs {
+				if m, ok := x.(map[string]any); ok {
+					st.Images = append(st.Images, m)
 				}
+			}
+		}
+		if job.pin > 0 {
+			// A kit before AB#860 pulls and ignores "pin"; only the echo
+			// says the images are kept.
+			if pinned, ok := res["pinned"].([]any); ok {
+				st.Pin, st.Pinned = "pinned", pinned
+			} else {
+				st.Pin = imageListNotKitted
 			}
 		}
 	default:
