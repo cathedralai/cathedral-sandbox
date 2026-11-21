@@ -1424,3 +1424,33 @@ func TestUsageMeterReplaySyncFailureServesNothingUntilSynced(t *testing.T) {
 		t.Fatalf("after the sync: served %v head %d", seqsOf(p), p.Head)
 	}
 }
+
+// While appends fail, pending_readings counts what is observed and not yet
+// durable and write_errors grows; after recovery pending_readings is 0.
+func TestUsageMeterRouteReportsPendingReadings(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	m := tc.b.meter
+	m.write = func(f *os.File, p []byte) error { return errors.New("no space left on device") }
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	read := func() map[string]any {
+		t.Helper()
+		status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter", nil)
+		if status != 200 {
+			t.Fatalf("route: %d %v", status, doc)
+		}
+		return doc
+	}
+	_ = m.flush()
+	first := read()
+	_ = m.flush()
+	second := read()
+	if first["pending_readings"].(float64) != 2 || first["head"].(float64) != 0 || second["write_errors"].(float64) <= first["write_errors"].(float64) {
+		t.Fatalf("while failing: %v then %v", first, second)
+	}
+	m.write = appendDurable
+	mustFlush(t, m)
+	if doc := read(); doc["pending_readings"].(float64) != 0 || doc["head"].(float64) != 2 {
+		t.Fatalf("after recovery: %v", doc)
+	}
+}

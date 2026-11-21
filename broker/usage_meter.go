@@ -826,6 +826,10 @@ type usagePage struct {
 	// UnobservedHotels: hotels holding live rooms left out of observed_at
 	// (latest list failed, no new room placed there).
 	UnobservedHotels int `json:"unobserved_hotels"`
+	// PendingReadings: readings observed but not durable yet (queued for a
+	// retried append, or in a replayed file whose sync failed). 0 when all
+	// is durable. head stops while the disk refuses writes; this grows.
+	PendingReadings int64 `json:"pending_readings"`
 }
 
 // page serves up to limit durable readings after seq after, records after
@@ -843,8 +847,10 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 		m.acked, acked, moved = a, a, true
 	}
 	skip := append([][2]int64(nil), m.burned...)
+	p.PendingReadings = int64(len(m.pending))
 	for _, u := range m.unsynced {
 		skip = append(skip, [2]int64{u.lo, u.hi})
+		p.PendingReadings += u.hi - u.lo + 1
 	}
 	m.mu.Unlock()
 	if moved {
