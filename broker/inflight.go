@@ -105,7 +105,11 @@ func (b *broker) reapRoom(h *hotel, rm *room) {
 	}
 	h.rooms[rm.hid] = rm
 	b.rememberGuestRoom(rm.guest, h.cfg.ID, rm.hid)
+	turned := b.usageMeter.seen(usageSightingOf(h, rm, nil), time.Now()) // metered, not billable: no client id (usage_meter.go)
 	b.mu.Unlock()
+	if turned { // durable before the delete, outside b.mu, bounded
+		b.usageMeter.awaitDurable(usageTurnWait)
+	}
 	path := "/v1/sandboxes/" + url.PathEscape(rm.hid)
 	for attempt := 0; attempt < 3; attempt++ {
 		status, _, _, err := h.do(waitForConnUntilDeadline(context.Background()), "DELETE", path, nil, nil, 2*time.Minute)
