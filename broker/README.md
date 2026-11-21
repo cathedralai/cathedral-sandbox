@@ -150,6 +150,7 @@ Each guest in the config can have limits (`guests.go`):
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
 | `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
+| `pin_max_gib` | Image bytes the guest may pin on each hotel (prefetch `"pin": true`). Absent or 0: no pins; a pin gets 403 `pins_not_enabled`. Config only. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -164,6 +165,22 @@ limits without a restart:
 | `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels`, `policy` (`"policy": null` removes it) and `own_hosts_only`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
 
 A runtime change stays in memory. A restart goes back to the config file.
+
+### Meter routes (AB#890)
+
+`meter_key_sha256` is the SHA-256 of a narrow key for an external meter (the
+Polaris API meters const's broker-guest rooms against a Gamma hotkey
+account). It allows the two routes below and no other route. The operator
+key, the operator read key, the miner enrollment key and guest keys get 401
+on them. Without `meter_key_sha256` both answer 404. The digest must be a
+SHA-256 hex digest and must differ from the operator key, the operator read
+key, the miner enrollment key, and every guest key, next key and view token.
+An unknown guest id gets 404 `guest_not_found`.
+
+| Route (meter key) | What it does |
+|---|---|
+| `GET /v1/broker/guests/<id>/rooms` | The guest's rooms on the hotels it may use, asked like the guest's own `GET /v1/sandboxes` (label `broker_guest=<id>`): `{"rooms": [{"id": "<hotel>.<room>", "hotel", "state", "memory_gib", "vcpu", "created_at"}], "hotel_errors": {"<hotel>": "unavailable"}}`. `state` and `created_at` are the hotel's; `memory_gib` and `vcpu` are the hotel's `resources.memory_gib` and `resources.vcpu` (whole numbers, the ones the hotel's usage multiplies), null when the hotel did not send one. A hotel that does not answer is in `hotel_errors` and its rooms are left out; the call still answers 200. |
+| `POST /v1/broker/guests/<id>/freeze-all` | Calls the hotel's `POST /v1/sandboxes/<room>/freeze` for the guest on every room of the list above in state `running`: `{"frozen": [ids], "failed": {"<id>": "<hotel error code>"}, "hotel_errors": {...}}` (`unavailable` when a hotel call got no answer). Rooms in any other state are not touched. It never deletes and never thaws; a second call freezes nothing new. A frozen room still counts in the hotel's own usage and may still be removed by the hotel's TTL or idle sweep. |
 
 ## Guest policy and capacity catalog
 
@@ -313,7 +330,10 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 - Guest key: only the hotels the guest can reach, each with `tier`
   (`prefer`, `allow`, or `hotels` for a guest with no policy), preferred
   first, plus `guest` with `max_rooms` and `active_rooms`, and `classes`
-  over those hotels only.
+  over those hotels only. Each hotel also has `disk_used_pct` (how full its
+  data volume is; null: no reading yet) and `disk_admit_used_pct` (the fill
+  at which it takes no more rooms; null: not set). The disk budget fields
+  stay operator only.
 
 `free_rooms` comes from the function the placer uses (`admissibleFree`: 0
 when the hotel is down, draining, resting after a failure, at
@@ -603,6 +623,26 @@ pulled with `registry_auth` are not pulled again: the broker never keeps
 the login, so prefetch those again after a hotel restart. A broker restart
 forgets the list.
 
+`"pin": true` also asks each hotel to keep the images from its image
+cleanup. It needs the guest limit `pin_max_gib` (else 403
+`pins_not_enabled`); the broker sends it in bytes in `X-Pin-Max-Bytes`. A
+hotel answers 507 `pin_cap_exceeded` when the guest's pins there would pass
+the cap (or the hotel's own pin ceiling). Each image entry then has `pin`
+(`pinned`, `not_pinned`, or `not_supported` for a room kit without pins),
+and each hotel `pin` (`pinned`, or `not_supported` when any image there was
+pulled without a pin; `partial` when only some were pinned) with the `pinned`
+refs. The hotel-up replay pins a pinned ref again after a reboot; an unpin
+stops that.
+`DELETE /v1/images/pins?ref=<ref>&hotel=<id>` unpins one image there.
+
+`GET /v1/images?hotel=<id>` lists the images the guest pulled or was given
+on that hotel: `ref`, `digest`, `size_bytes`, `last_used_at`, `pinned`.
+Without `hotel`, the broker asks every hotel the guest reaches that is up
+(4 at a time, 10 s each) and answers `{"hotels": [...]}`, one entry per
+hotel, with `error` for a hotel that did not answer. A hotel outside the
+guest's reach is 404 `hotel_not_found`; a hotel whose room kit has no list
+says `"images_list": "not_supported"`.
+
 `GET /v1/broker/stats` gives per-hotel counts and latency percentiles
 (hotel call, wait in the broker queue, broker overhead). `POST` resets them.
 Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
@@ -654,7 +694,9 @@ view (every hotel and the admission policy) and `GET /v1/broker/miner-exits`,
 and no other route: it cannot
 read hotel documents, join, change or leave hotels, read or change guests, or
 open rooms. The digest must differ from the operator key, the miner
-enrollment key, and every guest key or view token.
+enrollment key, and every guest key or view token. `meter_key_sha256` is a
+separate key for the two meter routes (see "Meter routes" under Guest
+limits).
 The observed TLS key must match the AMD-verified binding before the broker
 sends the hotel key. Miner calls pin the guest key on both data and control
 connections. Plain HTTP, a client-supplied pin, and `verify=false` are refused.
