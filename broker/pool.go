@@ -401,8 +401,11 @@ func (b *broker) poolRateLocked(h *hotel, ph *poolHotel, now time.Time) float64 
 	}
 	for i := range p.keys {
 		k := &p.keys[i]
-		if t := p.settings.target(k.name); t > 0 && float64(p.readyOfLocked(ph, k.name)) < poolBelowQuarter*float64(t) {
-			return fast // a key below a quarter of its target refills at the full rate, claims or not
+		// A key below a quarter of its target refills at the full rate, claims
+		// or not; a key whose image is cold here gets no create here, so it
+		// does not count.
+		if t := p.settings.target(k.name); t > 0 && h.warm[k.image] && float64(p.readyOfLocked(ph, k.name)) < poolBelowQuarter*float64(t) {
+			return fast
 		}
 	}
 	return min(p.settings.RefillDuringClaims, fast)

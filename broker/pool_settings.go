@@ -486,6 +486,6 @@ func (b *broker) readyRoomsViewLocked(now time.Time) map[string]any {
 		"guest": poolGuestID, "keys": keys,
 		"settings": map[string]any{"per_hotel": per, "refill_per_second": p.settings.RefillPerSecond,
 			"refill_during_claims": p.settings.RefillDuringClaims, "reserve_share": p.settings.ReserveShare},
-		"creates_per_second_per_hotel_max": 1, "journal": journal, "hotels": hotels, "totals": totals,
+		"creates_per_second_per_hotel_max": min(p.settings.RefillPerSecond, poolRefillCap), "journal": journal, "hotels": hotels, "totals": totals,
 	}
 }

@@ -27,6 +27,9 @@ func TestRefillRateCaps(t *testing.T) {
 		"refill_per_second": 4, "refill_during_claims": 1, "reserve_share": 0.25}); st != 200 {
 		t.Fatalf("PUT: %d %v", st, doc)
 	}
+	if _, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil); doc["creates_per_second_per_hotel_max"] != float64(4) {
+		t.Fatalf("GET creates_per_second_per_hotel_max %v, want 4", doc["creates_per_second_per_hotel_max"])
+	}
 	pc.runPool(3*time.Second, nil)
 	starts := f.createStarts()
 	node, lfm := 0, 0
@@ -48,6 +51,9 @@ func TestRefillRateCaps(t *testing.T) {
 	poolSpacingFactor = 1.05
 	g.up("b")
 	g.putRefill(30, 2, 1)
+	if _, doc := g.operator("GET", "/v1/broker/ready-rooms", nil); doc["creates_per_second_per_hotel_max"] != float64(2) {
+		t.Fatalf("GET creates_per_second_per_hotel_max %v at refill 2, want 2", doc["creates_per_second_per_hotel_max"])
+	}
 	g.runPool(3*time.Second, nil)
 	if s := g.hotels["b"].createStarts(); maxInWindow(s, time.Second) > 2 || len(s) < 4 {
 		t.Fatalf("refill_per_second 2: %d creates in 3 s, %d within one second", len(s), maxInWindow(s, time.Second))
@@ -380,5 +386,34 @@ func TestPoolTrimsReadyRoomsAboveTheBound(t *testing.T) {
 		if want := "/v1/sandboxes/sbx-" + strconv.Itoa(i+1); d.path != want {
 			t.Fatalf("trim %d deleted %s, want %s", i, d.path, want)
 		}
+	}
+}
+
+// A key whose image is not warm on a hotel gets no pool create there, so its
+// empty count must not hold that hotel at the full rate during claims
+// (Bugbot review of #663).
+func TestRefillColdKeyDoesNotForceTheFullRate(t *testing.T) {
+	lfm, _ := templateByName("lfm3-1.7b")
+	pc := newPoolChain(t, []string{"a"}, func(c *config) {
+		c.ReadyRooms.Keys = append(c.ReadyRooms.Keys, readyRoomKeyEntry{Template: "lfm3-1.7b"})
+	})
+	pc.hotels["a"].set(func(f *fakePoolHotel) { f.coldImages = map[string]bool{lfm.Image: true} })
+	h := pc.b.hotelByID("a")
+	pc.up("a")
+	if st, doc := pc.operator("PUT", "/v1/broker/ready-rooms", map[string]any{"per_hotel": map[string]int{"node-22": 20, "lfm3-1.7b": 20},
+		"refill_per_second": 4, "refill_during_claims": 1, "reserve_share": 0.25}); st != 200 {
+		t.Fatalf("PUT: %d %v", st, doc)
+	}
+	pc.b.mu.Lock()
+	ph := pc.b.pool.hotel("a")
+	for i := 0; i < 10; i++ { // node-22 at half its target; lfm3-1.7b at 0 and cold here
+		ph.rooms[strconv.Itoa(i)] = &poolRoom{state: poolReady, key: "node-22"}
+	}
+	ph.claims = 1
+	got := pc.b.poolRateLocked(h, ph, time.Now())
+	ph.rooms, ph.claims = map[string]*poolRoom{}, 0
+	pc.b.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("rate during a claim with a cold key at 0: %v, want 1 (refill_during_claims)", got)
 	}
 }
