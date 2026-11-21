@@ -775,3 +775,22 @@ func TestPoolCreateRechecksDiskBeforeItIsSent(t *testing.T) {
 		t.Fatalf("pool holds %+v", c)
 	}
 }
+
+// The target is read again just before a pool create is sent: a rollback to
+// targets 0 made while the step ran stops the create it had planned.
+func TestPoolCreateRechecksTheTargetBeforeItIsSent(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	h := pc.b.hotelByID("a")
+	pc.up("a")
+	pc.target(1)
+	w := pc.b.poolPlan(h)
+	if w == nil || w.create == nil {
+		t.Fatal("the plan made no create")
+	}
+	pc.target(0) // the rollback, between the plan and the create
+	pc.b.poolCreate(context.Background(), h, *w.create, w.att)
+	if n := len(f.creates()); n != 0 {
+		t.Fatalf("%d pool creates after targets 0, want 0", n)
+	}
+}

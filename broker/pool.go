@@ -438,18 +438,31 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	if b.poolCreateRefusalLocked(h, ph, now) != "" || now.Before(ph.nextCreate) || ph.full {
 		return w
 	}
-	c := p.countsLocked(h.cfg.ID)
-	if c.held >= p.boundLocked() {
-		return w
-	}
 	for i := range p.keys {
 		k := &p.keys[i]
-		if ph.creating[k.name]+len(ready[k.name]) < p.settings.target(k.name) && h.warm[k.image] && b.diskFits(h, k.diskGiB) {
+		if b.poolNeedsLocked(h, ph, k) && h.warm[k.image] && b.diskFits(h, k.diskGiB) {
 			w.create = k
 			break
 		}
 	}
 	return w
+}
+
+// poolNeedsLocked reports whether h's pool needs one more room of key k
+// now: the hotel holds less than its bound, and the key's ready rooms and
+// creates in flight are under its target. Caller holds b.mu.
+func (b *broker) poolNeedsLocked(h *hotel, ph *poolHotel, k *poolKey) bool {
+	p := b.pool
+	if p.countsLocked(h.cfg.ID).held >= p.boundLocked() {
+		return false
+	}
+	n := ph.creating[k.name]
+	for _, pr := range ph.rooms {
+		if pr.state == poolReady && pr.key == k.name {
+			n++
+		}
+	}
+	return n < p.settings.target(k.name)
 }
 
 // sortedPoolRooms is ph's rooms, oldest first. Caller holds b.mu.
@@ -685,7 +698,7 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	b.mu.Lock()
 	ph := p.hotel(h.cfg.ID)
 	// Read again at dispatch: the step's reads and deletes ran since the plan.
-	if why := b.poolCreateRefusalLocked(h, ph, time.Now()); why != "" || !h.warm[k.image] || !b.diskFits(h, k.diskGiB) {
+	if why := b.poolCreateRefusalLocked(h, ph, time.Now()); why != "" || !b.poolNeedsLocked(h, ph, &k) || !h.warm[k.image] || !b.diskFits(h, k.diskGiB) {
 		b.mu.Unlock()
 		<-h.sem
 		return
