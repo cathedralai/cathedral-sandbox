@@ -19,15 +19,22 @@
 // vcpu and memory_gib come from the room's resources (0: unknown).
 // started_at and at are unix seconds on the broker clock. state is
 // "running" or "ended". guest is the room's broker_guest label ("" for a
-// room no guest created through the broker).
+// room no guest created through the broker). An optional "billable": false
+// marks a room the broker took back from a cancelled or failed create (its
+// reap, or a recorded leftover): it used compute, so it is metered, but the
+// guest does not pay for it. Absent means billable; once a run says false,
+// every later reading of it does.
 //
 // A run is sighted when the broker's own create answers, when a hotel room
-// list shows it (syncHotel, every 2 s), and when the broker's own delete is
-// confirmed. seconds adds the time between two sightings only when they are
-// at most usageMaxGap apart. A hotel that stops answering, or a broker that
-// is down, adds nothing: a customer is never billed for time nobody saw.
-// After a restart a run goes on from its logged seconds and keeps its logged
-// started_at; the downtime adds nothing.
+// list shows it (syncHotel, every 2 s), when a bulk delete's list shows it
+// just before the delete, and when the broker's own delete removes it.
+// seconds adds the time between two sightings only when they are at most
+// usageMaxGap apart. A hotel that stops answering, or a broker that is down,
+// adds nothing: a customer is never billed for time nobody saw. A delete
+// adds its tail only when no answered list since the last sighting left the
+// room out (the hotel answers 204 for a room already gone). After a restart
+// a run goes on from its logged seconds and keeps its logged started_at;
+// the downtime adds nothing.
 //
 // A reading is written at first sight (seconds 0), then on a sighting once
 // usage_meter_every_seconds (default 60) have passed since the run's last
@@ -50,8 +57,11 @@
 // durable readings after seq "after" in seq order. A file is deleted only
 // when every seq in it is at or below the acknowledged cursor (the highest
 // "after" the route was called with, kept in state_dir/usage/acked.json)
-// and it is older than 7 days. With no state_dir the meter is off and the
-// route answers 404 usage_meter_off.
+// and it is older than 7 days; an open run whose newest reading is in it
+// gets that reading written again (new seq) first, so replay never loses
+// it. The route serves only durable readings: a seq at or below the durable
+// head, never one of an append the file could not take back. With no
+// state_dir the meter is off and the route answers 404 usage_meter_off.
 //
 // These readings are the front door's observation, not proof: nothing here
 // is signed by the guest. Guest-signed checkpoints are stage 2.
@@ -69,10 +79,12 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -108,6 +120,7 @@ type usageReading struct {
 	Seconds     int64   `json:"seconds"`
 	State       string  `json:"state"`
 	At          int64   `json:"at"`
+	Billable    *bool   `json:"billable,omitempty"` // only false is written; absent: billable
 }
 
 // usageRun is a run without an ended reading.
@@ -116,6 +129,8 @@ type usageRun struct {
 	observed time.Duration // observed time so far
 	lastSeen time.Time     // last sighting; zero: none since this broker started
 	lastAt   int64         // at of the run's last queued reading
+	lastSeq  int64         // seq of the run's newest durable reading; 0: none
+	missed   bool          // an answered list since the last sighting left the room out
 }
 
 // observe adds the time since the last sighting when the gap is short.
@@ -134,10 +149,16 @@ func (r *usageRun) observe(at time.Time) {
 type usageSighting struct {
 	run, guest, hotel, miner string
 	vcpu, memGiB             float64
+	billable                 bool
 }
+
+var usageNotBillable = false
 
 func (r *usageRun) update(s usageSighting) {
 	r.last.Guest, r.last.Hotel, r.last.MinerHotkey = s.guest, s.hotel, s.miner
+	if !s.billable {
+		r.last.Billable = &usageNotBillable
+	}
 	if s.vcpu > 0 {
 		r.last.VCPU = s.vcpu
 	}
@@ -146,9 +167,11 @@ func (r *usageRun) update(s usageSighting) {
 	}
 }
 
+// usageSightingOf is a sighting of a room in h's room map. A registered room
+// is a guest's; one without a client id is being reaped and is not billable.
 func usageSightingOf(h *hotel, rm *room, resources any) usageSighting {
 	vcpu, mem := usageSizeOf(resources)
-	return usageSighting{run: rm.id, guest: rm.guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem}
+	return usageSighting{run: rm.id, guest: rm.guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem, billable: rm.uuid != ""}
 }
 
 // usageSizeOf reads resources.vcpu and resources.memory_gib, as diskGiBOf
@@ -205,6 +228,7 @@ type usageMeter struct {
 	head        int64                // highest durable seq
 	acked       int64                // highest "after" the route was called with, at most head
 	listedAt    map[string]time.Time // hotel id -> its last room list that answered
+	burned      [][2]int64           // seq ranges of appends the file could not take back: not durable, never served
 	opened      time.Time
 	writeErrors int64
 	errLogged   time.Time
@@ -293,11 +317,17 @@ func (m *usageMeter) files() ([]usageFile, error) {
 }
 
 func (m *usageMeter) replay(path string) error {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// A line the last broker wrote but never synced may still be only in the
+	// page cache. Sync it now, before replay counts it into head and the route
+	// serves it: a served seq must survive a machine crash.
+	if err := f.Sync(); err != nil {
+		log.Printf("usage meter: %s: sync before replay: %v", path, err)
+	}
 	rd := bufio.NewReader(f)
 	for n := 1; ; n++ {
 		line, err := rd.ReadBytes('\n')
@@ -335,7 +365,7 @@ func (m *usageMeter) replay(path string) error {
 		}
 		run.last = r
 		run.observed = time.Duration(r.Seconds) * time.Second
-		run.lastAt = r.At
+		run.lastAt, run.lastSeq = r.At, r.Seq
 	}
 }
 
@@ -372,14 +402,16 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) {
 	}
 	r.update(s)
 	r.observe(at)
+	r.missed = false
 	if at.Unix()-r.lastAt >= m.every {
 		m.queueLocked(r, "running", at)
 	}
 }
 
 // end writes the ended reading of a run. confirmed: the broker's own delete
-// removed the room at at, so the time since its last sighting counts (when
-// the gap is short). Callers may hold b.mu.
+// removed the room at at, so the time since its last sighting counts, when
+// the gap is short and no answered list since that sighting left the room
+// out (a 204 for a room already gone proves nothing). Callers may hold b.mu.
 func (m *usageMeter) end(run string, at time.Time, confirmed bool) {
 	if m == nil {
 		return
@@ -395,7 +427,7 @@ func (m *usageMeter) endLocked(run string, at time.Time, confirmed bool) {
 	if r == nil {
 		return
 	}
-	if confirmed {
+	if confirmed && !r.missed {
 		r.observe(at)
 	}
 	m.queueLocked(r, "ended", at)
@@ -431,11 +463,18 @@ func (m *usageMeter) hotelPass(hotelID string, listed []usageSighting, present m
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if listOK {
-		m.listedAt[hotelID] = at
-	}
+	shown := make(map[string]bool, len(listed))
 	for _, s := range listed {
 		m.seenLocked(s, at)
+		shown[s.run] = true
+	}
+	if listOK {
+		m.listedAt[hotelID] = at
+		for id, r := range m.runs {
+			if r.last.Hotel == hotelID && !shown[id] && r.lastSeen.Before(at) {
+				r.missed = true
+			}
+		}
 	}
 	for id, r := range m.runs {
 		if endAbsent && r.last.Hotel == hotelID && !present[id] {
@@ -535,6 +574,11 @@ func (m *usageMeter) flush() error {
 	}
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
+	return m.flushLocked()
+}
+
+// flushLocked is flush for a caller that holds ioMu.
+func (m *usageMeter) flushLocked() error {
 	for {
 		m.mu.Lock()
 		batch := append([]usageReading(nil), m.pending...)
@@ -564,6 +608,11 @@ func (m *usageMeter) flush() error {
 		}
 		m.fileLines += n
 		m.mu.Lock()
+		for i := range batch[:n] {
+			if r := m.runs[batch[i].Run]; r != nil {
+				r.lastSeq = batch[i].Seq
+			}
+		}
 		m.pending = m.pending[n:]
 		if len(m.pending) == 0 {
 			m.pending = nil
@@ -590,6 +639,7 @@ func (m *usageMeter) appendLocked(p []byte, n int64) error {
 	_ = m.f.Close()
 	m.f, m.fname = nil, ""
 	m.mu.Lock()
+	m.burned = append(m.burned, [2]int64{m.nextSeq, m.nextSeq + n - 1})
 	m.nextSeq += n
 	m.mu.Unlock()
 	return err
@@ -653,7 +703,7 @@ func (m *usageMeter) failed(err error) error {
 type usagePage struct {
 	Readings    []json.RawMessage `json:"readings"`
 	Next        int64             `json:"next"`         // seq of the last reading here, or after when there is none
-	Head        int64             `json:"head"`         // highest seq written
+	Head        int64             `json:"head"`         // highest durable seq
 	ObservedAt  int64             `json:"observed_at"`  // oldest last answered list among hotels with live rooms; now if none
 	WriteErrors int64             `json:"write_errors"` // failed appends since start
 }
@@ -670,6 +720,7 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 	if a := min(after, head); a > acked {
 		m.acked, acked, moved = a, a, true
 	}
+	burned := append([][2]int64(nil), m.burned...)
 	m.mu.Unlock()
 	if moved {
 		if err := m.saveAcked(acked); err != nil {
@@ -687,7 +738,7 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 		if i+1 < len(files) && files[i+1].first-1 <= after {
 			continue // every seq in it is at or below after
 		}
-		if err := readUsageFile(f.path, &p, head, limit); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := readUsageFile(f.path, &p, head, limit, burned); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return p, err
 		}
 	}
@@ -697,8 +748,10 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 
 // readUsageFile adds the readings of one file after p.Next and up to head.
 // p.Next moves with every reading taken, so the page is in seq order and
-// skips none. A torn last line is not served.
-func readUsageFile(path string, p *usagePage, head int64, limit int) error {
+// skips none. A torn last line is not served, nor a seq in burned (an
+// append that failed and could not be taken back: those readings were
+// queued again under new seqs).
+func readUsageFile(path string, p *usagePage, head int64, limit int, burned [][2]int64) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -723,17 +776,31 @@ func readUsageFile(path string, p *usagePage, head int64, limit int) error {
 		if r.Seq > head {
 			return nil
 		}
+		if inUsageRanges(r.Seq, burned) {
+			continue
+		}
 		p.Readings = append(p.Readings, json.RawMessage(bytes.TrimRight(line, "\n")))
 		p.Next = r.Seq
 	}
 	return nil
 }
 
+func inUsageRanges(seq int64, ranges [][2]int64) bool {
+	for _, r := range ranges {
+		if seq >= r[0] && seq <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
 // pruneLocked deletes the files whose every seq is at or below acked and
 // that are older than usagePruneAge. The newest file and the open one stay.
+// Caller holds ioMu.
 func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) {
 	for i := 0; i+1 < len(files); i++ {
-		if files[i+1].first-1 > acked {
+		last := files[i+1].first - 1
+		if last > acked {
 			return // files are in seq order: no later file is acknowledged either
 		}
 		if files[i].path == m.fname {
@@ -743,12 +810,37 @@ func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) 
 		if err != nil || now.Sub(st.ModTime()) <= usagePruneAge {
 			continue
 		}
+		if err := m.carryForwardLocked(files[i].first, last, now); err != nil {
+			log.Printf("usage meter: %s kept: open runs not carried forward: %v", filepath.Base(files[i].path), err)
+			continue
+		}
 		if err := os.Remove(files[i].path); err != nil {
 			log.Printf("usage meter: prune %s: %v", filepath.Base(files[i].path), err)
 			continue
 		}
 		log.Printf("usage meter: pruned %s (acknowledged through %d)", filepath.Base(files[i].path), acked)
 	}
+}
+
+// carryForwardLocked writes again, under new seqs, the newest reading of
+// every open run whose newest durable reading has a seq in [first, last], so
+// deleting the file that holds it loses no run's start or seconds. The
+// reading's seconds are the run's own; only seq and at are new. Caller holds
+// ioMu.
+func (m *usageMeter) carryForwardLocked(first, last int64, now time.Time) error {
+	m.mu.Lock()
+	n := 0
+	for _, r := range m.runs {
+		if r.lastSeq >= first && r.lastSeq <= last {
+			m.queueLocked(r, "running", now)
+			n++
+		}
+	}
+	m.mu.Unlock()
+	if n == 0 {
+		return nil
+	}
+	return m.flushLocked()
 }
 
 func (m *usageMeter) saveAcked(acked int64) error {
@@ -763,18 +855,81 @@ func (m *usageMeter) saveAcked(acked int64) error {
 	return os.Rename(tmp, filepath.Join(m.dir, usageAckedFile))
 }
 
-// meterHotel hands one sync pass of h to the meter. Until a room list has
-// answered since start, the room map is empty because nobody looked, not
-// because the rooms are gone: their runs do not end. Caller holds b.mu.
+// meterHotel hands one sync pass of h to the meter: a run is present while
+// h's room map holds it or this list showed it (a recorded leftover is never
+// in the room map). Runs end only on a pass whose list answered, and not
+// before a room list has answered since start: until then the room map is
+// empty because nobody looked, not because the rooms are gone. Caller holds
+// b.mu.
 func (b *broker) meterHotel(h *hotel, listed []usageSighting, at time.Time, listOK bool) {
 	if b.meter == nil {
 		return
 	}
-	present := make(map[string]bool, len(h.rooms))
+	present := make(map[string]bool, len(h.rooms)+len(listed))
 	for _, rm := range h.rooms {
 		present[rm.id] = true
 	}
-	b.meter.hotelPass(h.cfg.ID, listed, present, at, listOK, !h.roomsUnchecked)
+	for _, s := range listed {
+		present[s.run] = true
+	}
+	b.meter.hotelPass(h.cfg.ID, listed, present, at, listOK, listOK && !h.roomsUnchecked)
+}
+
+// usageListSighting is a listed room that is not in h's room map: a
+// recorded leftover of a failed create. It used compute; the guest does not
+// pay for it.
+func usageListSighting(h *hotel, id string, labels map[string]string, resources any) usageSighting {
+	vcpu, mem := usageSizeOf(resources)
+	return usageSighting{run: h.cfg.ID + "." + id, guest: labels[guestLabel], hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem}
+}
+
+// bulkDeleteTargets lists the rooms of h that a bulk delete with q will
+// remove, so their runs end at this sighting (a bulk delete answers no ids).
+// Nil when the meter is off or the list fails: those runs then end at their
+// last sync list.
+func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) ([]string, time.Time) {
+	if b.meter == nil {
+		return nil, time.Time{}
+	}
+	var list struct {
+		Sandboxes []struct {
+			ID     string            `json:"id"`
+			Labels map[string]string `json:"labels"`
+		} `json:"sandboxes"`
+	}
+	if err := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", q, &list); err != nil {
+		return nil, time.Time{}
+	}
+	at := time.Now()
+	var ids []string
+	for _, s := range list.Sandboxes {
+		match := true
+		for _, want := range q["label"] { // a hotel that ignores the filter must not end other runs
+			k, v, _ := strings.Cut(want, "=")
+			match = match && s.Labels[k] == v
+		}
+		if match {
+			ids = append(ids, s.ID)
+		}
+	}
+	return ids, at
+}
+
+// meterBulkDeleted ends the runs a successful bulk delete removed, at the
+// list that showed them just before it, never later: the delete itself may
+// take minutes.
+func (b *broker) meterBulkDeleted(h *hotel, ids []string, at time.Time) {
+	if b.meter == nil || len(ids) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, id := range ids {
+		if rm := h.rooms[id]; rm != nil {
+			b.meter.seen(usageSightingOf(h, rm, nil), at)
+			b.meter.end(rm.id, at, false)
+		}
+	}
 }
 
 // handleUsageMeter serves GET /v1/broker/usage-meter (operator key).

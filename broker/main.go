@@ -1709,11 +1709,12 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	}
 	if r.Method == "DELETE" && tail == "" && (status == 204 || status == 404) {
 		b.mu.Lock()
-		if rm.state == stRunning {
+		live := rm.state == stRunning // not already marked gone by the sync loop
+		if live {
 			rm.state, rm.vanished = stDeleting, time.Now()
 		}
 		rm.deleteSent = true
-		b.meter.end(rm.id, time.Now(), status == 204) // the run's ended reading (usage_meter.go)
+		b.meter.end(rm.id, time.Now(), status == 204 && live) // the run's ended reading (usage_meter.go)
 		b.mu.Unlock()
 	}
 	for _, k := range []string{"Content-Type", "Content-Range", "Content-Length", "Retry-After", "Accept-Ranges"} {
@@ -2087,7 +2088,11 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
+			gone, listedAt := b.bulkDeleteTargets(r.Context(), h, q) // the usage meter ends these runs (usage_meter.go)
 			status, busy := bulkDeleteFromHotel(r.Context(), h, q)
+			if status >= 200 && status < 300 {
+				b.meterBulkDeleted(h, gone, listedAt)
+			}
 			mu.Lock()
 			res[h.cfg.ID] = status
 			claimBusy = claimBusy || busy
@@ -2352,9 +2357,12 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		h.place(rm)
 	}
 	for _, s := range list.Sandboxes {
-		// A registered room is a guest's; a room the broker is reaping is not.
-		if rm := h.rooms[s.ID]; rm != nil && rm.uuid != "" {
+		// Every listed room uses compute. One not in the room map is a
+		// recorded leftover of a failed create (usage_meter.go).
+		if rm := h.rooms[s.ID]; rm != nil {
 			listed = append(listed, usageSightingOf(h, rm, s.Resources))
+		} else {
+			listed = append(listed, usageListSighting(h, s.ID, s.Labels, s.Resources))
 		}
 	}
 	for batchID, ub := range h.unreaped {

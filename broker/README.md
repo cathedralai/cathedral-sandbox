@@ -125,12 +125,16 @@ fields `seq`, `run` (the broker room id), `guest`, `hotel`, `miner_hotkey`,
 answer, or the first room list that shows it), every
 `usage_meter_every_seconds` (default 60) while lists show it, and once
 `ended` when it leaves. `seconds` is observed time: a gap over 30 s between
-two sightings (a hotel that stops answering, a broker restart) adds nothing.
+two sightings (a hotel that stops answering, a broker restart) adds nothing,
+and a delete adds its tail only when the hotel's last answered list still
+showed the room. A bulk delete ends its rooms at the list it takes just
+before the delete. A room the broker took back from a cancelled or failed
+create is metered too, with `"billable": false` (absent means billable).
 Readings are cumulative, so a reader keeps the largest per run.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/usage-meter?after=<seq>&limit=<n>` | Readings after `after` (default 0) in seq order, at most `limit` (default 500, at most 1,000): `{"readings", "next", "head", "observed_at", "write_errors"}`. `next` is the seq of the last reading returned (or `after`), so a reader never skips one. `head` is the highest seq written. `observed_at` is the oldest last answered room list among hotels with live rooms (now if none). The highest `after` is the acknowledged cursor: a file whose seqs are all at or below it and that is older than 7 days is deleted. Without `state_dir`: 404 `usage_meter_off`. |
+| `GET /v1/broker/usage-meter?after=<seq>&limit=<n>` | Readings after `after` (default 0) in seq order, at most `limit` (default 500, at most 1,000): `{"readings", "next", "head", "observed_at", "write_errors"}`. `next` is the seq of the last reading returned (or `after`), so a reader never skips one. `head` is the highest seq written. `observed_at` is the oldest last answered room list among hotels with live rooms (now if none). Only durable (fsynced) readings are served. The highest `after` is the acknowledged cursor: a file whose seqs are all at or below it and that is older than 7 days is deleted, after the newest reading of each open run in it is written again under a new seq. Without `state_dir`: 404 `usage_meter_off`. |
 
 ## Guest policy and capacity catalog
 

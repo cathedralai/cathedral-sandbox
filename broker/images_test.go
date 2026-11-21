@@ -93,6 +93,9 @@ type fakeHotel struct {
 	// with this status and keep the room (AB#338).
 	labelListFail  int
 	roomDeleteFail int
+	// absentDelete204: answer 204 to a delete of a room the hotel does not
+	// hold, as the real hotel does (usage_meter_test.go).
+	absentDelete204 bool
 	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
 	// runs without f.mu so it may hijack and hold the connection.
 	upgrade http.HandlerFunc
@@ -461,6 +464,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(204)
 				return
 			}
+		}
+		if f.absentDelete204 {
+			w.WriteHeader(204)
+			return
 		}
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+id)
 	default:

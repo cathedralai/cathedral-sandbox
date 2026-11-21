@@ -103,6 +103,7 @@ func (b *broker) reapRoom(h *hotel, rm *room) {
 	}
 	h.rooms[rm.hid] = rm
 	b.rememberGuestRoom(rm.guest, h.cfg.ID, rm.hid)
+	b.meter.seen(usageSightingOf(h, rm, nil), time.Now()) // metered, not billable: no client id (usage_meter.go)
 	b.mu.Unlock()
 	path := "/v1/sandboxes/" + url.PathEscape(rm.hid)
 	for attempt := 0; attempt < 3; attempt++ {
