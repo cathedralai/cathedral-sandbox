@@ -645,3 +645,37 @@ func TestPoolRollbackToTargetsZeroDeletesOnlyProvenRooms(t *testing.T) {
 		t.Fatalf("after the rollback: %v", ha)
 	}
 }
+
+// The manager acts on a hotel only after its room list has answered once
+// since start: before that, an empty room map means nobody looked, so it
+// neither makes rooms nor reads any.
+func TestPoolWaitsForTheFirstRoomList(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	f.addRoom("r-pool", "pool")
+	f.set(func(f *fakePoolHotel) { f.listFail = true })
+	h := pc.b.hotelByID("a")
+	img := nodeImage()
+	waitFor(t, "hotel a admitted and warm", func() bool {
+		pc.sync("a")
+		pc.b.mu.Lock()
+		defer pc.b.mu.Unlock()
+		return pc.b.admitted(h, time.Now()) && h.warm[img]
+	})
+	pc.target(2)
+	pc.steps("a", 3)
+	if n := len(f.creates()); n != 0 {
+		t.Fatalf("%d creates before the first room list, want 0", n)
+	}
+	_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+	ha := doc["hotels"].(map[string]any)["a"].(map[string]any)
+	if ha["listed_since_start"] != false || !strings.Contains(ha["why_no_creates"].(string), "no room list since start") {
+		t.Fatalf("GET hotel a before its first list: %v", ha)
+	}
+	f.set(func(f *fakePoolHotel) { f.listFail = false })
+	pc.sync("a")
+	pc.fill("a", 2)
+	if n := len(f.creates()); n != 1 {
+		t.Fatalf("%d creates, want 1: r-pool, read after the first list, is one of the 2", n)
+	}
+}
