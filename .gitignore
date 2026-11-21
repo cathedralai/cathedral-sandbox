@@ -43,3 +43,4 @@ ops/roll/hotels.conf
 
 # Published public keys only (never private keys).
 !docs/keys/*.pub.pem
+broker/broker

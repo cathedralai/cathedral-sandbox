@@ -110,6 +110,14 @@ func (b *broker) admit(g *guestState, n int) (*apiErr, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	lim := g.limits
+	// One call larger than a limit can never pass: say so (400), rather
+	// than a 429 whose Retry-After a client obeys forever (AB#865).
+	if n > lim.maxRooms() {
+		return &apiErr{400, "count_over_room_limit", fmt.Sprintf("this key may have %d rooms at one time; one create asked for %d. Send at most %d in one call", lim.maxRooms(), n, lim.maxRooms())}, 0
+	}
+	if lim.MaxCreatesPerMinute > 0 && n > lim.MaxCreatesPerMinute {
+		return &apiErr{400, "count_over_rate_limit", fmt.Sprintf("this key may ask for %d rooms per minute; one create asked for %d. Send at most %d in one call", lim.MaxCreatesPerMinute, n, lim.MaxCreatesPerMinute)}, 0
+	}
 	if used := b.activeRooms(g); used+n > lim.maxRooms() {
 		return &apiErr{429, "room_limit", fmt.Sprintf("this key may have %d rooms at one time; %d are running or starting. Delete rooms, or ask Cathedral for a higher limit", lim.maxRooms(), used)}, 10
 	}
@@ -320,6 +328,14 @@ func (g *guestState) limitsAllow(b *broker, id string) bool {
 // list holds it).
 func (g *guestState) allowsHotel(h *hotel) bool {
 	return g.tierOf(h) != ""
+}
+
+// guestReaches reports whether h is one of g's hotels as placement sees them:
+// allowed, and not a miner hotel for an own-hosts-only guest. Every guest view
+// of hotels (capacity, /v1/broker/hotels, /v1/status) counts these and no
+// others (AB#869). Caller holds b.mu.
+func (g *guestState) guestReaches(h *hotel) bool {
+	return g.allowsHotel(h) && !(g.limits.OwnHostsOnly && isMinerHotel(h))
 }
 
 // tierOf is guestLimits.tierOf behind the hotel reservation: a hotel

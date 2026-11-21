@@ -31,6 +31,9 @@ type fakeHotel struct {
 	calls         []string                  // "METHOD /path?query" of every request
 	snaps         map[string]map[string]any // hotel snapshot id -> document
 	prefetch      []map[string]any
+	prefetchGuest []string        // the guest header of every prefetch (AB#859)
+	failRef       string          // a prefetch of this ref answers 502 (AB#859)
+	cached        map[string]bool // GET /v1/images/<ref> answers cached (AB#859 replay)
 	pushes        []map[string]any
 	deleted       []string
 	failPull      bool
@@ -45,6 +48,7 @@ type fakeHotel struct {
 	healthLive    map[string]any   // "live" in the /room/health answer; nil: omitted (disk_test.go)
 	answerDelay   time.Duration    // wait between starting a room and answering its create (disk_test.go)
 	listFail      bool             // answer every room list 503 (disk_test.go)
+	snapListFail  bool             // answer GET /v1/snapshots 500, like a hotel API that is down (AB#866)
 	rooms         []map[string]any // id + labels, for the room list
 	listExtra     map[string]any   // top-level fields added to the room list answer (ended_test.go)
 	networks      []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
@@ -383,6 +387,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.snaps[sid] = doc
 		writeJSON(w, 202, map[string]any{"operation_id": "op_1", "status": "done", "result": doc})
+	case p == "/v1/snapshots" && r.Method == "GET" && f.snapListFail:
+		writeErr(w, 500, "internal", "snapshot store unavailable")
 	case p == "/v1/snapshots" && r.Method == "GET":
 		want := r.URL.Query().Get("label")
 		k, v, _ := strings.Cut(want, "=")
@@ -415,8 +421,16 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		delete(f.snaps, sid)
 		f.deleted = append(f.deleted, sid)
 		writeJSON(w, 200, map[string]any{"deleted": true})
+	case strings.HasPrefix(p, "/v1/images/") && r.Method == "GET" && !strings.HasPrefix(p, "/v1/images/prefetch"):
+		ref := strings.TrimPrefix(p, "/v1/images/")
+		writeJSON(w, 200, map[string]any{"ref": ref, "cached": f.cached[ref]})
 	case p == "/v1/images/prefetch":
 		f.prefetch = append(f.prefetch, req)
+		f.prefetchGuest = append(f.prefetchGuest, r.Header.Get(guestHeader))
+		if refs, _ := req["images"].([]any); f.failRef != "" && len(refs) > 0 && refs[0] == f.failRef {
+			writeErr(w, 502, "image_pull_failed", "manifest unknown")
+			return
+		}
 		if f.pullDelay > 0 {
 			f.mu.Unlock()
 			time.Sleep(f.pullDelay)
