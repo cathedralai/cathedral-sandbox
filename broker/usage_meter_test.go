@@ -1870,3 +1870,225 @@ func TestUsageMeterNewStateDirSyncsEveryNewAncestor(t *testing.T) {
 		t.Fatalf("synced %v, want %v first", synced, want)
 	}
 }
+
+// Main's meter key routes (#648, meter.go) and the usage meter route share
+// the word meter and nothing else. After the merge the meter key gets no
+// usage readings, and the operator key keeps the usage meter and gets no
+// meter key route.
+func TestUsageMeterRouteAndMeterKeyRoutesStayApart(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MeterKeySHA256 = sha("meter-key")
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	syncNow(tc, "b")
+	mustFlush(t, tc.b.usageMeter)
+	for _, c := range [][2]string{{"GET", "/v1/broker/usage-meter"}, {"GET", "/v1/broker/usage-meter?after=0&limit=10"}, {"POST", "/v1/broker/usage-meter"}} {
+		if status, doc := tc.call(t, "meter-key", c[0], c[1], nil); status != 401 {
+			t.Fatalf("meter key %s %s: %d %v, want 401", c[0], c[1], status, doc)
+		}
+	}
+	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter?after=0", nil)
+	rs, _ := doc["readings"].([]any)
+	if status != 200 || len(rs) != 1 || rs[0].(map[string]any)["run"] != id {
+		t.Fatalf("operator key usage meter: %d %v, want the room's first reading", status, doc)
+	}
+	for _, rt := range meterPaths("g1") {
+		if status, doc := tc.call(t, "operator-key", rt[0], rt[1], nil); status != 401 {
+			t.Fatalf("operator key %s %s: %d %v, want 401", rt[0], rt[1], status, doc)
+		}
+	}
+	if n := len(tc.hotels["b"].freezes); n != 0 {
+		t.Fatalf("hotel got %d freezes", n)
+	}
+	if status, doc := tc.call(t, "meter-key", "GET", "/v1/broker/guests/g1/rooms", nil); status != 200 {
+		t.Fatalf("meter key on its own route: %d %v", status, doc)
+	}
+}
+
+// endedReadings is how many ended readings run has in tc's log.
+func endedReadings(t *testing.T, tc *testChain, run string) (n int, all []usageReading) {
+	t.Helper()
+	all = usageMeterRunsOf(t, tc, run)
+	for _, r := range all {
+		if r.State == "ended" {
+			n++
+		}
+	}
+	return n, all
+}
+
+// Every way a room leaves the broker on main (#637 records why) gives its
+// run exactly one ended reading, and a later sync adds none. #637 adds no
+// end path of its own: its records are written at the sync loop's release
+// of a vanished room and at the miner forget, both of which end the run.
+func TestUsageMeterEndsOnceOnEveryEndPathOfMain(t *testing.T) {
+	for _, c := range []struct {
+		name, reason string
+		end          func(t *testing.T, tc *testChain, bid string)
+	}{
+		{"delete by id", "deleted", func(t *testing.T, tc *testChain, bid string) {
+			if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+bid, nil); status != 204 {
+				t.Fatalf("delete: %d %v", status, doc)
+			}
+			releaseGone(t, tc, "b")
+		}},
+		{"delete by label", "deleted", func(t *testing.T, tc *testChain, bid string) {
+			if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+				t.Fatalf("bulk delete: %d %v", status, doc)
+			}
+			releaseGone(t, tc, "b")
+		}},
+		{"listed expiry", "ttl_expired", func(t *testing.T, tc *testChain, bid string) {
+			setOnHotel(tc, bid, "expires_at", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339))
+			syncNow(tc, "b")
+			vanish(t, tc, bid)
+		}},
+		{"hotel ended list", "idle_timeout", func(t *testing.T, tc *testChain, bid string) {
+			f := tc.hotels["b"]
+			f.mu.Lock()
+			f.listExtra = map[string]any{"ended": []map[string]any{{"id": strings.SplitN(bid, ".", 2)[1], "end_reason": "idle_timeout"}}}
+			f.mu.Unlock()
+			vanish(t, tc, bid)
+		}},
+		{"hotel api restart", "hotel_restarted", func(t *testing.T, tc *testChain, bid string) {
+			f := tc.hotels["b"]
+			f.mu.Lock()
+			f.listExtra = map[string]any{"api_started_at": "2026-11-21T07:00:00+00:00"}
+			f.mu.Unlock()
+			syncNow(tc, "b")
+			f.mu.Lock()
+			f.listExtra = map[string]any{"api_started_at": "2026-11-21T08:00:00+00:00"}
+			f.mu.Unlock()
+			vanish(t, tc, bid)
+		}},
+		{"vanished", "unknown", func(t *testing.T, tc *testChain, bid string) {
+			vanish(t, tc, bid)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tc := newChainState(t, t.TempDir())
+			bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "labels": map[string]string{"job": "x"}})
+			syncNow(tc, "b")
+			c.end(t, tc, bid)
+			if r := goneReason(t, tc, "key1", bid); r != c.reason {
+				t.Fatalf("end record reason %q, want %q", r, c.reason)
+			}
+			syncNow(tc, "b")
+			if n, all := endedReadings(t, tc, bid); n != 1 || all[len(all)-1].State != "ended" {
+				t.Fatalf("readings %+v, want exactly one ended reading, last", all)
+			}
+		})
+	}
+
+	t.Run("miner forget", func(t *testing.T) {
+		tc := newChainState(t, t.TempDir())
+		g := newRebootingGuest(t, "m1")
+		_, bid, _ := readyToForget(t, tc, g)
+		if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1?forget_rooms=true", nil); status != 204 {
+			t.Fatalf("forget: %d %v", status, doc)
+		}
+		if r := goneReason(t, tc, "key1", bid); r != "hotel_removed" {
+			t.Fatalf("end record reason %q, want hotel_removed", r)
+		}
+		syncNow(tc, "b") // any pass sweeps the runs of a hotel the broker no longer has
+		syncNow(tc, "b")
+		if n, all := endedReadings(t, tc, bid); n != 1 || all[len(all)-1].State != "ended" {
+			t.Fatalf("readings %+v, want exactly one ended reading, last", all)
+		}
+	})
+
+	t.Run("refused create", func(t *testing.T) {
+		tc := newChainState(t, t.TempDir()) // no hotel applies tunables: the broker reaps the room
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{
+			"image": "alpine:3.20", "hotels": []string{"b"}, "tunables": coldTunables()})
+		if status != 409 || errCode(doc) != "tunables_unavailable" {
+			t.Fatalf("create: %d %v", status, doc)
+		}
+		releaseGone(t, tc, "b")
+		syncNow(tc, "b")
+		if status, list := endedOf(t, tc, "key1", ""); status != 200 || len(list) != 0 {
+			t.Fatalf("end records after a refused create: %d %v, want none", status, list)
+		}
+		mustFlush(t, tc.b.usageMeter)
+		var runs []string
+		for _, r := range logReadings(t, filepath.Join(tc.b.cfg.StateDir, usageDirName)) {
+			if r.State == "ended" {
+				runs = append(runs, r.Run)
+			}
+			if r.Billable == nil || *r.Billable {
+				t.Fatalf("a refused create's reading is billable: %+v", r)
+			}
+		}
+		if len(runs) != 1 {
+			t.Fatalf("ended readings for %v, want one run", runs)
+		}
+	})
+
+	// #637 drops the end record when a late list shows the room again; the
+	// run stays ended (README: not metered again for 24 h).
+	t.Run("late list after the end", func(t *testing.T) {
+		tc := newChainState(t, t.TempDir())
+		bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+		syncNow(tc, "b")
+		f := tc.hotels["b"]
+		f.mu.Lock()
+		saved := append([]map[string]any(nil), f.rooms...)
+		f.mu.Unlock()
+		vanish(t, tc, bid)
+		_, before := endedReadings(t, tc, bid)
+		f.mu.Lock()
+		f.rooms = saved
+		f.mu.Unlock()
+		syncNow(tc, "b")
+		if status, _ := tc.call(t, "key1", "GET", "/v1/sandboxes/"+bid, nil); status != 200 {
+			t.Fatalf("re-adopted room: %d, want 200", status)
+		}
+		n, after := endedReadings(t, tc, bid)
+		if n != 1 || len(after) != len(before) {
+			t.Fatalf("readings before %+v after %+v, want one ended reading and nothing new", before, after)
+		}
+	})
+}
+
+// Pins today's behaviour for #648's freeze, which another team must rule on
+// (is a frozen room billable?). The hotel still lists a frozen room, with
+// state "frozen"; the broker keeps it as a running room, and the usage meter
+// counts its seconds like any listed room: readings say "running" and carry
+// no billable field.
+func TestUsageMeterFrozenRoomIsStillMeteredAsBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MeterKeySHA256 = sha("meter-key")
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	syncNow(tc, "b")
+	status, doc := tc.call(t, "meter-key", "POST", "/v1/broker/guests/g1/freeze-all", nil)
+	if frozen, _ := doc["frozen"].([]any); status != 200 || len(frozen) != 1 || frozen[0] != bid {
+		t.Fatalf("freeze-all: %d %v", status, doc)
+	}
+	if s := hotelRoomState(tc.hotels["b"], strings.SplitN(bid, ".", 2)[1]); s != "frozen" {
+		t.Fatalf("hotel room state %v, want frozen", s)
+	}
+	m := tc.b.usageMeter
+	for i := 0; i < 2; i++ {
+		// 20 s between sightings and a reading due, without sleeping.
+		m.mu.Lock()
+		r := m.runs[bid]
+		r.lastSeen, r.lastAt = r.lastSeen.Add(-20*time.Second), r.lastAt-61
+		m.mu.Unlock()
+		syncNow(tc, "b")
+	}
+	tc.b.mu.Lock()
+	rm := tc.b.byBID(bid)
+	running := rm != nil && rm.state == stRunning
+	tc.b.mu.Unlock()
+	if !running {
+		t.Fatal("the broker no longer holds the frozen room as running")
+	}
+	all := usageMeterRunsOf(t, tc, bid)
+	if len(all) != 3 {
+		t.Fatalf("readings %+v, want the first and two more", all)
+	}
+	for i, r := range all {
+		if r.State != "running" || r.Billable != nil || r.Seconds < int64(20*i) {
+			t.Fatalf("reading %d of a frozen room: %+v", i, r)
+		}
+	}
+}
