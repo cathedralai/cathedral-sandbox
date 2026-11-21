@@ -661,8 +661,14 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		t, dead := b.compat.tombs[id]
 		b.compat.mu.Unlock()
 		if dead && r.Method == "GET" && tail == "" {
+			// An operator forget also writes a tombstone; its end record says
+			// hotel_removed, which the client must see (review F1 on #637).
+			reason, goneAt := endDeleted, t.at
+			if rec := b.endedByUUID(g.cfg.ID, id); rec != nil {
+				reason, goneAt = rec.Reason, rec.GoneAt
+			}
 			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid),
-				"end_reason": endDeleted, "gone_at": t.at.UTC().Format(time.RFC3339Nano)})
+				"end_reason": reason, "gone_at": goneAt.UTC().Format(time.RFC3339Nano)})
 			return
 		}
 		if dead && r.Method == "DELETE" && tail == "" {

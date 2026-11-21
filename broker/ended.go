@@ -20,6 +20,7 @@ package main
 // per guest, oldest dropped first.
 
 import (
+	"cmp"
 	"net/http"
 	"slices"
 	"strconv"
@@ -28,10 +29,13 @@ import (
 )
 
 const (
-	endedKeep        = 24 * time.Hour
-	endedMaxPerGuest = 50000
-	endedListMax     = 1000
-	endedListDefault = 100
+	endedKeep = 24 * time.Hour
+	// endedStreamLookback: how far back a live stream looks for records written
+	// late, after rooms held back as deleting are freed (endedSince).
+	endedStreamLookback = 15 * time.Minute
+	endedMaxPerGuest    = 50000
+	endedListMax        = 1000
+	endedListDefault    = 100
 	// The hotel reaps at expires_at plus a grace; a room gone at most this
 	// long before its listed expiry ended by its TTL.
 	endedTTLSlack = 10 * time.Second
@@ -112,7 +116,14 @@ func (b *broker) addEnded(rec *endRecord) {
 	if rec.UUID != "" {
 		ge.byUUID[rec.UUID] = rec
 	}
-	ge.order = append(ge.order, rec)
+	// order stays sorted by GoneAt: the list, newest first, and prune rely on
+	// it, and one sync tick can release rooms that vanished at different
+	// times in any order (review F2 on #637).
+	i := len(ge.order)
+	for i > 0 && ge.order[i-1].GoneAt.After(rec.GoneAt) {
+		i--
+	}
+	ge.order = slices.Insert(ge.order, i, rec)
 	ge.prune(time.Now())
 	b.markDirty()
 }
@@ -244,12 +255,23 @@ func (b *broker) endedSince(guest string, seq uint64) ([]map[string]any, uint64)
 	if ge == nil {
 		return nil, last
 	}
-	i := len(ge.order)
-	for i > 0 && ge.order[i-1].seq > seq {
-		i--
+	// order is by GoneAt, so a new record can sit before older ones: a room
+	// held back as deleting is released minutes after it vanished. Look back
+	// over that window, not only the tail, and send in write order.
+	cutoff := time.Now().Add(-endedStreamLookback)
+	var picked []*endRecord
+	for i := len(ge.order) - 1; i >= 0; i-- {
+		rec := ge.order[i]
+		if rec.seq <= seq && rec.GoneAt.Before(cutoff) {
+			break
+		}
+		if rec.seq > seq {
+			picked = append(picked, rec)
+		}
 	}
+	slices.SortFunc(picked, func(a, b *endRecord) int { return cmp.Compare(a.seq, b.seq) })
 	var out []map[string]any
-	for _, rec := range ge.order[i:] {
+	for _, rec := range picked {
 		out = append(out, rec.view())
 	}
 	return out, last

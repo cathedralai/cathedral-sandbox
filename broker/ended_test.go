@@ -440,3 +440,28 @@ func TestRefusedCreateLeavesNoEndRecord(t *testing.T) {
 		t.Fatalf("ended after a refused create: %d %v, want none", status, list)
 	}
 }
+
+// Review F2 on #637: records written out of GoneAt order (rooms held back as
+// deleting and freed together) still list newest first, and a live stream
+// still gets the late one once.
+func TestEndedListStaysNewestFirstWhenWrittenOutOfOrder(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	now := time.Now()
+	seq0 := tc.b.endSeq
+	for _, x := range []struct {
+		id  string
+		ago time.Duration
+	}{{"b.sbx_mid", 2 * time.Minute}, {"b.sbx_new", time.Minute}, {"b.sbx_old", 3 * time.Minute}} {
+		tc.b.mu.Lock()
+		tc.b.addEnded(&endRecord{ID: x.id, Guest: "g1", Hotel: "b", GoneAt: now.Add(-x.ago), Reason: endUnknown})
+		tc.b.mu.Unlock()
+	}
+	_, list := endedOf(t, tc, "key1", "?limit=2")
+	if len(list) != 2 || list[0]["id"] != "b.sbx_new" || list[1]["id"] != "b.sbx_mid" {
+		t.Fatalf("ended limit 2 = %v, want new then mid", list)
+	}
+	got, _ := tc.b.endedSince("g1", seq0+2)
+	if len(got) != 1 || got[0]["id"] != "b.sbx_old" {
+		t.Fatalf("stream after the first two records = %v, want only the late old one", got)
+	}
+}

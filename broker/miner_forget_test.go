@@ -166,6 +166,10 @@ func TestOperatorForgetsTheRoomsOfADeadMinerHotel(t *testing.T) {
 	if !ok || tomb.bid != roomID {
 		t.Fatalf("forgotten room not tombstoned for its client: %v %+v", ok, tomb)
 	}
+	// The client path says why too, not "deleted" (review F1 on #637).
+	if status, doc := tc.clientCall(t, "GET", "/v1/sandboxes/"+clientID, nil, nil); status != 200 || doc["end_reason"] != "hotel_removed" {
+		t.Fatalf("forgotten room by client id: %d %v, want 200 end_reason hotel_removed", status, doc)
+	}
 	if tc.b.hotelByID("m1") != nil {
 		t.Fatal("hotel still in the set after the forget")
 	}
