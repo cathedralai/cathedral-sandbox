@@ -495,16 +495,16 @@ uses it to keep the hotel key off the host too:
 2. In the broker config entry set `"sealed": true, "guest_tls": true` and
    point `api` and `health` at the guest's `https://` port. The broker pins
    the attested key (`broker/README.md`, "Guest TLS for config hotels").
-3. Install the hotel key the broker's `key_file` holds with
-   `POST /room/hotel-key`, signed by an install signer, after every boot.
+3. Set `"hotel_key_install_signing_key_file"` on that broker entry (AB#817).
+   The broker installs its `key_file` key with `POST /room/hotel-key` right
+   after it pins each new guest key, so after every boot, and admits the
+   hotel only after a good install (`broker/README.md`). The seed's public
+   key is the `SEALED_HOTEL_KEY_INSTALL_SIGNERS` value of step 1.
 4. `install-sealed.sh` cannot count rooms (no key on the host): drain the
    hotel before a restart and set `SEALED_RESTART_WITH_ROOMS=1`.
 
 ### Still open
 
-- **Installer for config hotels.** Who signs the `POST /room/hotel-key`
-  envelope for a config hotel (the control plane, as for miners in #1588, or
-  an ops tool beside the broker key file) is not decided.
 - **fw_cfg hotel key.** The config-hotel path that reads the hotel key from
   fw_cfg (`guest-boot.sh`, `launch-guest.sh`, `install-sealed.sh`) goes once
   every config hotel runs guest TLS. It is a measured change: a re-seal.

@@ -58,6 +58,7 @@ UNSIGNED = {
     ("GET", r"/v1/secrets"): "read: secret names, never values",
     ("GET", r"/v1/sandbox-templates"): "read: lists templates",
     ("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)"): "read: one template",
+    ("GET", r"/v1/images"): "read: the caller's cached images and pins",
     ("GET", r"/v1/images/(?P<ref>.+)"): "read: an image's state",
     ("GET", r"/v1/quota"): "read",
     ("GET", r"/v1/usage"): "read",
