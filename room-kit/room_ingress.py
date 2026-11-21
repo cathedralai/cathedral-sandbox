@@ -53,7 +53,10 @@ DROP_REQUEST = {"connection", "keep-alive", "transfer-encoding", "te", "trailer"
                 "x-cathedral-guest", "x-room-exec-handle", "x-forwarded-host", "x-forwarded-proto",
                 "x-forwarded-for", "forwarded"}
 DROP_RESPONSE = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
-                 "proxy-authenticate", "content-length"}
+                 "proxy-authenticate", "content-length", "server", "date"}  # the ingress sends its own Server and Date
+# Connections the ingress serves at once. It shares the front's process, which signs for every room on the
+# hotel: past this many, a new connection is closed at once instead of taking another thread.
+MAX_CONNECTIONS = 256
 FIRST_RETRY_SECONDS = 30
 MAX_RETRY_SECONDS = 3600
 MIN_RENEW_WAIT_SECONDS = 3600
@@ -120,7 +123,9 @@ class IngressState:
 
     @property
     def ready(self) -> bool:
-        return self.leaf is not None
+        """A CA certificate that has not expired. A renewal that keeps failing turns expose off again."""
+        leaf = self.leaf
+        return leaf is not None and leaf.not_valid_after_utc.timestamp() > time.time()
 
     def names(self) -> list[str]:
         return [self.base, f"*.{self.base}"]
@@ -247,7 +252,24 @@ class IngressServer(ThreadingHTTPServer):
 
     def __init__(self, addr, state: IngressState, api_port: int, api_key: bytes):
         self.state, self.api_port, self.api_key = state, api_port, api_key
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         super().__init__(addr, IngressHandler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
     def finish_request(self, request, client_address):
         request.settimeout(self.handshake_timeout)

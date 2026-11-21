@@ -587,7 +587,11 @@ id>.<zone>` and `*.<hotel id>.<zone>` must point at the host (A records), and
 the host needs `SEALED_GUEST_INGRESS=1` (above). Every boot (and every restart of
 the front) makes a new key, so each orders a new certificate: Let's Encrypt allows 5 for the same
 names per week, so a hotel that restarts more often than that waits for the
-limit (the old URLs serve the self-issued certificate meanwhile). Point
+limit (the old URLs serve the self-issued certificate meanwhile). Every
+hotel in the zone also shares Let's Encrypt's 50 certificates per week for the
+registered domain (cathedral.computer for hotels.cathedral.computer). A
+certificate that expires without a renewal turns expose off again (503) until
+the next one arrives. Point
 `SEALED_ACME_DIRECTORY` at Let's Encrypt staging for trials.
 
 Still open: a live run after the re-seal (https to a room port answered with

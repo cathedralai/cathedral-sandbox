@@ -414,7 +414,7 @@ def test_build_with_a_zone_resolves_and_checks() -> None:
     assert ok.stdout == f"{ZONE}|8443|https://live.example|{room_acme.LETS_ENCRYPT_DIRECTORY}"
     for bad in ({"SEALED_INGRESS_BROKER_URL": ""}, {"SEALED_INGRESS_BROKER_URL": "http://live.example"},
                 {"SEALED_INGRESS_ZONE": "Hotels.Example.com"}, {"SEALED_INGRESS_TLS_PORT": "18090"},
-                {"SEALED_INGRESS_TLS_PORT": "70000"}, {"SEALED_ACME_DIRECTORY": "http://x/dir"},
+                {"SEALED_INGRESS_TLS_PORT": "70000"}, {"SEALED_INGRESS_TLS_PORT": "22"}, {"SEALED_ACME_DIRECTORY": "http://x/dir"},
                 {"SEALED_ROOM_GUEST_INGRESS": "yes"}):
         env = {"SEALED_ROOM_GUEST_INGRESS": "1", "SEALED_INGRESS_ZONE": ZONE,
                "SEALED_INGRESS_BROKER_URL": "https://live.example", **bad}
@@ -481,3 +481,35 @@ def test_start_turns_serving_on_only_when_configured_and_bound(tmp_path, monkeyp
     busy.close()  # the same port, now free
     state = room_ingress.start(ledger, env, 1, KEY, str(tmp_path), log=lambda *a, **k: None)
     assert ledger.ingress.serving is state and not state.ready
+
+
+def test_an_expired_certificate_turns_expose_off(world, monkeypatch) -> None:
+    world["keeper"].once()
+    assert world["state"].ready
+    later = world["state"].leaf.not_valid_after_utc.timestamp() + 1
+    monkeypatch.setattr(room_ingress.time, "time", lambda: later)
+    assert not world["state"].ready
+    status, _h, body = _expose(world)
+    assert status == 503 and json.loads(body)["error"]["code"] == "ingress_not_ready"
+
+
+def test_connections_past_the_cap_are_closed_and_slots_come_back(world, monkeypatch) -> None:
+    import time as _t
+    world["keeper"].once()
+    _expose(world)
+    monkeypatch.setattr(room_ingress, "MAX_CONNECTIONS", 1)
+    srv = room_ingress.IngressServer(("127.0.0.1", 0), world["state"], 1, KEY)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    try:
+        held = socket.create_connection(("127.0.0.1", port), timeout=10)  # takes the one slot (handshake pending)
+        _t.sleep(0.3)
+        refused = socket.create_connection(("127.0.0.1", port), timeout=10)
+        assert refused.recv(10) == b""  # closed at once
+        refused.close()
+        held.close()
+        _t.sleep(0.5)
+        (status, _h, _b), _spki, _c = _https(port, "nothing.example")
+        assert status == 404  # the slot came back: the next connection is served
+    finally:
+        srv.shutdown()

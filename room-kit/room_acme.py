@@ -266,8 +266,8 @@ class AcmeClient:
             status = doc.get("status")
             if status in done:
                 return doc
-            if status == "invalid":
-                raise AcmeError(f"ACME {what} is invalid{_problem_doc(doc)}")
+            if status in ("invalid", "deactivated", "expired", "revoked"):
+                raise AcmeError(f"ACME {what} is {status}{_problem_doc(doc)}")
             if self._clock() - start > POLL_LIMIT_SECONDS:
                 raise AcmeError(f"ACME {what} still {status} after {POLL_LIMIT_SECONDS} s")
             self._sleep(_retry_after(ans.headers.get("retry-after")))

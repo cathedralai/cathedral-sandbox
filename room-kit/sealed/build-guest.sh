@@ -61,9 +61,9 @@ if [ "$GUEST_INGRESS" = 1 ] && [ -n "${SEALED_INGRESS_ZONE:-}" ]; then
       echo "SEALED_INGRESS_TLS_PORT and SEALED_INGRESS_PUBLIC_PORT must be TCP ports" >&2; exit 1
     fi
   done
-  if [ "$INGRESS_TLS_PORT" = 18090 ] || [ "$INGRESS_TLS_PORT" = 18091 ] \
+  if [ "$INGRESS_TLS_PORT" = 18090 ] || [ "$INGRESS_TLS_PORT" = 18091 ] || [ "$INGRESS_TLS_PORT" = 22 ] \
      || { [ "$MINER" = 1 ] && [ "$INGRESS_TLS_PORT" = "$MINER_TLS_PORT" ]; }; then
-    echo "SEALED_INGRESS_TLS_PORT must not be 18090, 18091 or the miner TLS port" >&2; exit 1
+    echo "SEALED_INGRESS_TLS_PORT must not be 18090, 18091, 22 or the miner TLS port" >&2; exit 1
   fi
   if ! [[ "$INGRESS_BROKER_URL" =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$ ]]; then
     echo "SEALED_INGRESS_ZONE needs SEALED_INGRESS_BROKER_URL: the broker https origin" >&2; exit 1

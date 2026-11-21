@@ -237,3 +237,10 @@ def test_a_long_hotel_name_leaves_the_common_name_out(world) -> None:
     assert sans == long_names
     short = x509.load_der_x509_csr(acme.make_csr(NAMES, key))
     assert short.subject.rfc4514_string() == f"CN={NAMES[0]}"
+
+
+def test_poll_stops_at_a_terminal_authorization_state() -> None:
+    client = acme.AcmeClient("http://127.0.0.1:1/dir", sleep=lambda s: None)
+    client.post = lambda url, payload, **k: acme.Answer(200, {}, b'{"status":"deactivated"}')
+    with pytest.raises(acme.AcmeError, match="authorization is deactivated"):
+        client._poll("http://127.0.0.1:1/authz/1", {"valid"}, "authorization")
