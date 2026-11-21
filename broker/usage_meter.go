@@ -34,7 +34,9 @@
 // adds its tail only when no answered list since the last sighting left the
 // room out (the hotel answers 204 for a room already gone). After a restart
 // a run goes on from its logged seconds and keeps its logged started_at;
-// the downtime adds nothing.
+// the downtime adds nothing. seconds is truncated to whole seconds; with
+// usage_meter_min_second (default false) a billable run's ended reading
+// rounds up to the next whole second, at least 1 (queueLocked).
 //
 // A reading is written at first sight (seconds 0), then on a sighting once
 // usage_meter_every_seconds (default 60) have passed since the run's last
@@ -299,9 +301,10 @@ type usageState struct {
 }
 
 type usageMeter struct {
-	dir      string
-	every    int64 // seconds
-	maxLines int   // lines per file (usageFileLines; tests lower it)
+	dir       string
+	every     int64 // seconds
+	minSecond bool  // usage_meter_min_second: a billable run's ended reading rounds up (queueLocked)
+	maxLines  int   // lines per file (usageFileLines; tests lower it)
 	// write appends p to f and makes it durable. Tests replace it to fail.
 	write func(f *os.File, p []byte) error
 	known func(hotelID string) bool // the hotel is in the broker now; nil: every hotel
@@ -353,6 +356,7 @@ func (b *broker) loadUsageMeter() error {
 		return err
 	}
 	m.known = func(id string) bool { return b.hotelByID(id) != nil }
+	m.minSecond = b.cfg.UsageMeterMinSecond
 	b.usageMeter = m
 	return nil
 }
@@ -591,6 +595,17 @@ func (m *usageMeter) queueLocked(r *usageRun, state string, at time.Time) {
 	rd := r.last
 	rd.Schema, rd.Seq, rd.State, rd.At = usageReadingSchema, 0, state, at.Unix()
 	rd.Seconds = int64(r.observed / time.Second)
+	// usage_meter_min_second (off by default; turning it on is a pricing
+	// decision): a billable run's ended reading rounds up to the next whole
+	// second, at least 1, so a room used and deleted within one observed
+	// second is not free. The ended reading is never below the run's last
+	// running one, so readings stay cumulative. A run that is not billable
+	// (a cancelled or failed create's room) is never rounded: pool runs and
+	// any other run that is not a customer's, when they come, must stay not
+	// billable to keep it so.
+	if m.minSecond && state == "ended" && rd.Billable == nil {
+		rd.Seconds = max(1, int64((r.observed+time.Second-1)/time.Second))
+	}
 	r.last.Seconds = rd.Seconds
 	r.lastAt = rd.At
 	m.pending = append(m.pending, rd)
