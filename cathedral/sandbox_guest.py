@@ -55,6 +55,7 @@ from cathedral.sandbox_api import (
 )
 from cathedral.sandbox_egress import EgressClient
 from cathedral.sandbox_image_owners import ImageOwnerStore, normalize_image_id, refuse_shared_hotel_build
+from cathedral.sandbox_image_pins import ImagePinStore, hotel_ceiling_bytes, pins_path
 from cathedral.start_commands import (
     StartCommandsError,
     image_config_argv,
@@ -498,6 +499,28 @@ def _save_auth_pulled(refs: set[str]) -> None:
         path.write_text(json.dumps(sorted(refs)))
     except OSError:
         pass
+
+
+def _gc_last_used() -> dict[str, str]:
+    """Image id -> last use (UTC) from the room kit image GC state (AB#860).
+
+    The GC writes it every run; unset, missing or unreadable: no times.
+    """
+    raw = os.environ.get("CATHEDRAL_IMAGE_GC_STATE", "").strip()
+    if not raw:
+        return {}
+    try:
+        images = json.loads(Path(raw).read_text()).get("images")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(images, dict):
+        return {}
+    out = {}
+    for iid, seen in images.items():
+        last = seen.get("last_used") if isinstance(seen, dict) else None
+        if isinstance(last, (int, float)) and last > 0:
+            out[iid] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last))
+    return out
 
 
 class PullGate:
@@ -1706,6 +1729,9 @@ class DockerGuestProvider:
         # Per-guest image ownership (AB#650 Gate S.1). Fail closed when metadata
         # is missing: a local image with no grant cannot start.
         self._image_owners = ImageOwnerStore()
+        # Images owners keep from the image GC (AB#860). None: no pins file set.
+        pins_file = pins_path()
+        self._image_pins = ImagePinStore(pins_file) if pins_file is not None else None
         # Customer-sealed secrets (AB#417). None: CATHEDRAL_SEALED_SECRETS_DIR is unset.
         secrets_root = os.environ.get("CATHEDRAL_SEALED_SECRETS_DIR", "").strip()
         self._secrets_root = Path(secrets_root) if secrets_root else None
@@ -1874,6 +1900,12 @@ class DockerGuestProvider:
                         )
                     self._image_owners.grant(refreshed, owner, provenance="registry", ref=image)
                     return refreshed
+            if not self._looks_like_image_id(image):
+                try:
+                    # The owner's name for the image, for its image list (AB#860).
+                    self._image_owners.note_ref(local_id, owner, image)
+                except SandboxOpError:
+                    pass  # the list misses a name; the create must not fail for it
             return local_id
 
         if self._looks_like_image_id(image):
@@ -3688,6 +3720,61 @@ class DockerGuestProvider:
             }
             self._inner._images[ref] = entry  # noqa: SLF001
         return entry
+
+    def list_images(self, owner: str) -> list[dict[str, Any]]:
+        """The images *owner* pulled or was granted that Docker still holds (AB#860).
+
+        One entry per image id. Size and digest come from Docker; a grant
+        whose image is gone, or whose name now points at another image, is
+        not listed. last_used_at comes from the image GC state when readable.
+        """
+        last_used = _gc_last_used()
+        pins = self._image_pins.pinned_by(owner) if self._image_pins is not None else []
+        pinned = {p["ref"] for p in pins} | {p.get("image_id") for p in pins}
+        out: dict[str, dict[str, Any]] = {}
+        for nid, refs in self._image_owners.owned_refs(owner).items():
+            for ref in refs:
+                inspected = self._client.image_inspect(ref)
+                if normalize_image_id(str(inspected.get("Id") or "")) != nid:
+                    continue
+                entry = out.get(nid)
+                if entry is None:
+                    entry = out[nid] = {
+                        "ref": ref,
+                        "refs": [],
+                        "image_id": nid,
+                        "digest": (inspected.get("RepoDigests") or [None])[0],
+                        "size_bytes": int(inspected.get("Size") or 0),
+                        "last_used_at": last_used.get(nid),
+                        "pinned": nid in pinned,
+                    }
+                entry["refs"].append(ref)
+                entry["pinned"] = entry["pinned"] or ref in pinned
+        return sorted(out.values(), key=lambda e: e["ref"])
+
+    def pin_images(self, refs: tuple[str, ...], owner: str, owner_cap: int | None) -> list[str] | None:
+        """Pin the just-prefetched *refs* for *owner*. None: this hotel has no pins."""
+        if self._image_pins is None:
+            return None
+        images = []
+        for ref in refs:
+            inspected = self._client.image_inspect(ref)
+            nid = normalize_image_id(str(inspected.get("Id") or ""))
+            if nid is None or not self._image_owners.owns(nid, owner):
+                raise SandboxOpError("image_not_owned", 403, "this guest cannot use that image on this hotel")
+            images.append({
+                "ref": ref,
+                "image_id": nid,
+                "digest": (inspected.get("RepoDigests") or [None])[0],
+                "size_bytes": int(inspected.get("Size") or 0),
+            })
+        return self._image_pins.pin(owner, images, owner_cap=owner_cap, ceiling=hotel_ceiling_bytes())
+
+    def unpin_image(self, owner: str, ref: str) -> None:
+        if self._image_pins is None:
+            raise SandboxOpError("pins_unavailable", 501, "this hotel has no image pins")
+        if not self._image_pins.unpin(owner, ref):
+            raise SandboxOpError("pin_not_found", 404, f"no pin of {ref} for this key")
 
     def terminal_write(self, sandbox_id: str, terminal_id: str, data: str | bytes) -> dict[str, Any]:
         # The inner provider keeps the terminal's buffers; each complete line
