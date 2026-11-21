@@ -1751,7 +1751,7 @@ class DockerGuestProvider:
                 self._ensure_image(image, registry_auth=registry_auth, refresh=True)
                 # Refresh may land a newer Id under the same tag; grant that Id
                 # so the post-authorize require() on the run Id can pass.
-                refreshed = self._image_id_of(image)
+                refreshed = self._image_id_after_auth(image, registry_auth=registry_auth)
                 if refreshed is None:
                     raise SandboxOpError(
                         "image_pull_failed", 502, f"image {image} has no docker id after pull"
@@ -1795,7 +1795,7 @@ class DockerGuestProvider:
                     "this guest cannot use that image on this hotel",
                 ) from None
             raise
-        image_id = self._image_id_of(image)
+        image_id = self._image_id_after_auth(image, registry_auth=registry_auth)
         if image_id is None:
             raise SandboxOpError("image_pull_failed", 502, f"image {image} has no docker id after pull")
         # A pull that still resolves to a snapshot/build id did not authorize it.
@@ -1809,6 +1809,18 @@ class DockerGuestProvider:
             )
         self._image_owners.grant(image_id, owner, provenance="registry", ref=image)
         return image_id
+
+    def _image_id_after_auth(
+        self, image: str, *, registry_auth: Mapping[str, str] | None = None
+    ) -> str | None:
+        """Immutable id of *image*, falling back to its Hub-direct digest pull."""
+        image_id = self._image_id_of(image)
+        if image_id is not None or registry_auth is None:
+            return image_id
+        direct = hub_direct_ref(image)
+        if direct and direct != image:
+            return self._image_id_of(direct)
+        return None
 
     def _require_credentials_support(self, credentials) -> None:
         if credentials and self._egress is None:
@@ -2120,7 +2132,24 @@ class DockerGuestProvider:
             if registry_auth is not None:
                 self._auth_pulled.add(image)
                 _save_auth_pulled(self._auth_pulled)
-            inspected = self._client.image_inspect(image)
+            inspected = self._inspect_pulled_image(image, registry_auth=registry_auth)
+        return inspected
+
+    def _inspect_pulled_image(
+        self, image: str, *, registry_auth: Mapping[str, str] | None = None
+    ) -> dict[str, Any]:
+        """Inspect *image*, or its Hub-direct digest form after an auth pull.
+
+        A Hub digest with registry_auth is pulled as registry-1.docker.io/…@…
+        (ensure_image); the short digest name may not resolve until we look at
+        that direct ref (AB#817 Fred HOLD).
+        """
+        inspected = self._client.image_inspect(image)
+        if inspected.get("Id") or registry_auth is None:
+            return inspected
+        direct = hub_direct_ref(image)
+        if direct and direct != image:
+            return self._client.image_inspect(direct)
         return inspected
 
     def _pull_anonymous_once(self, image: str, *, refresh: bool) -> None:
@@ -2238,7 +2267,7 @@ class DockerGuestProvider:
             # inspect afterwards fills the create receipt. Do not call
             # _ensure_image again here — that double-pulled after AB#597/#426.
             self._authorize_image(image, effective_owner, registry_auth=request.image.registry_auth)
-            inspected = self._client.image_inspect(image)
+            inspected = self._inspect_pulled_image(image, registry_auth=request.image.registry_auth)
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
                 "cached": True,
@@ -2257,7 +2286,8 @@ class DockerGuestProvider:
                 "digest": request.build.content_hash,
             }
         dind = is_dind_image(image)
-        inspected = self._client.image_inspect(image)
+        auth = request.image.registry_auth if request.image is not None else None
+        inspected = self._inspect_pulled_image(image, registry_auth=auth)
         # Pin docker run to the inspected Id. Allowlist / start:image decisions
         # were made against this inspect; running the mutable tag would race a
         # retag between inspect and create (AB#709 HOLD).
