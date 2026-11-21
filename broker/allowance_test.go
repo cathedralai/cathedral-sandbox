@@ -374,6 +374,11 @@ func TestMeteredCapZeroRefusesWithNoHotelCreateOrDelete(t *testing.T) {
 		if status != 402 || errCode(doc) != "allowance_exhausted" {
 			t.Fatalf("create %v at cap 0: %d %v", body, status, doc)
 		}
+		// Cap 0 has more causes than credit (a disabled key, a debt, too many
+		// unreadable readings): the wording blames none of them.
+		if msg := doc["error"].(map[string]any)["message"]; msg != "this key's allowance is 0 rooms right now; check the account's balance and status, then try again" {
+			t.Fatalf("create %v at cap 0: message %q", body, msg)
+		}
 	}
 	if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil); status != 402 || anyCode(doc) != "allowance_exhausted" {
 		t.Fatalf("client create at cap 0: %d %v", status, doc)

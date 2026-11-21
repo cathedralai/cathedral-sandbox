@@ -434,7 +434,7 @@ A metered create, and each lifetime extension of a metered room, is refused:
 |---|---|
 | 503 `allowance_recount`, `Retry-After: 5` | Until every hotel the guest may use (or has had rooms on) has answered one room list since the broker started or the hotel joined: its rooms there are not counted yet. |
 | 402 `allowance_lease_expired`, `Retry-After: 30` | `now - ledger_seen_at > lease_seconds`, or no allowance yet. The message says the key is sold out right now. |
-| 402 `allowance_exhausted` | Live rooms plus the new ones would pass `cap` (an extension: the live rooms pass it). `cap` may be 0. |
+| 402 `allowance_exhausted` | Live rooms plus the new ones would pass `cap` (an extension: the live rooms pass it). `cap` may be 0. At cap 0 the message says the key's allowance is 0 and to check the account's balance and status: the ledger sends cap 0 for more than a lack of credit. |
 
 Live rooms are the guest's creates in flight, every room the broker still
 holds for it (rooms being removed included, until the sync loop lets them

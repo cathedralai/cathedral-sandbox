@@ -103,6 +103,8 @@ const (
 	// hotelDefaultMemoryGiB is the memory_gib a hotel gives a create that
 	// names none (cathedral/sandbox_api.py Resources).
 	hotelDefaultMemoryGiB = 4
+	// allowanceZeroMessage is the allowance_exhausted wording at cap 0.
+	allowanceZeroMessage = "this key's allowance is 0 rooms right now; check the account's balance and status, then try again"
 )
 
 // guestAllowance is what the ledger last sent for one guest. A stored value
@@ -290,7 +292,10 @@ func (b *broker) allowanceRefusalLocked(g *guestState, n int, now time.Time) (*a
 	}
 	if live := b.meteredLiveLocked(g); live+n > a.Cap {
 		if a.Cap == 0 {
-			return &apiErr{402, "allowance_exhausted", "this key has no allowance for rooms right now; add credit to the account, then try again"}, 0
+			// The ledger sends cap 0 for no credit, a disabled key, a debt or
+			// too many unreadable readings, and the PUT carries no reason, so
+			// the wording names none of them.
+			return &apiErr{402, "allowance_exhausted", allowanceZeroMessage}, 0
 		}
 		return &apiErr{402, "allowance_exhausted", fmt.Sprintf("this key's allowance is %d rooms at one time and %d are running, starting or being removed; delete rooms or add credit to the account", a.Cap, live)}, 0
 	}
