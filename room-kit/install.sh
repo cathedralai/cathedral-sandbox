@@ -385,6 +385,7 @@ eval "$XTRACE"
   echo "DOCKER_HOST=unix://$SOCK"
   echo "HOME=/var/lib/pool-room"
   echo "TMPDIR=$ROOM_DATA_DIR/work"
+  echo "CATHEDRAL_PULL_DATA_DIR=$ROOM_DATA_DIR" # pull disk floor (AB#861)
   profile_env
 } > "$ROOM_ETC/api.env"
 cat > "$UNIT_DIR/$ROOM_ID.service" <<EOF
