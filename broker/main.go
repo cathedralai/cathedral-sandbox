@@ -1160,6 +1160,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// the guest's own image fault is a refusal: no room was started.
 			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
+				b.noteUncertainLocked(g) // counts for a metered guest until reaped (allowance.go)
 			}
 			if err != nil {
 				last = createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
@@ -1168,6 +1169,10 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			}
 			if (status >= 400 && status < 500) || guestImage { // the request itself is wrong: no retry
 				g.failed++
+				b.mu.Unlock()
+				return finish(last)
+			}
+			if b.retryRefusedLocked(g) { // a metered guest: no room under the cap for a retry (allowance.go)
 				b.mu.Unlock()
 				return finish(last)
 			}
@@ -1257,6 +1262,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 			}
 		}
 	}
+	b.settleUncertain(g, batchID, results) // allowance.go
 	return results
 }
 
@@ -1483,7 +1489,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	pl.apply(payload)
 	pl.image, _ = payload["image"].(string)
-	if e, retry := b.admit(g, count); e != nil {
+	if e, retry := b.admitCreate(g, count, payload); e != nil {
 		writeLimitErr(w, e, retry)
 		return
 	}

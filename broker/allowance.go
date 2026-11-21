@@ -1,24 +1,32 @@
 // Metered guests: the ledger's allowance at the front door.
 //
-// A guest is metered when its config says "metered": true or an operator has
-// sent it an allowance. A metered guest is admitted only on the ledger's
-// word, and it starts closed: cap 0 and no lease, so every create is refused
-// until the ledger sends an allowance. A guest that is not metered behaves as
-// before.
+// A guest is metered when its config says "metered": true (the config, not
+// state_dir, decides it, so a lost file never opens a guest). A metered guest
+// is admitted only on the ledger's word, and it starts closed: cap 0 and no
+// lease, so every create is refused until the ledger sends an allowance. A
+// guest that is not metered behaves as before.
 //
 // The ledger sends and reads the allowance with the operator key:
 //
 //	PUT /v1/broker/guests/<id>/allowance  {"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}
 //	GET /v1/broker/guests/<id>/allowance  the allowance, live rooms and the lease seconds left
 //
-// A PUT marks the guest metered, stamps ledger_seen_at with the broker's
-// clock and keeps the allowance in state_dir/guest-allowances.json (a
-// temporary file, synced, then renamed; mode 0600). Each PUT carries an
-// issue above the stored one; an issue at or below it is stale: 409
-// stale_allowance, and nothing changes. After a restart the file is read
-// again: a cap of 0 stays 0, and a lease keeps its ledger_seen_at, so it can
-// expire across the restart. A file that is missing or does not parse leaves
-// every metered guest closed; one that does not parse is moved aside.
+// A PUT for a guest that is not metered answers 409 guest_not_metered. A PUT
+// stamps ledger_seen_at with the broker's clock and keeps the allowance in
+// state_dir/guest-allowances.json (a temporary file, synced, renamed, then
+// the directory synced; mode 0600) before it applies. A write that fails at
+// any step answers 500 state_write_failed and closes the guest until a later
+// PUT is saved. Each PUT carries an issue above the stored one; an issue at
+// or below it is stale: 409 stale_allowance, and nothing changes.
+//
+// After a restart the file is read again: a cap of 0 stays 0, the issue is
+// kept, and a lease keeps its ledger_seen_at, so it can expire across the
+// restart. A missing file leaves every metered guest closed. A file that does
+// not parse is moved aside and closes every metered guest; its issues are
+// lost, so the next issue must be above the broker's clock in unix
+// milliseconds at start. A stored entry that cannot open admission closes
+// that guest and keeps its issue (or that clock value when the issue itself
+// is not usable).
 //
 // A metered create, and each lifetime extension of a metered room, is refused:
 //   - 503 allowance_recount with Retry-After until every hotel the guest may
@@ -29,19 +37,24 @@
 //   - 402 allowance_exhausted when the live rooms plus the new ones would pass
 //     the cap (an extension: when the live rooms pass the cap).
 //
-// Live rooms of a metered guest are its creates in flight and every room the
-// broker still holds for it, rooms being removed included, until the sync
-// loop lets them go.
+// Live rooms of a metered guest are its creates in flight, every room the
+// broker still holds for it (rooms being removed included, until the sync
+// loop lets them go), and every create attempt whose answer was lost, until
+// its orphan reap is confirmed or the hotel no longer lists the room. A lost
+// attempt is retried on another hotel only while the cap has room for both.
+// Size, lifetime, lease and cap are checked against one allowance, under the
+// lock that reserves the rooms.
 //
 // A metered create always sends ttl_seconds of at most max_ttl_seconds (the
 // maximum when absent) and resources.memory_gib (4, the hotel default, when
 // absent); a create that asks for more memory than max_memory_gib is refused
 // 400 memory_limit before any hotel call. Each route that resets a room's
 // deadline at the hotel (PATCH on the room, POST heartbeat, POST and PATCH
-// lifetime, the client lifetime route) is a new admission: it sends
-// ttl_seconds of at most max_ttl_seconds, and a refused one sends nothing, so
-// the room keeps the deadline it has. A room claim (room kit) is refused for
-// a metered guest: it sets a lifetime this gate does not see.
+// lifetime, the client lifetime route) is a new admission, checked after the
+// body is read and any hotel lookup is done, right before the hotel call: it
+// sends ttl_seconds of at most max_ttl_seconds, and a refused one sends
+// nothing, so the room keeps the deadline it has. A room claim (room kit) is
+// refused for a metered guest: it sets a lifetime this gate does not see.
 //
 // Nothing here stops or deletes a running room.
 package main
@@ -120,25 +133,40 @@ type allowances struct {
 	// guests not in the config now (kept for when they come back). Guarded
 	// by broker.mu; a PUT replaces the whole map.
 	byGuest map[string]*guestAllowance
+	// uncertain is guest id -> create attempts whose answer was lost (the
+	// hotel may have started a room) and whose create request has not yet
+	// finished its reap pass. Guarded by broker.mu.
+	uncertain map[string]int
+	// orphans is orphanKey(hotel, batch) -> the lost attempts of one create
+	// request on one hotel that its reap pass could not confirm gone, while
+	// the hotel's unreaped record of the request lasts. Guarded by broker.mu.
+	orphans map[string]int
 }
 
-// meteredLocked reports whether g is metered, and its allowance (nil: none
-// yet, which is closed). Caller holds b.mu.
+func orphanKey(hotelID, batchID string) string { return hotelID + "\x00" + batchID }
+
+// meteredLocked reports whether g is metered (its config says so), and its
+// allowance (nil: none yet, which is closed). Caller holds b.mu.
 func (b *broker) meteredLocked(g *guestState) (bool, *guestAllowance) {
-	a, stored := b.allow.byGuest[g.cfg.ID]
-	return stored || g.limits.Metered, a
+	return g.limits.Metered, b.allow.byGuest[g.cfg.ID]
 }
 
-// meteredLiveLocked counts the rooms a metered guest holds: creates admitted
-// and not yet placed or failed, and every room the broker still has for it,
-// rooms being removed included, until the sync loop lets them go. Caller
-// holds b.mu.
+// meteredLiveLocked counts the rooms a metered guest may hold: creates
+// admitted and not yet placed or failed, every room the broker still has for
+// it (rooms being removed included, until the sync loop lets them go), create
+// attempts whose answer was lost, and the orphans of those attempts that a
+// reap pass has not confirmed gone (h.unreaped). Caller holds b.mu.
 func (b *broker) meteredLiveLocked(g *guestState) int {
-	n := g.pending
+	n := g.pending + b.allow.uncertain[g.cfg.ID]
 	for _, h := range b.hotelList() {
 		for _, rm := range h.rooms {
 			if rm.guest == g.cfg.ID {
 				n++
+			}
+		}
+		for batchID, ub := range h.unreaped {
+			if ub.guest == g.cfg.ID {
+				n += max(1, b.allow.orphans[orphanKey(h.cfg.ID, batchID)])
 			}
 		}
 	}
@@ -180,10 +208,19 @@ func (b *broker) allowanceRefusalLocked(g *guestState, n int, now time.Time) (*a
 	return nil, 0
 }
 
+// meteredRefusal is allowanceRefusalLocked under b.mu: an early refusal,
+// before any hotel or build call. admitCreate decides.
+func (b *broker) meteredRefusal(g *guestState, n int) (*apiErr, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.allowanceRefusalLocked(g, n, time.Now())
+}
+
 // meteredCreate checks a metered guest's create of n rooms before any hotel
 // call and applies its size and lifetime limits to payload, the body the
-// hotel receives. admit checks the allowance again, under the lock that
-// reserves the rooms. A guest that is not metered: no change.
+// hotel receives. admitCreate checks again against the allowance of the
+// moment, under the lock that reserves the rooms. A guest that is not
+// metered: no change.
 func (b *broker) meteredCreate(g *guestState, payload map[string]any, n int) (*apiErr, int) {
 	b.mu.Lock()
 	metered, a := b.meteredLocked(g)
@@ -207,9 +244,84 @@ func (b *broker) meteredCreate(g *guestState, payload map[string]any, n int) (*a
 }
 
 // afterMeteredCheck runs between a metered create's early check and its
-// reservation in admit. Tests hold creates there to prove the reservation
-// alone keeps the cap.
+// reservation in admitCreate. Tests hold creates there to prove the
+// reservation alone keeps the cap and the limits.
 var afterMeteredCheck = func() {}
+
+// admitCreate is admit for a create of n rooms with body payload: for a
+// metered guest, the lease, the cap, the size and the lifetime are checked
+// against one allowance, under the lock that reserves the rooms.
+func (b *broker) admitCreate(g *guestState, n int, payload map[string]any) (*apiErr, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if metered, a := b.meteredLocked(g); metered {
+		if e, retry := b.allowanceRefusalLocked(g, n, time.Now()); e != nil {
+			return e, retry
+		}
+		if e := limitCreateMemory(payload, a.MaxMemoryGiB); e != nil {
+			return e, 0
+		}
+		if e := limitCreateTTL(payload, a.MaxTTLSeconds); e != nil {
+			return e, 0
+		}
+	}
+	return b.admitLocked(g, n)
+}
+
+// noteUncertainLocked counts one create attempt of g whose answer was lost:
+// the hotel may hold a room. createMany settles it after its reap pass.
+// Caller holds b.mu.
+func (b *broker) noteUncertainLocked(g *guestState) {
+	if b.allow.uncertain == nil {
+		b.allow.uncertain = map[string]int{}
+	}
+	b.allow.uncertain[g.cfg.ID]++
+}
+
+// retryRefusedLocked reports whether a create of metered guest g whose
+// attempt was just lost may not try another hotel: the lost attempt counts
+// as a room, so a retry needs room under the cap for both (and a fresh
+// lease). Caller holds b.mu.
+func (b *broker) retryRefusedLocked(g *guestState) bool {
+	e, _ := b.allowanceRefusalLocked(g, 0, time.Now())
+	return e != nil
+}
+
+// settleUncertain ends the lost attempts of one create request once its reap
+// pass ran: those whose rooms a hotel could not confirm gone go on counting
+// through that hotel's unreaped record of the request.
+func (b *broker) settleUncertain(g *guestState, batchID string, results []createResult) {
+	lostOn := map[*hotel]int{}
+	total := 0
+	for _, res := range results {
+		for _, h := range res.lost {
+			lostOn[h]++
+			total++
+		}
+	}
+	if total == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.allow.orphans == nil {
+		b.allow.orphans = map[string]int{}
+	}
+	for k := range b.allow.orphans { // records whose request was reaped since
+		hotelID, bid, _ := strings.Cut(k, "\x00")
+		if h := b.hotelByID(hotelID); h == nil || h.unreaped[bid] == nil {
+			delete(b.allow.orphans, k)
+		}
+	}
+	for h, n := range lostOn {
+		if h.unreaped[batchID] != nil {
+			b.allow.orphans[orphanKey(h.cfg.ID, batchID)] = n
+		}
+	}
+	if b.allow.uncertain[g.cfg.ID] -= total; b.allow.uncertain[g.cfg.ID] <= 0 {
+		delete(b.allow.uncertain, g.cfg.ID)
+	}
+}
 
 // numberOf is v as a number: a JSON number decoded by encoding/json, or an
 // int the broker set itself (compat.go).
@@ -322,11 +434,9 @@ func (b *broker) meteredRoomRoute(w http.ResponseWriter, r *http.Request, g *gue
 		writeErr(w, 403, "claim_refused_metered", "a room claim sets a lifetime outside this key's allowance; it is refused for a metered key")
 		return nil, false
 	}
-	maxTTL, e, retry := b.meteredExtension(g)
-	if e != nil {
-		writeLimitErr(w, e, retry)
-		return nil, false
-	}
+	// The body is read (handleRoom) and checked, and any hotel lookup done,
+	// before the admission below: a body held back past a lease or a cap
+	// change meets the allowance of the moment it goes to the hotel.
 	doc := map[string]any{}
 	if len(bytes.TrimSpace(body)) > 0 {
 		if err := json.Unmarshal(body, &doc); err != nil || doc == nil {
@@ -351,6 +461,11 @@ func (b *broker) meteredRoomRoute(w http.ResponseWriter, r *http.Request, g *gue
 			return nil, false
 		}
 		ask = own
+	}
+	maxTTL, e, retry := b.meteredExtension(g)
+	if e != nil {
+		writeLimitErr(w, e, retry)
+		return nil, false
 	}
 	doc["ttl_seconds"] = int(math.Min(math.Floor(ask), float64(maxTTL)))
 	out, _ := json.Marshal(doc)
@@ -438,10 +553,6 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 		writeErr(w, 400, "invalid_allowance", bad)
 		return
 	}
-	if b.cfg.StateDir == "" {
-		writeErr(w, 409, "no_state_dir", "the broker has no state_dir, so it cannot keep an allowance")
-		return
-	}
 	b.allow.saveMu.Lock()
 	defer b.allow.saveMu.Unlock()
 	b.mu.Lock()
@@ -449,6 +560,16 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 	if g == nil {
 		b.mu.Unlock()
 		writeErr(w, 404, "guest_not_found", "no guest "+id)
+		return
+	}
+	if !g.limits.Metered {
+		b.mu.Unlock()
+		writeErr(w, 409, "guest_not_metered", "guest "+id+" is not metered: mark it \"metered\": true in the broker config first; nothing changed")
+		return
+	}
+	if b.cfg.StateDir == "" { // a metered guest needs state_dir (loadAllowances); kept as a guard
+		b.mu.Unlock()
+		writeErr(w, 409, "no_state_dir", "the broker has no state_dir, so it cannot keep an allowance")
 		return
 	}
 	if old := b.allow.byGuest[id]; old != nil && *req.Issue <= old.Issue {
@@ -464,10 +585,20 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 	}
 	next[id] = a
 	b.mu.Unlock()
-	// Written before it applies: a write that fails changes nothing.
+	// Written before it applies. A write that fails at any step may or may
+	// not have reached the disk, so the guest is closed (cap 0, no lease) and
+	// keeps this issue, until a later PUT is saved.
 	if err := b.saveAllowances(next); err != nil {
-		log.Printf("guest allowance for %s not written: %v", id, err)
-		writeErr(w, 500, "state_write_failed", "could not write "+allowancesFile+"; nothing changed")
+		log.Printf("guest allowance for %s not written: %v; the guest is closed until an allowance is saved", id, err)
+		b.mu.Lock()
+		closed := make(map[string]*guestAllowance, len(b.allow.byGuest)+1)
+		for k, v := range b.allow.byGuest {
+			closed[k] = v
+		}
+		closed[id] = &guestAllowance{Issue: a.Issue}
+		b.allow.byGuest = closed
+		b.mu.Unlock()
+		writeErr(w, 500, "state_write_failed", "could not write "+allowancesFile+"; the key is closed until an allowance is saved")
 		return
 	}
 	b.mu.Lock()
@@ -546,24 +677,35 @@ func (b *broker) saveAllowances(m map[string]*guestAllowance) error {
 	if err := os.Rename(tmp, final); err != nil {
 		return err
 	}
-	// The rename is done; a directory that cannot sync is logged only.
-	if d, err := os.Open(b.cfg.StateDir); err == nil {
-		if err := d.Sync(); err != nil {
-			log.Printf("%s: state_dir not synced after the rename: %v", allowancesFile, err)
-		}
-		d.Close()
+	return syncAllowanceDir(b.cfg.StateDir) // the rename is durable only once the directory is
+}
+
+// syncAllowanceDir syncs dir. A variable, so a test can make it fail.
+var syncAllowanceDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
 	}
-	return nil
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // loadAllowances reads state_dir/guest-allowances.json at start. A metered
 // guest needs state_dir. A missing file leaves every metered guest closed. A
-// file that does not parse is moved aside and leaves every metered guest
-// closed, as does one entry that is not usable (that guest stays metered).
-// A file that cannot be read stops the broker: starting without it could
-// open a guest the file meters.
+// file that does not parse is moved aside and closes every metered guest,
+// with an issue watermark of the clock in unix milliseconds: the issues it
+// held are unknown, so only a later one may open the guest. An entry that
+// cannot open admission closes that guest and keeps its issue, or that clock
+// value when the issue is not usable. A file that cannot be read stops the
+// broker.
 func (b *broker) loadAllowances() error {
 	b.allow.byGuest = map[string]*guestAllowance{}
+	b.allow.uncertain = map[string]int{}
+	b.allow.orphans = map[string]int{}
+	startMs := time.Now().UnixMilli()
 	for id, g := range b.guests {
 		if g.limits.Metered && b.cfg.StateDir == "" {
 			return fmt.Errorf("config: guest %q is metered, which needs state_dir to keep its allowance", id)
@@ -582,18 +724,27 @@ func (b *broker) loadAllowances() error {
 	}
 	var f allowanceFile
 	if err := json.Unmarshal(raw, &f); err != nil || f.Version != 1 || f.Guests == nil {
+		for id, g := range b.guests {
+			if g.limits.Metered {
+				b.allow.byGuest[id] = &guestAllowance{Issue: startMs}
+			}
+		}
 		aside := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405Z")
 		if rerr := os.Rename(path, aside); rerr != nil {
-			log.Printf("%s does not parse (%v) and was not moved aside: %v; metered guests stay closed until the ledger sends an allowance", path, err, rerr)
+			log.Printf("%s does not parse (%v) and was not moved aside: %v; metered guests stay closed until the ledger sends an issue above %d", path, err, rerr, startMs)
 			return nil
 		}
-		log.Printf("%s does not parse (%v); moved to %s; metered guests stay closed until the ledger sends an allowance", path, err, aside)
+		log.Printf("%s does not parse (%v); moved to %s; metered guests stay closed until the ledger sends an issue above %d", path, err, aside, startMs)
 		return nil
 	}
 	for id, a := range f.Guests {
-		if !a.usable() {
-			log.Printf("%s: guest %s: the stored allowance is not usable; the guest stays metered and closed until the ledger sends an allowance", path, id)
-			a = guestAllowance{}
+		switch {
+		case a.Issue < 1:
+			log.Printf("%s: guest %s: the stored issue is not usable; the guest stays closed until the ledger sends an issue above %d", path, id, startMs)
+			a = guestAllowance{Issue: startMs}
+		case !a.usable():
+			log.Printf("%s: guest %s: the stored allowance is not usable; the guest stays closed until the ledger sends an issue above %d", path, id, a.Issue)
+			a = guestAllowance{Issue: a.Issue}
 		}
 		b.allow.byGuest[id] = &a
 	}

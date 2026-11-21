@@ -114,6 +114,12 @@ func (b *broker) activeRooms(g *guestState) int {
 func (b *broker) admit(g *guestState, n int) (*apiErr, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.admitLocked(g, n)
+}
+
+// admitLocked is admit with b.mu held: admitCreate (allowance.go) checks a
+// metered create against its allowance under the same lock.
+func (b *broker) admitLocked(g *guestState, n int) (*apiErr, int) {
 	if e, retry := b.allowanceRefusalLocked(g, n, time.Now()); e != nil {
 		return e, retry // a metered guest outside its allowance (allowance.go)
 	}

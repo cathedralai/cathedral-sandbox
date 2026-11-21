@@ -317,27 +317,31 @@ and c48 on 48092.
 ## Metered guests
 
 A metered guest is admitted only on the ledger's word (`allowance.go`). A
-guest is metered when its config says `"metered": true` or an operator has
-sent it an allowance. It starts closed: cap 0 and no lease, so every create
-is refused until the ledger sends an allowance. A guest that is not metered
-behaves as before.
+guest is metered when its config says `"metered": true` (the config decides,
+so a lost state file never opens a guest). It starts closed: cap 0 and no
+lease, so every create is refused until the ledger sends an allowance. A
+guest that is not metered behaves as before.
 
 | Route (operator key) | What it does |
 |---|---|
-| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Marks the guest metered, stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename; mode 0600), then answers the stored allowance. An issue at or below the stored one: 409 `stale_allowance`, nothing changes. Bad body: 400. Unknown guest: 404. No `state_dir`: 409 `no_state_dir`. |
+| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. |
 | `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`. A guest that is not metered: `{"metered": false, "live_rooms"}`. |
 
 A metered create, and each lifetime extension of a metered room, is refused:
 
 | Answer | When |
 |---|---|
-| 503 `allowance_recount`, `Retry-After: 5` | After a broker start, until every hotel the guest may use (or has had rooms on) has answered one room list: its rooms there are not counted yet. |
+| 503 `allowance_recount`, `Retry-After: 5` | Until every hotel the guest may use (or has had rooms on) has answered one room list since the broker started or the hotel joined: its rooms there are not counted yet. |
 | 402 `allowance_lease_expired`, `Retry-After: 30` | `now - ledger_seen_at > lease_seconds`, or no allowance yet. The message says the key is sold out right now. |
 | 402 `allowance_exhausted` | Live rooms plus the new ones would pass `cap` (an extension: the live rooms pass it). `cap` may be 0. |
 
-Live rooms are the guest's creates in flight and every room the broker still
-holds for it, rooms being removed included, until the sync loop lets them
-go. `max_rooms` still applies on top (429 `room_limit`).
+Live rooms are the guest's creates in flight, every room the broker still
+holds for it (rooms being removed included, until the sync loop lets them
+go), and every create attempt whose answer was lost, until its orphan reap
+is confirmed or the hotel stops listing the room. A create whose attempt was
+lost tries another hotel only while the cap has room for both. Lease, cap,
+size and lifetime are checked against one allowance, under the lock that
+reserves the rooms. `max_rooms` still applies on top (429 `room_limit`).
 
 Size and lifetime of a metered room:
 
@@ -347,10 +351,11 @@ Size and lifetime of a metered room:
   `max_memory_gib` gets 400 `memory_limit` before any hotel call.
 - Every route that resets a room's deadline at the hotel is a new admission:
   `PATCH /v1/sandboxes/<id>`, `POST .../heartbeat`, `POST` and `PATCH
-  .../lifetime`, and the client lifetime route. It sends `ttl_seconds` of at
-  most `max_ttl_seconds`; with no `ttl_seconds` it sends the room's own, read
-  from the hotel. A refused extension sends nothing, so the room keeps the
-  deadline it has.
+  .../lifetime`, and the client lifetime route. It is checked after the body
+  is read and any hotel lookup is done, right before the hotel call. It sends
+  `ttl_seconds` of at most `max_ttl_seconds`; with no `ttl_seconds` it sends
+  the room's own, read from the hotel. A refused extension sends nothing, so
+  the room keeps the deadline it has.
 - A room claim (`POST .../claim`, room kit) gets 403 `claim_refused_metered`:
   it sets a lifetime outside the allowance.
 - An owner-signed create on a dedicated machine signs the body the hotel
@@ -358,13 +363,27 @@ Size and lifetime of a metered room:
   allowance, so the broker changes nothing.
 
 Nothing here stops or deletes a running room. After a restart the file is
-read again: a cap of 0 stays 0, and a lease keeps its `ledger_seen_at`, so it
-can expire across the restart. A missing file leaves every metered guest
-closed. A file that does not parse is moved aside
-(`guest-allowances.json.corrupt-<time>`) and leaves every metered guest
-closed; an entry that cannot open admission keeps that guest closed. Mark
-each metered guest `"metered": true` in the config as well: a guest metered
-by a PUT alone is metered only while the file is readable.
+read again: a cap of 0 stays 0, the issue is kept, and a lease keeps its
+`ledger_seen_at`, so it can expire across the restart. A missing file leaves
+every metered guest closed. A file that does not parse is moved aside
+(`guest-allowances.json.corrupt-<time>`) and closes every metered guest; its
+issues are lost, so only an issue above the broker clock at start, in unix
+milliseconds, opens a guest again. An entry that cannot open admission
+closes that guest and keeps its issue (or that clock value when the issue
+itself is not usable). The ledger sends `issue = max(last + 1, unix ms)`.
+
+Known limits:
+
+- A room whose removal keeps failing is hidden from its hotel's list. A
+  broker restart forgets it: at most one extra room per such room, until the
+  hotel removes it. It is not listed, so it is not metered.
+- A hotel that never answers a list after a restart or a join keeps its
+  metered guests at 503 until it lists or is removed.
+- Between the check and the hotel call an extension can wait for a hotel
+  data connection: `data_conn_wait_seconds` (default 10 s), or the call's
+  own deadline (30 s to 2 min) when that is negative.
+- Unreaped records of lost create attempts live in memory. After a restart
+  their rooms are listed with the guest's label and counted as its rooms.
 
 ## Per-room tunables
 

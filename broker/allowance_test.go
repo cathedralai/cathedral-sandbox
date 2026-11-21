@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +29,11 @@ type lifeHotel struct {
 	seen   []string   // "METHOD /path" of every request
 	got    []lifeCall // the lifetime calls, with their bodies
 	docTTL any        // ttl_seconds of GET /v1/sandboxes/{id}; nil: none in the document
+	// hideDeletes: a room DELETE answers 204 but the container stays, and
+	// the room list hides the room, like a hotel whose container removal
+	// keeps failing (cathedral/sandbox_provider.py list skips "deleting").
+	hideDeletes bool
+	hidden      map[string]bool
 }
 
 type lifeCall struct {
@@ -35,7 +44,36 @@ type lifeCall struct {
 func (l *lifeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	l.mu.Lock()
 	l.seen = append(l.seen, r.Method+" "+r.URL.Path)
+	hide := l.hideDeletes
 	l.mu.Unlock()
+	if hide && r.URL.Path == "/v1/sandboxes" && r.Method == "GET" {
+		rec := httptest.NewRecorder()
+		l.inner.ServeHTTP(rec, r)
+		var list struct {
+			Sandboxes []map[string]any `json:"sandboxes"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &list)
+		out := []map[string]any{}
+		l.mu.Lock()
+		for _, rm := range list.Sandboxes {
+			if id, _ := rm["id"].(string); !l.hidden[id] {
+				out = append(out, rm)
+			}
+		}
+		l.mu.Unlock()
+		writeJSON(w, rec.Code, map[string]any{"sandboxes": out})
+		return
+	}
+	if rest, ok := strings.CutPrefix(r.URL.Path, "/v1/sandboxes/"); ok && hide && r.Method == "DELETE" && !strings.Contains(rest, "/") {
+		l.mu.Lock()
+		if l.hidden == nil {
+			l.hidden = map[string]bool{}
+		}
+		l.hidden[rest] = true
+		l.mu.Unlock()
+		w.WriteHeader(204)
+		return
+	}
 	if rest, ok := strings.CutPrefix(r.URL.Path, "/v1/sandboxes/"); ok {
 		id, tail, _ := strings.Cut(rest, "/")
 		tail, _, _ = strings.Cut(tail, ";") // as the hotel's urlparse drops ";params"
@@ -82,9 +120,9 @@ func (l *lifeHotel) last() lifeCall {
 	return l.got[len(l.got)-1]
 }
 
-// meteredChain is newChainState with a state_dir and every hotel API behind
-// a lifeHotel. edit may change the config first. Every hotel lists its rooms
-// once, so no recount is pending.
+// meteredChain is newChainState with a state_dir, guest g1 metered in the
+// config, and every hotel API behind a lifeHotel. edit may change the config
+// first. Every hotel lists its rooms once, so no recount is pending.
 func meteredChain(t *testing.T, edit func(*config)) (*testChain, map[string]*lifeHotel) {
 	t.Helper()
 	tc := newChainState(t, t.TempDir())
@@ -105,6 +143,7 @@ func meteredChain(t *testing.T, edit func(*config)) (*testChain, map[string]*lif
 		cfg.Hotels[i].API = s.URL
 		lives[id] = l
 	}
+	cfg.Guests[0].Metered = true // g1; g2 is not metered
 	if edit != nil {
 		edit(&cfg)
 	}
@@ -384,9 +423,9 @@ func TestMeteredConfigNeedsStateDir(t *testing.T) {
 	if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "state_dir") {
 		t.Fatalf("metered guest without state_dir: %v", err)
 	}
-	// An allowance cannot be kept without state_dir either.
+	// Without state_dir no guest is metered, so no allowance is taken.
 	tc2 := newChain(t)
-	if status, doc := tc2.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(1, 1)); status != 409 || errCode(doc) != "no_state_dir" {
+	if status, doc := tc2.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(1, 1)); status != 409 || errCode(doc) != "guest_not_metered" {
 		t.Fatalf("PUT without state_dir: %d %v", status, doc)
 	}
 }
@@ -513,8 +552,14 @@ func TestMeteredCorruptAllowanceFileKeepsGuestClosed(t *testing.T) {
 	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 || errCode(doc) != "allowance_lease_expired" {
 		t.Fatalf("create after a corrupt file: %d %v", status, doc)
 	}
-	if v := tc.getAllowance(t, "g1"); v["cap"] != 0.0 || v["ledger_seen_at"] != nil {
+	v := tc.getAllowance(t, "g1")
+	if v["cap"] != 0.0 || v["ledger_seen_at"] != nil || v["issue"].(float64) < float64(time.Now().Add(-time.Minute).UnixMilli()) {
 		t.Fatalf("view after a corrupt file: %v", v)
+	}
+	// The stored issues are lost: only an issue above the broker clock at
+	// start (unix ms) opens the guest, so a delayed old push stays out.
+	if status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(2, 5)); status != 409 || errCode(doc) != "stale_allowance" {
+		t.Fatalf("old issue after a corrupt file: %d %v", status, doc)
 	}
 	aside, _ := filepath.Glob(path + ".corrupt-*")
 	if _, err := os.Stat(path); len(aside) != 1 || !os.IsNotExist(err) {
@@ -529,9 +574,24 @@ func TestMeteredCorruptAllowanceFileKeepsGuestClosed(t *testing.T) {
 	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 || errCode(doc) != "allowance_lease_expired" {
 		t.Fatalf("create after an unusable entry: %d %v", status, doc)
 	}
-	// The ledger's next allowance opens it again.
-	tc.putAllowance(t, "g1", allowanceBody(1, 5))
+	// The issue of an unusable entry is kept: issue 3 or lower stays out,
+	// the ledger's next issue opens the guest again.
+	if status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(3, 5)); status != 409 || errCode(doc) != "stale_allowance" {
+		t.Fatalf("issue 3 after an unusable entry with issue 3: %d %v", status, doc)
+	}
+	tc.putAllowance(t, "g1", allowanceBody(4, 5))
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	// An entry whose issue is not usable: the clock watermark applies.
+	bad = `{"version": 1, "guests": {"g1": {"issue": 0, "cap": 5, "lease_seconds": 600, "max_ttl_seconds": 3600, "max_memory_gib": 4, "ledger_seen_at": "` + time.Now().UTC().Format(time.RFC3339Nano) + `"}}}`
+	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.restart(t)
+	if status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(5, 5)); status != 409 || errCode(doc) != "stale_allowance" {
+		t.Fatalf("small issue after an unusable issue: %d %v", status, doc)
+	}
+	ms := int(time.Now().UnixMilli()) + 1000
+	tc.putAllowance(t, "g1", allowanceBody(ms, 5))
 }
 
 // ---------------------------------------------------------------- size and lifetime
@@ -746,11 +806,334 @@ func TestAllowanceRouteChecksItsInput(t *testing.T) {
 			t.Fatalf("bad body %v: %d %v", body, status, doc)
 		}
 	}
-	if v := tc.getAllowance(t, "g1"); v["metered"] != false {
+	if v := tc.getAllowance(t, "g1"); v["metered"] != true || v["cap"] != 0.0 || v["ledger_seen_at"] != nil {
 		t.Fatalf("bad bodies changed the guest: %v", v)
+	}
+	// A guest not metered in the config takes no allowance, and nothing changes.
+	if status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g2/allowance", allowanceBody(1, 5)); status != 409 || errCode(doc) != "guest_not_metered" {
+		t.Fatalf("PUT for a guest not metered: %d %v", status, doc)
+	}
+	if v := tc.getAllowance(t, "g2"); v["metered"] != false {
+		t.Fatalf("g2 after a refused PUT: %v", v)
+	}
+	if _, err := os.Stat(filepath.Join(tc.b.cfg.StateDir, allowancesFile)); !os.IsNotExist(err) {
+		t.Fatalf("a refused PUT wrote the allowance file: %v", err)
 	}
 	doc := tc.putAllowance(t, "g1", allowanceBody(1, 2))
 	if doc["metered"] != true || doc["cap"] != 2.0 || doc["issue"] != 1.0 || doc["lease_seconds"] != 600.0 || doc["max_ttl_seconds"] != 3600.0 || doc["max_memory_gib"] != 4.0 || doc["ledger_seen_at"] == nil {
 		t.Fatalf("PUT answer: %v", doc)
+	}
+}
+
+// ---------------------------------------------------------------- review round 1
+
+// doJSON is tc.call for goroutines: it returns the error instead of failing.
+func doJSON(base, key, method, path string, body any) (int, map[string]any, error) {
+	req, _ := http.NewRequest(method, base+path, bytes.NewReader(mustMarshal(body)))
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	var doc map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&doc)
+	return resp.StatusCode, doc, nil
+}
+
+// heldRequest sends a request's headers now and its body only when send is
+// called, over a raw connection, so the broker waits on the body.
+func heldRequest(t *testing.T, tc *testChain, method, path, userAgent string, body any) (send func() (int, map[string]any)) {
+	t.Helper()
+	raw := mustMarshal(body)
+	conn, err := net.Dial("tcp", tc.srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	head := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer key1\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n", method, path, len(raw))
+	if userAgent != "" {
+		head += "User-Agent: " + userAgent + "\r\n"
+	}
+	if _, err := io.WriteString(conn, head+"\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	return func() (int, map[string]any) {
+		t.Helper()
+		if _, err := conn.Write(raw); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var doc map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&doc)
+		return resp.StatusCode, doc
+	}
+}
+
+func TestMeteredHeldLifetimeBodyMeetsTheAllowanceAtDispatch(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 5))
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	uuid := tc.uuidOf(bid)
+	l := lives["b"]
+	issue := 1
+	for _, c := range []struct {
+		name   string
+		change func()
+		code   string
+	}{
+		{"lease expires", func() { tc.ageLease("g1", time.Hour) }, "allowance_lease_expired"},
+		{"cap drops to 0", func() { issue++; tc.putAllowance(t, "g1", allowanceBody(issue, 0)) }, "allowance_exhausted"},
+	} {
+		issue++
+		tc.putAllowance(t, "g1", allowanceBody(issue, 5)) // allowed when the headers arrive
+		n := l.gotCount()
+		native := heldRequest(t, tc, "POST", "/v1/sandboxes/"+bid+"/heartbeat", "", map[string]any{"ttl_seconds": 600})
+		client := heldRequest(t, tc, "POST", "/v1/sandboxes/"+uuid+"/lifetime", "ctcli/1.0", map[string]any{"lifetime_seconds": 600})
+		time.Sleep(200 * time.Millisecond) // both handlers wait on their bodies
+		c.change()
+		if status, doc := native(); status != 402 || anyCode(doc) != c.code {
+			t.Fatalf("%s: held native heartbeat: %d %v", c.name, status, doc)
+		}
+		if status, doc := client(); status != 402 || anyCode(doc) != c.code {
+			t.Fatalf("%s: held client lifetime: %d %v", c.name, status, doc)
+		}
+		if l.gotCount() != n {
+			t.Fatalf("%s: the hotel got %d lifetime calls", c.name, l.gotCount()-n)
+		}
+	}
+}
+
+func TestMeteredLostCreateAnswerCountsUntilReaped(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	setFail := func(fail int) {
+		for _, id := range []string{"b", "c"} {
+			f := tc.hotels[id]
+			f.mu.Lock()
+			f.createFail, f.createFailAfterStart, f.labelListFail = fail, fail != 0, fail
+			f.mu.Unlock()
+		}
+	}
+	setFail(503) // a room starts, its answer is an error, and the orphan reap cannot list it
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}})
+	if _, creates, _ := hotelCalls(tc, lives); status != 503 || creates != 1 {
+		t.Fatalf("lost answer at cap 1: %d %v, %d creates dispatched (no retry may join the uncertain room)", status, doc, creates)
+	}
+	// The uncertain room counts until its reap is confirmed.
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create while the orphan is unreaped: %d %v", status, doc)
+	}
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 1.0 {
+		t.Fatalf("view while the orphan is unreaped: %v", v)
+	}
+	if _, creates, _ := hotelCalls(tc, lives); creates != 1 {
+		t.Fatalf("%d creates dispatched at cap 1", creates)
+	}
+	setFail(0) // the background reap now confirms the orphan gone
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		tc.b.mu.Lock()
+		left := 0
+		for _, h := range tc.b.hotelList() {
+			left += len(h.unreaped)
+		}
+		tc.b.mu.Unlock()
+		if left == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the orphan was never reaped")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 0.0 {
+		t.Fatalf("view after the reap: %v", v)
+	}
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}) // the hotel that failed rests
+}
+
+func TestMeteredLimitsComeFromTheAllowanceThatReserves(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	wide := map[string]any{"issue": 1, "cap": 2, "lease_seconds": 600, "max_ttl_seconds": 7200, "max_memory_gib": 64}
+	tc.putAllowance(t, "g1", wide)
+	saved := afterMeteredCheck
+	defer func() { afterMeteredCheck = saved }()
+	for i, c := range []struct {
+		body  map[string]any
+		check func(status int, doc map[string]any)
+	}{
+		{map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "resources": map[string]any{"memory_gib": 64}}, func(status int, doc map[string]any) {
+			if _, creates, _ := hotelCalls(tc, lives); status != 400 || errCode(doc) != "memory_limit" || creates != 0 {
+				t.Fatalf("64 GiB checked against the older allowance: %d %v, %d creates", status, doc, creates)
+			}
+		}},
+		{map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "ttl_seconds": 7200}, func(status int, doc map[string]any) {
+			if status != 202 || lastCreateOn(t, tc, "b")["ttl_seconds"] != 3600.0 {
+				t.Fatalf("ttl checked against the older allowance: %d %v, hotel got %v", status, doc, lastCreateOn(t, tc, "b")["ttl_seconds"])
+			}
+		}},
+	} {
+		held, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		afterMeteredCheck = func() { once.Do(func() { close(held); <-release }) }
+		type answer struct {
+			status int
+			doc    map[string]any
+			err    error
+		}
+		done := make(chan answer, 1)
+		go func() {
+			status, doc, err := doJSON(tc.srv.URL, "key1", "POST", "/v1/sandboxes", c.body)
+			done <- answer{status, doc, err}
+		}()
+		<-held // passed the early check against the wide allowance
+		tc.putAllowance(t, "g1", map[string]any{"issue": 2*i + 2, "cap": 2, "lease_seconds": 600, "max_ttl_seconds": 3600, "max_memory_gib": 4})
+		close(release)
+		a := <-done
+		if a.err != nil {
+			t.Fatal(a.err)
+		}
+		c.check(a.status, a.doc)
+		wide["issue"] = 2*i + 3
+		tc.putAllowance(t, "g1", wide)
+	}
+}
+
+func TestMeteredStaleIssueAfterPartialCorruption(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(6, 0))
+	path := filepath.Join(tc.b.cfg.StateDir, allowancesFile)
+	raw, _ := os.ReadFile(path)
+	var f allowanceFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	a := f.Guests["g1"]
+	a.MaxTTLSeconds = 0 // one field goes bad; the issue stays readable
+	f.Guests["g1"] = a
+	raw, _ = json.Marshal(f)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.restart(t)
+	if status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(5, 3)); status != 409 || errCode(doc) != "stale_allowance" {
+		t.Fatalf("delayed issue 5 after issue 6 and a bad field: %d %v", status, doc)
+	}
+	if v := tc.getAllowance(t, "g1"); v["issue"] != 6.0 || v["cap"] != 0.0 {
+		t.Fatalf("view: %v", v)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+}
+
+func TestMeteredFailedSaveClosesTheGuest(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 5))
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	saved := syncAllowanceDir
+	syncAllowanceDir = func(string) error { return errors.New("injected directory sync failure") }
+	status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(2, 5))
+	syncAllowanceDir = saved
+	if status != 500 || errCode(doc) != "state_write_failed" {
+		t.Fatalf("PUT with a failing directory sync: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 || errCode(doc) != "allowance_lease_expired" {
+		t.Fatalf("create after a failed save: %d %v", status, doc)
+	}
+	if v := tc.getAllowance(t, "g1"); v["cap"] != 0.0 || v["lease_fresh"] != false || v["issue"] != 2.0 {
+		t.Fatalf("view after a failed save: %v", v)
+	}
+	if status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g1/allowance", allowanceBody(2, 5)); status != 409 || errCode(doc) != "stale_allowance" {
+		t.Fatalf("same issue after a failed save: %d %v", status, doc)
+	}
+	tc.putAllowance(t, "g1", allowanceBody(3, 5)) // durably saved: open again
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+}
+
+func TestMeteredRuntimeJoinWaitsForItsFirstList(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 5))
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, listFail: true} // holds back its first list
+	hs := httptest.NewServer(f)
+	t.Cleanup(hs.Close)
+	tc.hotels["d"] = f
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+		t.Fatalf("join d: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); status != 503 || errCode(doc) != "allowance_recount" {
+		t.Fatalf("metered create before the joined hotel listed: %d %v", status, doc)
+	}
+	tc.room(t, "key2", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}) // not metered: no wait
+	f.mu.Lock()
+	f.listFail = false
+	f.mu.Unlock()
+	tc.syncAll("d")
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+}
+
+func TestMeteredUnreadyImageAtCapZeroRefusedBeforeBuilds(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	for _, f := range tc.hotels {
+		f.mu.Lock()
+		f.failBuild = true
+		f.mu.Unlock()
+	}
+	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
+	_, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
+	imgID, _ := doc["image_id"].(string)
+	if imgID == "" {
+		t.Fatalf("build: %v", doc)
+	}
+	waitImage(t, tc, imgID)
+	tc.putAllowance(t, "g1", allowanceBody(1, 0))
+	builds := func() int {
+		n := 0
+		for _, f := range tc.hotels {
+			f.mu.Lock()
+			n += len(f.builds)
+			f.mu.Unlock()
+		}
+		return n
+	}
+	before := builds()
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
+	time.Sleep(100 * time.Millisecond) // a build the create started would have reached a hotel
+	if status != 402 || anyCode(doc) != "allowance_exhausted" || builds() != before {
+		t.Fatalf("cap 0 create of an unready image: %d %v, %d new builds", status, doc, builds()-before)
+	}
+}
+
+// A room whose container removal keeps failing is hidden from the hotel's
+// list. After a broker restart it is not counted: the documented bound is
+// one extra room per such room, which is not listed, so not metered.
+func TestMeteredHiddenDeletingRoomBoundAfterRestart(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	lives["b"].mu.Lock()
+	lives["b"].hideDeletes = true
+	lives["b"].mu.Unlock()
+	r1 := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	if status, _ := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+r1, nil); status != 204 {
+		t.Fatalf("delete: %d", status)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create while the room is being removed: %d %v", status, doc)
+	}
+	tc.restart(t)
+	tc.b.mu.Lock()
+	known := tc.b.byBID(r1) != nil
+	tc.b.mu.Unlock()
+	if known {
+		t.Fatal("the hidden room was listed after the restart")
+	}
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}) // the one extra room of the bound
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("second create after the restart: %d %v", status, doc)
 	}
 }

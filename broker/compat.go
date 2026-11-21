@@ -377,6 +377,11 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
 	}
+	// A metered guest out of its allowance: refused before any hotel or build call (allowance.go).
+	if e, retry := b.meteredRefusal(g, 1); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
 	if ref, _ := req["image"].(string); ref != "" {
 		if e := localImageRefusal(ref); e != nil {
 			compatErr(w, e.status, e.code, e.msg, 0)
@@ -486,7 +491,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 409, "image_not_ready", "the image is not built yet on a hotel this create may use (sealed hotels unless the create says \"sealed\": false); the broker is building it there, retry", 10)
 		return
 	}
-	if e, retry := b.admit(g, 1); e != nil {
+	if e, retry := b.admitCreate(g, 1, native); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
@@ -761,12 +766,6 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	case tail == "stat" && r.Method == "GET":
 		b.compatStat(w, r, rm)
 	case tail == "lifetime" && (r.Method == "POST" || r.Method == "PATCH"):
-		// A metered guest: the extension is a new admission (allowance.go).
-		maxTTL, e, retry := b.meteredExtension(g)
-		if e != nil {
-			compatErr(w, e.status, e.code, e.msg, retry)
-			return
-		}
 		raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 		var req map[string]any
 		_ = json.Unmarshal(raw, &req)
@@ -787,6 +786,14 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		}
 		if ttl > 48*3600 {
 			ttl = 48 * 3600
+		}
+		// A metered guest: the extension is a new admission, checked after
+		// the body is read and the hotel lookup is done, right before the
+		// heartbeat goes out (allowance.go).
+		maxTTL, e, retry := b.meteredExtension(g)
+		if e != nil {
+			compatErr(w, e.status, e.code, e.msg, retry)
+			return
 		}
 		if maxTTL > 0 && ttl > float64(maxTTL) {
 			ttl = float64(maxTTL)
