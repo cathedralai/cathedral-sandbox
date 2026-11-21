@@ -200,8 +200,8 @@ func TestMinSecondOnRoundsTheEndUp(t *testing.T) {
 // On, a run that is not billable is never rounded, whatever its seconds:
 // not billable from its first reading (a cancelled or failed create's room)
 // or turned not billable later (the orphan cleanup took it back). Later
-// provisional and pool runs rely on this: they stay not billable, so the
-// setting never rounds them.
+// pool runs and other runs that are not a customer's rely on this: they
+// stay not billable, so the setting never rounds them.
 func TestMinSecondOnNeverRoundsANotBillableRun(t *testing.T) {
 	m, dir := minSecondMeter(t, `,"usage_meter_min_second":true`)
 	notBillable := func(run string) usageSighting {

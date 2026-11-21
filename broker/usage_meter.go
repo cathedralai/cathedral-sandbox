@@ -595,8 +595,9 @@ func (m *usageMeter) queueLocked(r *usageRun, state string, at time.Time) {
 	// second, at least 1, so a room used and deleted within one observed
 	// second is not free. The ended reading is never below the run's last
 	// running one, so readings stay cumulative. A run that is not billable
-	// (a cancelled or failed create's room) is never rounded: provisional
-	// and pool runs, when they come, must stay not billable to keep it so.
+	// (a cancelled or failed create's room) is never rounded: pool runs and
+	// any other run that is not a customer's, when they come, must stay not
+	// billable to keep it so.
 	if m.minSecond && state == "ended" && rd.Billable == nil {
 		rd.Seconds = max(1, int64((r.observed+time.Second-1)/time.Second))
 	}
