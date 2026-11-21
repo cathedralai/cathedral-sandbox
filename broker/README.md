@@ -40,7 +40,12 @@ Creates in flight:
   10; -1 turns it off) for a create slot moves to another eligible hotel
   with a free room. If there is none, it keeps waiting.
 - A hotel whose host memory use is at or above `mem_full_pct` (config,
-  default 90; -1 turns it off) takes no new rooms. The value is the hotel
+  default 90; -1 turns it off) takes no new rooms. A hotel may carry its own
+  `mem_full_pct` (1 to 100; config, operator join, or PATCH
+  `{"mem_full_pct": n}`, `null` back to the broker-wide value; AB#855). It
+  replaces the broker-wide value for that hotel, even when that one is -1. A
+  PATCH of a config file hotel is not saved: the file keeps the durable
+  value. Hotel docs and `/v1/broker/stats` show the limit in force. The value is the hotel
   health value `host_mem_used_pct` (MemTotal minus MemAvailable, so page
   cache does not count). Hotel slots come from an install-time sizing with
   memory overcommit, so free slots alone cannot see rooms that use their
