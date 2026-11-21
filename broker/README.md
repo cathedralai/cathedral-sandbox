@@ -28,6 +28,44 @@ Creates in flight:
   `deleted_during_create`. A create received after the delete runs as usual.
   The broker keeps each delete filter for 15 minutes.
 
+## Room end reasons (AB#864)
+
+When a room of a guest leaves for good, the broker keeps an end record for
+24 hours (at most 50,000 per guest, oldest dropped first; kept in
+`client-state.json` section `ended_rooms`).
+
+- Any `/v1/sandboxes/<hotel>.<id>[/...]` call on that room answers 410
+  `sandbox_gone`:
+  `{"error":{"code":"sandbox_gone","message":"..."},"sandbox":{"id":"...","state":"gone","gone_at":"<RFC 3339>","reason":"...","hotel":"..."}}`.
+  Background exec results (`GET /v1/sandboxes/<id>/execs/<exec id>`) still
+  read. Another guest's room id, or a wrong id, stays 404 `sandbox_not_found`.
+- `GET /v1/sandboxes/ended?since=<RFC 3339>&limit=<1..1000, default 100>`
+  lists the guest's records gone at or after `since`, newest first:
+  `{"ended":[{"id","uuid"?,"hotel","created_at"?,"gone_at","reason","detail"?}],"count":n}`.
+- The live stream (`/<guest>/live/events`, also through a share link) sends
+  one `event: room_gone` per new record, with the record as `data`. A new
+  stream gets records of the last 60 seconds, no older backlog.
+- Client path: `GET /v1/sandboxes/<uuid>` of a vanished room answers 200
+  `{"id","state":"deleted","end_reason","gone_at"}`; a client delete reads
+  `end_reason` `deleted`.
+
+`reason`, best known first:
+
+| Reason | When |
+|---|---|
+| `oom_killed`, `container_exited` | The hotel listed the room's container as dead before the room ended (`detail` then carries the hotel's removal reason). |
+| `deleted`, `ttl_expired`, `idle_timeout`, `key_revoked` | The hotel's `ended` list named the room with this reason. |
+| `deleted` | The guest deleted the room, by id or by label. |
+| `hotel_removed` | The operator forgot the rooms of a dead miner hotel, or a miner hotel came back without the room. |
+| `ttl_expired` | The room left at most 10 s before its listed `expires_at`, or after it. |
+| `hotel_restarted` | The room left with a new hotel API start time (`api_started_at` in the hotel list). |
+| `unknown` | Anything else. |
+
+The hotel fields (`end_reason` and `container_state` per room, top-level
+`ended` and `api_started_at` in the room list) come with a sealed guest
+rebuild; a hotel without them gives `deleted`, `ttl_expired`,
+`hotel_removed` and `unknown` only.
+
 ## Placement
 
 - The broker picks a hotel at random. The weight is free rooms x CPU
@@ -587,8 +625,8 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
   to a registry and create from it. A built image left in older state reads
   as `failed` with the same error, and a create from it gets the same 409.
 - With `state_dir` set, the broker keeps client room ids, Idempotency-Key
-  answers (48 hours), deleted-room tombstones, images, and guest→hotel→room
-  mappings in `state_dir/client-state.json` (mode 0600). After a restart, a repeated create with
+  answers (48 hours), deleted-room tombstones, room end records (24 hours),
+  images, and guest→hotel→room mappings in `state_dir/client-state.json` (mode 0600). After a restart, a repeated create with
   the same key returns the first answer, a room keeps its client id, and
   `GET /v1/hotels/<id>/receipts` still filters correctly for each guest
   (the room→guest mapping is persisted, so a reload does not expose another

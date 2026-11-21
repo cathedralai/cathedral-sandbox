@@ -55,6 +55,7 @@ from cathedral.sandbox_api import (
 )
 from cathedral.sandbox_egress import EgressClient
 from cathedral.sandbox_image_owners import ImageOwnerStore, normalize_image_id, refuse_shared_hotel_build
+from cathedral.sandbox_image_pins import ImagePinStore, hotel_ceiling_bytes, pins_path
 from cathedral.start_commands import (
     StartCommandsError,
     image_config_argv,
@@ -66,6 +67,7 @@ from cathedral.sandbox_workspaces import WorkspaceStore
 from cathedral.sandbox_quota import GIB, ROOM_IDS, QuotaUnavailable, XfsProjectQuota, pick_id
 from cathedral.sandbox_owner import owner_hash, owner_id
 from cathedral.sandbox_provider import (
+    _LEAVING,
     InMemorySandboxProvider,
     SandboxOpError,
     _parse_label_filters,
@@ -497,6 +499,28 @@ def _save_auth_pulled(refs: set[str]) -> None:
         path.write_text(json.dumps(sorted(refs)))
     except OSError:
         pass
+
+
+def _gc_last_used() -> dict[str, str]:
+    """Image id -> last use (UTC) from the room kit image GC state (AB#860).
+
+    The GC writes it every run; unset, missing or unreadable: no times.
+    """
+    raw = os.environ.get("CATHEDRAL_IMAGE_GC_STATE", "").strip()
+    if not raw:
+        return {}
+    try:
+        images = json.loads(Path(raw).read_text()).get("images")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(images, dict):
+        return {}
+    out = {}
+    for iid, seen in images.items():
+        last = seen.get("last_used") if isinstance(seen, dict) else None
+        if isinstance(last, (int, float)) and last > 0:
+            out[iid] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last))
+    return out
 
 
 class PullGate:
@@ -1133,6 +1157,19 @@ class DockerClient:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
         self.run(["docker", "rm", *ROOM_RM_FLAGS, container_id], timeout=60.0)
 
+    def kill_confirmed(self, container_ref: str, *, timeout: float = 10.0) -> bool:
+        """docker kill, then True only when docker inspect says the container is not running.
+
+        A kill of a container that already ended fails but still counts, as
+        the inspect decides. A timeout or an unreadable state returns False.
+        """
+        try:
+            self.run(["docker", "kill", container_ref], timeout=timeout)
+        except SandboxOpError:
+            return False
+        state = self.container_state(container_ref)
+        return state is not None and not state[0]
+
     def remove_confirmed(self, container_ref: str, *, timeout: float = 60.0) -> bool:
         """Remove a container. Return True only when it is gone.
 
@@ -1692,6 +1729,9 @@ class DockerGuestProvider:
         # Per-guest image ownership (AB#650 Gate S.1). Fail closed when metadata
         # is missing: a local image with no grant cannot start.
         self._image_owners = ImageOwnerStore()
+        # Images owners keep from the image GC (AB#860). None: no pins file set.
+        pins_file = pins_path()
+        self._image_pins = ImagePinStore(pins_file) if pins_file is not None else None
         # Customer-sealed secrets (AB#417). None: CATHEDRAL_SEALED_SECRETS_DIR is unset.
         secrets_root = os.environ.get("CATHEDRAL_SEALED_SECRETS_DIR", "").strip()
         self._secrets_root = Path(secrets_root) if secrets_root else None
@@ -1703,6 +1743,8 @@ class DockerGuestProvider:
         self._drain_lock = threading.Lock()
         self._gc_parallelism = _env_int("CATHEDRAL_SANDBOX_GC_PARALLELISM", 8, minimum=1)
         self._rm_timeout = _env_float("CATHEDRAL_SANDBOX_RM_TIMEOUT", 60.0, minimum=0.1)
+        # docker kill before docker rm (AB#863): a killed room leaves quota at once.
+        self._kill_timeout = _env_float("CATHEDRAL_SANDBOX_KILL_TIMEOUT", 10.0, minimum=0.1)
         self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
         self._last_reconcile: float | None = None
         # AB#864: docker State per room id from the last reconcile, and why a
@@ -1858,6 +1900,12 @@ class DockerGuestProvider:
                         )
                     self._image_owners.grant(refreshed, owner, provenance="registry", ref=image)
                     return refreshed
+            if not self._looks_like_image_id(image):
+                try:
+                    # The owner's name for the image, for its image list (AB#860).
+                    self._image_owners.note_ref(local_id, owner, image)
+                except SandboxOpError:
+                    pass  # the list misses a name; the create must not fail for it
             return local_id
 
         if self._looks_like_image_id(image):
@@ -2338,7 +2386,7 @@ class DockerGuestProvider:
         sandbox_id = doc["id"]
         with self._inner._lock:  # noqa: SLF001
             record = self._inner._sandboxes.get(sandbox_id)  # noqa: SLF001
-            if record is None or record.state in ("deleting", "deleted"):
+            if record is None or record.state == "deleted" or record.state in _LEAVING:
                 # An Idempotency-Key replay of a sandbox that is gone or going.
                 raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         effective_owner = owner if owner is not None else owner_id(None, None)
@@ -3260,9 +3308,11 @@ class DockerGuestProvider:
     def delete(self, sandbox_id: str) -> None:
         """DELETE is idempotent (204). The record only goes when the container is gone.
 
-        When the container removal fails, the sandbox stays "deleting": GET
-        answers 409 sandbox_deleting (not 404), still counted in quota. The
-        next sweep retries it. Never drop the API record via the in-memory
+        The container is killed first: once docker says it stopped, the
+        record is "stopped_deleting" and out of quota (AB#863). When the
+        removal fails, the record stays: GET answers 409 sandbox_deleting (not
+        404), and a room whose kill failed is still counted. The next sweep
+        retries it. Never drop the API record via the in-memory
         provider alone when a labeled container may still be running.
         """
         guest = self._guests.get(sandbox_id)
@@ -3298,7 +3348,7 @@ class DockerGuestProvider:
             targets = [
                 sid
                 for sid, s in self._inner._sandboxes.items()  # noqa: SLF001
-                if s.state != "deleting"
+                if s.state not in _LEAVING
                 and all(s.labels.get(k) == v for k, v in want.items())
                 and (caller is None or s.api_key is None or s.api_key == caller)
             ]
@@ -3398,7 +3448,7 @@ class DockerGuestProvider:
             if gone:
                 self._confirm_removed(batch[index][0])
 
-        self._remove_many([cid for _, cid in batch], on_done=done)
+        self._remove_many([cid for _, cid in batch], on_done=done, sandbox_ids=[sid for sid, _ in batch])
 
     def mark_expired(self) -> int:
         """Move every collectable sandbox to "deleting". Fast; runs no docker command."""
@@ -3408,22 +3458,41 @@ class DockerGuestProvider:
                 marked += 1
         return marked
 
-    def _remove_many(self, refs: list[str], *, on_done=None) -> list[bool]:
+    def _kill_then_remove(self, sandbox_id: str, container_ref: str) -> bool:
+        """Kill a leaving room's container, then remove it. True when it is gone.
+
+        After a confirmed kill the record moves to "stopped_deleting" and
+        leaves quota (AB#863); it is dropped only when docker rm confirms. A
+        failed kill keeps it "deleting" and counted; the next drain retries.
+        """
+        if self._inner.state_of(sandbox_id) == "deleting":
+            if self._client.kill_confirmed(container_ref, timeout=self._kill_timeout):
+                self._inner.mark_stopped(sandbox_id)
+        return self._client.remove_confirmed(container_ref, timeout=self._rm_timeout)
+
+    def _remove_many(self, refs: list[str], *, on_done=None, sandbox_ids: list[str] | None = None) -> list[bool]:
         """Remove containers with bounded parallelism. Return one result per ref.
 
         *on_done(index, gone)* runs as soon as each removal ends, not after the
         whole list. So each sandbox leaves "deleting" and quota when its own
-        container is confirmed gone.
+        container is confirmed gone. With *sandbox_ids* (one per ref) each
+        container is killed first, so its room leaves quota at the kill.
         """
         if not refs:
             return []
         results = [False] * len(refs)
         workers = min(self._gc_parallelism, len(refs))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cathedral-gc") as pool:
-            futures = {
-                pool.submit(self._client.remove_confirmed, ref, timeout=self._rm_timeout): i
-                for i, ref in enumerate(refs)
-            }
+            if sandbox_ids is None:
+                futures = {
+                    pool.submit(self._client.remove_confirmed, ref, timeout=self._rm_timeout): i
+                    for i, ref in enumerate(refs)
+                }
+            else:
+                futures = {
+                    pool.submit(self._kill_then_remove, sandbox_ids[i], ref): i
+                    for i, ref in enumerate(refs)
+                }
             for future in as_completed(futures):
                 index = futures[future]
                 try:
@@ -3462,7 +3531,7 @@ class DockerGuestProvider:
                         flush=True,
                     )
 
-            self._remove_many([cid for _, cid in batch], on_done=done)
+            self._remove_many([cid for _, cid in batch], on_done=done, sandbox_ids=[sid for sid, _ in batch])
 
     def _reconcile_locked(self) -> int:
         """Remove containers with our owner label that have no sandbox record.
@@ -3651,6 +3720,61 @@ class DockerGuestProvider:
             }
             self._inner._images[ref] = entry  # noqa: SLF001
         return entry
+
+    def list_images(self, owner: str) -> list[dict[str, Any]]:
+        """The images *owner* pulled or was granted that Docker still holds (AB#860).
+
+        One entry per image id. Size and digest come from Docker; a grant
+        whose image is gone, or whose name now points at another image, is
+        not listed. last_used_at comes from the image GC state when readable.
+        """
+        last_used = _gc_last_used()
+        pins = self._image_pins.pinned_by(owner) if self._image_pins is not None else []
+        pinned = {p["ref"] for p in pins} | {p.get("image_id") for p in pins}
+        out: dict[str, dict[str, Any]] = {}
+        for nid, refs in self._image_owners.owned_refs(owner).items():
+            for ref in refs:
+                inspected = self._client.image_inspect(ref)
+                if normalize_image_id(str(inspected.get("Id") or "")) != nid:
+                    continue
+                entry = out.get(nid)
+                if entry is None:
+                    entry = out[nid] = {
+                        "ref": ref,
+                        "refs": [],
+                        "image_id": nid,
+                        "digest": (inspected.get("RepoDigests") or [None])[0],
+                        "size_bytes": int(inspected.get("Size") or 0),
+                        "last_used_at": last_used.get(nid),
+                        "pinned": nid in pinned,
+                    }
+                entry["refs"].append(ref)
+                entry["pinned"] = entry["pinned"] or ref in pinned
+        return sorted(out.values(), key=lambda e: e["ref"])
+
+    def pin_images(self, refs: tuple[str, ...], owner: str, owner_cap: int | None) -> list[str] | None:
+        """Pin the just-prefetched *refs* for *owner*. None: this hotel has no pins."""
+        if self._image_pins is None:
+            return None
+        images = []
+        for ref in refs:
+            inspected = self._client.image_inspect(ref)
+            nid = normalize_image_id(str(inspected.get("Id") or ""))
+            if nid is None or not self._image_owners.owns(nid, owner):
+                raise SandboxOpError("image_not_owned", 403, "this guest cannot use that image on this hotel")
+            images.append({
+                "ref": ref,
+                "image_id": nid,
+                "digest": (inspected.get("RepoDigests") or [None])[0],
+                "size_bytes": int(inspected.get("Size") or 0),
+            })
+        return self._image_pins.pin(owner, images, owner_cap=owner_cap, ceiling=hotel_ceiling_bytes())
+
+    def unpin_image(self, owner: str, ref: str) -> None:
+        if self._image_pins is None:
+            raise SandboxOpError("pins_unavailable", 501, "this hotel has no image pins")
+        if not self._image_pins.unpin(owner, ref):
+            raise SandboxOpError("pin_not_found", 404, f"no pin of {ref} for this key")
 
     def terminal_write(self, sandbox_id: str, terminal_id: str, data: str | bytes) -> dict[str, Any]:
         # The inner provider keeps the terminal's buffers; each complete line

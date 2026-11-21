@@ -179,6 +179,13 @@ def _disk_full_is_413(sandbox: "_Sandbox"):
 
 # AB#534: how stale a room's disk_bytes may be in a list answer.
 _DISK_LIST_MAX_AGE = 10.0
+# States of a record on its way out (AB#863). "deleting": the container may
+# still run. "stopped_deleting": killed, docker rm not yet confirmed. Both are
+# hidden from the API and keep the record (AB#815 leak guard).
+_LEAVING = ("deleting", "stopped_deleting")
+# The disk every hotel slot assumes (the default resources.disk_gib); the
+# broker counts only the disk above it against a hotel budget (broker/disk.go).
+_BASE_ROOM_DISK_GIB = api.Resources().disk_gib
 
 # AB#864: how long a room that left is named, with why, in list "ended" and a GET 404.
 ENDED_RETENTION = timedelta(minutes=10)
@@ -411,7 +418,7 @@ class InMemorySandboxProvider:
         # still counts it. Answer 409 (not 404) so callers that treat GET 404 as
         # "container gone" (broker cleanup_state, Polaris stop) keep waiting
         # while docker rm may still be running — Spock soak 2026-10-26 c46 ghost.
-        if sandbox is not None and sandbox.state == "deleting":
+        if sandbox is not None and sandbox.state in _LEAVING:
             raise SandboxOpError(
                 "sandbox_deleting",
                 409,
@@ -1166,7 +1173,7 @@ class InMemorySandboxProvider:
         """
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
-            if sandbox is None or sandbox.state in ("deleted", "deleting"):
+            if sandbox is None or sandbox.state == "deleted" or sandbox.state in _LEAVING:
                 return
             for handle, _ in sandbox.processes.values():
                 if handle is None:
@@ -1287,7 +1294,7 @@ class InMemorySandboxProvider:
         Callers must already hold ``self._lock``. A record that is already
         "deleting" is not collectable again; its owner finishes the removal.
         """
-        if sandbox.state in ("deleted", "deleting"):
+        if sandbox.state == "deleted" or sandbox.state in _LEAVING:
             return None
         if api.is_collectable(now, deadline_at=api.gc_deadline(sandbox.expires_at), last_heartbeat_at=None):
             return "ttl_expired"
@@ -1368,7 +1375,9 @@ class InMemorySandboxProvider:
         """
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
-            if sandbox is None or sandbox.state in ("deleted", "deleting"):
+            # A stopped_deleting record is still leaving: a second retire with
+            # no guest would finish_delete while its container exists (AB#815).
+            if sandbox is None or sandbox.state == "deleted" or sandbox.state in _LEAVING:
                 return False
             for handle, _ in sandbox.processes.values():
                 if handle is not None and handle.poll() is None:
@@ -1381,19 +1390,43 @@ class InMemorySandboxProvider:
         self._close_ptys(terms)
         return True
 
+    def mark_stopped(self, sandbox_id: str) -> bool:
+        """Move a "deleting" record whose container is confirmed killed to "stopped_deleting".
+
+        It then leaves resident quota: its CPU and memory are free, only docker
+        rm (disk) is left. At most limits.running_sandboxes (the slots) records
+        stop counting, so a docker rm that never ends cannot grow usage without
+        bound; past that the record stays "deleting" and counted.
+        """
+        with self._lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+            if sandbox is None or sandbox.state != "deleting":
+                return False
+            stopped = sum(1 for s in self._sandboxes.values() if s.state == "stopped_deleting")
+            if stopped >= self._limits.running_sandboxes:
+                return False
+            sandbox.state = "stopped_deleting"
+            return True
+
     def finish_delete(self, sandbox_id: str) -> None:
         """Drop a record after its guest is confirmed gone. Idempotent."""
         with self._lock:
             sandbox = self._sandboxes.pop(sandbox_id, None)
             if sandbox is None:
                 return
-            if sandbox.state != "deleting":
+            if sandbox.state not in _LEAVING:
                 self._retain_logs(sandbox)
             sandbox.state = "deleted"
             shutil.rmtree(sandbox.root, ignore_errors=True)
 
+    def state_of(self, sandbox_id: str) -> str | None:
+        """The state of a record, None when there is none."""
+        with self._lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+            return None if sandbox is None else sandbox.state
+
     def has_record(self, sandbox_id: str) -> bool:
-        """True while any record (live or "deleting") exists for *sandbox_id*."""
+        """True while any record (live or leaving) exists for *sandbox_id*."""
         with self._lock:
             return sandbox_id in self._sandboxes
 
@@ -1405,7 +1438,7 @@ class InMemorySandboxProvider:
         def matches(sandbox: _Sandbox) -> bool:
             if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
                 return False
-            if sandbox.state == "deleting":
+            if sandbox.state in _LEAVING:
                 return False
             if state and sandbox.state != state:
                 return False
@@ -1434,7 +1467,7 @@ class InMemorySandboxProvider:
             targets = [
                 sid
                 for sid, s in self._sandboxes.items()
-                if s.state != "deleting"
+                if s.state not in _LEAVING
                 and all(s.labels.get(k) == v for k, v in want.items())
                 and (caller is None or s.api_key is None or s.api_key == caller)
             ]
@@ -1959,7 +1992,8 @@ class InMemorySandboxProvider:
         """Resident capacity: running + creating + frozen + deleting.
 
         Freeze does not free host slots. A "deleting" record still holds its guest
-        until removal is confirmed, so it still counts.
+        until it is killed, so it still counts. A "stopped_deleting" record
+        (killed, docker rm pending) does not (AB#863, capped in mark_stopped).
         """
         resident = [
             s
@@ -1978,6 +2012,7 @@ class InMemorySandboxProvider:
         running = [s for s in self._sandboxes.values() if s.state in ("running", "creating")]
         frozen = [s for s in self._sandboxes.values() if s.state == "frozen"]
         deleting = [s for s in self._sandboxes.values() if s.state == "deleting"]
+        removing = [s for s in self._sandboxes.values() if s.state == "stopped_deleting"]
         return {
             "limits": {
                 "running_sandboxes": self._limits.running_sandboxes,
@@ -1988,6 +2023,14 @@ class InMemorySandboxProvider:
                 "running_sandboxes": len(running),
                 "frozen_sandboxes": len(frozen),
                 "deleting_sandboxes": len(deleting),
+                # Killed rooms whose docker rm is pending (AB#863): out of resident
+                # quota, but their disk is still in use. removing_disk_gib is the
+                # disk above the default each slot already assumes, the part a
+                # broker disk budget counts.
+                "removing_sandboxes": len(removing),
+                "removing_disk_gib": sum(
+                    max(s.resources.disk_gib - _BASE_ROOM_DISK_GIB, 0) for s in removing
+                ),
                 "resident_sandboxes": usage.running_sandboxes,
                 "vcpu": usage.vcpu,
                 "memory_gib": usage.memory_gib,
@@ -2028,7 +2071,7 @@ class InMemorySandboxProvider:
         with self._lock:
             # A "deleting" record already has a tombstone; do not bill it twice.
             # Each key sees its own sandboxes, tombstones and snapshots only.
-            actives = [s for s in self._sandboxes.values() if s.state != "deleting" and mine(s.api_key)]
+            actives = [s for s in self._sandboxes.values() if s.state not in _LEAVING and mine(s.api_key)]
             tombs = [t for t in self._log_tombstones.values()
                      if t.get("resources") is not None and mine(t.get("api_key"))]
 
