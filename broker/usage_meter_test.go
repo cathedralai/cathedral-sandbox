@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2089,6 +2091,176 @@ func TestUsageMeterFrozenRoomIsStillMeteredAsBillable(t *testing.T) {
 	for i, r := range all {
 		if r.State != "running" || r.Billable != nil || r.Seconds < int64(20*i) {
 			t.Fatalf("reading %d of a frozen room: %+v", i, r)
+		}
+	}
+}
+
+// seedListedRoom puts a room on fake hotel f with these labels and size, as
+// a hotel lists a room the broker has not seen yet.
+func seedListedRoom(f *fakeHotel, id string, labels map[string]any, vcpu, gib int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": labels,
+		"resources": map[string]any{"vcpu": vcpu, "memory_gib": gib, "disk_gib": 10}})
+}
+
+// unseen fails the test unless neither the room map nor the meter knows run.
+func unseen(t *testing.T, tc *testChain, run string) {
+	t.Helper()
+	tc.b.mu.Lock()
+	inMap := tc.b.byBID(run) != nil
+	tc.b.mu.Unlock()
+	tc.b.usageMeter.mu.Lock()
+	known := tc.b.usageMeter.runs[run] != nil
+	tc.b.usageMeter.mu.Unlock()
+	if inMap || known {
+		t.Fatalf("run %s already seen: in the room map %v, in the meter %v", run, inMap, known)
+	}
+}
+
+// Codex finding on #622: a room that no sync list has shown (here no list of
+// its hotel has answered since the broker started, as right after a deploy)
+// and that a bulk delete removes gets its first reading from the delete's
+// own list, built as the sync builds it, and its ended reading from the
+// delete: once each, with the guest and size of the list.
+func TestUsageMeterBulkDeleteMetersARoomNoSyncSaw(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	seedListedRoom(tc.hotels["b"], "sbx_old", map[string]any{guestLabel: "g1", "job": "x"}, 2, 8)
+	run := "b.sbx_old"
+	unseen(t, tc, run)
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+		t.Fatalf("bulk delete: %d %v", status, doc)
+	}
+	syncNow(tc, "b") // the room is gone: a later sync adds nothing
+	got := usageMeterRunsOf(t, tc, run)
+	if len(got) != 2 {
+		t.Fatalf("readings %+v, want a first and an ended reading", got)
+	}
+	for i, r := range got {
+		want := []string{"running", "ended"}[i]
+		if r.State != want || r.Guest != "g1" || r.Hotel != "b" || r.VCPU != 2 || r.MemoryGiB != 8 || r.Billable != nil || r.Seconds != 0 || r.StartedAt != got[0].StartedAt {
+			t.Fatalf("reading %d: %+v, want %s for g1 with 2 vCPU, 8 GiB, billable", i, r, want)
+		}
+	}
+}
+
+// A hotel that ignores the bulk delete's label filter lists every room. A
+// room outside the filter (another label, another guest, no guest label)
+// gets no reading from that list, as before the fix.
+func TestUsageMeterBulkDeleteSkipsRoomsOutsideTheFilter(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.listIgnoresLabels = true
+	f.mu.Unlock()
+	seedListedRoom(f, "sbx_other", map[string]any{guestLabel: "g1", "job": "y"}, 1, 4)
+	seedListedRoom(f, "sbx_g2", map[string]any{guestLabel: "g2", "job": "x"}, 1, 4)
+	seedListedRoom(f, "sbx_nolabel", map[string]any{"job": "x"}, 1, 4)
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+		t.Fatalf("bulk delete: %d %v", status, doc)
+	}
+	for _, run := range []string{"b.sbx_other", "b.sbx_g2", "b.sbx_nolabel"} {
+		if got := usageMeterRunsOf(t, tc, run); len(got) != 0 {
+			t.Fatalf("run %s outside the filter: readings %+v, want none", run, got)
+		}
+	}
+}
+
+// A bulk delete that fails after its list leaves the run open: the first
+// reading is written and there is no ended reading; the next sync observes
+// the run.
+func TestUsageMeterFailedBulkDeleteLeavesTheRunOpen(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	seedListedRoom(f, "sbx_old", map[string]any{guestLabel: "g1", "job": "x"}, 2, 8)
+	run := "b.sbx_old"
+	unseen(t, tc, run)
+	f.mu.Lock()
+	f.bulkClaimBusy, f.bulkFailAfterBusy = 1, true // a claim refusal, then a 503
+	f.mu.Unlock()
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status == 200 {
+		t.Fatalf("bulk delete succeeded: %v", doc)
+	}
+	got := usageMeterRunsOf(t, tc, run)
+	if len(got) != 1 || got[0].State != "running" || got[0].Guest != "g1" || got[0].VCPU != 2 || got[0].MemoryGiB != 8 || got[0].Billable != nil {
+		t.Fatalf("readings after a failed delete %+v, want one first reading", got)
+	}
+	syncNow(tc, "b")
+	tc.b.usageMeter.mu.Lock()
+	open := tc.b.usageMeter.runs[run] != nil
+	tc.b.usageMeter.mu.Unlock()
+	if !open {
+		t.Fatal("the run is not open after a failed delete and a sync")
+	}
+	for _, r := range usageMeterRunsOf(t, tc, run) {
+		if r.State == "ended" {
+			t.Fatalf("ended reading after a failed delete: %+v", r)
+		}
+	}
+}
+
+// A recorded leftover of a failed create that the bulk delete's list shows
+// first is metered by the sync's rule: not billable, then ended.
+func TestUsageMeterBulkDeleteMetersALeftoverAsNotBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	seedListedRoom(tc.hotels["b"], "sbx_left", map[string]any{guestLabel: "g1", batchLabel: "bt1", "job": "x"}, 1, 4)
+	setHotel(tc, "b", func(h *hotel) {
+		if h.unreaped == nil {
+			h.unreaped = map[string]*unreapedBatch{}
+		}
+		h.unreaped["bt1"] = &unreapedBatch{guest: "g1", keep: map[string]bool{}}
+	})
+	run := "b.sbx_left"
+	unseen(t, tc, run)
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+		t.Fatalf("bulk delete: %d %v", status, doc)
+	}
+	got := usageMeterRunsOf(t, tc, run)
+	if len(got) != 2 || got[0].State != "running" || got[1].State != "ended" {
+		t.Fatalf("readings %+v, want a first and an ended reading", got)
+	}
+	for _, r := range got {
+		if r.Billable == nil || *r.Billable {
+			t.Fatalf("a leftover's reading is billable: %+v", r)
+		}
+	}
+}
+
+// The bulk delete's list and a sync that see a new room at the same time
+// write one first reading between them: seenLocked keeps one run per id. In
+// either order, and when both run at once.
+func TestUsageMeterBulkDeleteListAndSyncWriteOneFirstReading(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	h := tc.b.hotelByID("b")
+	q := url.Values{"label": {"job=x", guestLabel + "=g1"}}
+	firsts := func(run string) int {
+		n := 0
+		for _, r := range usageMeterRunsOf(t, tc, run) {
+			if r.State == "running" && r.Seconds == 0 {
+				n++
+			}
+		}
+		return n
+	}
+	seedListedRoom(f, "sbx_1", map[string]any{guestLabel: "g1", "job": "x"}, 1, 4)
+	tc.b.bulkDeleteTargets(context.Background(), h, q)
+	syncNow(tc, "b")
+	seedListedRoom(f, "sbx_2", map[string]any{guestLabel: "g1", "job": "x"}, 1, 4)
+	syncNow(tc, "b")
+	tc.b.bulkDeleteTargets(context.Background(), h, q)
+	for i := 3; i < 13; i++ {
+		seedListedRoom(f, fmt.Sprintf("sbx_%d", i), map[string]any{guestLabel: "g1", "job": "x"}, 1, 4)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); tc.b.bulkDeleteTargets(context.Background(), h, q) }()
+		go func() { defer wg.Done(); syncNow(tc, "b") }()
+		wg.Wait()
+	}
+	for i := 1; i < 13; i++ {
+		run := fmt.Sprintf("b.sbx_%d", i)
+		if n := firsts(run); n != 1 {
+			t.Fatalf("run %s: %d first readings, want 1: %+v", run, n, usageMeterRunsOf(t, tc, run))
 		}
 	}
 }

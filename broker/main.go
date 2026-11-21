@@ -406,6 +406,15 @@ type unreapedBatch struct {
 	busy  bool            // a removal pass is running
 }
 
+// recordedLeftover reports whether listed room id, with these labels, is a
+// room a failed or cancelled create left behind: its batch is a recorded
+// unreaped request of the same guest that did not keep it. Such a room is
+// never the guest's room. Caller holds b.mu.
+func (h *hotel) recordedLeftover(id string, labels map[string]string) bool {
+	ub := h.unreaped[labels[batchLabel]]
+	return ub != nil && ub.guest == labels[guestLabel] && !ub.keep[id]
+}
+
 type guestState struct {
 	cfg      guestConfig
 	created  int
@@ -2545,7 +2554,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		// A room a failed create left behind is not the guest's room: the
 		// guest got its room elsewhere or an error. It is never adopted (or
 		// billed) under the guest label; it waits for its removal.
-		if ub := h.unreaped[s.Labels[batchLabel]]; ub != nil && ub.guest == s.Labels[guestLabel] && !ub.keep[s.ID] {
+		if h.recordedLeftover(s.ID, s.Labels) {
 			leftover[s.Labels[batchLabel]] = true
 			if rm := h.rooms[s.ID]; rm != nil { // adopted before the request was recorded
 				b.release(h, rm)
@@ -2575,13 +2584,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		b.forgetEnded(rm.guest, rm.id) // a late list: the room is back
 	}
 	for _, s := range list.Sandboxes {
-		// Every listed room uses compute. One not in the room map is a
-		// recorded leftover of a failed create (usage_meter.go).
-		if rm := h.rooms[s.ID]; rm != nil {
-			listed = append(listed, usageSightingOf(h, rm, s.Resources))
-		} else {
-			listed = append(listed, usageListSighting(h, s.ID, s.Labels, s.Resources))
-		}
+		// Every listed room uses compute. After the loop above, one not in
+		// the room map is a recorded leftover of a failed create (usage_meter.go).
+		listed = append(listed, b.usageSightingOfListed(h, s.ID, s.Labels, s.Resources))
 	}
 	for batchID, ub := range h.unreaped {
 		switch {

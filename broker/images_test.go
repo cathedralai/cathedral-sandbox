@@ -102,6 +102,9 @@ type fakeHotel struct {
 	// absentDelete204: answer 204 to a delete of a room the hotel does not
 	// hold, as the real hotel does (usage_meter_test.go).
 	absentDelete204 bool
+	// listIgnoresLabels: a room list that ignores its label filters and lists
+	// every room (usage_meter_test.go).
+	listIgnoresLabels bool
 	// bulkDeleteHold: when set, a bulk delete removes its rooms at once but
 	// answers only when the channel closes (usage_meter_test.go).
 	bulkDeleteHold chan struct{}
@@ -211,12 +214,16 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, f.labelListFail, "list_failed", "the hotel could not list its rooms")
 			return
 		}
-		// Like a hotel: every "label" filter must match.
+		// Like a hotel: every "label" filter must match (listIgnoresLabels:
+		// a hotel that ignores the filter and lists every room).
 		out := []map[string]any{}
 		for _, rm := range f.rooms {
 			labels, _ := rm["labels"].(map[string]any)
 			keep := true
 			for _, want := range r.URL.Query()["label"] {
+				if f.listIgnoresLabels {
+					break
+				}
 				k, v, _ := strings.Cut(want, "=")
 				if labels[k] != v {
 					keep = false
