@@ -324,6 +324,7 @@ type hotel struct {
 	containers      int
 	apiRunning      int
 	apiDeleting     int
+	removingDiskGiB int // usage.removing_disk_gib: disk of killed rooms not yet removed (AB#863, disk.go); 0 from an old hotel
 	created         int
 	failed          int
 	rejected        int
@@ -2384,6 +2385,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	if qerr == nil {
 		h.apiRunning = int(quota.Usage["running_sandboxes"] + quota.Usage["frozen_sandboxes"])
 		h.apiDeleting = int(quota.Usage["deleting_sandboxes"])
+		h.removingDiskGiB = int(quota.Usage["removing_disk_gib"])
 	}
 	// Slot delivery credits only a trusted health report this tick (AB#331).
 	b.recordDelivery(h, offered, now, slotsTrusted) // before the room list return: a failed list does not stop the count
