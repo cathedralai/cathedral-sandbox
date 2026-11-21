@@ -1146,7 +1146,10 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// registry says the image is missing or denied; a hotel that
 			// cannot reach the registry (DNS, network, rate limit, disk) is
 			// at fault and must rest so the create moves on.
-			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" && guestImageFault(out)
+			// With the guest's own registry login, the registry's rate limit is
+			// the guest's quota, not the hotel's (AB#817).
+			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" &&
+				(guestImageFault(out) || (pl.registryAuth && registryRateLimited(out)))
 			// A dedicated machine refusing a create the owner did not sign
 			// (owner_signature_*) is the guest's error, not a broken hotel.
 			ownerRefused := status == 403 && strings.HasPrefix(errCodeOf(out), "owner_signature_")
@@ -1444,11 +1447,18 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if ref, _ := payload["image"].(string); ref != "" {
+	// The object form {"image", "registry_auth"} names its reference inside:
+	// the same refusal applies to it (AB#817).
+	if ref := createImageRef(payload); ref != "" {
 		if e := localImageRefusal(ref); e != nil {
 			writeErr(w, e.status, e.code, e.msg)
 			return
 		}
+	}
+	authErr, withAuth := createRegistryAuth(payload)
+	if authErr != nil {
+		writeErr(w, authErr.status, authErr.code, authErr.msg)
+		return
 	}
 	if e := applyCatalogTemplate(payload); e != nil {
 		writeErr(w, e.status, e.code, e.msg)
@@ -1473,13 +1483,18 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "create_request_batch_unsupported", "the create bytes can be returned for a single create only (count 1)")
 		return
 	}
+	if wantBytes && withAuth {
+		// The bytes hold the registry login: they never travel back.
+		writeErr(w, 400, "create_request_with_registry_auth", "the create bytes are not returned for a create with registry_auth")
+		return
+	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
 		writeAPIErr(w, perr)
 		return
 	}
 	pl.apply(payload)
-	pl.image, _ = payload["image"].(string)
+	pl.image = createImageRef(payload)
 	if e, retry := b.admit(g, count); e != nil {
 		writeLimitErr(w, e, retry)
 		return
@@ -2899,6 +2914,17 @@ func errCodeOf(body []byte) string {
 
 // guestImageFault reports whether a hotel's image_pull_failed message names
 // a missing or denied image (the guest's error) rather than a hotel fault.
+// registryRateLimited reports a pull the registry refused for its rate limit.
+func registryRateLimited(body []byte) bool {
+	var doc struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	return strings.Contains(strings.ToLower(doc.Error.Message), "toomanyrequests")
+}
+
 func guestImageFault(body []byte) bool {
 	var doc struct {
 		Error struct {
