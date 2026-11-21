@@ -518,6 +518,8 @@ def test_a_clean_host_gets_the_units_the_key_store_and_the_daemon_config(host: F
     assert "User=poolroom" in api and f"EnvironmentFile={host.etc}/secret.env" in api
     assert re.search(r"^ExecStart=\S+/opt/pool-room/venv/bin/python \S+/opt/pool-room/bin/room_api.py sandbox serve --host 127.0.0.1 --port 18090 --runtime docker$", api, re.M)
     assert re.search(f"^TMPDIR={re.escape(str(host.data_dir))}/work$", (host.etc / "api.env").read_text(), re.M)
+    # Pull disk floor (AB#861): the API reads the room data volume from api.env.
+    assert re.search(f"^CATHEDRAL_PULL_DATA_DIR={re.escape(str(host.data_dir))}$", (host.etc / "api.env").read_text(), re.M)
     # Image owner table (AB#650): a directory of its own that the API user owns,
     # and the path points into it. The fake host cannot chown: the owner is read
     # from the install(1) call, the mode from the directory itself.

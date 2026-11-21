@@ -85,7 +85,7 @@ def test_reconcile_and_a_second_retire_never_drop_a_stopped_room(fake: FakeDocke
         assert _usage(provider)["removing_sandboxes"] == 1
         # A second retire (GC, bulk delete) must not finish_delete while the container exists.
         assert provider._inner.begin_delete(sid) is False  # noqa: SLF001
-        assert provider._retire(sid) is False  # noqa: SLF001
+        assert provider._retire(sid, "deleted") is False  # noqa: SLF001
         assert provider.bulk_delete(["job=none"]) == 0
         with provider._drain_lock:  # noqa: SLF001
             provider._reconcile_locked()  # noqa: SLF001
