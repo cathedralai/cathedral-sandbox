@@ -417,3 +417,24 @@ func TestRefillColdKeyDoesNotForceTheFullRate(t *testing.T) {
 		t.Fatalf("rate during a claim with a cold key at 0: %v, want 1 (refill_during_claims)", got)
 	}
 }
+
+// Rooms already deleted but still in the hotel's room map are not in the
+// pool's count, so they do not shrink the trim to a lower bound (Bugbot
+// review of #663).
+func TestPoolBoundTrimIgnoresRoomsAlreadyDeleted(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	pc.up("a")
+	pc.target(20)
+	pc.fill("a", 20)
+	pc.target(15)
+	pc.steps("a", 2) // 5 deleted, still in the room map until the sync drops them
+	f.set(func(f *fakePoolHotel) { f.slots = 50 })
+	pc.b.mu.Lock()
+	pc.b.hotelByID("a").slots = 50 // the health answer, without a sync that would drop the deleted rooms
+	pc.b.mu.Unlock()
+	pc.steps("a", 2)
+	if c := pc.counts("a"); c.ready != 10 {
+		t.Fatalf("bound 10 with 5 rooms deleted and not yet gone: %+v, want 10 ready", c)
+	}
+}

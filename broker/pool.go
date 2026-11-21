@@ -709,10 +709,11 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	}
 	// Above the hotel's bound (fewer slots or less memory reported, or a pool
 	// made under an older bound): the oldest ready rooms go until it holds no
-	// more than the bound, rooms already leaving counted as gone. Quarantined
-	// rooms never.
+	// more than the bound, its stale rooms (being deleted) counted as gone.
+	// Rooms deleted already are not in its count. Quarantined rooms never.
 	if bs := b.poolBoundsLocked(h); h.slots > 0 {
-		excess := p.countsLocked(h.cfg.ID).held - poolLeavingLocked(h, ph) - bs.bound
+		c := p.countsLocked(h.cfg.ID)
+		excess := c.held - c.stale - bs.bound
 		for _, pr := range sortedPoolRooms(ph) {
 			if excess <= 0 {
 				break
