@@ -10,6 +10,7 @@
 //	"own_hosts_only": true         never a miner hotel, whatever the policy says (reserved customers)
 //	"pin_max_gib": 400             image bytes the guest may pin on each hotel (0 or absent: no pins, guest_images.go)
 //	"ops": true                    the guest may run the probe and reset the broker counters
+//	"metered": true                admitted only on the ledger's allowance; closed until one comes (allowance.go)
 //
 // With "default_sealed", a create gets an unsealed room only when it says
 // "sealed": false, names hotels with "hotels", or excludes sealed hotels
@@ -51,6 +52,10 @@ type guestLimits struct {
 	// policy opts into miner hotels. For reserved customers (const). It is
 	// the guest-wide form of the create flag "own_hosts_only" (images.go).
 	OwnHostsOnly bool `json:"own_hosts_only,omitempty"`
+	// Metered: the guest is admitted only on the ledger's allowance
+	// (allowance.go). It starts closed: cap 0 and no lease. Only the config
+	// makes a guest metered.
+	Metered bool `json:"metered,omitempty"`
 	// PinMaxGiB caps the image bytes the guest may pin on each hotel
 	// (prefetch "pin": true, guest_images.go). 0: pins are off.
 	PinMaxGiB int `json:"pin_max_gib,omitempty"`
@@ -113,6 +118,15 @@ func (b *broker) activeRooms(g *guestState) int {
 func (b *broker) admit(g *guestState, n int) (*apiErr, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.admitLocked(g, n)
+}
+
+// admitLocked is admit with b.mu held: admitCreate (allowance.go) checks a
+// metered create against its allowance under the same lock.
+func (b *broker) admitLocked(g *guestState, n int) (*apiErr, int) {
+	if e, retry := b.allowanceRefusalLocked(g, n, time.Now()); e != nil {
+		return e, retry // a metered guest outside its allowance (allowance.go)
+	}
 	lim := g.limits
 	// One call larger than a limit can never pass: say so (400), rather
 	// than a 429 whose Retry-After a client obeys forever (AB#865).
@@ -216,6 +230,10 @@ func (b *broker) guestView(g *guestState) map[string]any {
 func (b *broker) handleGuestAdmin(w http.ResponseWriter, r *http.Request, id string) {
 	if !b.isOperator(r) {
 		writeErr(w, 401, "unauthorized", "operator key required")
+		return
+	}
+	if gid, ok := allowancePath(id); ok {
+		b.handleAllowance(w, r, gid) // allowance.go
 		return
 	}
 	switch {

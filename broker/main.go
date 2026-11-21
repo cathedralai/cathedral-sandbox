@@ -158,6 +158,11 @@ type config struct {
 	// MaxQueueWaitSeconds: a create that waits longer than this for a create
 	// slot at its hotel moves to another eligible hotel (default 10; -1: never).
 	MaxQueueWaitSeconds float64 `json:"max_queue_wait_seconds"`
+	// UncertainCreateHoldSeconds: how long a metered guest's create attempt
+	// whose answer was lost, and whose reap found no room, still counts
+	// against its cap (allowance.go). 0 or absent: the create timeout to a
+	// hotel (hotelCreateTimeout, 720); less is refused.
+	UncertainCreateHoldSeconds int `json:"uncertain_create_hold_seconds,omitempty"`
 	// MemFullPct: a hotel whose host memory use is at or above this percent
 	// takes no new rooms (default 90; -1: no memory limit). Slots come from an
 	// install-time sizing with memory overcommit, so they cannot see rooms
@@ -410,6 +415,13 @@ type unreapedBatch struct {
 	guest string
 	keep  map[string]bool // room ids the request did receive: never reaped
 	busy  bool            // a removal pass is running
+	// holdUntil: a metered guest's lost create whose reap found no room; the
+	// record stays, unlisted, until then (allowance.go settleUncertain).
+	holdUntil time.Time
+	// unsettled: reapOrphans recorded the request before settleUncertain
+	// counted its lost attempts, which still count in uncertain until then
+	// (allowance.go unresolvedLocked).
+	unsettled bool
 }
 
 type guestState struct {
@@ -434,6 +446,7 @@ type broker struct {
 	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order (hotels.json and hotel-lends.json)
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
+	allow            allowances                // metered guests (allowance.go)
 	capsOnDisk       map[string]map[string]any // probe results read from state_dir at start
 	probationFileMu  sync.Mutex                // serializes miner-probation.json writes (probation.go)
 	probationSavedAt time.Time                 // guarded by mu
@@ -736,6 +749,9 @@ func loadBroker(path string) (*broker, error) {
 	}
 	// The lend state in state_dir wins over reserved_for in the config file.
 	if err := b.loadConfigLends(); err != nil {
+		return nil, fmt.Errorf("state: %w", err)
+	}
+	if err := b.loadAllowances(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
 	}
 	if err := b.loadUsageMeter(); err != nil {
@@ -1050,13 +1066,26 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	finish := func(r createResult) createResult { r.lost = lost; return r }
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
+	// size: read from body at the first retry of a metered create (allowance.go).
+	var size *createSize
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 && createDeadlinePassed(pl) {
 			// A retry (the first hotel refused or had no free connection)
 			// would wait for a slot again past the create's own deadline.
 			return finish(createTimedOut())
 		}
+		if attempt > 0 && size == nil && g.limits.Metered { // Metered is set once, at load
+			s := createSizeOf(body)
+			size = &s
+		}
 		b.mu.Lock()
+		if size != nil {
+			// A retry is a new admission for a metered guest (allowance.go).
+			if e, retry := b.retryRefusalLocked(g, *size); e != nil {
+				b.mu.Unlock()
+				return finish(refusedRetry(last, e, retry))
+			}
+		}
 		h := b.pick(tried, pl)
 		if h == nil && !fellBack {
 			// "placement": "prefer": the named hotels are down or full.
@@ -1279,6 +1308,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// the guest's own image fault is a refusal: no room was started.
 			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
+				b.noteUncertainLocked(g) // counts for a metered guest until reaped (allowance.go)
 			}
 			if err != nil {
 				last = createResult{status: 502, doc: map[string]any{"error": map[string]string{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}}}
@@ -1376,6 +1406,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 			}
 		}
 	}
+	b.settleUncertain(g, batchID, results, keep) // allowance.go
 	return results
 }
 
@@ -1393,14 +1424,14 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 	if h.unreaped == nil {
 		h.unreaped = map[string]*unreapedBatch{}
 	}
-	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true}
+	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true}
 	h.unreaped[batchID] = ub
 	b.mu.Unlock()
 	go func() {
 		for _, wait := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second} {
 			time.Sleep(wait)
 			if b.reapPass(h, g.cfg.ID, batchID, keep, 10*time.Second) {
-				b.reaped(h, batchID)
+				b.reaped(h, batchID, ub)
 				return
 			}
 		}
@@ -1413,8 +1444,20 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 }
 
 // reaped clears a recorded request once its rooms on h are confirmed gone.
-func (b *broker) reaped(h *hotel, batchID string) {
+// ub is the record the finished pass worked on: the pass ends (busy) and the
+// record's fate is decided in one b.mu step, so no second pass starts in
+// between.
+func (b *broker) reaped(h *hotel, batchID string, ub *unreapedBatch) {
 	b.mu.Lock()
+	ub.busy = false
+	if h.unreaped[batchID] != ub { // removed meanwhile
+		b.mu.Unlock()
+		return
+	}
+	if b.holdsLocked(h, batchID, ub, b.cleanupListedAtLocked(h, batchID)) {
+		b.mu.Unlock() // a metered guest's lost create may still start its room (allowance.go)
+		return
+	}
 	delete(h.unreaped, batchID)
 	b.mu.Unlock()
 	log.Printf("orphan rooms on hotel %s (batch %s) confirmed removed", h.cfg.ID, batchID)
@@ -1428,6 +1471,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 	q := url.Values{}
 	q.Add("label", batchLabel+"="+batchID)
 	q.Add("label", guestLabel+"="+guestID)
+	asked := time.Now() // when the list was asked for: a hold ends only on a list asked for after it (allowance.go)
 	status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes", q, nil, timeout)
 	if err != nil || status != 200 {
 		return false
@@ -1442,6 +1486,9 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 	if json.Unmarshal(out, &list) != nil {
 		return false
 	}
+	b.mu.Lock()
+	b.noteCleanupListLocked(h, batchID, asked) // allowance.go
+	b.mu.Unlock()
 	ok := true
 	for _, s := range list.Sandboxes {
 		if keep[s.ID] {
@@ -1467,6 +1514,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
 			b.release(h, rm)
 		}
+		b.noteOrphanRemovedLocked(h, batchID, s.ID) // counted once per room id (allowance.go)
 		b.usageMeterOrphan(h, s.ID, guestID, listedAt, true)
 		b.mu.Unlock()
 		log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, guestID)
@@ -1615,6 +1663,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "create_request_with_registry_auth", "the create bytes are not returned for a create with registry_auth")
 		return
 	}
+	// A metered guest: allowance, size and lifetime before any hotel call (allowance.go).
+	if e, retry := b.meteredCreate(g, payload, count); e != nil {
+		writeLimitErr(w, e, retry)
+		return
+	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
 		writeAPIErr(w, perr)
@@ -1623,7 +1676,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	pl.apply(payload)
 	pl.image = createImageRef(payload)
 	pl.deadline = deadline
-	if e, retry := b.admit(g, count); e != nil {
+	if e, retry := b.admitCreate(g, count, payload); e != nil {
 		writeLimitErr(w, e, retry)
 		return
 	}
@@ -1794,6 +1847,11 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	if len(body) > 256<<20 {
 		// Forwarding the first 256 MiB would write a short file and answer 200.
 		writeErr(w, 413, "request_too_large", "the body is over 256 MiB")
+		return
+	}
+	// A metered guest: a lifetime route is a new admission (allowance.go).
+	body, pass := b.meteredRoomRoute(w, r, g, h, hid, gate, tail, body)
+	if !pass {
 		return
 	}
 	if r.Method == "POST" && tail == "snapshot" {
@@ -2432,6 +2490,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		} `json:"ended"`
 		APIStartedAt string `json:"api_started_at"`
 	}
+	listAsked := time.Now() // a hold ends only on a list asked for after it (allowance.go)
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
 	listedAt := time.Now()
 	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
@@ -2592,6 +2651,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	for batchID, ub := range h.unreaped {
 		switch {
 		case ub.busy:
+		case !leftover[batchID] && b.holdsLocked(h, batchID, ub, listAsked): // a lost create may still start its room (allowance.go)
 		case !leftover[batchID]:
 			delete(h.unreaped, batchID) // the hotel lists none of its rooms
 			log.Printf("orphan rooms on hotel %s (batch %s) no longer listed", h.cfg.ID, batchID)
@@ -2599,12 +2659,14 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			ub.busy = true
 			go func() {
 				ok := b.reapPass(h, ub.guest, batchID, ub.keep, 10*time.Second)
+				runAfterCleanupPass(h, batchID) // allowance.go
+				if ok {
+					b.reaped(h, batchID, ub) // ends the pass and decides the record in one step
+					return
+				}
 				b.mu.Lock()
 				ub.busy = false
 				b.mu.Unlock()
-				if ok {
-					b.reaped(h, batchID)
-				}
 			}()
 		}
 	}
@@ -2651,6 +2713,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	}
 	forced = b.checkReservedRooms(h)
 	h.roomsUnchecked = false
+	b.listedLocked(h) // the metered recount of a joined hotel (allowance.go)
 }
 
 func (b *broker) syncLoop(ctx context.Context, h *hotel) {

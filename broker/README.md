@@ -152,6 +152,7 @@ Each guest in the config can have limits (`guests.go`):
 | `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
 | `pin_max_gib` | Image bytes the guest may pin on each hotel (prefetch `"pin": true`). Absent or 0: no pins; a pin gets 403 `pins_not_enabled`. Config only. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
+| `metered` | `true`: the guest is admitted only on the ledger's allowance, and it starts closed. Needs `state_dir`. See "Metered guests". |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
 routes. `GET /v1/quota` shows the guest its limits.
@@ -484,6 +485,117 @@ For a hotel behind an SSH tunnel, forward 18092 as well: a fourth port in
 and `permitopen="127.0.0.1:18092"` on the tunnel key in the hotel's
 `authorized_keys`. Live since 2026-10-24 00:06Z: nc on 18092, c46 on 38092
 and c48 on 48092.
+
+## Metered guests
+
+A metered guest is admitted only on the ledger's word (`allowance.go`). A
+guest is metered when its config says `"metered": true` (the config decides,
+so a lost state file never opens a guest). It starts closed: cap 0 and no
+lease, so every create is refused until the ledger sends an allowance. A
+guest that is not metered behaves as before.
+
+| Route (operator key) | What it does |
+|---|---|
+| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. |
+| `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`. A guest that is not metered: `{"metered": false, "live_rooms"}`. |
+
+A metered create, and each lifetime extension of a metered room, is refused:
+
+| Answer | When |
+|---|---|
+| 503 `allowance_recount`, `Retry-After: 5` | Until every hotel the guest may use (or has had rooms on) has answered one room list since the broker started or the hotel joined: its rooms there are not counted yet. |
+| 402 `allowance_lease_expired`, `Retry-After: 30` | `now - ledger_seen_at > lease_seconds`, or no allowance yet. The message says the key is sold out right now. |
+| 402 `allowance_exhausted` | Live rooms plus the new ones would pass `cap` (an extension: the live rooms pass it). `cap` may be 0. At cap 0 the message says the key's allowance is 0 and to check the account's balance and status: the ledger sends cap 0 for more than a lack of credit. |
+
+Live rooms are the guest's creates in flight, every room the broker still
+holds for it (rooms being removed included, until the sync loop lets them
+go), and every create attempt whose answer was lost. A lost attempt counts
+until the hotel has listed its room and the broker has removed it, or until
+a hold of `uncertain_create_hold_seconds` has passed (config; default and
+minimum 720, the broker's create timeout to a hotel, `hotelCreateTimeout`):
+a proxy may time out while the hotel goes on, so a cleanup that finds no
+room, at once or after failed tries, does not end the count early, and only
+a list asked for after the hold's deadline ends it (an older answer that
+arrives late does not). A room the hotel lists in that time is reaped as an
+orphan. In a batch each lost attempt counts on its own: removing one late
+room does not release the others. A hold still counts after its hotel
+leaves, until its deadline; the leave itself is not blocked. Every retry of a
+create on another hotel is a new admission: the lease must be fresh, the cap
+must hold the live rooms with the room the failed attempt may hold, and the
+create's `ttl_seconds` and memory must fit the allowance of that moment (409
+`allowance_changed` when they no longer do); a retry that does not fit is
+not sent, and the guest gets the last attempt's error. Lease, cap, size and
+lifetime are checked against one allowance, under the lock that reserves the
+rooms. `max_rooms` still applies on top (429 `room_limit`).
+
+Size and lifetime of a metered room:
+
+- A create always sends `ttl_seconds` of at most `max_ttl_seconds` (the
+  maximum when absent) and an explicit `resources.memory_gib` (4, the hotel
+  default, when absent). A create that asks for more memory than
+  `max_memory_gib` gets 400 `memory_limit` before any hotel call.
+- Every route that resets a room's deadline at the hotel is a new admission:
+  `PATCH /v1/sandboxes/<id>`, `POST .../heartbeat`, `POST` and `PATCH
+  .../lifetime`, and the client lifetime route. It is checked after the body
+  is read and any hotel lookup is done, right before the hotel call. It sends
+  `ttl_seconds` of at most `max_ttl_seconds`; with no `ttl_seconds` it sends
+  the room's own, read from the hotel. A refused extension sends nothing, so
+  the room keeps the deadline it has.
+- A room claim (`POST .../claim`, room kit) gets 403 `claim_refused_metered`:
+  it sets a lifetime outside the allowance.
+- An owner-signed create on a dedicated machine signs the body the hotel
+  receives: send `ttl_seconds` and `resources.memory_gib` within the
+  allowance, so the broker changes nothing.
+
+Nothing here stops or deletes a running room. After a restart the file is
+read again: a cap of 0 stays 0, the issue is kept, and a lease keeps its
+`ledger_seen_at`, so it can expire across the restart. A missing file leaves
+every metered guest closed. A file that does not parse is moved aside
+(`guest-allowances.json.corrupt-<time>`) and closes every metered guest; its
+issues are lost, so only an issue above the broker clock at start, in unix
+milliseconds, opens a guest again. An entry that cannot open admission
+closes that guest and keeps its issue (or that clock value when the issue
+itself is not usable). In both cases the broker writes the closed entries
+and their watermarks to a fresh file at once, so every later start keeps
+them; if it cannot, it does not start. The ledger sends
+`issue = max(last + 1, unix ms)`.
+
+Known limits:
+
+- A hotel answers DELETE 204 even when the container removal fails, and
+  then hides the room from its list (`cathedral/sandbox_guest.py`). A room
+  the hotel hides while its removal is failing is not counted against the
+  cap, with or without a broker restart: an orphan stops counting at its
+  DELETE, one of the guest's rooms when the sync loop releases it (which
+  keeps at most as many gone rooms as the hotel reports deleting). The
+  bound is one extra room per such hidden room, until the hotel removes it,
+  so repeated failed removals can add up. A hidden room is not listed, so it
+  is not metered or billed. Confirming each removal would need a probe per
+  delete; that is left for a follow-up.
+- A lost create that the hotel completes after the hold escapes the count
+  until its room is listed (then it counts as one of the guest's rooms).
+- A hold on a hotel that is removed or replaced during the hold ends at its
+  deadline with no further list of that hotel. A room that started there
+  before the deadline and keeps running is then not counted: one extra room
+  per unresolved attempt on a removed or replaced hotel, until the room ends
+  or the hotel rejoins and lists it (then it counts as one of the guest's
+  rooms). Repeated removals can add up.
+- Holds and unreaped records of lost create attempts live in memory. A
+  broker restart forgets them: one extra room per lost attempt in flight at
+  the restart, and only when the hotel had not yet listed that room. A room
+  the hotel lists counts as one of the guest's rooms after the restart.
+- After a failed save (500) the guest is closed in memory only. A restart
+  loads whatever the file holds: the allowance the ledger just sent (the
+  rename was done, the directory sync failed) or the previous one (the write
+  failed before the rename), which keeps its original `ledger_seen_at`.
+  Either is an allowance the ledger sent, so admission after the restart
+  lasts at most one `lease_seconds` from that allowance's own stamp, and the
+  next push replaces it.
+- A hotel that never answers a list after a restart or a join keeps its
+  metered guests at 503 until it lists or is removed.
+- Between the check and the hotel call an extension can wait for a hotel
+  data connection: `data_conn_wait_seconds` (default 10 s), or the call's
+  own deadline (30 s to 2 min) when that is negative.
 
 ## Per-room tunables
 

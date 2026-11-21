@@ -449,6 +449,11 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
 	}
+	// A metered guest out of its allowance: refused before any hotel or build call (allowance.go).
+	if e, retry := b.meteredRefusal(g, compatCountOf(req)); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
 	if ref, _ := req["image"].(string); ref != "" {
 		if e := imageRefRefusal(ref, true); e != nil {
 			compatErr(w, e.status, e.code, e.msg, 0)
@@ -529,6 +534,11 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ttl = 48 * 3600
 	}
 	native["ttl_seconds"] = ttl
+	// A metered guest: allowance, size and lifetime before any hotel call (allowance.go).
+	if e, retry := b.meteredCreate(g, native, compatCountOf(req)); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
 	// Hotel choice: the guest's hotel set and sealed default apply; "sealed"
 	// true or false in the request chooses explicitly.
 	sealed, sealedField := req["sealed"].(bool)
@@ -570,7 +580,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		}
 		count = int(f)
 	}
-	if e, retry := b.admit(g, count); e != nil {
+	if e, retry := b.admitCreate(g, count, native); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
@@ -880,6 +890,17 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		}
 		if ttl > 48*3600 {
 			ttl = 48 * 3600
+		}
+		// A metered guest: the extension is a new admission, checked after
+		// the body is read and the hotel lookup is done, right before the
+		// heartbeat goes out (allowance.go).
+		maxTTL, e, retry := b.meteredExtension(g)
+		if e != nil {
+			compatErr(w, e.status, e.code, e.msg, retry)
+			return
+		}
+		if maxTTL > 0 && ttl > float64(maxTTL) {
+			ttl = float64(maxTTL)
 		}
 		hb, _ := json.Marshal(map[string]any{"ttl_seconds": int(ttl)})
 		status, hdr, out, err := rm.h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/heartbeat", nil, hb, 30*time.Second)
