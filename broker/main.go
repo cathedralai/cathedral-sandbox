@@ -377,6 +377,9 @@ type hotel struct {
 	// login, prewarm.go). AB#859.
 	guestWarm map[string]map[string]bool
 	guestWant map[string]map[string]time.Time
+	// guestPinned: per guest, the refs this hotel pinned for it, so the replay
+	// after a reboot pins them again (AB#860). Guarded by broker.mu.
+	guestPinned map[string]map[string]bool
 }
 
 // unreapedBatch is one create request's leftover rooms on a hotel.
@@ -2945,6 +2948,10 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleQuota(w, r, g)
 		case p == "/v1/usage" && r.Method == "GET":
 			b.handleUsage(w, r, g)
+		case p == "/v1/images" && r.Method == "GET":
+			b.handleImageList(w, r, g) // guest_images.go
+		case p == "/v1/images/pins" && r.Method == "DELETE":
+			b.handleUnpin(w, r, g)
 		case p == "/v1/images/prefetch" && r.Method == "POST":
 			b.handlePrefetch(w, r, g)
 		case strings.HasPrefix(p, "/v1/images/prefetch/") && r.Method == "GET":

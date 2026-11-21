@@ -150,6 +150,7 @@ Each guest in the config can have limits (`guests.go`):
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
 | `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
+| `pin_max_gib` | Image bytes the guest may pin on each hotel (prefetch `"pin": true`). Absent or 0: no pins; a pin gets 403 `pins_not_enabled`. Config only. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -329,7 +330,10 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 - Guest key: only the hotels the guest can reach, each with `tier`
   (`prefer`, `allow`, or `hotels` for a guest with no policy), preferred
   first, plus `guest` with `max_rooms` and `active_rooms`, and `classes`
-  over those hotels only.
+  over those hotels only. Each hotel also has `disk_used_pct` (how full its
+  data volume is; null: no reading yet) and `disk_admit_used_pct` (the fill
+  at which it takes no more rooms; null: not set). The disk budget fields
+  stay operator only.
 
 `free_rooms` comes from the function the placer uses (`admissibleFree`: 0
 when the hotel is down, draining, resting after a failure, at
@@ -618,6 +622,26 @@ pull; a missing one (a reboot wiped the scratch) is pulled again. Images
 pulled with `registry_auth` are not pulled again: the broker never keeps
 the login, so prefetch those again after a hotel restart. A broker restart
 forgets the list.
+
+`"pin": true` also asks each hotel to keep the images from its image
+cleanup. It needs the guest limit `pin_max_gib` (else 403
+`pins_not_enabled`); the broker sends it in bytes in `X-Pin-Max-Bytes`. A
+hotel answers 507 `pin_cap_exceeded` when the guest's pins there would pass
+the cap (or the hotel's own pin ceiling). Each image entry then has `pin`
+(`pinned`, `not_pinned`, or `not_supported` for a room kit without pins),
+and each hotel `pin` (`pinned`, or `not_supported` when any image there was
+pulled without a pin; `partial` when only some were pinned) with the `pinned`
+refs. The hotel-up replay pins a pinned ref again after a reboot; an unpin
+stops that.
+`DELETE /v1/images/pins?ref=<ref>&hotel=<id>` unpins one image there.
+
+`GET /v1/images?hotel=<id>` lists the images the guest pulled or was given
+on that hotel: `ref`, `digest`, `size_bytes`, `last_used_at`, `pinned`.
+Without `hotel`, the broker asks every hotel the guest reaches that is up
+(4 at a time, 10 s each) and answers `{"hotels": [...]}`, one entry per
+hotel, with `error` for a hotel that did not answer. A hotel outside the
+guest's reach is 404 `hotel_not_found`; a hotel whose room kit has no list
+says `"images_list": "not_supported"`.
 
 `GET /v1/broker/stats` gives per-hotel counts and latency percentiles
 (hotel call, wait in the broker queue, broker overhead). `POST` resets them.
