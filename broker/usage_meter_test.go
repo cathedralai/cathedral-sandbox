@@ -1074,3 +1074,34 @@ func TestUsageMeterCrashBeforeFsyncReissuesNoServedSeq(t *testing.T) {
 		})
 	}
 }
+
+// vcpu and memory_gib are whole numbers on the line; a fractional hotel
+// value rounds up, and an absent one is 0.
+func TestUsageMeterSizeIsWholeNumbers(t *testing.T) {
+	for _, c := range []struct {
+		res       any
+		vcpu, mem int64
+	}{
+		{map[string]any{"vcpu": 2.0, "memory_gib": 8.0}, 2, 8},
+		{map[string]any{"vcpu": 1.5, "memory_gib": 3.2}, 2, 4},
+		{map[string]any{"vcpu": 1}, 1, 0},
+		{map[string]any{"vcpu": "4", "memory_gib": -1.0}, 0, 0},
+		{nil, 0, 0},
+	} {
+		if v, m := usageSizeOf(c.res); v != c.vcpu || m != c.mem {
+			t.Fatalf("%v: %d, %d, want %d, %d", c.res, v, m, c.vcpu, c.mem)
+		}
+	}
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_frac", "state": "running",
+		"labels": map[string]any{guestLabel: "g1"}, "resources": map[string]any{"vcpu": 1.5, "memory_gib": 3.2}})
+	f.mu.Unlock()
+	syncNow(tc, "b")
+	mustFlush(t, tc.b.meter)
+	p, _ := tc.b.meter.page(0, 10, time.Now())
+	if len(p.Readings) != 1 || !strings.Contains(string(p.Readings[0]), `"vcpu":2,"memory_gib":4,`) {
+		t.Fatalf("line %s", p.Readings)
+	}
+}

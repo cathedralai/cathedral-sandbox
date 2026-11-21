@@ -108,19 +108,19 @@ var usageFileRE = regexp.MustCompile(`^[0-9]{20}\.jsonl$`)
 // usageReading is one line of the log. Keep the field order: seq is the
 // second field, so a reader can find it at a glance.
 type usageReading struct {
-	Schema      string  `json:"schema"`
-	Seq         int64   `json:"seq"`
-	Run         string  `json:"run"`
-	Guest       string  `json:"guest"`
-	Hotel       string  `json:"hotel"`
-	MinerHotkey string  `json:"miner_hotkey"`
-	VCPU        float64 `json:"vcpu"`
-	MemoryGiB   float64 `json:"memory_gib"`
-	StartedAt   int64   `json:"started_at"`
-	Seconds     int64   `json:"seconds"`
-	State       string  `json:"state"`
-	At          int64   `json:"at"`
-	Billable    *bool   `json:"billable,omitempty"` // only false is written; absent: billable
+	Schema      string `json:"schema"`
+	Seq         int64  `json:"seq"`
+	Run         string `json:"run"`
+	Guest       string `json:"guest"`
+	Hotel       string `json:"hotel"`
+	MinerHotkey string `json:"miner_hotkey"`
+	VCPU        int64  `json:"vcpu"`
+	MemoryGiB   int64  `json:"memory_gib"`
+	StartedAt   int64  `json:"started_at"`
+	Seconds     int64  `json:"seconds"`
+	State       string `json:"state"`
+	At          int64  `json:"at"`
+	Billable    *bool  `json:"billable,omitempty"` // only false is written; absent: billable
 }
 
 // usageRun is a run without an ended reading.
@@ -148,7 +148,7 @@ func (r *usageRun) observe(at time.Time) {
 // usageSighting is what the broker saw of one room.
 type usageSighting struct {
 	run, guest, hotel, miner string
-	vcpu, memGiB             float64
+	vcpu, memGiB             int64
 	billable                 bool
 }
 
@@ -174,13 +174,20 @@ func usageSightingOf(h *hotel, rm *room, resources any) usageSighting {
 	return usageSighting{run: rm.id, guest: rm.guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem, billable: rm.uuid != ""}
 }
 
-// usageSizeOf reads resources.vcpu and resources.memory_gib, as diskGiBOf
-// reads disk_gib. 0: absent or not a positive number.
-func usageSizeOf(resources any) (vcpu, memGiB float64) {
+// usageSizeOf reads resources.vcpu and resources.memory_gib as whole
+// numbers, as diskGiBOf reads disk_gib: a fractional value rounds up. 0:
+// absent or not a positive number. The hotel's list always carries both
+// (cathedral/sandbox_api.py Resources: integers, memory_gib 1 to 64).
+func usageSizeOf(resources any) (vcpu, memGiB int64) {
 	m, _ := resources.(map[string]any)
-	num := func(k string) float64 {
-		if v, ok := m[k].(float64); ok && v > 0 && !math.IsInf(v, 0) {
-			return v
+	num := func(k string) int64 {
+		switch v := m[k].(type) {
+		case float64:
+			if v > 0 && v < math.MaxInt32 {
+				return int64(math.Ceil(v))
+			}
+		case int:
+			return int64(max(v, 0))
 		}
 		return 0
 	}
