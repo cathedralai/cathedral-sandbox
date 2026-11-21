@@ -253,11 +253,8 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 	case p == "/v1/quota" && r.Method == "GET":
 		b.compatQuota(w, r, g)
 	case p == "/v1/usage" && r.Method == "GET":
-		c := &capture{hdr: http.Header{}, status: 200}
-		b.handleUsage(c, r, g)
-		var doc map[string]any
-		_ = json.Unmarshal(c.buf.Bytes(), &doc)
-		writeJSON(w, 200, map[string]any{"as_of": time.Now().UTC().Format(time.RFC3339), "groups": []any{}, "hotels": doc["hotels"]})
+		writeJSON(w, 200, map[string]any{"as_of": time.Now().UTC().Format(time.RFC3339), "groups": []any{},
+			"hotels": b.usageParts(r, g), "cost": usageCostNote, "price_doc": usagePriceDoc})
 	case strings.HasPrefix(p, "/v1/sandboxes/"):
 		b.compatRoom(w, r, g, strings.TrimPrefix(p, "/v1/sandboxes/"))
 	default:

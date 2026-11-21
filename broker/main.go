@@ -2074,11 +2074,59 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 	writeJSON(w, 200, total)
 }
 
-func (b *broker) handleUsage(w http.ResponseWriter, r *http.Request, g *guestState) {
+// A hotel's /v1/usage prices its hours with an illustrative rate card (cathedral/sandbox_api.py
+// Pricing), about 8x the list price on 21 Nov 2026 (AB#870). The broker holds no price, so a guest
+// gets hours only: each hotel part keeps an allowlist of fields, and the answer says where prices are.
+const usageCostNote = "not_priced_here"
+const usagePriceDoc = "https://cathedral.computer/pricing/"
+
+func usageHoursOnly(raw json.RawMessage) any {
+	var doc map[string]any
+	if json.Unmarshal(raw, &doc) != nil || doc == nil {
+		return map[string]any{"error": "unavailable"}
+	}
+	if e, ok := doc["error"]; ok {
+		return map[string]any{"error": e}
+	}
+	out := map[string]any{}
+	if v, ok := doc["group_by"].(string); ok {
+		out["group_by"] = v
+	}
+	if v, ok := doc["snapshot_gib_months"].(float64); ok {
+		out["snapshot_gib_months"] = v
+	}
+	groups := map[string]any{}
+	if gs, ok := doc["groups"].(map[string]any); ok {
+		for name, gv := range gs {
+			gm, ok := gv.(map[string]any)
+			if !ok {
+				continue
+			}
+			kept := map[string]any{}
+			for _, k := range []string{"sandbox_hours", "vcpu_hours", "gib_hours"} {
+				if v, ok := gm[k].(float64); ok {
+					kept[k] = v
+				}
+			}
+			groups[name] = kept
+		}
+	}
+	out["groups"] = groups
+	return out
+}
+
+func (b *broker) usageParts(r *http.Request, g *guestState) map[string]any {
 	q := r.URL.Query()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
-	parts := b.fanout(r.Context(), g, "/v1/usage", q)
-	writeJSON(w, 200, map[string]any{"hotels": parts})
+	parts := map[string]any{}
+	for hid, raw := range b.fanout(r.Context(), g, "/v1/usage", q) {
+		parts[hid] = usageHoursOnly(raw)
+	}
+	return parts
+}
+
+func (b *broker) handleUsage(w http.ResponseWriter, r *http.Request, g *guestState) {
+	writeJSON(w, 200, map[string]any{"hotels": b.usageParts(r, g), "cost": usageCostNote, "price_doc": usagePriceDoc})
 }
 
 func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *guestState) {
