@@ -1278,6 +1278,9 @@ func (b *broker) usageSightingOfListed(h *hotel, id string, labels map[string]st
 	}
 	s := usageListSighting(h, id, labels, resources)
 	s.billable = !h.recordedLeftover(id, labels)
+	if s.guest == poolGuestID { // a ready-room pool room is never billable (pool.go)
+		s.billable, s.pool = false, true
+	}
 	return s
 }
 

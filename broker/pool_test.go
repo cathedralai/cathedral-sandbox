@@ -464,15 +464,14 @@ func TestPoolManagerOffWhenJournalIncomplete(t *testing.T) {
 	}
 }
 
-// Pool creates go only to operator, shared, sealed hotels with a verified
-// attestation where the image is warm.
+// Pool creates go only to operator, shared hotels with a verified
+// attestation where the image is warm. (Every hotel is sealed since AB#776:
+// the loader refuses any other, so there is no unsealed case to test here.)
 func TestPoolOnlyOnOperatorSealedAttestedWarmHotels(t *testing.T) {
-	ids := []string{"ok", "cold", "unattested", "unsealed", "reserved", "gate-off", "miner"}
+	ids := []string{"ok", "cold", "unattested", "reserved", "gate-off", "miner"}
 	pc := newPoolChain(t, ids, func(c *config) {
 		for i := range c.Hotels {
 			switch c.Hotels[i].ID {
-			case "unsealed":
-				c.Hotels[i].Sealed = false
 			case "reserved":
 				c.Hotels[i].ReservedFor = "g1"
 			case "gate-off":
@@ -487,7 +486,7 @@ func TestPoolOnlyOnOperatorSealedAttestedWarmHotels(t *testing.T) {
 	for _, id := range []string{"ok", "reserved", "gate-off", "miner"} {
 		pc.up(id)
 	}
-	for _, id := range []string{"cold", "unattested", "unsealed"} {
+	for _, id := range []string{"cold", "unattested"} {
 		pc.sync(id)
 		pc.sync(id)
 	}
@@ -513,7 +512,7 @@ func TestPoolOnlyOnOperatorSealedAttestedWarmHotels(t *testing.T) {
 	}
 	_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
 	hs := doc["hotels"].(map[string]any)
-	for id, why := range map[string]string{"cold": "not warm", "unattested": "no verified attestation", "unsealed": "not a sealed hotel",
+	for id, why := range map[string]string{"cold": "not warm", "unattested": "no verified attestation",
 		"reserved": "reserved for a guest", "gate-off": "no verified attestation", "miner": "miner hotel"} {
 		if got, _ := hs[id].(map[string]any)["why_no_creates"].(string); !strings.Contains(got, why) {
 			t.Fatalf("hotel %s: why_no_creates %q, want %q", id, got, why)

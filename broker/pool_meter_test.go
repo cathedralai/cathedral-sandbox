@@ -60,3 +60,21 @@ func TestPoolRunIsNotRoundedUpByTheMinimumSecond(t *testing.T) {
 		t.Fatalf("pool readings with the minimum second on: %+v", rs)
 	}
 }
+
+// A listed pool room that is not in the room map (the list paths #656 added,
+// usageSightingOfListed) is not billable either: a pool room is never
+// billable on any sighting path.
+func TestPoolListedRoomOutsideTheRoomMapIsNotBillable(t *testing.T) {
+	b := &broker{}
+	h := &hotel{cfg: hotelConfig{ID: "h"}, rooms: map[string]*room{}}
+	b.mu.Lock()
+	s := b.usageSightingOfListed(h, "p9", map[string]string{guestLabel: poolGuestID, poolLabel: "1"}, nil)
+	c := b.usageSightingOfListed(h, "c9", map[string]string{guestLabel: "g1"}, nil)
+	b.mu.Unlock()
+	if s.billable || !s.pool || s.guest != poolGuestID {
+		t.Fatalf("listed pool room sighting %+v", s)
+	}
+	if !c.billable || c.pool {
+		t.Fatalf("listed customer room sighting %+v, want billable as #656 has it", c)
+	}
+}

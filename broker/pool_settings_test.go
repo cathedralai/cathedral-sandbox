@@ -144,7 +144,7 @@ func TestReadyRoomsConfigRefusals(t *testing.T) {
 		key := filepath.Join(dir, "k")
 		_ = os.WriteFile(key, []byte("hotel-key"), 0o600)
 		c := config{Listen: "127.0.0.1:1", StateDir: filepath.Join(dir, "state"),
-			Hotels:     []hotelConfig{{ID: "a", API: "http://127.0.0.1:2", Health: "http://127.0.0.1:2", KeyFile: key}},
+			Hotels:     []hotelConfig{{ID: "a", API: "http://127.0.0.1:2", Health: "http://127.0.0.1:2", KeyFile: key, Sealed: true}},
 			ReadyRooms: &readyRoomsConfig{Guest: poolGuestID, Keys: []readyRoomKeyEntry{{Template: "node-22"}}}}
 		mutate(&c)
 		raw, _ := json.Marshal(c)

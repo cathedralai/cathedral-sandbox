@@ -9,13 +9,13 @@
 //
 // Where pool rooms are made. A hotel takes pool creates only when it is an
 // operator hotel (no miner hotkey), shared (not reserved for a guest),
-// sealed, admitted with a verified SEV-SNP attestation whose AMD chain passed
-// and whose binding names a receipt key, and it would place a room now
-// (admissibleFree, diskFits); and a key's rooms go only where that key's
-// image is warm (the catalog pre-pull, prewarm.go). At most 1 pool create a second per hotel: a
-// create starts no sooner than poolCreateEvery after the previous one's
-// answer, and a create slot is taken without waiting, so a customer create
-// never waits for a pool create.
+// admitted with a verified SEV-SNP attestation whose AMD chain passed and
+// whose binding names a receipt key (every hotel is sealed, AB#776), and it
+// would place a room now (admissibleFree, diskFits); and a key's rooms go
+// only where that key's image is warm (the catalog pre-pull, prewarm.go).
+// At most 1 pool create a second per hotel: a create starts no sooner than
+// poolCreateEvery after the previous one's answer, and a create slot is
+// taken without waiting, so a customer create never waits for a pool create.
 //
 // Body of a pool create, exactly: image, resources, network (deny_all, empty
 // allow), labels (cathedral_pool "1" and the broker guest label of
@@ -270,7 +270,7 @@ func (b *broker) runPool(ctx context.Context) {
 // when the hotel has no verified attestation the pool may use. Caller holds
 // b.mu.
 func (b *broker) poolAttestLocked(h *hotel, ph *poolHotel, now time.Time) (poolAttest, bool) {
-	if b.cfg.ReadyRoomsUnsealedForTests && admissionOff(h) && h.cfg.Sealed && loopbackURL(h.cfg.API) && loopbackURL(h.cfg.Health) {
+	if b.cfg.ReadyRoomsUnsealedForTests && admissionOff(h) && loopbackURL(h.cfg.API) && loopbackURL(h.cfg.Health) {
 		if ph.level1 == nil || !h.ok {
 			return poolAttest{}, false
 		}
@@ -298,8 +298,6 @@ func (b *broker) poolCreateRefusalLocked(h *hotel, ph *poolHotel, now time.Time)
 		return "miner hotel"
 	case h.reservedFor() != "":
 		return "reserved for a guest"
-	case !h.cfg.Sealed:
-		return "not a sealed hotel"
 	}
 	if _, ok := b.poolAttestLocked(h, ph, now); !ok {
 		return "no verified attestation with a receipt key"
@@ -520,7 +518,7 @@ func (b *broker) poolLevel1(ctx context.Context, h *hotel) {
 	if !h.ok {
 		ph.level1 = nil // a hotel that comes back may have a new front
 	}
-	due := admissionOff(h) && h.cfg.Sealed && loopbackURL(h.cfg.API) && loopbackURL(h.cfg.Health) && h.ok &&
+	due := admissionOff(h) && loopbackURL(h.cfg.API) && loopbackURL(h.cfg.Health) && h.ok &&
 		(ph.level1 == nil || ph.reattest || now.Sub(ph.level1At) >= b.attestEvery())
 	b.mu.Unlock()
 	if !due {

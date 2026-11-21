@@ -28,11 +28,13 @@
 // the claim path, and every hotel gets at most 1 pool create a second.
 //
 // ready_rooms_unsealed_for_tests (LOAD-RIG.md 6.2, the Mac rig only) also lets
-// the pool use a sealed hotel with "sealed_admission": "off" whose receipts
-// front runs at level 1 (an Ed25519 hotel chain, no SNP report). It is
-// refused at load unless ready_rooms is set and the listen address and every
-// hotel's api and health are on 127.0.0.1. Production pool rooms stay on
-// hotels with a verified SEV-SNP attestation.
+// the pool use a hotel with "sealed_admission": "off" (the config-only ops
+// escape) whose receipts front runs at level 1 (an Ed25519 hotel chain, no
+// SNP report). It is refused at load unless ready_rooms is set and the
+// listen address and every hotel's api and health are on 127.0.0.1, and a
+// hotel that joins later is used that way only when it is on 127.0.0.1 too
+// (a joined hotel cannot turn the gate off anyway). Production pool rooms
+// stay on hotels with a verified SEV-SNP attestation.
 package main
 
 import (
