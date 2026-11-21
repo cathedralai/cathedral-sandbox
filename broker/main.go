@@ -142,8 +142,12 @@ type guestConfig struct {
 	// LiveShares lets this guest mint share links to its live view (AB#584).
 	// Off unless set: with it off, /v1/live/shares answers 403 and no share
 	// link or cookie opens the view.
-	LiveShares  bool `json:"live_shares,omitempty"`
-	guestLimits      // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
+	LiveShares bool `json:"live_shares,omitempty"`
+	// EscapeFreshGuest opts the guest into the AB#683 fresh guest capability
+	// on /v1/quota (fresh_guest.go). Absent: off. Present, it is still not
+	// advertised until this build implements the enforcement it names.
+	EscapeFreshGuest *freshGuestConfig `json:"escape_fresh_guest,omitempty"`
+	guestLimits                        // max_rooms, max_creates_per_minute, default_sealed, hotels (guests.go)
 }
 
 type config struct {
@@ -722,6 +726,9 @@ func loadBroker(path string) (*broker, error) {
 			if err := gc.Policy.validate(); err != nil {
 				return nil, fmt.Errorf("config: guest %q: %w", gc.ID, err)
 			}
+		}
+		if err := validateFreshGuestConfig(gc); err != nil {
+			return nil, err
 		}
 		g := &guestState{cfg: gc, limits: gc.guestLimits}
 		g.limits.Hotels = append([]string(nil), gc.Hotels...)
@@ -2271,6 +2278,7 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 		}
 	}
 	lim := g.limits
+	fresh := b.freshGuestAdvertisement(g, lim)
 	b.mu.Unlock()
 	allowed := lim.Hotels
 	if allowed == nil {
@@ -2279,6 +2287,11 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 	total["hotels"] = hotels
 	total["guest"] = map[string]any{"id": g.cfg.ID, "running_sandboxes": mine, "max_rooms": lim.maxRooms(),
 		"max_creates_per_minute": lim.MaxCreatesPerMinute, "default_sealed": lim.DefaultSealed, "allowed_hotels": allowed}
+	if fresh != nil {
+		total["escape_fresh_guest"] = fresh
+	}
+	// The fresh guest capability must not outlive a broker downgrade (AB#683).
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, total)
 }
 
