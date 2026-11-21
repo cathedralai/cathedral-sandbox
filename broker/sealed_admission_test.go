@@ -262,6 +262,14 @@ func TestSealedAdmissionOffIsRefusedForMinersJoinsAndContradictions(t *testing.T
 		cfg.MinGenoaSNPSPL = bad
 		mustNotLoad(t, cfg, "min_genoa_snp_spl must be an 8-bit")
 	}
+	microcodeWithEscape := base(hotelConfig{ID: "s", Sealed: true, SealedAdmission: "off"})
+	microcodeWithEscape.MinGenoaMicrocodeSPL = 0x5b
+	mustNotLoad(t, microcodeWithEscape, "sealed_admission off bypasses min_genoa_microcode_spl")
+	for _, bad := range []int{-1, 256} {
+		cfg := base(hotelConfig{ID: "s", Sealed: true})
+		cfg.MinGenoaMicrocodeSPL = bad
+		mustNotLoad(t, cfg, "min_genoa_microcode_spl must be an 8-bit")
+	}
 	top := base(hotelConfig{ID: "s", Sealed: true})
 	top.SealedAdmission = "off"
 	mustNotLoad(t, top, `top-level "sealed_admission": "off" is refused`)

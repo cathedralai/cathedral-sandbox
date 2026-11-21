@@ -516,32 +516,88 @@ func TestGenoaSnpFloorChecksEachTCBComponent(t *testing.T) {
 	}
 	encoded := func() string { return base64.StdEncoding.EncodeToString(report) }
 	amd := map[string]any{"product": "Genoa"}
-	if err := checkGenoaSnpFloor(encoded(), amd, floor); err != nil {
+	if err := checkGenoaTCBFloor(encoded(), amd, floor, 0); err != nil {
 		t.Fatalf("patched report refused: %v", err)
 	}
 	for _, field := range offsets {
 		report[field.offset+6] = floor - 1
 		// A high microcode byte must not compensate for old SNP firmware.
 		report[field.offset+7] = 0xff
-		if err := checkGenoaSnpFloor(encoded(), amd, floor); err == nil || !strings.Contains(err.Error(), field.name) {
+		if err := checkGenoaTCBFloor(encoded(), amd, floor, 0); err == nil || !strings.Contains(err.Error(), field.name) {
 			t.Fatalf("old %s SNP component passed: %v", field.name, err)
 		}
 		report[field.offset+6], report[field.offset+7] = floor, 0
 	}
-	if err := checkGenoaSnpFloor("not-base64", amd, floor); err == nil {
+	if err := checkGenoaTCBFloor("not-base64", amd, floor, 0); err == nil {
 		t.Fatal("malformed report passed")
 	}
-	if err := checkGenoaSnpFloor(base64.StdEncoding.EncodeToString(report[:100]), amd, floor); err == nil {
+	if err := checkGenoaTCBFloor(base64.StdEncoding.EncodeToString(report[:100]), amd, floor, 0); err == nil {
 		t.Fatal("short report passed")
 	}
-	if err := checkGenoaSnpFloor(encoded(), amd, 0); err != nil {
+	if err := checkGenoaTCBFloor(encoded(), amd, 0, 0); err != nil {
 		t.Fatalf("unset floor changed existing admission: %v", err)
 	}
-	if err := checkGenoaSnpFloor(encoded(), nil, floor); err == nil {
+	if err := checkGenoaTCBFloor(encoded(), nil, floor, 0); err == nil {
 		t.Fatal("missing AMD product passed")
 	}
-	if err := checkGenoaSnpFloor(encoded(), map[string]any{"product": "Milan"}, floor); err != nil {
+	if err := checkGenoaTCBFloor(encoded(), map[string]any{"product": "Milan"}, floor, 0); err != nil {
 		t.Fatalf("Genoa floor applied to Milan: %v", err)
+	}
+}
+
+func TestGenoaMicrocodeFloorChecksEachTCBComponent(t *testing.T) {
+	// AMD-SB-3061 (CVE-2026-40671): Genoa RS-B1 0x0A10115B, RS-B2 0x0A10125B.
+	// Every host on 21 Nov 2026 runs 0x0A101158 with SNP 0x1e or 0x1c.
+	const snpFloor, microcodeFloor = 0x1e, 0x5b
+	report := make([]byte, snpReportMinLen)
+	offsets := []struct {
+		name   string
+		offset int
+	}{
+		{"current", 0x38}, {"reported", 0x180},
+		{"committed", 0x1E0}, {"launch", 0x1F0},
+	}
+	set := func(snp, microcode byte) {
+		for _, field := range offsets {
+			report[field.offset+6], report[field.offset+7] = snp, microcode
+		}
+	}
+	encoded := func() string { return base64.StdEncoding.EncodeToString(report) }
+	amd := map[string]any{"product": "Genoa"}
+
+	set(0x1e, 0x58) // today's patched-SNP host: passes the SNP floor alone
+	if err := checkGenoaTCBFloor(encoded(), amd, snpFloor, 0); err != nil {
+		t.Fatalf("SNP-only floor refused a 0x1e host: %v", err)
+	}
+	if err := checkGenoaTCBFloor(encoded(), amd, snpFloor, microcodeFloor); err == nil || !strings.Contains(err.Error(), "current TCB microcode component below 5b") {
+		t.Fatalf("pre-SB-3061 microcode 0x58 passed the microcode floor: %v", err)
+	}
+	set(0x1e, microcodeFloor)
+	if err := checkGenoaTCBFloor(encoded(), amd, snpFloor, microcodeFloor); err != nil {
+		t.Fatalf("fixed microcode refused: %v", err)
+	}
+	for _, field := range offsets {
+		report[field.offset+7] = microcodeFloor - 1
+		// A high SNP byte must not compensate for old microcode.
+		report[field.offset+6] = 0xff
+		if err := checkGenoaTCBFloor(encoded(), amd, snpFloor, microcodeFloor); err == nil || !strings.Contains(err.Error(), field.name+" TCB microcode") {
+			t.Fatalf("old %s microcode component passed: %v", field.name, err)
+		}
+		report[field.offset+6], report[field.offset+7] = 0x1e, microcodeFloor
+	}
+	set(0x1c, 0xff) // new microcode does not hide old SNP firmware
+	if err := checkGenoaTCBFloor(encoded(), amd, snpFloor, microcodeFloor); err == nil || !strings.Contains(err.Error(), "SNP component below 1e") {
+		t.Fatalf("old SNP firmware passed with new microcode: %v", err)
+	}
+	set(0x1c, 0x58)
+	if err := checkGenoaTCBFloor(encoded(), amd, 0, 0); err != nil {
+		t.Fatalf("unset floors changed existing admission: %v", err)
+	}
+	if err := checkGenoaTCBFloor(encoded(), map[string]any{"product": "Milan"}, 0, microcodeFloor); err != nil {
+		t.Fatalf("Genoa microcode floor applied to Milan: %v", err)
+	}
+	if err := checkGenoaTCBFloor(encoded(), nil, 0, microcodeFloor); err == nil {
+		t.Fatal("missing AMD product passed the microcode floor")
 	}
 }
 
