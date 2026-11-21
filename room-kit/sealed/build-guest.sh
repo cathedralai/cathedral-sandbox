@@ -39,6 +39,26 @@ print(" ".join(dict.fromkeys(keys)) if ok else "")' "${SEALED_HOTEL_KEY_INSTALL_
   [ -n "$MINER_SIGNERS" ] || { echo "SEALED_MINER=1 needs SEALED_HOTEL_KEY_INSTALL_SIGNERS: 1 to 4 base64 Ed25519 public keys" >&2; exit 1; }
 fi
 
+# Docker Hub mirrors for the guest's dockerd (daemon.json registry-mirrors, AB#854). Part of
+# the measured room.env. Unset keeps mirror.gcr.io, so a hotel that does not set it builds the
+# same room.env bytes as before. 1 to 4 https origins (host and optional port, no path, no
+# login): dockerd tries them in order, then Docker Hub; a mirror answering 404 is skipped.
+# Checked before the long build.
+# >>> registry mirrors (tests/test_ab854_sealed_registry_mirrors.py runs this block)
+read -r -d '' -a mirror_list <<< "${SEALED_ROOM_REGISTRY_MIRRORS:-https://mirror.gcr.io}" || true
+REGISTRY_MIRRORS="${mirror_list[*]}"  # one space between entries, whatever whitespace sealed.env used
+mirror_count=0
+for mirror in "${mirror_list[@]}"; do
+  if ! [[ "$mirror" =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$ ]]; then
+    echo "SEALED_ROOM_REGISTRY_MIRRORS: '$mirror' is not an https origin (https://host[:port], lower case, no path or login)" >&2; exit 1
+  fi
+  mirror_count=$((mirror_count + 1))
+done
+if [ "$mirror_count" -lt 1 ] || [ "$mirror_count" -gt 4 ]; then
+  echo "SEALED_ROOM_REGISTRY_MIRRORS needs 1 to 4 mirrors" >&2; exit 1
+fi
+# <<< registry mirrors
+
 # Persistent data volume (docs/SEALED_DATA_VOLUME.md): checked before the long
 # build. It holds workspaces only, so it needs them on.
 DATA_GIB=${SEALED_DATA_GIB:-0}
@@ -208,7 +228,7 @@ ROOM_API_PORT=18090
 ROOM_HEALTH_PORT=18091
 ROOM_PUBLIC_PORT=443
 ROOM_TLS=off
-ROOM_REGISTRY_MIRRORS="https://mirror.gcr.io"
+ROOM_REGISTRY_MIRRORS="$REGISTRY_MIRRORS"
 ROOM_DATA_DIR=/srv/room-sealed
 ROOM_DATA_DEVICE=/dev/mapper/sealed-scratch
 ROOM_DATA_DEVICE_WIPE=yes
