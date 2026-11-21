@@ -60,6 +60,7 @@ type installGuest struct {
 
 	prefetch401 int            // POST /v1/images/prefetch answered 401 (no key installed)
 	pulled      map[string]int // keyed prefetch pulls by "<guest header> <image>"
+	dataPct     *float64       // room_data_used_pct that health reports; nil: none
 }
 
 func newInstallGuest(t *testing.T, hotel string, signers ...string) *installGuest {
@@ -156,7 +157,11 @@ func (g *installGuest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/room/health":
-		writeJSON(w, 200, map[string]any{"slots": 4})
+		doc := map[string]any{"slots": 4}
+		if g.dataPct != nil {
+			doc["live"] = map[string]any{"room_data_used_pct": *g.dataPct}
+		}
+		writeJSON(w, 200, doc)
 	case "/v1/quota":
 		writeJSON(w, 200, map[string]any{"usage": map[string]float64{}})
 	case "/v1/sandboxes":
@@ -633,6 +638,59 @@ func TestGuestReplayWaitsForALateKeyInstall(t *testing.T) {
 		defer tc.b.mu.Unlock()
 		return h.guestWarm["g1"][guestImage]
 	})
+}
+
+// reportsScratch makes the guest's health report its scratch at pct used.
+func (g *installGuest) reportsScratch(pct float64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.dataPct = &pct
+}
+
+// A held catalog pull starts after the install pass read the scratch, so it
+// uses this boot's reading, not the one from before the reboot, for the
+// full-disk skip (prewarmSkipsFullDisk, #651).
+func TestHeldCatalogPullUsesTheScratchReadAfterTheInstall(t *testing.T) {
+	signerFile, signer, _ := installSeedFile(t, 0o600)
+	tc := newChainState(t, t.TempDir())
+	g := newInstallGuest(t, "ct", signer)
+	g.reportsScratch(10)
+	h := prewarmInstallHotel(t, tc, signerFile, g, true)
+	before := 99.0
+	setHotel(tc, "ct", func(h *hotel) { h.roomDataPct = &before }) // the scratch before the guest rebooted
+	upWithoutKey(t, tc, g, h)
+	installNow(t, tc, g, h)
+	pulledOnce(t, tc, g, h, catalogPulls(t, h))
+	tc.b.mu.Lock()
+	skipped := len(h.prewarmFull)
+	tc.b.mu.Unlock()
+	if skipped != 0 {
+		t.Fatalf("%d catalog images skipped for a full scratch on a 10%% used scratch", skipped)
+	}
+}
+
+// A held catalog pull still waits on a full scratch, as a come-up pull does.
+func TestHeldCatalogPullSkipsAFullScratch(t *testing.T) {
+	signerFile, signer, _ := installSeedFile(t, 0o600)
+	tc := newChainState(t, t.TempDir())
+	g := newInstallGuest(t, "ct", signer)
+	g.reportsScratch(99)
+	h := prewarmInstallHotel(t, tc, signerFile, g, true)
+	upWithoutKey(t, tc, g, h)
+	installNow(t, tc, g, h)
+	waitFor(t, "the full-scratch skip of "+warmImage, func() bool {
+		tc.b.mu.Lock()
+		defer tc.b.mu.Unlock()
+		return h.prewarmFull[warmImage]
+	})
+	time.Sleep(200 * time.Millisecond)
+	refused, pulled := g.prefetches()
+	tc.b.mu.Lock()
+	warm := len(h.warm)
+	tc.b.mu.Unlock()
+	if refused != 0 || len(pulled) != 0 || warm != 0 {
+		t.Fatalf("full scratch: %d prefetches answered 401, pulls %v, %d warm; want none", refused, pulled, warm)
+	}
 }
 
 // The usual order: the install lands in the sync pass before health first
