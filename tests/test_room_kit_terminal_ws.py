@@ -283,3 +283,112 @@ def test_wants_websocket(headers, want) -> None:
     for k, v in headers.items():
         msg[k] = v
     assert rr.wants_websocket(msg) is want
+
+
+# AB#405 step 3: the front's limits match the hotel PTY socket's, and the subprotocol passes through.
+
+def test_the_front_idle_backstop_follows_the_hotel_pty_idle() -> None:
+    from cathedral import sandbox_server
+
+    assert rr.HOTEL_PTY_IDLE_SECONDS == sandbox_server.PTY_WS_IDLE_SECONDS
+    # Later than the hotel, so the hotel's own idle close frame reaches the caller first.
+    assert rr.HOTEL_PTY_IDLE_SECONDS < rr.WS_IDLE_SECONDS <= rr.HOTEL_PTY_IDLE_SECONDS + 60
+
+
+def test_a_silent_caller_is_ended_by_the_front_with_an_idle_close_receipt(stack, monkeypatch) -> None:
+    port, ledger, _api_port = stack
+    monkeypatch.setattr(rr, "WS_IDLE_SECONDS", 0.5)
+    room, tid, ticket = _terminal(port)
+    sock, head, _got = _handshake(port, f"/v1/sandboxes/{room}/terminals/{tid}/ws", ticket)
+    try:
+        assert b" 101 " in head.split(b"\r\n", 1)[0] + b" "
+        closed = _wait_for(ledger, "terminal_session_close")["statement"]
+    finally:
+        sock.close()
+    assert closed["close_reason"] == "idle" and closed["client_bytes"] == 0
+
+
+def test_an_input_frame_over_the_hotel_limit_gets_the_hotel_1009_through_the_front(stack) -> None:
+    from cathedral import sandbox_server
+
+    port, ledger, _api_port = stack
+    room, tid, ticket = _terminal(port)
+    sock, head, got = _handshake(port, f"/v1/sandboxes/{room}/terminals/{tid}/ws", ticket)
+    assert b" 101 " in head.split(b"\r\n", 1)[0] + b" "
+    # Far over the limit, so the hotel sees the unfinished frame pass 64 KiB + 16 before it is whole.
+    big = ws.encode_frame(b"x" * (16 * sandbox_server.PTY_WS_MAX_FRAME), opcode=ws.OP_BINARY, masked=True)
+
+    def push() -> None:
+        try:
+            sock.sendall(big)
+        except OSError:
+            pass  # the far side may close before the whole frame is in
+
+    pusher = threading.Thread(target=push, daemon=True)
+    pusher.start()
+    received = bytearray(got)
+    try:
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            received += chunk
+    finally:
+        pusher.join(5)
+        sock.close()
+    frames, _ = ws.decode_frames(bytearray(received))
+    close = next(p for op, p in frames if op == ws.OP_CLOSE)
+    assert struct.unpack("!H", close[:2])[0] == 1009 and close[2:] == b"terminal_input_too_large", close
+    closed = _wait_for(ledger, "terminal_session_close")["statement"]
+    assert 0 < closed["client_bytes"] <= len(big)
+    assert closed["room_bytes"] == len(received) and closed["room_sha256"] == hashlib.sha256(received).hexdigest()
+
+
+def test_the_terminal_subprotocol_offer_reaches_the_api_and_its_choice_comes_back(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "tsm_provider", lambda: None)
+    api = socket.socket()
+    api.bind(("127.0.0.1", 0))
+    api.listen(1)
+    seen: list[bytes] = []
+
+    def answer() -> None:
+        conn, _ = api.accept()
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += conn.recv(4096)
+        seen.append(buf)
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     b"Sec-WebSocket-Accept: x\r\nSec-WebSocket-Protocol: cathedral.terminal.v1\r\n\r\n")
+        conn.close()
+
+    threading.Thread(target=answer, daemon=True).start()
+    ledger = rr.Ledger("room-a", str(tmp_path))
+    front = rr.Server(("127.0.0.1", 0), ledger, api.getsockname()[1], 1, KEY, "/x.sock", pool_scan=False)
+    threading.Thread(target=front.serve_forever, daemon=True).start()
+    offer = "cathedral.terminal.v1, cathedral.ticket.tkt"
+    try:
+        sock = socket.create_connection(front.server_address, timeout=10)
+        sock.sendall(("GET /v1/sandboxes/sbx_1/terminals/t_1/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+                      "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                      f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {offer}\r\n"
+                      "Authorization: Bearer agent-k1\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        sock.close()
+        head = buf.partition(b"\r\n\r\n")[0]
+        assert b" 101 " in head.split(b"\r\n", 1)[0] + b" "
+        assert _headers(head)["sec-websocket-protocol"] == "cathedral.terminal.v1"
+        assert f"Sec-WebSocket-Protocol: {offer}\r\n".encode() in seen[0]
+        assert b"Upgrade: websocket\r\n" in seen[0]
+        _wait_for(ledger, "terminal_session_close")
+    finally:
+        front.shutdown()
+        front.server_close()
+        api.close()
