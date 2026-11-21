@@ -377,6 +377,14 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	w := &poolWork{}
 	w.att, w.attOK = b.poolAttestLocked(h, ph, now)
 	if w.attOK {
+		for _, pr := range ph.rooms {
+			if pr.state == poolReady && !pr.att.same(w.att) {
+				pr.state, pr.why = poolStale, "the hotel's binding or receipt key changed"
+			}
+		}
+	}
+	b.poolAlarmLocked(h, ph, now)
+	if w.attOK {
 		for _, pr := range sortedPoolRooms(ph) {
 			if pr.state == poolUnverified && !now.Before(pr.retryAt) && len(w.reads) < poolReadsPerStep {
 				w.reads = append(w.reads, pr.hid)
@@ -385,8 +393,19 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	}
 	ready := map[string][]*poolRoom{}
 	for _, pr := range sortedPoolRooms(ph) {
-		if pr.state == poolReady {
-			ready[pr.key] = append(ready[pr.key], pr)
+		if pr.state != poolReady {
+			continue
+		}
+		if !pr.expiresAt.IsZero() && pr.expiresAt.Sub(now) <= poolRetireLeft {
+			pr.state, pr.why = poolStale, "retired: 20 minutes left"
+			continue
+		}
+		ready[pr.key] = append(ready[pr.key], pr)
+	}
+	for name, list := range ready {
+		// Oldest first: they retire first anyway.
+		for i := 0; i < len(list)-p.settings.target(name); i++ {
+			list[i].state, list[i].why = poolStale, "over target"
 		}
 	}
 	if h.ok {
@@ -396,7 +415,7 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 			}
 		}
 	}
-	if b.poolCreateRefusalLocked(h, ph, now) != "" || now.Before(ph.nextCreate) {
+	if b.poolCreateRefusalLocked(h, ph, now) != "" || now.Before(ph.nextCreate) || ph.full {
 		return w
 	}
 	c := p.countsLocked(h.cfg.ID)
@@ -426,6 +445,32 @@ func sortedPoolRooms(ph *poolHotel) []*poolRoom {
 		return out[i].hid < out[j].hid
 	})
 	return out
+}
+
+// poolAlarmLocked raises the quarantine alarm: when a hotel's quarantine
+// grows (at most once per alertCooldown), and when it fills the pool bound,
+// which stops refill there. Caller holds b.mu.
+func (b *broker) poolAlarmLocked(h *hotel, ph *poolHotel, now time.Time) {
+	c := b.pool.countsLocked(h.cfg.ID)
+	bound := b.pool.boundLocked()
+	full := bound > 0 && c.quarantined >= bound
+	switch {
+	case c.quarantined == 0:
+		ph.alarm, ph.alarmQ, ph.full = "", 0, false
+		return
+	case full && !ph.full:
+	case c.quarantined > ph.alarmQ && now.Sub(ph.alarmAt) >= alertCooldown:
+	default:
+		ph.full = full
+		return
+	}
+	ph.full = full
+	ph.alarmQ, ph.alarmAt = c.quarantined, now
+	ph.alarm = fmt.Sprintf("%s: %d pool rooms quarantined (kept, never handed out, never deleted; they end at their hotel lifetime); pool bound %d", hotelAlertName(h), c.quarantined, bound)
+	if full {
+		ph.alarm += "; quarantine fills the bound: no pool refill on this hotel"
+	}
+	b.alerts.send("ready_rooms", b.alerts.opsChat, ph.alarm, nil, nil)
 }
 
 // poolLevel1 reads the level-1 binding of a rig front
@@ -482,6 +527,22 @@ func (b *broker) poolLevel1(ctx context.Context, h *hotel) {
 	ph.level1, ph.level1At, ph.reattest = att, now, false
 }
 
+// poolBindingMovedLocked handles a receipt that names another binding than
+// the attested one: the front restarted or the attestation is old. Every
+// ready room of the hotel turns stale (design 6.5) and the hotel is attested
+// again at once. Caller holds b.mu.
+func (b *broker) poolBindingMovedLocked(h *hotel, ph *poolHotel) {
+	for _, pr := range ph.rooms {
+		if pr.state == poolReady {
+			pr.state, pr.why = poolStale, "a receipt of this hotel names another binding"
+		}
+	}
+	ph.reattest = true
+	if strictAttestation(h) {
+		h.adm.checkedAt = time.Time{} // the sync loop attests again on its next pass
+	}
+}
+
 // poolRead reads one unverified room's receipts through the front.
 func (b *broker) poolRead(ctx context.Context, h *hotel, hid string, att poolAttest) {
 	status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes/"+url.PathEscape(hid)+"/receipts", nil, nil, poolReadTimeout)
@@ -507,8 +568,10 @@ func (b *broker) poolRead(ctx context.Context, h *hotel, hid string, att poolAtt
 	k := b.pool.keyByImage(image)
 	switch {
 	case errors.Is(verr, errPoolReceiptBinding):
-		// The front's chain is another than the attested one: read again
-		// later. Until then the room stays set aside.
+		// The front's chain is another than the attested one: attest again,
+		// and read again under the binding that comes back. Until then the
+		// room stays set aside.
+		b.poolBindingMovedLocked(h, ph)
 		pr.tries++
 		pr.retryAt = now.Add(poolRetry(pr.tries))
 		pr.why = "receipts read: " + verr.Error()
@@ -660,6 +723,9 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 		pr.state, pr.why = poolStale, "its receipt 1 names image "+strconv.Quote(image)
 	default:
 		pr.state, pr.why = poolStale, "no verified pool receipt: "+derr.Error()
+		if errors.Is(derr, errPoolReceiptBinding) {
+			b.poolBindingMovedLocked(h, ph)
+		}
 	}
 	ph.rooms[hid] = pr
 	b.mu.Unlock()

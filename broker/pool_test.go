@@ -12,11 +12,49 @@ import (
 	"time"
 )
 
+// letGo makes hotel id's room map drop rooms its list no longer shows, as the
+// sync loop does after its grace times.
+func (pc *poolChain) letGo(id string) {
+	h := pc.b.hotelByID(id)
+	for i := 0; i < 2; i++ {
+		pc.b.mu.Lock()
+		for _, rm := range h.rooms {
+			rm.since, rm.vanished = time.Now().Add(-time.Minute), time.Now().Add(-time.Minute)
+		}
+		pc.b.mu.Unlock()
+		pc.sync(id)
+	}
+}
+
 // readingsOfRun is the usage readings of run in pc's log.
 func (pc *poolChain) readingsOfRun(run string) []usageReading {
 	pc.t.Helper()
 	mustFlush(pc.t, pc.b.usageMeter)
 	return readingsOf(logReadings(pc.t, filepath.Join(pc.stateDir, usageDirName)), run)
+}
+
+// breakJournal stops pc's broker's journal, writes one record, and removes
+// every segment, so the next open finds a listed segment missing.
+func (pc *poolChain) breakJournal() {
+	pc.t.Helper()
+	pc.b.pool.close()
+	j, _, err := openClaimJournal(pc.stateDir)
+	if err != nil {
+		pc.t.Fatal(err)
+	}
+	if err := <-j.append(claimRecord{Kind: "won", Body: json.RawMessage(`{"request_key":"k1"}`)}); err != nil {
+		pc.t.Fatal(err)
+	}
+	_ = j.close()
+	segs, _ := filepath.Glob(filepath.Join(pc.stateDir, claimJournalDirName, "gen-*", "*.jsonl"))
+	if len(segs) == 0 {
+		pc.t.Fatal("the journal has no segment to remove")
+	}
+	for _, s := range segs {
+		if err := os.Remove(s); err != nil {
+			pc.t.Fatal(err)
+		}
+	}
 }
 
 func notBillable(r usageReading) bool { return r.Billable != nil && !*r.Billable }
@@ -99,6 +137,126 @@ func TestPoolRoomWithoutPoolReceiptIsDeleted(t *testing.T) {
 	}
 }
 
+// A binding change (a receipts front restart) turns every ready room stale:
+// deleted and replaced under the new binding, never ready again. Seen by the
+// next attestation, or at once by a create receipt that names another
+// binding.
+func TestPoolRoomsTurnStaleOnBindingChange(t *testing.T) {
+	t.Run("next attestation", func(t *testing.T) {
+		pc := newPoolChain(t, []string{"a"}, func(c *config) { c.AttestEverySeconds = 0.001 })
+		f := pc.hotels["a"]
+		pc.up("a")
+		pc.target(3)
+		pc.fill("a", 3)
+		f.set(func(f *fakePoolHotel) { f.newBinding() })
+		pc.sync("a") // attests: the new binding
+		pc.step("a")
+		dels := f.roomDeletes()
+		if len(dels) != 3 {
+			t.Fatalf("%d deletes after the binding change, want the 3 stale rooms\n%s", len(dels), pc.debug("a"))
+		}
+		for _, d := range dels {
+			if d.path != "/v1/sandboxes/sbx-1" && d.path != "/v1/sandboxes/sbx-2" && d.path != "/v1/sandboxes/sbx-3" {
+				t.Fatalf("deleted %s, not an old room", d.path)
+			}
+		}
+		pc.letGo("a")
+		pc.fill("a", 3)
+		if n := len(f.roomDeletes()); n != 3 {
+			t.Fatalf("%d deletes, want 3: the new rooms are ready under the new binding\n%s", n, pc.debug("a"))
+		}
+	})
+	t.Run("receipt names another binding", func(t *testing.T) {
+		pc := newPoolChain(t, []string{"a"}, nil)
+		f := pc.hotels["a"]
+		pc.up("a")
+		pc.target(2)
+		pc.fill("a", 2)
+		f.set(func(f *fakePoolHotel) { f.newBinding() })
+		pc.target(3)
+		pc.step("a") // the create's receipt names the new binding; attestation still has the old one
+		dels := f.roomDeletes()
+		if c := pc.counts("a"); len(dels) != 1 || dels[0].path != "/v1/sandboxes/sbx-3" || c.ready != 0 || c.stale != 2 {
+			t.Fatalf("deletes %v, counts %+v; want the new room deleted and both ready rooms stale\n%s", dels, c, pc.debug("a"))
+		}
+		pc.b.mu.Lock()
+		again := pc.b.hotelByID("a").adm.checkedAt.IsZero()
+		pc.b.mu.Unlock()
+		if !again {
+			t.Fatal("the hotel is not attested again at once")
+		}
+		pc.sync("a") // attests: the new binding
+		pc.step("a")
+		if n := len(f.roomDeletes()); n != 3 {
+			t.Fatalf("%d deletes, want the 2 stale rooms deleted too\n%s", n, pc.debug("a"))
+		}
+		pc.letGo("a")
+		pc.fill("a", 3)
+		if n := len(f.roomDeletes()); n != 3 {
+			t.Fatalf("%d deletes, want 3: the new rooms are ready under the new binding\n%s", n, pc.debug("a"))
+		}
+	})
+}
+
+// A guest reboot wipes every room: the sync loop ends their runs (not
+// billable), the pool forgets them, and refill waits until the hotel is
+// attested again and the image is warm again.
+func TestPoolRoomsGoneAfterGuestReboot(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	h := pc.b.hotelByID("a")
+	pc.up("a")
+	pc.target(2)
+	pc.fill("a", 2)
+	gate := make(chan struct{})
+	f.set(func(f *fakePoolHotel) {
+		f.healthFail = true
+		f.rooms = map[string]*fakePoolRoom{}
+		f.newBinding()
+		f.prefetchGate = gate // the image is cold after the reboot until this opens
+	})
+	pc.b.mu.Lock()
+	h.lastOK = time.Now().Add(-time.Minute) // health has been missing past okWindow
+	h.lastAnswer.Store(time.Now().Add(-time.Minute).UnixNano())
+	pc.b.mu.Unlock()
+	pc.sync("a") // down: attestation and warm marks are gone
+	pc.steps("a", 3)
+	if n := len(f.creates()); n != 2 {
+		t.Fatalf("%d creates while the hotel is down, want the 2 from before", n)
+	}
+	f.set(func(f *fakePoolHotel) { f.healthFail = false })
+	pc.sync("a") // up again: attested under the new binding, the pre-pull waits at the gate
+	pc.letGo("a")
+	pc.steps("a", 3)
+	if n := len(f.creates()); n != 2 {
+		t.Fatalf("%d creates while the image is cold, want 2", n)
+	}
+	if c := pc.counts("a"); c.held != 0 {
+		t.Fatalf("pool still holds %+v after the reboot\n%s", c, pc.debug("a"))
+	}
+	if n := len(f.roomDeletes()); n != 0 {
+		t.Fatalf("%d deletes of rooms the reboot removed, want 0", n)
+	}
+	for _, run := range []string{"a.sbx-1", "a.sbx-2"} {
+		rs := pc.readingsOfRun(run)
+		if len(rs) == 0 || rs[len(rs)-1].State != "ended" {
+			t.Fatalf("run %s not ended: %+v", run, rs)
+		}
+		for _, r := range rs {
+			if !notBillable(r) {
+				t.Fatalf("run %s has a billable reading %+v", run, r)
+			}
+		}
+	}
+	close(gate)
+	waitFor(t, "warm again", func() bool {
+		pc.b.mu.Lock()
+		defer pc.b.mu.Unlock()
+		return h.warm[nodeImage()]
+	})
+	pc.fill("a", 2)
+}
+
 // After a broker restart every pool-labelled room is read through the
 // front: ready only with exactly one receipt, a verified pool receipt 1;
 // otherwise quarantined. None is deleted. Reads stay at 20 a second or less.
@@ -162,6 +320,95 @@ func TestPoolRestartVerifiesByReceipts(t *testing.T) {
 	ha, _ := doc["hotels"].(map[string]any)["a"].(map[string]any)
 	if st != 200 || ha["quarantined"] != float64(3) || ha["mapped"] != float64(0) || ha["claiming"] != float64(0) {
 		t.Fatalf("GET ready-rooms %d %v", st, ha)
+	}
+}
+
+// A delivered claimed room whose journal record was lost (a segment removed)
+// is quarantined after the restart, never deleted, even with every target 0,
+// and its readings stay on the pool guest, not billable. The same holds with
+// a complete journal: the deletion rule is the room's proof, not the journal.
+func TestPoolManagerNeverDeletesAnUnprovenRoom(t *testing.T) {
+	for _, broken := range []bool{true, false} {
+		name := "journal complete"
+		if broken {
+			name = "journal segment removed"
+		}
+		t.Run(name, func(t *testing.T) {
+			pc := newPoolChain(t, []string{"a"}, nil)
+			f := pc.hotels["a"]
+			f.addRoom("claimed", "pool", "claim") // a room a customer got through a claim
+			if broken {
+				pc.breakJournal()
+			}
+			pc.start()
+			want := "complete"
+			if broken {
+				want = "incomplete"
+			}
+			if pc.b.pool.journalState != want {
+				t.Fatalf("journal %s, want %s (%s)", pc.b.pool.journalState, want, pc.b.pool.journalWhy)
+			}
+			pc.up("a")
+			for i := 0; i < 5; i++ {
+				pc.sync("a")
+				pc.step("a")
+			}
+			pc.b.mu.Lock()
+			pr := pc.b.pool.hotel("a").rooms["claimed"]
+			pc.b.mu.Unlock()
+			if pr == nil || pr.state != poolQuarantined {
+				t.Fatalf("claimed room %v, want quarantined\n%s", pr, pc.debug("a"))
+			}
+			if n := len(f.roomDeletes()); n != 0 || f.roomCount() != 1 {
+				t.Fatalf("%d deletes, %d rooms; want the claimed room kept", n, f.roomCount())
+			}
+			rs := pc.readingsOfRun("a.claimed")
+			if len(rs) == 0 {
+				t.Fatal("no reading of the claimed room")
+			}
+			for _, r := range rs {
+				if r.Guest != poolGuestID || !notBillable(r) {
+					t.Fatalf("reading %+v, want the pool guest and not billable", r)
+				}
+			}
+		})
+	}
+}
+
+// Quarantine that fills a hotel's pool bound stops refill there, deletes
+// nothing and raises an alarm; the other hotel fills. Quarantined rooms
+// count in the bound, so a higher target leaves only the difference.
+func TestQuarantineFillingTheBoundStopsRefill(t *testing.T) {
+	pc := newPoolChain(t, []string{"a", "b"}, nil)
+	fa := pc.hotels["a"]
+	for _, id := range []string{"q1", "q2", "q3"} {
+		fa.addRoom(id, "pool", "claim")
+	}
+	pc.up("a")
+	pc.up("b")
+	pc.target(3)
+	pc.steps("a", 5)
+	pc.fill("b", 3)
+	if c := pc.counts("a"); c.quarantined != 3 || c.ready != 0 {
+		t.Fatalf("hotel a %+v, want 3 quarantined and nothing else\n%s", c, pc.debug("a"))
+	}
+	if n := len(fa.creates()); n != 0 {
+		t.Fatalf("%d pool creates on the full hotel, want 0", n)
+	}
+	if n := len(fa.roomDeletes()); n != 0 {
+		t.Fatalf("%d deletes on hotel a, want 0", n)
+	}
+	_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+	ha := doc["hotels"].(map[string]any)["a"].(map[string]any)
+	alarm, _ := ha["alarm"].(string)
+	if !strings.Contains(alarm, "3 pool rooms quarantined") || !strings.Contains(alarm, "no pool refill") {
+		t.Fatalf("alarm %q", alarm)
+	}
+	pc.target(5)
+	pc.fill("a", 2)
+	pc.steps("a", 3)
+	if c := pc.counts("a"); c.ready != 2 || c.quarantined != 3 {
+		t.Fatalf("hotel a at target 5: %+v, want 2 ready and 3 quarantined", c)
 	}
 }
 
@@ -299,5 +546,53 @@ func TestPoolCreatesAtMostOneASecondPerHotel(t *testing.T) {
 				t.Fatalf("hotel %s: creates %d and %d %s apart", id, i-1, i, gap)
 			}
 		}
+	}
+}
+
+// Ready rooms retire at 20 minutes left: deleted and replaced.
+func TestPoolRetiresAtTwentyMinutesLeft(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	pc.up("a")
+	f.set(func(f *fakePoolHotel) { f.createTTL = 19 * time.Minute })
+	pc.target(1)
+	pc.step("a") // sbx-1, 19 minutes left
+	f.set(func(f *fakePoolHotel) { f.createTTL = 0 })
+	pc.step("a") // retired and deleted
+	pc.letGo("a")
+	pc.fill("a", 1)
+	dels := f.roomDeletes()
+	if len(dels) != 1 || dels[0].path != "/v1/sandboxes/sbx-1" {
+		t.Fatalf("deletes %v, want sbx-1 retired", dels)
+	}
+}
+
+// The rollback: targets 0 by the route deletes the rooms the manager proved
+// unclaimed and nothing else.
+func TestPoolRollbackToTargetsZeroDeletesOnlyProvenRooms(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	f.addRoom("q1", "pool", "claim")
+	f.addRoom("q2")
+	pc.up("a")
+	pc.target(5)
+	pc.fill("a", 3)
+	pc.target(0)
+	pc.steps("a", 2)
+	dels := f.roomDeletes()
+	if len(dels) != 3 {
+		t.Fatalf("%d deletes, want the 3 ready rooms", len(dels))
+	}
+	for _, d := range dels {
+		if strings.HasSuffix(d.path, "/q1") || strings.HasSuffix(d.path, "/q2") {
+			t.Fatalf("deleted quarantined room %s", d.path)
+		}
+	}
+	pc.letGo("a")
+	pc.step("a")
+	_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+	ha := doc["hotels"].(map[string]any)["a"].(map[string]any)
+	if ha["ready"] != float64(0) || ha["quarantined"] != float64(2) || ha["mapped"] != float64(0) {
+		t.Fatalf("after the rollback: %v", ha)
 	}
 }
