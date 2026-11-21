@@ -382,18 +382,20 @@ func TestPoolManagerNeverDeletesAnUnprovenRoom(t *testing.T) {
 
 // Quarantine that fills a hotel's pool bound stops refill there, deletes
 // nothing and raises an alarm; the other hotel fills. Quarantined rooms
-// count in the bound, so a higher target leaves only the difference.
+// count in the bound (20% of slots, PR 3): a hotel with more slots has room
+// for only the difference.
 func TestQuarantineFillingTheBoundStopsRefill(t *testing.T) {
 	pc := newPoolChain(t, []string{"a", "b"}, nil)
 	fa := pc.hotels["a"]
+	fa.set(func(f *fakePoolHotel) { f.slots = 15 }) // bound 3
 	for _, id := range []string{"q1", "q2", "q3"} {
 		fa.addRoom(id, "pool", "claim")
 	}
 	pc.up("a")
 	pc.up("b")
-	pc.target(3)
+	pc.target(10)
 	pc.steps("a", 5)
-	pc.fill("b", 3)
+	pc.fill("b", 10)
 	if c := pc.counts("a"); c.quarantined != 3 || c.ready != 0 {
 		t.Fatalf("hotel a %+v, want 3 quarantined and nothing else\n%s", c, pc.debug("a"))
 	}
@@ -406,14 +408,15 @@ func TestQuarantineFillingTheBoundStopsRefill(t *testing.T) {
 	_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
 	ha := doc["hotels"].(map[string]any)["a"].(map[string]any)
 	alarm, _ := ha["alarm"].(string)
-	if !strings.Contains(alarm, "3 pool rooms quarantined") || !strings.Contains(alarm, "no pool refill") {
-		t.Fatalf("alarm %q", alarm)
+	if !strings.Contains(alarm, "3 pool rooms quarantined") || !strings.Contains(alarm, "no pool refill") || ha["bound"] != float64(3) {
+		t.Fatalf("alarm %q, hotel %v", alarm, ha)
 	}
-	pc.target(5)
+	fa.set(func(f *fakePoolHotel) { f.slots = 25 }) // bound 5
+	pc.sync("a")
 	pc.fill("a", 2)
 	pc.steps("a", 3)
 	if c := pc.counts("a"); c.ready != 2 || c.quarantined != 3 {
-		t.Fatalf("hotel a at target 5: %+v, want 2 ready and 3 quarantined", c)
+		t.Fatalf("hotel a with bound 5: %+v, want 2 ready and 3 quarantined", c)
 	}
 }
 
@@ -567,28 +570,18 @@ func TestPoolReadingsAreNotBillable(t *testing.T) {
 	}
 }
 
-// A pool create starts no sooner than 1 s after the previous answer on the
-// same hotel: no hotel ever gets 2 pool creates in one second.
+// At refill_per_second 1 a pool create starts at least 1 s after the
+// previous one on the same hotel: no hotel gets 2 pool creates in one second.
 func TestPoolCreatesAtMostOneASecondPerHotel(t *testing.T) {
 	pc := newPoolChain(t, []string{"a", "b"}, nil)
-	poolCreateEvery = time.Second
+	poolSpacingFactor = 1.05
 	pc.up("a")
 	pc.up("b")
-	pc.target(10)
-	ctx, cancel := context.WithCancel(context.Background())
-	go pc.b.runPool(ctx)
-	time.Sleep(3500 * time.Millisecond)
-	cancel()
-	waitFor(t, "pool steps to end", func() bool {
-		pc.b.mu.Lock()
-		defer pc.b.mu.Unlock()
-		for _, ph := range pc.b.pool.hotels {
-			if ph.busy {
-				return false
-			}
-		}
-		return true
-	})
+	if st, doc := pc.operator("PUT", "/v1/broker/ready-rooms", map[string]any{"per_hotel": map[string]int{"node-22": 10},
+		"refill_per_second": 1, "refill_during_claims": 1, "reserve_share": 0.25}); st != 200 {
+		t.Fatalf("PUT: %d %v", st, doc)
+	}
+	pc.runPool(3500*time.Millisecond, nil)
 	for _, id := range []string{"a", "b"} {
 		c := pc.hotels[id].creates()
 		if len(c) < 2 || len(c) > 4 {

@@ -23,9 +23,9 @@
 // (temporary file, fsync, rename, directory fsync), written before they
 // apply. Default: every target 0, which makes nothing and, once set at
 // runtime, is the rollback: the manager deletes the rooms it proved
-// unclaimed and nothing else. This pull request reads per_hotel only; the
-// refill settings and the reserve are kept for the refill policy (PR 3) and
-// the claim path, and every hotel gets at most 1 pool create a second.
+// unclaimed and nothing else. refill_per_second (at most 4) and
+// refill_during_claims (at least 1 while refill is on) are the refill
+// policy's (pool.go); reserve_share is kept for the claim path.
 //
 // ready_rooms_unsealed_for_tests (LOAD-RIG.md 6.2, the Mac rig only) also lets
 // the pool use a hotel with "sealed_admission": "off" (the config-only ops
@@ -61,9 +61,9 @@ const (
 	// poolTargetMax bounds one key's target on one hotel: a hotel has at
 	// most about 1,000 slots (design 6.1). The hotel bounds are PR 3's.
 	poolTargetMax = 1000
-	// poolRefillMax refuses a typo: a hotel does 8 to 12 creates a second
-	// (design 6.3). PR 2 makes at most 1 a second per hotel whatever it says.
-	poolRefillMax = 12
+	// poolRefillMax: at most 4 pool creates a second per hotel over all keys
+	// (design 6.3); a hotel does 8 to 12, measured before raising it (M2).
+	poolRefillMax = poolRefillCap
 )
 
 type readyRoomsConfig struct {
@@ -236,8 +236,9 @@ func (s readyRoomsSettings) validate(p *readyRooms) error {
 	switch {
 	case !finite(s.RefillPerSecond) || s.RefillPerSecond < 0 || s.RefillPerSecond > poolRefillMax:
 		return fmt.Errorf("refill_per_second must be between 0 and %d", poolRefillMax)
-	case !finite(s.RefillDuringClaims) || s.RefillDuringClaims < 0 || s.RefillDuringClaims > s.RefillPerSecond:
-		return errors.New("refill_during_claims must be between 0 and refill_per_second")
+	case !finite(s.RefillDuringClaims) || s.RefillDuringClaims < min(1, s.RefillPerSecond) || s.RefillDuringClaims > s.RefillPerSecond:
+		// At least 1 a second while refill is on: no burst pattern stops it (design 6.3).
+		return errors.New("refill_during_claims must be between 1 (or refill_per_second when that is under 1) and refill_per_second")
 	case !finite(s.ReserveShare) || s.ReserveShare < 0 || s.ReserveShare >= 1:
 		return errors.New("reserve_share must be at least 0 and below 1")
 	}
@@ -438,10 +439,21 @@ func (b *broker) readyRoomsViewLocked(now time.Time) map[string]any {
 			continue
 		}
 		c := p.countsLocked(id)
-		why := b.poolCreateRefusalLocked(h, p.hotel(id), now)
+		ph := p.hotel(id)
+		why := b.poolCreateRefusalLocked(h, ph, now)
+		if why == "" && c.held >= b.poolBoundsLocked(h).bound && p.anyTargetLocked() {
+			why = fmt.Sprintf("pool bound reached: %d held of %d", c.held, b.poolBoundsLocked(h).bound)
+		}
+		bs := b.poolBoundsLocked(h)
+		var byMem any // null: the hotel reports no memory, the slot bound alone applies
+		if bs.byMemory >= 0 {
+			byMem = bs.byMemory
+		}
 		d := map[string]any{"ready": c.ready, "claiming": 0, "stale": c.stale, "quarantined": c.quarantined,
-			"unverified": c.unverified, "creating": c.creating, "mapped": 0, "bound": p.boundLocked(),
-			"pool_creates": why == "", "listed_since_start": p.hotel(id).listed}
+			"unverified": c.unverified, "creating": c.creating, "mapped": 0, "bound": bs.bound,
+			"bound_by_slots": bs.bySlots, "bound_by_memory": byMem, "slots": h.slots, "free_slots": poolFreeSlots(h),
+			"claims_in_flight": ph.claims, "refill_per_second_now": b.poolRateLocked(h, ph, now),
+			"pool_creates": why == "", "listed_since_start": ph.listed}
 		if cold := b.poolColdKeysLocked(h); len(cold) > 0 {
 			d["cold_keys"] = cold // these keys get no pool create here until their image is warm
 			if why == "" && len(cold) == len(p.keysWithTarget()) {

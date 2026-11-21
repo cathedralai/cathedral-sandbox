@@ -13,9 +13,27 @@
 // whose binding names a receipt key (every hotel is sealed, AB#776), and it
 // would place a room now (admissibleFree, diskFits); and a key's rooms go
 // only where that key's image is warm (the catalog pre-pull, prewarm.go).
-// At most 1 pool create a second per hotel: a create starts no sooner than
-// poolCreateEvery after the previous one's answer, and a create slot is
-// taken without waiting, so a customer create never waits for a pool create.
+// A create slot is taken without waiting, so a customer create never waits
+// for a pool create.
+//
+// Refill (design 6.3, PR 3): per hotel at most refill_per_second (4, the
+// most allowed) pool creates a second over all keys, started evenly
+// (poolCreateSpacing apart) and up to poolCreatesInFlight at once; while a
+// claim is in flight on the hotel, and for 1 s after the last one ended,
+// refill_during_claims (1); but the full rate again whenever a key there is
+// below a quarter of its target. No pause timer: refill never drops below
+// refill_during_claims, so no burst pattern stops it. Claims call
+// poolClaimBegin and poolClaimEnd (PR 6 adds the claims; nothing calls them
+// before it).
+//
+// Hotel bounds (design 6.1, PR 3): every pool room a hotel holds, in any
+// state (ready and quarantined, and unverified, stale and creating too), is
+// at most 20% of its slots and 5% of its memory, counted at an idle room's
+// footprint (poolIdleRoomMiB, design 6.1 and 11.4), whichever is smaller. No
+// pool create while the hotel's free slots are under 10% or its room disk is
+// 80% full or more. Under 5% free slots the pool gives slots back to
+// customers: ready rooms are deleted, oldest first, until 5% is free again;
+// quarantined rooms never.
 //
 // Body of a pool create, exactly: image, resources, network (deny_all, empty
 // allow), labels (cathedral_pool "1" and the broker guest label of
@@ -42,11 +60,8 @@
 // showed exactly one receipt, the pool create. Retirement, stale cleanup,
 // over-target trimming and the rollback to targets 0 follow that rule.
 //
-// The pool bound of a hotel in this pull request is its target: every pool
-// room the hotel holds, in any state, and the creates in flight count
-// against it. Quarantine at or over the bound stops refill on that hotel and
-// raises an alarm; it never causes a deletion. (PR 3 adds the slot, memory
-// and disk bounds.)
+// Quarantine at or over the hotel's bound stops refill on that hotel and
+// raises an alarm; it never causes a deletion.
 //
 // Start order (design 9.2): the manager acts on a hotel only after that
 // hotel's room list has answered once since start, and makes and deletes
@@ -69,6 +84,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"sort"
 	"strconv"
@@ -80,16 +96,30 @@ const (
 	poolLabel        = "cathedral_pool"
 	poolTTLSeconds   = 14400
 	poolRetireLeft   = 20 * time.Minute
-	poolTick         = 200 * time.Millisecond
+	poolTick         = 50 * time.Millisecond
 	poolReadTimeout  = 10 * time.Second // design 2.6 step 7
 	poolReadsPerStep = 20
 	poolRetryFirst   = 5 * time.Second
 	poolRetryMax     = time.Minute
 )
 
+// Refill and bounds (design 6.1, 6.3).
+const (
+	poolRefillCap       = 4    // pool creates a second per hotel, over all keys, at most
+	poolCreatesInFlight = 4    // pool creates in flight per hotel, at most
+	poolBelowQuarter    = 0.25 // a key under this share of its target refills at the full rate, claims or not
+	poolSlotShare       = 0.20 // every pool room of a hotel: at most this share of its slots
+	poolMemShare        = 0.05 // and this share of its memory, at an idle room's footprint
+	poolIdleRoomMiB     = 35   // an idle pool room [M 11 Nov: 3,100 idle rooms in about 108 GiB; design 6.1]
+	poolMinFreeShare    = 0.10 // no pool create while free slots are under this share
+	poolYieldFreeShare  = 0.05 // under this share of free slots, ready rooms go, oldest first
+	poolDiskFullPct     = 80.0 // no pool create at this room disk use or more (diskFullPct)
+	poolClaimTail       = time.Second
+)
+
 // Vars for tests.
 var (
-	poolCreateEvery   = time.Second           // design: at most 1 pool create a second per hotel (PR 2)
+	poolSpacingFactor = 1.05                  // creates start (1 / rate) x this apart: under the rate at the hotel even with jitter
 	poolReadEvery     = 60 * time.Millisecond // receipts reads: under 20 a second per hotel, with room for timer jitter
 	poolCreateTimeout = 2 * time.Minute       // a warm image: no pull
 	poolDeleteTimeout = 30 * time.Second
@@ -127,8 +157,12 @@ type poolHotel struct {
 	listed     bool                 // a room list answered since start
 	busy       bool                 // a step runs
 	creating   map[string]int       // creates in flight, by key
-	nextCreate time.Time
-	nextRead   time.Time // receipts reads start at least poolReadEvery apart
+	lastCreate time.Time            // the last pool create's start
+	backoff    time.Time            // a create failed: none before this
+	claims     int                  // claims in flight (poolClaimBegin)
+	claimEnd   time.Time            // when the last claim ended
+	inflight   sync.WaitGroup       // creates started by steps, for tests
+	nextRead   time.Time            // receipts reads start at least poolReadEvery apart
 	// level1 is the binding a level-1 front served (ready_rooms_unsealed_for_tests).
 	level1   *poolAttest
 	level1At time.Time
@@ -305,14 +339,115 @@ func (p *readyRooms) hotel(id string) *poolHotel {
 	return ph
 }
 
-// boundLocked is a hotel's pool bound: the sum of its targets. Caller
-// holds b.mu.
-func (p *readyRooms) boundLocked() int {
+// poolBounds is a hotel's pool bound (design 6.1): the smaller of 20% of its
+// slots and 5% of its memory at an idle room's footprint. byMemory is -1
+// when the hotel reports no memory: the slot bound alone applies.
+type poolBounds struct{ bound, bySlots, byMemory int }
+
+// poolBoundsLocked is h's bound now. Caller holds b.mu.
+func (b *broker) poolBoundsLocked(h *hotel) poolBounds {
+	bs := poolBounds{bySlots: int(math.Floor(poolSlotShare * float64(max(h.slots, 0)))), byMemory: -1}
+	bs.bound = bs.bySlots
+	if mib := poolHotelMemMiB(h); mib > 0 {
+		bs.byMemory = int(math.Floor(poolMemShare * mib / poolIdleRoomMiB))
+		bs.bound = min(bs.bound, bs.byMemory)
+	}
+	return bs
+}
+
+// poolHotelMemMiB is h's memory: from its last health answer (used GiB over
+// used percent), else its config ram_gib, else 0 (unknown). Caller holds
+// b.mu.
+func poolHotelMemMiB(h *hotel) float64 {
+	if h.memPct > 0 && h.memGiB > 0 {
+		return h.memGiB * 100 / h.memPct * 1024
+	}
+	if h.cfg.RAMGiB > 0 {
+		return float64(h.cfg.RAMGiB) * 1024
+	}
+	return 0
+}
+
+// poolFreeSlots is h's free slots, pool rooms counted as used. Caller holds
+// b.mu.
+func poolFreeSlots(h *hotel) int { return h.slots - h.used() }
+
+// poolLeavingLocked is the pool rooms of h that hold a slot but are on their
+// way out: stale (to be deleted) or deleted and not yet gone from the room
+// map. The give-back counts them as free already, so it never deletes more
+// ready rooms than it needs. Caller holds b.mu.
+func poolLeavingLocked(h *hotel, ph *poolHotel) int {
 	n := 0
-	for _, k := range p.keys {
-		n += p.settings.target(k.name)
+	for _, pr := range ph.rooms {
+		if pr.state == poolStale && pr.proven {
+			n++
+		}
+	}
+	for hid, rm := range h.rooms {
+		if rm.guest == poolGuestID && rm.state == stDeleting && rm.deleteSent && ph.rooms[hid] == nil {
+			n++
+		}
 	}
 	return n
+}
+
+// poolRateLocked is h's pool create rate now, a second (design 6.3).
+// Caller holds b.mu.
+func (b *broker) poolRateLocked(h *hotel, ph *poolHotel, now time.Time) float64 {
+	p := b.pool
+	fast := min(p.settings.RefillPerSecond, poolRefillCap)
+	if ph.claims == 0 && (ph.claimEnd.IsZero() || now.Sub(ph.claimEnd) >= poolClaimTail) {
+		return fast
+	}
+	for i := range p.keys {
+		k := &p.keys[i]
+		if t := p.settings.target(k.name); t > 0 && float64(p.readyOfLocked(ph, k.name)) < poolBelowQuarter*float64(t) {
+			return fast // a key below a quarter of its target refills at the full rate, claims or not
+		}
+	}
+	return min(p.settings.RefillDuringClaims, fast)
+}
+
+// readyOfLocked is ph's ready rooms of key name. Caller holds b.mu.
+func (p *readyRooms) readyOfLocked(ph *poolHotel, name string) int {
+	n := 0
+	for _, pr := range ph.rooms {
+		if pr.state == poolReady && pr.key == name {
+			n++
+		}
+	}
+	return n
+}
+
+// poolCreateSpacing is how far apart pool creates start at rate.
+func poolCreateSpacing(rate float64) time.Duration {
+	if rate <= 0 {
+		return 0
+	}
+	return time.Duration(float64(time.Second) / rate * poolSpacingFactor)
+}
+
+// poolClaimBegin and poolClaimEnd bracket a claim on h (PR 6 calls them
+// around each claim attempt). While one is in flight, and for 1 s after the
+// last ends, refill on h runs at refill_during_claims.
+func (b *broker) poolClaimBegin(h *hotel) {
+	if b.pool == nil {
+		return
+	}
+	b.mu.Lock()
+	b.pool.hotel(h.cfg.ID).claims++
+	b.mu.Unlock()
+}
+
+func (b *broker) poolClaimEnd(h *hotel) {
+	if b.pool == nil {
+		return
+	}
+	b.mu.Lock()
+	ph := b.pool.hotel(h.cfg.ID)
+	ph.claims = max(ph.claims-1, 0)
+	ph.claimEnd = time.Now()
+	b.mu.Unlock()
 }
 
 type poolCounts struct{ ready, stale, unverified, quarantined, creating, held int }
@@ -424,6 +559,12 @@ func (b *broker) poolCreateRefusalLocked(h *hotel, ph *poolHotel, now time.Time)
 	if b.admissibleFree(h, now) <= 0 {
 		return "takes no room now"
 	}
+	if free := poolFreeSlots(h); float64(free) < poolMinFreeShare*float64(h.slots) {
+		return fmt.Sprintf("%d free slots of %d: under 10%%, kept for customers", free, h.slots)
+	}
+	if h.roomDataPct != nil && *h.roomDataPct >= poolDiskFullPct {
+		return fmt.Sprintf("room disk %.1f%% used: 80%% or more", *h.roomDataPct)
+	}
 	return ""
 }
 
@@ -441,15 +582,16 @@ func (b *broker) poolColdKeysLocked(h *hotel) []string {
 
 // poolWork is what one step does outside b.mu.
 type poolWork struct {
-	att     poolAttest
-	attOK   bool
-	reads   []string
-	deletes []string
-	create  *poolKey
+	att      poolAttest
+	attOK    bool
+	reads    []string
+	deletes  []string
+	create   *poolKey
+	createAt time.Time // when the create may start (its slot in the spacing)
 }
 
 // poolStep is one step of h's pool: receipts reads, deletes, then at most
-// one create.
+// one create, started on its own (creates run alongside the next steps).
 func (b *broker) poolStep(ctx context.Context, h *hotel) {
 	b.poolLevel1(ctx, h)
 	w := b.poolPlan(h)
@@ -464,7 +606,16 @@ func (b *broker) poolStep(ctx context.Context, h *hotel) {
 		b.poolDelete(ctx, h, hid)
 	}
 	if w.create != nil {
-		b.poolCreate(ctx, h, *w.create, w.att)
+		time.Sleep(time.Until(w.createAt)) // under one tick: the create starts on its slot
+		b.mu.Lock()
+		ph := b.pool.hotel(h.cfg.ID)
+		ph.inflight.Add(1)
+		b.mu.Unlock()
+		k, att := *w.create, w.att
+		go func() {
+			defer ph.inflight.Done()
+			b.poolCreate(ctx, h, k, att)
+		}()
 	}
 }
 
@@ -545,6 +696,20 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 			list[i].state, list[i].why = poolStale, "over target"
 		}
 	}
+	// Under 5% free slots the pool gives slots back to customers: ready
+	// rooms, oldest first, until 5% is free again. Quarantined rooms never go.
+	if want := int(math.Ceil(poolYieldFreeShare * float64(h.slots))); h.slots > 0 && poolFreeSlots(h)+poolLeavingLocked(h, ph) < want {
+		give := want - poolFreeSlots(h) - poolLeavingLocked(h, ph)
+		for _, pr := range sortedPoolRooms(ph) {
+			if give == 0 {
+				break
+			}
+			if pr.state == poolReady {
+				pr.state, pr.why = poolStale, "slots given back to customers: under 5% free"
+				give--
+			}
+		}
+	}
 	if h.ok {
 		for _, pr := range sortedPoolRooms(ph) {
 			if pr.state == poolStale && pr.proven && !now.Before(pr.retryAt) {
@@ -552,18 +717,33 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 			}
 		}
 	}
-	if b.poolCreateRefusalLocked(h, ph, now) != "" || now.Before(ph.nextCreate) || ph.full {
+	if b.poolCreateRefusalLocked(h, ph, now) != "" || now.Before(ph.backoff) || ph.full {
 		return w
+	}
+	inflight := 0
+	for _, n := range ph.creating {
+		inflight += n
+	}
+	rate := b.poolRateLocked(h, ph, now)
+	if rate <= 0 || inflight >= poolCreatesInFlight {
+		return w
+	}
+	at := ph.lastCreate.Add(poolCreateSpacing(rate))
+	if at.Sub(now) >= poolTick {
+		return w // the next tick's step decides
 	}
 	for _, pr := range ph.rooms {
 		if pr.state == poolUnverified && pr.tries == 0 {
 			return w // the receipts reads come first, after a restart or a late journal open
 		}
 	}
-	for i := range p.keys {
-		k := &p.keys[i]
+	for _, k := range b.poolKeysByNeedLocked(ph) {
 		if b.poolNeedsLocked(h, ph, k) && h.warm[k.image] && b.diskFits(h, k.diskGiB) {
-			w.create = k
+			if at.Before(now) {
+				at = now
+			}
+			w.create, w.createAt = k, at
+			ph.lastCreate = w.createAt // the slot is taken now: one create per spacing
 			break
 		}
 	}
@@ -571,20 +751,46 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 }
 
 // poolNeedsLocked reports whether h's pool needs one more room of key k
-// now: the hotel holds less than its bound, and the key's ready rooms and
-// creates in flight are under its target. Caller holds b.mu.
+// now: every pool room the hotel holds and its creates in flight are under
+// the hotel's bound (design 6.1), and the key's ready rooms and creates in
+// flight are under its target. Caller holds b.mu.
 func (b *broker) poolNeedsLocked(h *hotel, ph *poolHotel, k *poolKey) bool {
 	p := b.pool
-	if p.countsLocked(h.cfg.ID).held >= p.boundLocked() {
+	if p.countsLocked(h.cfg.ID).held >= b.poolBoundsLocked(h).bound {
 		return false
 	}
-	n := ph.creating[k.name]
-	for _, pr := range ph.rooms {
-		if pr.state == poolReady && pr.key == k.name {
-			n++
+	return ph.creating[k.name]+p.readyOfLocked(ph, k.name) < p.settings.target(k.name)
+}
+
+// anyTargetLocked reports whether some key has a target above 0. Caller
+// holds b.mu.
+func (p *readyRooms) anyTargetLocked() bool {
+	for _, k := range p.keys {
+		if p.settings.target(k.name) > 0 {
+			return true
 		}
 	}
-	return n < p.settings.target(k.name)
+	return false
+}
+
+// poolKeysByNeedLocked is the keys, the one furthest below its target (as a
+// share of it) first: a key below a quarter is the one the full rate during
+// claims is for. Caller holds b.mu.
+func (b *broker) poolKeysByNeedLocked(ph *poolHotel) []*poolKey {
+	p := b.pool
+	out := make([]*poolKey, 0, len(p.keys))
+	share := map[string]float64{}
+	for i := range p.keys {
+		k := &p.keys[i]
+		out = append(out, k)
+		if t := p.settings.target(k.name); t > 0 {
+			share[k.name] = float64(p.readyOfLocked(ph, k.name)+ph.creating[k.name]) / float64(t)
+		} else {
+			share[k.name] = math.Inf(1)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return share[out[i].name] < share[out[j].name] })
+	return out
 }
 
 // sortedPoolRooms is ph's rooms, oldest first. Caller holds b.mu.
@@ -607,8 +813,8 @@ func sortedPoolRooms(ph *poolHotel) []*poolRoom {
 // which stops refill there. Caller holds b.mu.
 func (b *broker) poolAlarmLocked(h *hotel, ph *poolHotel, now time.Time) {
 	c := b.pool.countsLocked(h.cfg.ID)
-	bound := b.pool.boundLocked()
-	full := bound > 0 && c.quarantined >= bound
+	bound := b.poolBoundsLocked(h).bound
+	full := b.pool.anyTargetLocked() && c.quarantined >= bound
 	switch {
 	case c.quarantined == 0:
 		ph.alarm, ph.alarmQ, ph.full = "", 0, false
@@ -840,14 +1046,13 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	h.creating--
 	h.holdDisk(pl, -1)
 	ph.creating[k.name]--
-	ph.nextCreate = time.Now().Add(poolCreateEvery) // from the answer: never 2 creates in one second
 	var doc map[string]any
 	if err == nil {
 		_ = json.Unmarshal(out, &doc)
 	}
 	hid, _ := doc["id"].(string)
 	if err != nil || (status != 200 && status != 201 && status != 202) || hid == "" {
-		ph.nextCreate = time.Now().Add(max(poolCreateEvery, poolRetryFirst)) // a failing hotel is not asked every second
+		ph.backoff = time.Now().Add(poolRetryFirst) // a failing hotel is not asked again for 5 s
 		h.release(rm)
 		b.mu.Unlock()
 		// A lost answer may have started a room: its pool label brings it

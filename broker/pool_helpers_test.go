@@ -63,13 +63,17 @@ type fakePoolHotel struct {
 	attestFail    bool
 	deleteFail    bool
 	createFail    bool            // answer creates 503 and start no room
+	slots         int             // /room/health slots (default 1,000)
+	memPct        float64         // /room/health live.host_mem_used_pct (default 10, of 384 GiB)
+	memGiB        float64         // /room/health live.host_mem_used_gib (default 38.4)
+	diskPct       *float64        // /room/health live.room_data_used_pct; nil: not sent
 	coldImages    map[string]bool // a prefetch of one of these answers 502: the image stays cold
 	readFail      bool
 	prefetchGate  chan struct{} // non-nil: a prefetch waits for it
 }
 
 func newFakePoolHotel(t *testing.T) *fakePoolHotel {
-	f := &fakePoolHotel{t: t, rooms: map[string]*fakePoolRoom{}}
+	f := &fakePoolHotel{t: t, rooms: map[string]*fakePoolRoom{}, slots: 1000, memPct: 10, memGiB: 38.4}
 	f.newBinding()
 	return f
 }
@@ -206,7 +210,11 @@ func (f *fakePoolHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reply(503, map[string]any{"error": "down"})
 			return
 		}
-		reply(200, map[string]any{"slots": 100, "sandboxes_running": len(f.rooms), "live": map[string]any{"host_mem_used_pct": 10.0}})
+		live := map[string]any{"host_mem_used_pct": f.memPct, "host_mem_used_gib": f.memGiB}
+		if f.diskPct != nil {
+			live["room_data_used_pct"] = *f.diskPct
+		}
+		reply(200, map[string]any{"slots": f.slots, "sandboxes_running": len(f.rooms), "live": live})
 	case p == "/room/attestation":
 		if f.attestFail || f.healthFail {
 			reply(503, map[string]any{"error": "down"})
@@ -357,9 +365,9 @@ func newPoolChain(t *testing.T, ids []string, mutate func(c *config)) *poolChain
 	if err := os.WriteFile(pc.cfgPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := poolCreateEvery
-	poolCreateEvery = 0 // tests step creates back to back; TestPoolCreatesAtMostOneASecondPerHotel keeps the second
-	t.Cleanup(func() { poolCreateEvery = old })
+	old := poolSpacingFactor
+	poolSpacingFactor = 0 // tests step creates back to back; the refill tests pace them again
+	t.Cleanup(func() { poolSpacingFactor = old })
 	pc.start()
 	return pc
 }
@@ -401,7 +409,25 @@ func (pc *poolChain) up(id string) {
 
 func (pc *poolChain) sync(id string) { pc.b.syncHotel(context.Background(), pc.b.hotelByID(id)) }
 
-func (pc *poolChain) step(id string) { pc.b.poolStep(context.Background(), pc.b.hotelByID(id)) }
+// step runs one pool step of hotel id and waits for the create it started.
+func (pc *poolChain) step(id string) {
+	pc.b.poolStep(context.Background(), pc.b.hotelByID(id))
+	pc.b.mu.Lock()
+	ph := pc.b.pool.hotel(id)
+	pc.b.mu.Unlock()
+	ph.inflight.Wait()
+}
+
+// addCustomerRooms lists n rooms of guest g1 on the fake hotel: they hold
+// slots as customer rooms do.
+func (f *fakePoolHotel) addCustomerRooms(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("cust-%d", len(f.rooms)+i)
+		f.rooms[id] = &fakePoolRoom{id: id, labels: map[string]string{guestLabel: "g1"}, expires: time.Now().Add(time.Hour)}
+	}
+}
 
 // steps runs n pool steps of hotel id.
 func (pc *poolChain) steps(id string, n int) {
@@ -462,4 +488,109 @@ func (pc *poolChain) fill(id string, n int) {
 	if c := pc.counts(id); c.ready != n {
 		pc.t.Fatalf("hotel %s: %d ready, want %d\n%s", id, c.ready, n, pc.debug(id))
 	}
+}
+
+// runPool runs the pool loop until stop is closed or d passes, then waits
+// for the loop, every step and every create it started to end.
+func (pc *poolChain) runPool(d time.Duration, stop <-chan struct{}) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pc.b.runPool(ctx)
+		close(done)
+	}()
+	select {
+	case <-time.After(d):
+	case <-stop:
+	}
+	cancel()
+	<-done
+	pc.quiesce()
+}
+
+// quiesce waits for every pool step and create of pc's broker to end.
+func (pc *poolChain) quiesce() {
+	waitFor(pc.t, "pool steps to end", func() bool {
+		pc.b.mu.Lock()
+		defer pc.b.mu.Unlock()
+		for _, ph := range pc.b.pool.hotels {
+			if ph.busy {
+				return false
+			}
+		}
+		return true
+	})
+	pc.b.mu.Lock()
+	var hs []*poolHotel
+	for _, ph := range pc.b.pool.hotels {
+		hs = append(hs, ph)
+	}
+	pc.b.mu.Unlock()
+	for _, ph := range hs {
+		ph.inflight.Wait()
+	}
+}
+
+// fakeClaim does to hotel id's pool what a won claim will do (PR 6): a claim
+// in flight on the hotel, one ready room (the oldest) out of the pool, and
+// the claim ended after inFlight. It reports whether a ready room was there.
+func (pc *poolChain) fakeClaim(id string, inFlight time.Duration) bool {
+	h := pc.b.hotelByID(id)
+	pc.b.poolClaimBegin(h)
+	pc.b.mu.Lock()
+	ph := pc.b.pool.hotel(id)
+	took := ""
+	for _, pr := range sortedPoolRooms(ph) {
+		if pr.state == poolReady {
+			took = pr.hid
+			break
+		}
+	}
+	if took != "" {
+		delete(ph.rooms, took)
+		if rm := h.rooms[took]; rm != nil {
+			pc.b.release(h, rm)
+		}
+	}
+	pc.b.mu.Unlock()
+	if took != "" {
+		f := pc.hotels[id]
+		f.mu.Lock()
+		delete(f.rooms, took)
+		f.mu.Unlock()
+	}
+	time.Sleep(inFlight)
+	pc.b.poolClaimEnd(h)
+	return took != ""
+}
+
+// putRefill sets the node-22 target and the refill rates through the route.
+func (pc *poolChain) putRefill(target int, perSecond, duringClaims float64) {
+	pc.t.Helper()
+	st, doc := pc.operator("PUT", "/v1/broker/ready-rooms", map[string]any{"per_hotel": map[string]int{"node-22": target},
+		"refill_per_second": perSecond, "refill_during_claims": duringClaims, "reserve_share": 0.25})
+	if st != 200 {
+		pc.t.Fatalf("PUT ready-rooms: %d %v", st, doc)
+	}
+}
+
+// createStarts is the times the fake hotel got its pool creates, in order.
+func (f *fakePoolHotel) createStarts() []time.Time {
+	var out []time.Time
+	for _, c := range f.creates() {
+		out = append(out, c.at)
+	}
+	return out
+}
+
+// maxInWindow is the most times within any window of d.
+func maxInWindow(ts []time.Time, d time.Duration) int {
+	best, j := 0, 0
+	for i := range ts {
+		for ts[i].Sub(ts[j]) >= d {
+			j++
+		}
+		best = max(best, i-j+1)
+	}
+	return best
 }
