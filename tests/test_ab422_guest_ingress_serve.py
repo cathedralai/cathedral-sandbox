@@ -433,3 +433,13 @@ def test_two_content_lengths_or_chunked_are_refused(world) -> None:
         tls.sendall(b"POST / HTTP/1.1\r\nHost: " + HOST.encode() + b"\r\n" + extra + b"\r\nab")
         assert want in tls.recv(200).split(b"\r\n")[0] + b" "
         tls.close()
+
+
+def test_a_serial_room_is_never_exposed(world) -> None:
+    world["keeper"].once()
+    with world["ledger"].lock:
+        world["ledger"].serial.add(ROOM)
+    status, headers, body = _expose(world)
+    assert status == 409 and json.loads(body)["error"]["code"] == "room_serial_unsigned"
+    assert "expose_url" not in _receipt(headers)["statement"]
+    assert _https(world["ingress"], HOST)[0][0] == 404

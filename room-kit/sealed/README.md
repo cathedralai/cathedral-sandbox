@@ -571,7 +571,8 @@ https origin) and the guest also serves on that key:
   `https://<room id with _ as ->-<port>.<hotel id>.<zone>/` (`:<public port>`
   when not 443) and an `X-Room-Receipt` that names `expose_port`,
   `expose_url`, `expose_host` and `ingress_tls_spki_sha256`. Before the
-  certificate it answers `503 ingress_not_ready`. Every answer to a caller
+  certificate it answers `503 ingress_not_ready`; a serial room answers `409
+  room_serial_unsigned` (its traffic would be unsigned). Every answer to a caller
   with the key is signed. `verify_receipts.py --receipt-header <value>
   --ingress-spki-sha256 <peer>` checks the receipt against the binding and the
   served key against `guest_ingress.tls_spki_sha256`.
@@ -583,8 +584,8 @@ https origin) and the guest also serves on that key:
 
 Before turning it on: the broker needs `acme_dns` for the zone, `<hotel
 id>.<zone>` and `*.<hotel id>.<zone>` must point at the host (A records), and
-the host needs `SEALED_GUEST_INGRESS=1` (above). Every boot makes a new key,
-so every boot orders a new certificate: Let's Encrypt allows 5 for the same
+the host needs `SEALED_GUEST_INGRESS=1` (above). Every boot (and every restart of
+the front) makes a new key, so each orders a new certificate: Let's Encrypt allows 5 for the same
 names per week, so a hotel that restarts more often than that waits for the
 limit (the old URLs serve the self-issued certificate meanwhile). Point
 `SEALED_ACME_DIRECTORY` at Let's Encrypt staging for trials.

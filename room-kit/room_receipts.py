@@ -4073,8 +4073,14 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             pass
         extra: dict = {}
+        with ledger.lock:
+            serial = room in ledger.serial
         if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
             status, out = 400, {"error": {"code": "invalid_port", "message": "port must be between 1 and 65535"}}
+        elif serial:
+            # A serial room takes signed requests and reads only; a Preview URL would let unsigned traffic in.
+            status, out = 409, {"error": {"code": "room_serial_unsigned",
+                                          "message": "a serial room serves no Preview URL: its traffic would be unsigned"}}
         else:
             try:
                 got = self.upstream(self.server.api_port, None, method="GET", path=f"/v1/sandboxes/{room}",
