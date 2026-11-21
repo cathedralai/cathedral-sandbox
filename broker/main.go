@@ -160,6 +160,11 @@ type config struct {
 	// terminal_hotels, an id that is not known yet is refused: a typo would
 	// leave the canary cold and its measurement would say nothing.
 	PrewarmCatalogHotels []string `json:"prewarm_catalog_hotels,omitempty"`
+	// PreferGuestWarm (default on): prefer a hotel where the create's guest
+	// prefetched the create's image (POST /v1/images/prefetch or a compat
+	// import) since the hotel last came up. false: guest prefetches pull
+	// but never steer creates (AB#859).
+	PreferGuestWarm *bool `json:"prefer_guest_warm,omitempty"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -340,6 +345,12 @@ type hotel struct {
 	// keeps those rooms out of the guest's rooms and retries their removal
 	// until a list shows none left (AB#338).
 	unreaped map[string]*unreapedBatch
+	// Guarded by broker.mu. guestWarm: per guest, the images that guest
+	// prefetched here since the hotel last came up. guestWant: per guest,
+	// the refs to pull again when the hotel comes back (prefetched without a
+	// login, prewarm.go). AB#859.
+	guestWarm map[string]map[string]bool
+	guestWant map[string]map[string]time.Time
 }
 
 // unreapedBatch is one create request's leftover rooms on a hotel.
@@ -868,7 +879,7 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) 
 			total += weight[i]
 		}
 	}
-	total = b.preferWarm(hotels, weight, total, pl.image)
+	total = b.preferWarm(hotels, weight, total, pl.image, pl.guest)
 	if total <= 0 {
 		return nil
 	}
@@ -2287,6 +2298,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	}
 	if cameUp && b.prewarms(h) {
 		go b.prewarmHotel(h)
+	}
+	if cameUp {
+		go b.replayGuestPrefetch(h)
 	}
 	offered := h.slots // health late: the slots placement still uses
 	slotsTrusted := herr == nil

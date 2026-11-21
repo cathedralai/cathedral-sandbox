@@ -517,6 +517,31 @@ does not keep it and does not show it. The answer (202) gives a
 hotel (`pulling`, `done` with image sizes, or `failed` with the error).
 The broker keeps a job for 24 hours, in memory.
 
+Each image is its own hotel call, up to 4 at once per hotel, so a long list
+does not run past one call's limit. Each entry of a hotel's `images` has
+its own `state` (`pulling`, `done`, `failed`) and `error`. A hotel is
+`failed` when any image failed; its `error` is the first failed image's
+error (with 2 or more: "n of m images failed; first: ...").
+
+A hotel whose scratch is at its admission line (`disk_admit_used_pct`, or
+80% used) pulls nothing: it reads `failed` with `image_store_full` (AB#861).
+
+Warm steering (AB#859): once an image is `done` on a hotel, that guest's
+creates of the same image reference prefer the hotels that hold it. Like
+the catalog prewarm, it only narrows the hotels that have a free room; when
+none of them does, a cold hotel serves. The reference must match exactly
+(`alpine` does not warm `alpine:latest`). Other guests are not steered.
+Config `"prefer_guest_warm": false` turns steering off. A compat
+`POST /v1/images/import` pulls as the guest and warms the same way.
+
+When a hotel comes back after being down, the broker asks it, as the guest,
+whether it still holds each image the guest prefetched there in the last
+7 days (up to 256 per guest and hotel). A held image is warm again with no
+pull; a missing one (a reboot wiped the scratch) is pulled again. Images
+pulled with `registry_auth` are not pulled again: the broker never keeps
+the login, so prefetch those again after a hotel restart. A broker restart
+forgets the list.
+
 `GET /v1/broker/stats` gives per-hotel counts and latency percentiles
 (hotel call, wait in the broker queue, broker overhead). `POST` resets them.
 Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
