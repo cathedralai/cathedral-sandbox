@@ -93,7 +93,7 @@ func TestRoomDesktopRoutesAreRefusedOnEveryHotel(t *testing.T) {
 // A miner hotel gets no desktop route either, while exec still runs there.
 func TestRoomDesktopRoutesAreRefusedOnMinerHotels(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "miner-1", true, 4, nil)
+	joinMiner(t, tc, "miner-1", 4, nil)
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{
 		"policy": map[string]any{"prefer": []any{
 			map[string]any{"label": map[string]string{"sealed": "true", "miner": "true"}},

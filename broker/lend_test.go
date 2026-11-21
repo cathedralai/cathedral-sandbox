@@ -12,9 +12,9 @@ import (
 )
 
 // Lend an idle reserved sealed hotel to the pool and reclaim it only after a
-// re-seal (lend.go). Hotels as in reservedChain: "a" sealed (pool), "b" and
-// "c" unsealed, "nc" and "nc2" sealed and reserved for g2 (the const shape:
-// a hotel list). g1 is a pool guest that prefers sealed. No network.
+// re-seal (lend.go). Hotels as in reservedChain, all sealed (AB#776): "a",
+// "b" and "c" in the pool, "nc" and "nc2" reserved for g2 (the const shape:
+// a hotel list). g1 is a pool guest. No network.
 
 // setLaunch makes hotel id serve an SEV-SNP attestation whose REPORT_ID is
 // all fill: one value per SNP launch.
@@ -33,7 +33,7 @@ func launchID(fill byte) string {
 func lendChain(t *testing.T) *testChain {
 	t.Helper()
 	tc := reservedChainState(t, t.TempDir())
-	addFakeHotel(t, tc, "nc2", true)
+	addFakeHotel(t, tc, "nc2")
 	reserve(t, tc, "nc2", "g2")
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g2", map[string]any{"hotels": []string{"nc", "nc2"}}); status != 200 {
 		t.Fatalf("g2 list: %d %v", status, doc)
@@ -110,10 +110,6 @@ func TestLendValidation(t *testing.T) {
 		if status, code := patch(c.id, c.body); status != c.status || code != c.code {
 			t.Fatalf("%s %v: %d %s, want %d %s", c.id, c.body, status, code, c.status, c.code)
 		}
-	}
-	reserve(t, tc, "b", "g2")
-	if status, code := patch("b", map[string]any{"lend": true}); status != 409 || code != "hotel_not_sealed" {
-		t.Fatalf("unsealed: %d %s", status, code)
 	}
 	setLaunch(t, tc, "nc2", 0) // a report with no REPORT_ID cannot prove a later re-seal
 	if status, code := patch("nc2", map[string]any{"lend": true}); status != 422 || code != "attestation_failed" {
@@ -253,7 +249,9 @@ func TestWorkspaceCreateSkipsALentHotel(t *testing.T) {
 	reserve(t, tc, "nc", "g2")
 	setLaunch(t, tc, "nc", 0x11)
 	lend(t, tc, "nc")
-	setHotel(tc, "a", func(h *hotel) { h.ok = false }) // the lent hotel is the only sealed hotel up
+	for _, id := range []string{"a", "b", "c"} {
+		setHotel(tc, id, func(h *hotel) { h.ok = false }) // the lent hotel is the only hotel up
+	}
 
 	// A room goes there; a workspace does not, named or not.
 	if h, _, _ := createdOn(t, tc, map[string]any{"image": "alpine:3.20", "sealed": true}); h != "nc" {
@@ -338,7 +336,7 @@ func TestReclaimNeedsNoRoomsAndANewLaunch(t *testing.T) {
 func TestLendStateOfAJoinedHotelSurvivesARestart(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	m := joinMiner(t, tc, "m1", true, 10, map[string]any{"reserved_for": "g2"})
+	m := joinMiner(t, tc, "m1", 10, map[string]any{"reserved_for": "g2"})
 	m.setAttestation(snpAttestation(t, attestOpts{chip: chipOf("m1"), reportID: 0x11}))
 	lend(t, tc, "m1")
 	raw, _ := os.ReadFile(filepath.Join(dir, runtimeHotelsFile))
@@ -602,11 +600,6 @@ func TestReservingASealedHotelWithForeignRoomsIsRefused(t *testing.T) {
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("owner change with g2's room: %d %v", status, doc)
 	}
-	// An unsealed hotel is unchanged: the fail-closed check covers sealed hotels.
-	if h, _, _ := createdOn(t, tc, map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); h != "b" {
-		t.Fatalf("pool room on %s, want b", h)
-	}
-	reserve(t, tc, "b", "g2")
 }
 
 // A lend or reclaim that state_dir cannot keep changes nothing: a restart

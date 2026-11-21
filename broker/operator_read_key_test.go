@@ -10,7 +10,7 @@ import (
 // sees on GET /v1/broker/capacity and nothing else.
 func TestOperatorReadKeySeesOperatorCapacity(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	status, doc := tc.call(t, "reader-key", "GET", "/v1/broker/capacity", nil)
 	if status != 200 || !listed(doc, "a") || !listed(doc, "b") || !listed(doc, "m1") || doc["admission_policy"] == nil {
 		t.Fatalf("read key capacity: %d %v", status, doc)
@@ -23,7 +23,7 @@ func TestOperatorReadKeySeesOperatorCapacity(t *testing.T) {
 
 func TestOperatorReadKeyCannotWrite(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	for _, c := range []struct {
 		method, path string
 		body         any

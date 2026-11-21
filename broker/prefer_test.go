@@ -7,22 +7,23 @@ import (
 )
 
 // "placement": "prefer" falls back only when every named hotel is down or
-// full, only to a hotel of the same class, and only inside the guest's list.
+// full, only to another sealed hotel (the one class, AB#776), and only inside
+// the guest's list or policy.
 // "require" (the default) keeps the 503 a pinned caller asked for.
 
 func downHotel(tc *testChain, id string) {
 	setHotel(tc, id, func(h *hotel) { h.ok = false; h.downSince = time.Now() })
 }
 
-func TestPreferFallsBackToAnotherUnsealedHotel(t *testing.T) {
-	tc := newChain(t)
+func TestPreferFallsBackToAnotherHotelInTheGuestsList(t *testing.T) {
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
 	downHotel(tc, "b")
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "placement": "prefer"})
 	if status != 202 {
 		t.Fatalf("prefer with the named hotel down: %d %v", status, doc)
 	}
 	if doc["hotel"] != "c" || doc["placement_fallback"] != true {
-		t.Fatalf("want a fallback to the other unsealed hotel c, got hotel=%v fallback=%v", doc["hotel"], doc["placement_fallback"])
+		t.Fatalf("want a fallback to the guest's other hotel c, got hotel=%v fallback=%v", doc["hotel"], doc["placement_fallback"])
 	}
 }
 
@@ -50,23 +51,6 @@ func TestRequireKeepsThe503(t *testing.T) {
 	}
 }
 
-func TestPreferNeverMovesASealedCreateToAnUnsealedHotel(t *testing.T) {
-	// Without a guest hotel list a sealed create never falls back.
-	tc := newChain(t)
-	downHotel(tc, "a")
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}, "placement": "prefer"})
-	if status != 503 || errCode(doc) != "hotels_unavailable" {
-		t.Fatalf("sealed prefer, no guest list: %d %v", status, doc)
-	}
-	// With a list that holds only unsealed spares, it still never falls back.
-	tc = limitedChain(t, guestLimits{Hotels: []string{"a", "b", "c"}})
-	downHotel(tc, "a")
-	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}, "placement": "prefer"})
-	if status != 503 || errCode(doc) != "hotels_unavailable" {
-		t.Fatalf("sealed prefer moved to an unsealed hotel: %d %v", status, doc)
-	}
-}
-
 func TestPreferMovesASealedCreateToTheGuestsOtherSealedHotel(t *testing.T) {
 	tc := limitedChain(t, guestLimits{Hotels: []string{"a", "c"}})
 	setHotel(tc, "c", func(h *hotel) {
@@ -91,7 +75,7 @@ func TestPreferStaysInsideTheGuestsHotelList(t *testing.T) {
 }
 
 func TestPreferKeepsTheOtherLabelRules(t *testing.T) {
-	tc := newChain(t)
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
 	setHotel(tc, "c", func(h *hotel) {
 		h.cfgMu.Lock()
 		h.cfg.Labels = map[string]string{"zone": "far"}
@@ -136,49 +120,14 @@ func TestHotelListShowsDownSince(t *testing.T) {
 	}
 }
 
-func TestPreferKeepsTheCallersOwnSealedLabelRules(t *testing.T) {
-	// Codex review on #323: a fallback must not replace the request's own
-	// exclude_hotel_labels {"sealed": "false"} with its class rule.
+func TestPreferFallbackNeedsTheGuestsList(t *testing.T) {
+	// Guest without a hotel list or policy: the named hotel is down, the
+	// others are up, and still no fallback.
 	tc := newChain(t)
-	setHotel(tc, "c", func(h *hotel) {
-		h.cfgMu.Lock()
-		h.cfg.Labels = map[string]string{"sealed": "false"}
-		h.cfgMu.Unlock()
-	})
-	downHotel(tc, "b")
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "placement": "prefer", "exclude_hotel_labels": map[string]string{"sealed": "false"}})
-	if status != 503 || errCode(doc) != "hotels_unavailable" {
-		t.Fatalf("fallback ignored exclude_hotel_labels sealed=false: %d %v", status, doc)
-	}
-}
-
-func makeSealed(tc *testChain, id string) {
-	setHotel(tc, id, func(h *hotel) {
-		h.cfgMu.Lock()
-		h.cfg.Sealed, h.cfg.SealedAdmission, h.cfg.Labels = true, sealedAdmissionOff, map[string]string{"sealed": "true"} // past the gate: placement only
-		h.cfgMu.Unlock()
-	})
-}
-
-func TestPreferSealedFallbackNeedsTheGuestsList(t *testing.T) {
-	// Two sealed hotels, guest without a hotel list: the named sealed hotel
-	// is down, the other sealed hotel is up, and still no fallback.
-	tc := newChain(t)
-	makeSealed(tc, "c")
 	downHotel(tc, "a")
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}, "placement": "prefer"})
 	if status != 503 || errCode(doc) != "hotels_unavailable" {
 		t.Fatalf("sealed fallback without a guest list: %d %v", status, doc)
-	}
-}
-
-func TestPreferMixedClassNeverFallsBack(t *testing.T) {
-	tc := newChain(t)
-	downHotel(tc, "a")
-	downHotel(tc, "b")
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a", "b"}, "placement": "prefer"})
-	if status != 503 || errCode(doc) != "hotels_unavailable" {
-		t.Fatalf("mixed sealed and unsealed named hotels fell back: %d %v", status, doc)
 	}
 }
 

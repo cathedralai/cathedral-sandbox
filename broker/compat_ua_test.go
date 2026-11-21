@@ -39,11 +39,12 @@ func TestComputeSDKAgentIsCompat(t *testing.T) {
 	}
 }
 
-// With one sealed and one unsealed hotel, the provider's node-22 creates and
-// its raw-image creates with "sealed": true all land on the sealed hotel.
+// A stale unsealed runtime entry must never receive ComputeSDK creates,
+// even though all newly configured hotels are now sealed (AB#776).
 func TestComputeSDKCreatesLandOnTheSealedHotelOnly(t *testing.T) {
 	tc := newChain(t)
-	setHotelOK(tc, "c", false) // fixture: sealed a, unsealed b
+	setHotelOK(tc, "c", false)
+	setHotel(tc, "b", func(h *hotel) { h.cfg.Sealed = false }) // stale runtime state
 	hdr := map[string]string{"User-Agent": computeSDKAgent}
 	bodies := map[string]map[string]any{
 		"template":  {"template": "node-22", "lifetime_seconds": 600, "network": "deny_all"},

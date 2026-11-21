@@ -71,7 +71,7 @@ func minSecondRooms(t *testing.T, m *usageMeter) {
 	m.end("h1.gone", msAt(500), false)
 	m.end("h1.one", msAt(1000), true)
 	m.end("h1.onetwo", msAt(1200), true)
-	m.sightRuns([]string{"h1.open"}, msAt(1200))
+	m.sightListed([]usageSighting{sighting("h1.open")}, msAt(1200)) // an open run: observed, as a bulk delete's list does
 	pass(msAt(2000), "h1.multi", "h1.long")
 	pass(msAt(4000), "h1.multi", "h1.long")
 	m.end("h1.multi", msAt(4700), true)

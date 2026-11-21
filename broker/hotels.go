@@ -400,17 +400,10 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.MinerHotkey != "" && !ss58RE.MatchString(hc.MinerHotkey):
 		writeErr(w, 400, "invalid_hotel", "miner_hotkey must be an SS58 address")
 		return
-	case hc.MinerHotkey != "" && !hc.Sealed:
-		writeErr(w, 400, "invalid_hotel", "miner hotels must be sealed")
-		return
-	case !hc.Sealed && hc.Labels["sealed"] == "true":
-		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
-		return
-	case hc.RequireAttestation && !hc.Sealed:
-		writeErr(w, 400, "invalid_hotel", "require_attestation needs a sealed hotel")
-		return
-	case hc.GuestTLS && !hc.Sealed:
-		writeErr(w, 400, "invalid_hotel", "guest_tls needs a sealed hotel")
+	case !hc.Sealed:
+		// AB#776: every Cathedral room is sealed; there is no unsealed class
+		// for a hotel to join.
+		writeErr(w, 400, "invalid_hotel", `every hotel must join with "sealed": true (there is no unsealed hotel class)`)
 		return
 	case hc.SealedAdmission == sealedAdmissionOff:
 		writeErr(w, 400, "invalid_hotel", `sealed_admission "off" is only for an operator hotel in the config file; a joined hotel is always gated`)
@@ -509,6 +502,13 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	h := newHotel(hc, req.Key)
 	h.runtime = true
 	h.pinChip = joinChip
+	b.markUnlisted(h) // metered admission waits for its first room list (allowance.go)
+	published := false
+	defer func() {
+		if !published {
+			b.unmarkUnlisted(h) // the join failed: nothing stays behind
+		}
+	}()
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {
@@ -609,6 +609,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	}
 	b.saveProbationLogged() // a rejoin under an old id must not inherit its saved probation
+	published = true
 	go b.syncLoop(ctx, h)
 	writeJSON(w, 201, b.hotelDoc(h))
 }
@@ -696,10 +697,6 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if req.AlertChatID != nil && !h.runtime {
 		// A config file hotel's PATCH is not saved: the chat would be lost on restart.
 		writeErr(w, 409, "hotel_in_config", "hotel "+id+" is in the config file; set alert_chat_id there")
-		return
-	}
-	if h.runtime && !h.cfg.Sealed && req.Labels["sealed"] == "true" {
-		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
 		return
 	}
 	var reserve *string
@@ -984,6 +981,11 @@ func (b *broker) loadRuntimeHotelList() error {
 		return err
 	}
 	for _, hc := range list {
+		if !hc.Sealed {
+			// Joined before AB#776 removed the unsealed class.
+			log.Printf("runtime hotel %s skipped: not sealed; every hotel must be sealed (AB#776)", hc.ID)
+			continue
+		}
 		if hc.MinerHotkey != "" && hc.TLSSPKISHA256 == "" {
 			log.Printf("runtime miner hotel %s skipped: no attested TLS pin", hc.ID)
 			continue

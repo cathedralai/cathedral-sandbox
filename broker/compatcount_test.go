@@ -59,7 +59,7 @@ func TestCompatCreateCountPartialFailureIsCounted(t *testing.T) {
 	setHotel(tc, "a", func(h *hotel) { h.ok = false })
 	setHotel(tc, "c", func(h *hotel) { h.ok = false })
 	setHotel(tc, "b", func(h *hotel) { h.slots = 2 }) // room for 2 of the 4
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "sealed": false, "count": 4}), nil)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "count": 4}), nil)
 	if status != 201 {
 		t.Fatalf("partial: %d %v", status, doc)
 	}

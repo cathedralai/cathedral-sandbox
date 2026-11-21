@@ -1266,64 +1266,133 @@ func usageListSighting(h *hotel, id string, labels map[string]string, resources 
 	return usageSighting{run: h.cfg.ID + "." + id, guest: labels[guestLabel], hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem}
 }
 
+// usageSightingOfListed is the sighting of a room that h's room list shows,
+// by the sync loop's rule (syncHotel): a room in the room map by its own
+// record (usageSightingOf), a recorded leftover of a failed create as not
+// billable (usageListSighting), and any other listed room as the guest's
+// room the sync adopts under its guest label on its next pass, which is
+// billable once adopted (register gives it a client id). Caller holds b.mu.
+func (b *broker) usageSightingOfListed(h *hotel, id string, labels map[string]string, resources any) usageSighting {
+	if rm := h.rooms[id]; rm != nil {
+		return usageSightingOf(h, rm, resources)
+	}
+	s := usageListSighting(h, id, labels, resources)
+	s.billable = !h.recordedLeftover(id, labels)
+	return s
+}
+
+// usageBulkTargets is what a bulk delete's pre-delete list saw on one hotel:
+// the run ids it will remove, and for the rooms the meter had no run for at
+// that moment, their sightings, kept until the delete answers.
+type usageBulkTargets struct {
+	runs   []string
+	unseen []usageSighting
+	at     time.Time // when the list answered
+}
+
 // bulkDeleteTargets lists the rooms of h that a bulk delete with q will
 // remove (a bulk delete answers no ids) and applies that list as a sighting
-// of their runs at once: a sync may drop the rooms from the room map, and end
-// their runs, before the delete answers. It returns the run ids, which
-// usageMeterBulkDeleted ends when the delete succeeds; whichever of the two comes
-// first writes the one ended reading. Nil when the meter is off or the list
-// fails: those runs then end at their last sync list.
-func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) []string {
+// of the runs the meter has, at once: a sync may drop the rooms from the
+// room map, and end their runs, before the delete answers. A listed room the
+// meter has no run for (no list of h has answered since the broker started,
+// the room is newer than the last one, or it is a create still in flight:
+// the tombstone is planted before this list) gets nothing written now; its
+// sighting, with the sync's identity and size (usageSightingOfListed), waits
+// for the delete's answer (usageMeterBulkDeleted). Nothing when the meter is
+// off or the list fails: those runs then end at their last sync list. The
+// caller does not hold b.mu.
+func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) usageBulkTargets {
 	if b.usageMeter == nil {
-		return nil
+		return usageBulkTargets{}
 	}
 	var list struct {
 		Sandboxes []struct {
 			ID     string            `json:"id"`
 			Labels map[string]string `json:"labels"`
+			// As the sync's list reads it: a map, so an odd field does not fail the list.
+			Resources map[string]any `json:"resources"`
 		} `json:"sandboxes"`
 	}
 	if err := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", q, &list); err != nil {
-		return nil
+		return usageBulkTargets{}
 	}
-	at := time.Now()
-	var runs []string
+	t := usageBulkTargets{at: time.Now()}
+	var listed []usageSighting
+	b.mu.Lock()
 	for _, s := range list.Sandboxes {
 		match := true
-		for _, want := range q["label"] { // a hotel that ignores the filter must not end other runs
+		for _, want := range q["label"] { // a hotel that ignores the filter must not touch other runs
 			k, v, _ := strings.Cut(want, "=")
 			match = match && s.Labels[k] == v
 		}
 		if match {
-			runs = append(runs, h.cfg.ID+"."+s.ID)
+			t.runs = append(t.runs, h.cfg.ID+"."+s.ID)
+			listed = append(listed, b.usageSightingOfListed(h, s.ID, s.Labels, s.Resources))
 		}
 	}
-	b.usageMeter.sightRuns(runs, at)
-	return runs
+	t.unseen = b.usageMeter.sightListed(listed, t.at)
+	b.mu.Unlock()
+	return t
 }
 
 // usageMeterBulkDeleted ends the runs a successful bulk delete removed. Their last
 // sighting is the list just before the delete, never the time the delete
-// took: it may take minutes.
-func (b *broker) usageMeterBulkDeleted(runs []string) {
-	for _, run := range runs {
-		b.usageMeter.end(run, time.Now(), false)
-	}
+// took: it may take minutes. A room the meter still has no run for gets its
+// first reading, at the list's time, and its ended reading together, both not
+// billable: the meter has no proof the guest was ever given the room (it was
+// in no create answer and no sync list; it may be a create that answers
+// deleted_during_create), and a run first seen at its delete has 0 observed
+// seconds. Unseen is decided now, under the meter lock: a room a sync adopted
+// or reapRoom recorded since the list is an existing run and only ends, its
+// billable state untouched. Known limit: a broker crash between the hotel's
+// 2xx and this write loses the record of a deleted room the meter had never
+// seen; nothing is charged either way. A failed delete writes nothing here:
+// the next sync adopts the room and meters it as before.
+func (b *broker) usageMeterBulkDeleted(t usageBulkTargets) {
+	b.usageMeter.bulkDeleted(t, time.Now())
 }
 
-// sightRuns applies a sighting at at to open runs known by id.
-func (m *usageMeter) sightRuns(runs []string, at time.Time) {
+// sightListed applies a bulk delete's list at at to the runs the meter has:
+// each is observed and keeps its billable state. It returns the sightings
+// of the listed rooms it has no run for, written only if the delete succeeds
+// (bulkDeleted).
+func (m *usageMeter) sightListed(listed []usageSighting, at time.Time) (unseen []usageSighting) {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range listed {
+		if r := m.runs[s.run]; r != nil {
+			r.observe(at)
+			r.missed = false
+			continue
+		}
+		unseen = append(unseen, s)
+	}
+	return unseen
+}
+
+// bulkDeleted writes a successful bulk delete into the log at at: a first
+// reading at the list's time and the ended reading for each room still
+// unseen, both not billable, then the end of every listed run the meter has.
+func (m *usageMeter) bulkDeleted(t usageBulkTargets, at time.Time) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, id := range runs {
-		if r := m.runs[id]; r != nil {
-			r.observe(at)
-			r.missed = false
+	for _, s := range t.unseen {
+		if m.runs[s.run] != nil || m.ended[s.run] != nil {
+			continue // seen since the list (a sync, a reap): it ends below as it is
 		}
+		s.billable = false // first seen at its delete: no proof the guest had it
+		m.seenLocked(s, t.at)
 	}
+	for _, run := range t.runs {
+		m.endLocked(run, at, false)
+	}
+	m.kickLocked()
 }
 
 // usageMeterOrphan records a room of a failed create that the orphan cleanup

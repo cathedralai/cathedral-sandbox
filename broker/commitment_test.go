@@ -62,14 +62,14 @@ func TestJoinRefusesCommitmentBelowMinimum(t *testing.T) {
 
 func TestCommitmentOptionalWithoutMinimumAndOnlyForMiners(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 2, nil)
+	joinMiner(t, tc, "m1", 2, nil)
 	_, doc := tc.call(t, "operator-key", "GET", "/v1/broker/hotels/m1", nil)
 	if v, ok := doc["commitment"]; !ok || v != nil {
 		t.Fatalf("miner without a floor joins without a commitment: %v", doc)
 	}
 	_, url := newOperatorHotel(t, 2, nil)
 	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
-		"id": "op1", "api": url, "key": joinKey, "commitment": map[string]any{"slots": 2, "daily_hours": 10},
+		"id": "op1", "api": url, "key": joinKey, "sealed": true, "commitment": map[string]any{"slots": 2, "daily_hours": 10},
 	})
 	if status != 400 || errCode(doc) != "invalid_commitment" || tc.b.hotelByID("op1") != nil {
 		t.Fatalf("operator hotel with a commitment: %d %v", status, doc)
@@ -123,7 +123,7 @@ func TestConfigRefusesBadCommitmentFields(t *testing.T) {
 // fake clock across a UTC midnight.
 func TestDeliveryIsMeasuredAgainstTheCommitment(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 8, map[string]any{"commitment": map[string]any{"slots": 4, "daily_hours": 0.01}})
+	joinMiner(t, tc, "m1", 8, map[string]any{"commitment": map[string]any{"slots": 4, "daily_hours": 0.01}})
 	h := tc.b.hotelByID("m1")
 	b := tc.b
 	t0 := time.Date(2026, 11, 13, 23, 57, 0, 0, time.UTC)
@@ -174,7 +174,7 @@ func TestDeliveryIsMeasuredAgainstTheCommitment(t *testing.T) {
 // reports 0 slots is up but not at its commitment.
 func TestSyncLoopCountsReportedSlots(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	m := joinMiner(t, tc, "m1", true, 4, map[string]any{"commitment": map[string]any{"slots": 4, "daily_hours": 12}})
+	m := joinMiner(t, tc, "m1", 4, map[string]any{"commitment": map[string]any{"slots": 4, "daily_hours": 12}})
 	time.Sleep(20 * time.Millisecond)
 	syncNow(tc, "m1")
 	h := tc.b.hotelByID("m1")
@@ -204,7 +204,7 @@ func TestSyncLoopCountsReportedSlots(t *testing.T) {
 // while /room/health fails; delivery must not credit the last known slot count.
 func TestHealthFailDoesNotCreditStaleSlots(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	m := joinMiner(t, tc, "m1", true, 8, map[string]any{"commitment": map[string]any{"slots": 4, "daily_hours": 12}})
+	m := joinMiner(t, tc, "m1", 8, map[string]any{"commitment": map[string]any{"slots": 4, "daily_hours": 12}})
 	time.Sleep(20 * time.Millisecond)
 	syncNow(tc, "m1")
 	h := tc.b.hotelByID("m1")

@@ -918,7 +918,7 @@ func TestClaimJournalIncompleteIsDetected(t *testing.T) {
 		{"the manifest deleted", func(t *testing.T, state string) {
 			_ = os.Remove(filepath.Join(claimGenDir(t, state), claimManifestName))
 		}},
-		{"both head files unreadable", func(t *testing.T, state string) {
+		{"both head files spoiled", func(t *testing.T, state string) {
 			for _, name := range claimHeadNames {
 				_ = os.WriteFile(filepath.Join(claimGenDir(t, state), name), make([]byte, claimHeadFileBytes), 0o600)
 			}
@@ -2079,5 +2079,195 @@ func TestClaimJournalOpenSyncsClaimsIDBeforeAcknowledging(t *testing.T) {
 	_ = j.close()
 	if !before {
 		t.Fatal("the second open acknowledged records without syncing state_dir, claims.id's directory")
+	}
+}
+
+// Bugbot finding A on #655: a head file that cannot be read at all (an I/O
+// error) is no verdict on the journal. open fails with that error, which is
+// not incomplete and changes no file, and once the read works again the
+// journal opens complete with every acknowledged record. It never falls back
+// on the other head file, which may hold the older head.
+func TestClaimJournalUnreadableHeadFileIsRetryableNotLoss(t *testing.T) {
+	eio := errors.New("read: input/output error")
+	cases := []struct {
+		name  string
+		fail  map[string]bool // head files whose read fails
+		spoil string          // a head file spoiled before the open as well
+	}{
+		{name: "ack-head-a unreadable, ack-head-b valid", fail: map[string]bool{claimHeadNames[0]: true}},
+		{name: "ack-head-b unreadable, ack-head-a valid", fail: map[string]bool{claimHeadNames[1]: true}},
+		{name: "both unreadable", fail: map[string]bool{claimHeadNames[0]: true, claimHeadNames[1]: true}},
+		{name: "one unreadable, the other spoiled", fail: map[string]bool{claimHeadNames[0]: true}, spoil: claimHeadNames[1]},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			state := t.TempDir()
+			j := openTestClaimJournal(t, state, claimJournalOptions{})
+			acked := claimIDRange("a", 5)
+			mustClaimAppend(t, j, acked...)
+			_ = j.close()
+			gen := claimGenDir(t, state)
+			var spoiled []byte
+			if c.spoil != "" {
+				spoiled, _ = os.ReadFile(filepath.Join(gen, c.spoil))
+				_ = os.WriteFile(filepath.Join(gen, c.spoil), make([]byte, claimHeadFileBytes), 0o600)
+			}
+			before := claimFingerprint(t, state)
+			var o claimJournalOptions
+			o.disk.readHead = func(path string) ([]byte, error) {
+				if c.fail[filepath.Base(path)] {
+					return nil, eio
+				}
+				return os.ReadFile(path)
+			}
+			j2, _, err := openClaimJournalWith(state, o)
+			switch {
+			case err == nil:
+				_ = j2.close()
+				t.Fatal("open succeeded although a head file could not be read")
+			case errors.Is(err, errClaimJournalIncomplete):
+				t.Fatalf("an I/O error on a head file was reported as loss: %v", err)
+			case !errors.Is(err, eio) || !errors.Is(err, errClaimHeadUnreadable):
+				t.Fatalf("open: %v, want the read error, marked as a head file that cannot be read", err)
+			case j2 != nil:
+				t.Fatal("a failed open returned a journal")
+			}
+			after := claimFingerprint(t, state)
+			for p, sum := range before {
+				if after[p] != sum {
+					t.Fatalf("the failed open changed %s", p)
+				}
+			}
+			if c.spoil != "" {
+				_ = os.WriteFile(filepath.Join(gen, c.spoil), spoiled, 0o600)
+			}
+			// The read works again: a plain retry opens complete.
+			j3, heads, err := openClaimJournal(state)
+			if err != nil {
+				t.Fatalf("open after the read healed: %v", err)
+			}
+			if heads.Acked != 5 {
+				t.Fatalf("head %d, want 5", heads.Acked)
+			}
+			if got := claimIDsOf(t, j3); !claimSame(got, acked) {
+				t.Fatalf("replay %v", got)
+			}
+			_ = j3.close()
+		})
+	}
+}
+
+// Bugbot finding B on #655: an empty segment that was never listed and could
+// not be removed must not wedge the writer on its name; the next roll takes
+// it over, appends go on, and a reopen replays every acknowledged record once.
+func TestClaimJournalUnremovableEmptySegmentDoesNotWedge(t *testing.T) {
+	state := t.TempDir()
+	gen := filepath.Join(state, claimJournalDirName, claimGenName(1))
+	var failDir, failRemove atomic.Bool
+	removed := errors.New("remove: input/output error")
+	o := claimJournalOptions{}
+	o.disk.syncDir = func(d string) error {
+		if failDir.Load() && d == gen {
+			return errors.New("sync gen-1: input/output error")
+		}
+		return claimJournalSyncDir(d)
+	}
+	o.disk.remove = func(path string) error {
+		if failRemove.Load() {
+			return removed
+		}
+		return os.Remove(path)
+	}
+	j := openTestClaimJournal(t, state, o)
+	mustClaimAppend(t, j, "a00")
+	// The next segment is created but never listed: its directory sync fails.
+	if err := claimAck(t, j.compact(nil)); err != nil { // a new generation, so the next batch rolls
+		t.Fatal(err)
+	}
+	gen = filepath.Join(state, claimJournalDirName, claimGenName(2))
+	failDir.Store(true)
+	if err := claimAck(t, j.append(testClaimRec("refused"))); err == nil {
+		t.Fatal("a record was acknowledged in a segment whose name is not durable")
+	}
+	failDir.Store(false)
+	// A compaction closes that unlisted segment, and its removal fails.
+	failRemove.Store(true)
+	if err := claimAck(t, j.compact(nil)); !errors.Is(err, removed) {
+		t.Fatalf("compaction: %v, want the injected remove error", err)
+	}
+	failRemove.Store(false)
+	segs, _ := filepath.Glob(filepath.Join(gen, "*.jsonl"))
+	if len(segs) != 1 {
+		t.Fatalf("segments %v, want the one empty file left behind", segs)
+	}
+	var acked []string
+	for _, id := range []string{"b00", "b01", "b02"} {
+		if err := claimAck(t, j.append(testClaimRec(id))); err != nil {
+			t.Fatalf("%s after the failed remove: %v", id, err)
+		}
+		acked = append(acked, id)
+	}
+	_ = j.close()
+	if got := claimReplayIDs(t, state); !claimSame(got, acked) {
+		t.Fatalf("replay %v, want %v", got, acked)
+	}
+	requireClaimTidy(t, state)
+}
+
+// Codex review finding 6 on #655: an open that fails after it opened the head
+// files (syncing the previous run's open segment, or writing the manifest
+// that closes it) returns no journal, so it must close those files; retries
+// through an I/O failure must not leak descriptors.
+func TestClaimJournalFailedOpenClosesHeadFiles(t *testing.T) {
+	cases := []struct {
+		name string
+		fail func(f *os.File) bool // the syncFile call to fail
+	}{
+		{"the previous open segment cannot be synced", func(f *os.File) bool { return strings.HasSuffix(f.Name(), ".jsonl") }},
+		{"the manifest that closes it cannot be written", func(f *os.File) bool { return strings.HasSuffix(f.Name(), claimManifestName+".tmp") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			state := t.TempDir()
+			j := openTestClaimJournal(t, state, claimJournalOptions{})
+			mustClaimAppend(t, j, "a00", "a01")
+			_ = j.close() // its segment stays open in the manifest: the next open closes it
+			var mu sync.Mutex
+			var opened []*os.File
+			var o claimJournalOptions
+			o.disk.open = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+				f, err := os.OpenFile(path, flag, perm)
+				if err == nil {
+					mu.Lock()
+					opened = append(opened, f)
+					mu.Unlock()
+				}
+				return f, err
+			}
+			o.disk.syncFile = func(f *os.File) error {
+				if c.fail(f) {
+					return errors.New("fsync: input/output error")
+				}
+				return f.Sync()
+			}
+			for i := 0; i < 3; i++ {
+				if j2, _, err := openClaimJournalWith(state, o); err == nil || j2 != nil {
+					t.Fatalf("open %d: %v, want a failure and no journal", i, err)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(opened) != 6 {
+				t.Fatalf("%d head files opened over 3 failed opens, want 6", len(opened))
+			}
+			for _, f := range opened {
+				if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("%s is still open after a failed open", f.Name())
+				}
+			}
+			if got := claimReplayIDs(t, state); !claimSame(got, []string{"a00", "a01"}) {
+				t.Fatalf("replay %v", got)
+			}
+		})
 	}
 }

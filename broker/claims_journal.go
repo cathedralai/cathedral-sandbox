@@ -87,7 +87,11 @@
 // batch's head. Because each line's prev commits to the one before, a valid
 // head whose line is on the chain proves every acknowledged record before it
 // is present and unchanged, in closed and open segments alike. Limit: this
-// covers a write that is interrupted; it does not detect a later corruption
+// covers a write that is interrupted; a head file that cannot be read at
+// all (an I/O error, not a missing, short or spoiled file) is no verdict:
+// open fails with that error and may be tried again, and never falls back
+// on the other file, which may hold the older head and so accept a tail
+// shorter than what was acknowledged. It does not detect a later corruption
 // of an acknowledged head file, nor a rollback that replaces a head file and
 // the tail together.
 //
@@ -129,9 +133,10 @@
 // generation; another journal-id; a missing or unreadable manifest; a listed
 // segment missing, or a closed one shorter than its size or last seq, or
 // with another sha256; the chain ending before the valid head, or another
-// chain hash there; a non-empty unlisted segment; both head files
-// unreadable; records in a generation while claims.id is missing or does
-// not parse. An incomplete
+// chain hash there; a non-empty unlisted segment; neither head file valid
+// (both missing, short or spoiled; a file open cannot read at all is an I/O
+// error, returned as such, not loss); records in a generation while
+// claims.id is missing or does not parse. An incomplete
 // journal is read only: replay yields what is readable, append and compact
 // refuse, and open changes no file, so the evidence stays for a person.
 //
@@ -223,6 +228,8 @@ type claimJournalDisk struct {
 	open     func(path string, flag int, perm os.FileMode) (*os.File, error) // a head file
 	rename   func(oldpath, newpath string) error                             // a temporary file into place
 	readBack func(path string) (string, error)                               // CURRENT read back after a rename that reported an error
+	readHead func(path string) ([]byte, error)                               // a head file at open
+	remove   func(path string) error                                         // an empty segment that was never listed
 	step     func(point string)                                              // nil: nothing; names a point a crash may hit
 }
 
@@ -253,6 +260,12 @@ func (d claimJournalDisk) withDefaults() claimJournalDisk {
 	}
 	if d.readBack == nil {
 		d.readBack = readClaimText
+	}
+	if d.readHead == nil {
+		d.readHead = os.ReadFile
+	}
+	if d.remove == nil {
+		d.remove = os.Remove
 	}
 	if d.step == nil {
 		d.step = func(string) {}
@@ -809,7 +822,12 @@ func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
 	if p := man.orderProblem(); p != "" {
 		return j.readOnly(append(reasons, p), nil)
 	}
-	head, headSeq, headErr := readClaimHeads(genDir)
+	head, headSeq, headErr := readClaimHeadsWith(genDir, j.disk.readHead)
+	if errors.Is(headErr, errClaimHeadUnreadable) {
+		// An I/O error is not loss: open fails and may be tried again, as for
+		// any other file it cannot read.
+		return nil, fmt.Errorf("claim journal: %s: %w", cur, headErr)
+	}
 	if headErr != nil {
 		reasons = append(reasons, cur+": "+headErr.Error())
 	} else {
@@ -950,6 +968,12 @@ func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
 		return nil, err
 	}
 	j.adoptGeneration(gen, man, chain, headSeq, files)
+	// From here a failed open returns no journal, so it closes what it holds:
+	// a caller that retries through an I/O failure must not leak descriptors.
+	fail := func(err error) (*claimJournal, error) {
+		j.shut()
+		return nil, err
+	}
 	j.peer = head.Peer
 	j.atOpen = records
 	j.nextSeq = max(man.NextSeq, top+1)
@@ -962,19 +986,19 @@ func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
 		s := &j.man.Segments[n-1]
 		f, err := os.OpenFile(filepath.Join(genDir, s.Name), os.O_RDWR, 0)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 		err = j.disk.syncFile(f)
 		_ = f.Close()
 		if err != nil {
-			return nil, fmt.Errorf("claim journal: sync of %s before closing it: %w", s.Name, err)
+			return fail(fmt.Errorf("claim journal: sync of %s before closing it: %w", s.Name, err))
 		}
 		found := loaded[s.Name]
 		*s = claimManifestSegment{Name: s.Name, First: s.First, Closed: true, Last: found.scan.last,
 			Size: int64(len(found.raw)), SHA256: claimSHA256(found.raw)}
 		j.nextSeq = max(j.nextSeq, s.First+1)
 		if err := j.writeManifest(""); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 	log.Printf("claim journal: %s %s, %d segments, %d records, head %d, next seq %d", j.dir, cur, len(man.Segments), len(records), head.Seq, j.nextSeq)
@@ -1142,16 +1166,29 @@ func decodeClaimHead(slot []byte) (claimHead, bool) {
 	return h, true
 }
 
+// errClaimHeadUnreadable marks a head file that could not be read at all (an
+// I/O error), as opposed to one read and found missing, short or spoiled.
+var errClaimHeadUnreadable = errors.New("claim journal: a head file cannot be read")
+
 // readClaimHeads returns the valid head file of dir with the higher seq, and
 // what each file holds (-1: missing or not valid).
 func readClaimHeads(dir string) (claimHead, [2]int64, error) {
+	return readClaimHeadsWith(dir, os.ReadFile)
+}
+
+// readClaimHeadsWith is readClaimHeads with its file read given. A file that
+// cannot be read is no verdict on either head: the call fails with
+// errClaimHeadUnreadable rather than fall back on the other file, which may
+// hold the older head and so accept a tail shorter than what was
+// acknowledged.
+func readClaimHeadsWith(dir string, read func(string) ([]byte, error)) (claimHead, [2]int64, error) {
 	seqs := [2]int64{-1, -1}
 	var best claimHead
 	found := false
 	for i, name := range claimHeadNames {
-		raw, err := os.ReadFile(filepath.Join(dir, name))
+		raw, err := read(filepath.Join(dir, name))
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return claimHead{}, seqs, err
+			return claimHead{}, seqs, fmt.Errorf("%w: %s: %w", errClaimHeadUnreadable, name, err)
 		}
 		h, ok := decodeClaimHead(raw)
 		if !ok {
@@ -1163,7 +1200,7 @@ func readClaimHeads(dir string) (claimHead, [2]int64, error) {
 		}
 	}
 	if !found {
-		return claimHead{}, seqs, errors.New("both head files unreadable")
+		return claimHead{}, seqs, errors.New("neither head file is valid (missing, short or spoiled)")
 	}
 	return best, seqs, nil
 }
@@ -1585,13 +1622,33 @@ func (j *claimJournal) roll() error {
 		}
 	}
 	name := claimSegmentName(j.nextSeq)
-	f, err := os.OpenFile(filepath.Join(j.genDir, name), os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_EXCL, 0o600)
+	path := filepath.Join(j.genDir, name)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) && !j.listed(name) {
+		// An empty file of this name that the manifest does not list is a
+		// segment that took nothing and could not be removed: open treats it
+		// as debris, and the writer takes it over instead of failing every
+		// later batch on its name.
+		if info, serr := os.Stat(path); serr == nil && info.Mode().IsRegular() && info.Size() == 0 {
+			f, err = os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("claim journal: new segment %s: %w", name, err)
 	}
 	j.seg = &claimSegment{name: name, first: j.nextSeq, f: f}
 	j.disk.step("roll-created")
 	return nil
+}
+
+// listed reports whether the manifest in memory names segment name.
+func (j *claimJournal) listed(name string) bool {
+	for _, s := range j.man.Segments {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // closeSegment syncs the open segment and records its last seq, size and
@@ -1603,7 +1660,9 @@ func (j *claimJournal) closeSegment() error {
 	if !s.listed {
 		_ = s.f.Close()
 		j.seg = nil
-		return os.Remove(path)
+		// If this fails the empty file stays; roll takes it over (see there)
+		// and open removes it as debris.
+		return j.disk.remove(path)
 	}
 	if err := j.disk.syncFile(s.f); err != nil {
 		return fmt.Errorf("claim journal: sync of %s before closing it: %w", s.name, err)

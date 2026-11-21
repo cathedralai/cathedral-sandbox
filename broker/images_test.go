@@ -102,6 +102,9 @@ type fakeHotel struct {
 	// absentDelete204: answer 204 to a delete of a room the hotel does not
 	// hold, as the real hotel does (usage_meter_test.go).
 	absentDelete204 bool
+	// listIgnoresLabels: a room list that ignores its label filters and lists
+	// every room (usage_meter_test.go).
+	listIgnoresLabels bool
 	// bulkDeleteHold: when set, a bulk delete removes its rooms at once but
 	// answers only when the channel closes (usage_meter_test.go).
 	bulkDeleteHold chan struct{}
@@ -211,12 +214,16 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, f.labelListFail, "list_failed", "the hotel could not list its rooms")
 			return
 		}
-		// Like a hotel: every "label" filter must match.
+		// Like a hotel: every "label" filter must match (listIgnoresLabels:
+		// a hotel that ignores the filter and lists every room).
 		out := []map[string]any{}
 		for _, rm := range f.rooms {
 			labels, _ := rm["labels"].(map[string]any)
 			keep := true
 			for _, want := range r.URL.Query()["label"] {
+				if f.listIgnoresLabels {
+					break
+				}
 				k, v, _ := strings.Cut(want, "=")
 				if labels[k] != v {
 					keep = false
@@ -540,7 +547,7 @@ type testChain struct {
 	cfgPath string
 }
 
-// newChain builds a broker over fake hotels "a" (sealed), "b" and "c".
+// newChain builds a broker over fake sealed hotels "a", "b" and "c".
 func newChain(t *testing.T) *testChain { return newChainState(t, "") }
 
 // newChainState is newChain with a broker state_dir.
@@ -559,10 +566,10 @@ func newChainState(t *testing.T, stateDir string) *testChain {
 		hs := httptest.NewServer(f)
 		t.Cleanup(hs.Close)
 		tc.hotels[id] = f
-		hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4}
-		if id == "a" {
-			hc.Labels = map[string]string{"sealed": "true"}
-		}
+		// Every hotel is sealed (AB#776). The fake hotels have no attestation,
+		// so they use the config-only ops escape (AB#596); sealed_admission_test.go
+		// covers the real gate.
+		hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4, Sealed: true, SealedAdmission: sealedAdmissionOff}
 		cfg.Hotels = append(cfg.Hotels, hc)
 	}
 	raw, _ := json.Marshal(cfg)
@@ -799,13 +806,23 @@ func TestSnapshotCallsCarryTheGuestToOwnerScopedHotel(t *testing.T) {
 	}
 }
 
+// zoneHotel adds the label zone=v to hotel id (it keeps its sealed label).
+func zoneHotel(tc *testChain, id, v string) {
+	setHotel(tc, id, func(h *hotel) {
+		h.cfgMu.Lock()
+		h.cfg.Labels = map[string]string{"sealed": "true", "zone": v}
+		h.cfgMu.Unlock()
+	})
+}
+
 func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 	tc := newChain(t)
+	zoneHotel(tc, "a", "eu")
 	for i := 0; i < 5; i++ {
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "true"}}); !strings.HasPrefix(id, "a.") {
-			t.Fatalf("sealed room on %s", id)
+		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"zone": "eu"}}); !strings.HasPrefix(id, "a.") {
+			t.Fatalf("zone=eu room on %s", id)
 		}
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "exclude_hotel_labels": map[string]string{"sealed": "true"}}); strings.HasPrefix(id, "a.") {
+		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "exclude_hotel_labels": map[string]string{"zone": "eu"}}); strings.HasPrefix(id, "a.") {
 			t.Fatalf("excluded hotel used: %s", id)
 		}
 	}
@@ -819,7 +836,7 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 			}
 		}
 	}
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "maybe"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"zone": "mars"}})
 	if status != 409 || errCode(doc) != "no_matching_hotel" {
 		t.Fatalf("no match: %d %v", status, doc)
 	}
@@ -832,9 +849,9 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 	tc.b.mu.Lock()
 	tc.b.hotelByID("a").slots = len(tc.b.hotelByID("a").rooms)
 	tc.b.mu.Unlock()
-	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "true"}})
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"zone": "eu"}})
 	if status != 429 || errCode(doc) != "no_free_rooms" {
-		t.Fatalf("full sealed hotel: %d %v", status, doc)
+		t.Fatalf("full selected hotel: %d %v", status, doc)
 	}
 	// Selected hotel down: 503 hotels_unavailable — not "all hotels are full".
 	setHotel(tc, "a", func(h *hotel) { h.ok = false; h.slots = 100 })
@@ -850,10 +867,11 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 
 func TestForkOutsideTheHotelSelectionIs409(t *testing.T) {
 	tc := newChain(t)
+	zoneHotel(tc, "a", "eu")
 	room := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	_, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+room+"/snapshot", map[string]any{})
 	snapID := doc["result"].(map[string]any)["snapshot_id"].(string)
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"snapshot_id": snapID, "hotel_labels": map[string]string{"sealed": "true"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"snapshot_id": snapID, "hotel_labels": map[string]string{"zone": "eu"}})
 	if status != 409 || errCode(doc) != "snapshot_hotel_excluded" {
 		t.Fatalf("%d %v", status, doc)
 	}
@@ -876,6 +894,7 @@ func waitPrefetch(t *testing.T, tc *testChain, key, id string) map[string]any {
 
 func TestPrefetchToChosenHotelsWithLoginAndStatus(t *testing.T) {
 	tc := newChain(t)
+	zoneHotel(tc, "a", "eu")
 	tc.hotels["c"].failPull = true
 	tc.hotels["a"].pullDelay = 200 * time.Millisecond
 	auth := map[string]any{"username": "robot", "password": "s3cret"}
@@ -917,7 +936,7 @@ func TestPrefetchToChosenHotelsWithLoginAndStatus(t *testing.T) {
 		t.Fatalf("foreign status: %d", status)
 	}
 	// By label, no login.
-	status, doc = tc.call(t, "key1", "POST", "/v1/images/prefetch", map[string]any{"images": []string{"alpine:3.20"}, "hotel_labels": map[string]string{"sealed": "true"}})
+	status, doc = tc.call(t, "key1", "POST", "/v1/images/prefetch", map[string]any{"images": []string{"alpine:3.20"}, "hotel_labels": map[string]string{"zone": "eu"}})
 	if status != 202 || len(doc["hotels"].(map[string]any)) != 1 {
 		t.Fatalf("label prefetch: %d %v", status, doc)
 	}
@@ -967,22 +986,22 @@ func TestCompatUnknownTemplateIsAnErrorNotABaseImageRoom(t *testing.T) {
 	}
 }
 
-func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
+// AB#776: every hotel is sealed, so a plain create, "sealed": true and a
+// named hotel all place, "sealed": false is refused, and the broker field
+// never reaches a hotel.
+func TestEveryCreateIsSealed(t *testing.T) {
 	tc := newChain(t)
-	// Make "b" a config-sealed hotel: exclusive, label added by the broker.
-	h := tc.b.hotelByID("b")
-	h.cfg.Sealed, h.cfg.SealedAdmission = true, sealedAdmissionOff // past the gate: placement only
-	h.cfg.Labels = map[string]string{"sealed": "true"}
-	for i := 0; i < 20; i++ {
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"}); strings.HasPrefix(id, "b.") {
-			t.Fatalf("plain create landed on the sealed hotel: %s", id)
-		}
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "sealed": true}); strings.HasPrefix(id, "c.") {
-			t.Fatalf("sealed create landed on an unsealed hotel: %s", id)
-		}
+	for i := 0; i < 5; i++ {
+		tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+		tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "sealed": true})
 	}
 	if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); !strings.HasPrefix(id, "b.") {
-		t.Fatalf("named sealed hotel not used: %s", id)
+		t.Fatalf("named hotel not used: %s", id)
+	}
+	before := totalCreates(tc)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": false, "hotels": []string{"b"}})
+	if status != 400 || errCode(doc) != "sealed_only" || totalCreates(tc) != before {
+		t.Fatalf(`"sealed": false: %d %v`, status, doc)
 	}
 	for _, f := range tc.hotels {
 		for _, c := range f.creates {
@@ -991,7 +1010,7 @@ func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
 			}
 		}
 	}
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": "yes"})
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": "yes"})
 	if status != 400 || errCode(doc) != "invalid_hotel_selection" {
 		t.Fatalf("bad sealed value: %d %v", status, doc)
 	}

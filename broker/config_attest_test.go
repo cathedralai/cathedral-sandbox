@@ -146,6 +146,70 @@ func TestGenoaFloorGatesMinerTLSBootstrap(t *testing.T) {
 	}
 }
 
+// microcodeTestReport sets the microcode byte of the unbound TCBs (current,
+// committed, launch). The reported TCB is bound by the binding and is 0x07 in
+// every byte of the fixture, so these tests use 0x07 as the floor; the real
+// SB-3061 values (0x58 refused, 0x5b passes) are in admission_test.go.
+func microcodeTestReport(t *testing.T, raw []byte, microcode byte) []byte {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	report, err := base64.StdEncoding.DecodeString(doc["report_b64"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int{0x38, 0x1E0, 0x1F0} {
+		report[offset+6], report[offset+7] = 0x07, microcode
+	}
+	doc["report_b64"] = base64.StdEncoding.EncodeToString(report)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestGenoaMicrocodeFloorRefusesBelowFloorHotel(t *testing.T) {
+	tc, guests := newConfigHotelChain(t, []configHotel{{id: "s1", att: attestOpts{chip: 46}, optIn: true}},
+		func(c *config) { c.MinGenoaSNPSPL, c.MinGenoaMicrocodeSPL = 0x07, 0x07 })
+	guests["s1"].setAttestation(microcodeTestReport(t, snpAttestation(t, attestOpts{chip: 46}), 0x06))
+	recheckNow(tc, "s1")
+	a := admissionOf(t, tc, "s1")
+	if a["state"] != "refused" || !strings.Contains(fmt.Sprint(a["reason"]), "current TCB microcode component below 07") {
+		t.Fatalf("below-floor microcode hotel was not refused: %v", a)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", sealedOn("s1")); status != 503 || errCode(doc) != "hotels_not_admitted" {
+		t.Fatalf("create on a below-floor hotel: %d %v", status, doc)
+	}
+	guests["s1"].setAttestation(microcodeTestReport(t, snpAttestation(t, attestOpts{chip: 46}), 0x07))
+	recheckNow(tc, "s1")
+	if a := admissionOf(t, tc, "s1"); a["state"] != "admitted" {
+		t.Fatalf("fixed microcode hotel not admitted: %v", a)
+	}
+}
+
+func TestGenoaMicrocodeFloorGatesMinerTLSBootstrap(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MinGenoaMicrocodeSPL = 0x07
+	join := func(id string, att []byte) (int, map[string]any) {
+		m, url := newMinerHotel(t, 5, att)
+		tc.hotels[id] = m.fakeHotel
+		return tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
+			"id": id, "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey,
+		})
+	}
+	old := microcodeTestReport(t, snpAttestation(t, attestOpts{chip: 91}), 0x06)
+	if status, doc := join("old-miner", old); status != 422 || !strings.Contains(fmt.Sprint(doc), "current TCB microcode component below 07") {
+		t.Fatalf("pre-SB-3061 miner passed bootstrap: %d %v", status, doc)
+	}
+	fixed := microcodeTestReport(t, snpAttestation(t, attestOpts{chip: 92}), 0x07)
+	if status, doc := join("fixed-miner", fixed); status != 201 {
+		t.Fatalf("microcode floor-compliant miner refused bootstrap: %d %v", status, doc)
+	}
+}
+
 func TestConfigHotelOptInTakesRoomsOnlyAfterAttestation(t *testing.T) {
 	tc, _ := newConfigHotelChain(t, []configHotel{{id: "s1", att: attestOpts{chip: 46}, optIn: true}}, nil)
 
@@ -358,7 +422,7 @@ func TestConfigHotelOptInFailsClosed(t *testing.T) {
 		if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "require_attestation needs") {
+		if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), `every hotel must be "sealed": true`) {
 			t.Fatalf("unsealed require_attestation hotel loaded: %v", err)
 		}
 	})

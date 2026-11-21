@@ -7,32 +7,31 @@ import (
 )
 
 // Capacity plane slice 1: guest policy (prefer, allow, deny), the tiered
-// placer and the capacity catalog. Hotels: "a" sealed (shared), "nc" sealed
-// (denied to the policy guest), "b" and "c" unsealed. No network: every
-// hotel is a fake in this process.
+// placer and the capacity catalog. Every hotel is sealed (AB#776): "a" (and
+// "s2" where a test adds it) is preferred, "nc" is denied to the policy
+// guest, "b" and "c" are allowed. No network: every hotel is a fake in this
+// process.
 
-// polarisSealed is the example policy of the PR: prefer sealed, allow
-// unsealed, deny nc, at most 10 rooms.
+// polarisSealed prefers a and s2, allows any other sealed hotel, denies nc,
+// at most 10 rooms.
 var polarisSealed = map[string]any{
 	"max_rooms": 10,
 	"policy": map[string]any{
-		"prefer": []any{map[string]any{"class": "sealed"}},
-		"allow":  []any{map[string]any{"class": "unsealed"}},
+		"prefer": []any{map[string]any{"hotel": "a"}, map[string]any{"hotel": "s2"}},
+		"allow":  []any{map[string]any{"class": "sealed"}},
 		"deny":   []any{map[string]any{"hotel": "nc"}},
 	},
 }
 
-// addHotel adds a fake hotel to the chain (as a config hotel would be).
-func addFakeHotel(t *testing.T, tc *testChain, id string, sealed bool) {
+// addFakeHotel adds a fake sealed hotel to the chain (as a config hotel
+// would be), past the gate with the ops escape (sealed_admission_test.go).
+func addFakeHotel(t *testing.T, tc *testChain, id string) {
 	t.Helper()
 	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels[id] = f
-	hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, Concurrency: 4, Sealed: sealed}
-	if sealed {
-		hc.SealedAdmission = sealedAdmissionOff // placement fixture, past the gate (sealed_admission_test.go)
-	}
+	hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, Concurrency: 4, Sealed: true, SealedAdmission: sealedAdmissionOff}
 	h := newHotel(hc, "hotel-key")
 	if err := tc.b.addHotel(h); err != nil {
 		t.Fatal(err)
@@ -40,13 +39,13 @@ func addFakeHotel(t *testing.T, tc *testChain, id string, sealed bool) {
 	setHotel(tc, id, func(h *hotel) { h.ok, h.slots = true, 100 })
 }
 
-// policyChain is a chain with a sealed "a", a sealed "nc" and guest g1 on
-// the polaris-sealed policy, set through the operator PATCH.
+// policyChain is a chain with hotels a, b, c and nc and guest g1 on the
+// polarisSealed policy, set through the operator PATCH.
 func policyChain(t *testing.T, stateDir string) *testChain {
 	t.Helper()
 	tc := newChainState(t, stateDir)
 	ungatedSealed(tc.b.hotelByID("a"))
-	addFakeHotel(t, tc, "nc", true)
+	addFakeHotel(t, tc, "nc")
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", polarisSealed); status != 200 {
 		t.Fatalf("set policy: %d %v", status, doc)
 	}
@@ -93,16 +92,12 @@ func TestPreferFullFallsBackToAllowThenBackToPrefer(t *testing.T) {
 	if h1 != "a" || tier1 != "prefer" {
 		t.Fatalf("first create: %s %s, want a prefer", h1, tier1)
 	}
-	// Sealed is full: the next create goes to an unsealed hotel, tier allow.
+	// Prefer is full: the next create goes to an allowed hotel.
 	h2, tier2, _ := createdOn(t, tc, plain)
 	if (h2 != "b" && h2 != "c") || tier2 != "allow" {
 		t.Fatalf("prefer full: %s %s, want b or c allow", h2, tier2)
 	}
-	// A sealed create never falls back to unsealed: it waits for sealed.
-	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": true}); status != 429 || errCode(doc) != "no_free_rooms" {
-		t.Fatalf("sealed create with sealed full: %d %v", status, doc)
-	}
-	// The sealed room goes away and the sync loop sees it: back to prefer.
+	// The preferred room goes away and the sync loop sees it: back to prefer.
 	if status, _ := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+room1, nil); status != 204 {
 		t.Fatalf("delete: %d", status)
 	}
@@ -162,7 +157,7 @@ func TestDenyFenceNeverChoosesADeniedHotel(t *testing.T) {
 func TestAutoFreeCapacityUsesEveryHotelOfTheClass(t *testing.T) {
 	dir := t.TempDir()
 	tc := policyChain(t, dir)
-	addFakeHotel(t, tc, "s2", true)
+	addFakeHotel(t, tc, "s2")
 	setHotel(tc, "a", func(h *hotel) { h.slots = 1 })
 	setHotel(tc, "s2", func(h *hotel) { h.slots = 1 })
 	// Two creates under one guest land on two different sealed hotels.
@@ -171,7 +166,10 @@ func TestAutoFreeCapacityUsesEveryHotelOfTheClass(t *testing.T) {
 	if h1 == h2 || t1 != "prefer" || t2 != "prefer" || (h1 != "a" && h1 != "s2") || (h2 != "a" && h2 != "s2") {
 		t.Fatalf("two creates: %s/%s and %s/%s, want a and s2, both prefer", h1, t1, h2, t2)
 	}
-	// A sealed hotel joins at runtime: the guest uses it with no policy edit.
+	// A sealed hotel joins at runtime: the guest's class selector reaches it
+	// with no policy edit. The other allowed hotels are full, so it is next.
+	setHotel(tc, "b", func(h *hotel) { h.slots = 0 })
+	setHotel(tc, "c", func(h *hotel) { h.slots = 0 })
 	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{})}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
@@ -182,8 +180,8 @@ func TestAutoFreeCapacityUsesEveryHotelOfTheClass(t *testing.T) {
 	setHotel(tc, "s3", func(h *hotel) { h.ok, h.slots = true, 10 })
 	admitNow(t, tc, "s3") // the sync loop's attestation step (slice 2 admission)
 	h3, t3, _ := createdOn(t, tc, plain)
-	if h3 != "s3" || t3 != "prefer" {
-		t.Fatalf("after join: %s %s, want s3 prefer", h3, t3)
+	if h3 != "s3" || t3 != "allow" {
+		t.Fatalf("after join: %s %s, want s3 allow", h3, t3)
 	}
 	status, doc := tc.call(t, "key1", "GET", "/v1/broker/capacity", nil)
 	if status != 200 || !listed(doc, "s3") {
@@ -227,7 +225,7 @@ func catalogEntry(doc map[string]any, id string) (map[string]any, bool) {
 
 func TestMinerEnrollerCapacityIsScopedAndReportsTLSPin(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	status, scoped := tc.call(t, "enroller-key", "GET", "/v1/broker/capacity", nil)
 	if status != 200 || !listed(scoped, "m1") || listed(scoped, "a") || listed(scoped, "b") {
 		t.Fatalf("scoped miner catalog: %d %v", status, scoped)
@@ -253,9 +251,9 @@ func TestMinerEnrollerCapacityIsScopedAndReportsTLSPin(t *testing.T) {
 
 func TestCatalogTruth(t *testing.T) {
 	tc := policyChain(t, "")
-	addFakeHotel(t, tc, "s2", true)
-	addFakeHotel(t, tc, "d", false)
-	addFakeHotel(t, tc, "m", false)
+	addFakeHotel(t, tc, "s2")
+	addFakeHotel(t, tc, "d")
+	addFakeHotel(t, tc, "m")
 	// One hotel per reason a free slot is not a free room.
 	setHotel(tc, "c", func(h *hotel) { h.ok = false })                                 // down
 	setHotel(tc, "s2", func(h *hotel) { h.cfg.Drain = true })                          // draining
@@ -263,12 +261,12 @@ func TestCatalogTruth(t *testing.T) {
 	setHotel(tc, "m", func(h *hotel) { h.memPct = 95 })                                // memory full
 	setHotel(tc, "a", func(h *hotel) { h.slots = 3 })
 
-	// Operator: every hotel, with the right class.
+	// Operator: every hotel, each of the one class (AB#776).
 	status, op := tc.call(t, "operator-key", "GET", "/v1/broker/capacity", nil)
 	if status != 200 {
 		t.Fatalf("operator catalog: %d %v", status, op)
 	}
-	wantClass := map[string]string{"a": "sealed", "nc": "sealed", "s2": "sealed", "b": "unsealed", "c": "unsealed", "d": "unsealed", "m": "unsealed"}
+	wantClass := map[string]string{"a": "sealed", "nc": "sealed", "s2": "sealed", "b": "sealed", "c": "sealed", "d": "sealed", "m": "sealed"}
 	for id, class := range wantClass {
 		e, ok := catalogEntry(op, id)
 		if !ok || e["class"] != class {
@@ -353,6 +351,7 @@ func TestPolicyPatchValidatesAndClears(t *testing.T) {
 	tc := policyChain(t, "")
 	for _, bad := range []map[string]any{
 		{"policy": map[string]any{"prefer": []any{map[string]any{"class": "gold"}}}},
+		{"policy": map[string]any{"allow": []any{map[string]any{"class": "unsealed"}}}}, // AB#776
 		{"policy": map[string]any{"prefer": []any{map[string]any{"class": "sealed", "hotel": "a"}}}},
 		{"policy": map[string]any{"deny": []any{map[string]any{"hotel": "nc"}}}},
 		{"policy": map[string]any{"prefer": []any{map[string]any{"zone": "x"}}}},
@@ -364,18 +363,22 @@ func TestPolicyPatchValidatesAndClears(t *testing.T) {
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"policy": nil}); status != 200 || doc["policy"] != nil {
 		t.Fatalf("clear: %d %v", status, doc)
 	}
-	// Without the policy, g1 is back to the old rules: a plain create never
-	// goes to a sealed hotel.
-	if h, tier, _ := createdOn(t, tc, plain); h == "a" || h == "nc" || tier != "" {
+	// Without the policy, g1 is back to the no-policy rules: no tier.
+	if h, tier, _ := createdOn(t, tc, plain); h == "" || tier != "" {
 		t.Fatalf("after clear: %s %s", h, tier)
 	}
 }
 
-func TestUnsealedCreateUnderPolicyGoesToAllow(t *testing.T) {
+// AB#776: a policy guest asking for an unsealed room is refused; there is
+// no class to send it to and the allow tier is sealed too.
+func TestUnsealedCreateUnderPolicyIsRefused(t *testing.T) {
 	tc := policyChain(t, "")
-	h, tier, _ := createdOn(t, tc, map[string]any{"image": "alpine:3.20", "sealed": false})
-	if (h != "b" && h != "c") || tier != "allow" {
-		t.Fatalf("sealed=false: %s %s, want b or c allow", h, tier)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": false})
+	if status != 400 || errCode(doc) != "sealed_only" {
+		t.Fatalf(`"sealed": false: %d %v, want 400 sealed_only`, status, doc)
+	}
+	if n := totalCreates(tc); n != 0 {
+		t.Fatalf("a refused create reached a hotel: %d", n)
 	}
 }
 
@@ -390,8 +393,9 @@ func reserve(t *testing.T, tc *testChain, hotelID string, owner any) {
 	}
 }
 
-// reservedChain: g1 on the polaris-sealed policy with no deny, g2 the owner
-// of sealed hotel "nc" through a hotel list (the const shape).
+// reservedChain: g1 on a policy that prefers a and nc and allows the rest,
+// with no deny; g2 the owner of hotel "nc" through a hotel list (the const
+// shape).
 func reservedChain(t *testing.T) *testChain { return reservedChainState(t, "") }
 
 // reservedChainState is reservedChain with a broker state_dir.
@@ -399,10 +403,10 @@ func reservedChainState(t *testing.T, stateDir string) *testChain {
 	t.Helper()
 	tc := newChainState(t, stateDir)
 	ungatedSealed(tc.b.hotelByID("a"))
-	addFakeHotel(t, tc, "nc", true)
+	addFakeHotel(t, tc, "nc")
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"policy": map[string]any{
-		"prefer": []any{map[string]any{"class": "sealed"}},
-		"allow":  []any{map[string]any{"class": "unsealed"}},
+		"prefer": []any{map[string]any{"hotel": "a"}, map[string]any{"hotel": "nc"}},
+		"allow":  []any{map[string]any{"class": "sealed"}},
 	}}); status != 200 {
 		t.Fatalf("policy: %d %v", status, doc)
 	}
@@ -462,7 +466,7 @@ func TestReleasedHotelJoinsThePool(t *testing.T) {
 		t.Fatalf("owner before release: %s", h)
 	}
 	if h, tier, _ := createdOn(t, tc, plain); h == "nc" || tier != "allow" {
-		t.Fatalf("g1 before release: %s %s, want an unsealed allow hotel", h, tier)
+		t.Fatalf("g1 before release: %s %s, want an allowed hotel", h, tier)
 	}
 	reserve(t, tc, "nc", nil) // release: no guest config edit
 	if h, tier, _ := createdOn(t, tc, plain); h != "nc" || tier != "prefer" {

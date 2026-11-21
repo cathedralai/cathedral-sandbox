@@ -48,19 +48,14 @@ type placement struct {
 	// id on the hotel.
 	snapshotRef, hotelSnap string
 	allowed                map[string]bool // non-empty: the guest may use only these hotels (guests.go)
-	// images: non-empty for a create from a broker-built image, the hotels
-	// that hold it. Unlike ids it is not a hotel choice: the sealed rule and
-	// the guest's sealed default still apply.
-	images          map[string]bool
-	sealedByDefault bool // match["sealed"] comes from the guest default, not the request
 	// hotelWorkspace: the hotel name of the workspace the create mounts
 	// (workspaces.go). only is then the hotel that holds it.
 	hotelWorkspace string
 	// prefer: "placement": "prefer". When every named hotel is down or full,
 	// the create may go to another hotel of the same class (fallbackFor).
 	prefer bool
-	// class: set only on a fallback. "sealed" or "unsealed": the hotel must be
-	// of that class, on top of every rule above.
+	// class: set only on a fallback, always "sealed" (the one class, AB#776):
+	// the hotel must be of that class, on top of every rule above.
 	class string
 	// policy: the guest's placement policy (capacity.go), nil for a guest
 	// with none. tier: "" for any tier the policy reaches, or "prefer" or
@@ -110,9 +105,6 @@ func (pl placement) selects(h *hotel) bool {
 	if len(pl.ids) > 0 && !pl.ids[h.cfg.ID] {
 		return false
 	}
-	if len(pl.images) > 0 && !pl.images[h.cfg.ID] {
-		return false
-	}
 	if r := h.reservedFor(); r != "" && r != pl.guest {
 		return false
 	}
@@ -125,23 +117,9 @@ func (pl placement) selects(h *hotel) bool {
 			return false
 		}
 	}
-	isSealed := h.labels()["sealed"] == "true"
-	switch pl.class {
-	case "sealed":
-		if !isSealed {
-			return false
-		}
-	case "unsealed":
-		if isSealed {
-			return false
-		}
-	}
-	// A hotel with "sealed": true in the config takes only creates that ask
-	// for a sealed room ("sealed": true or hotel label sealed=true) or name it.
-	// A sealed fallback counts as asking: it comes from a named sealed hotel.
-	// A guest policy that reaches the hotel (checked above) also counts: the
-	// operator gave the guest that class.
-	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" && pl.class != "sealed" && pl.policy == nil {
+	// Every hotel is sealed (AB#776), so every create is a sealed create and
+	// needs no opt-in: the guest's hotel set and policy (above) decide.
+	if pl.class != "" && hotelClass(h) != pl.class {
 		return false
 	}
 	for k, v := range pl.match {
@@ -426,10 +404,15 @@ func stringMap(v any, field string) (map[string]string, *apiErr) {
 }
 
 // parseSelection reads "hotels", "hotel_labels", "exclude_hotel_labels" and
-// "sealed", and applies the guest's hotel set and sealed default (guests.go).
-// It answers 409 for an unknown hotel id and 409 when no hotel matches.
+// "sealed", and applies the guest's hotel set or policy (guests.go). It
+// answers 400 sealed_only for "sealed": false, 409 for an unknown hotel id
+// and 409 when no hotel matches.
 func (b *broker) parseSelection(g *guestState, payload map[string]any) (placement, *apiErr) {
 	var pl placement
+	// First, so the answer does not depend on the rest of the selection.
+	if v, ok := payload["sealed"].(bool); ok && !v {
+		return pl, errSealedOnly
+	}
 	if v, ok := payload["hotels"]; ok && v != nil {
 		list, ok := v.([]any)
 		if !ok {
@@ -451,28 +434,19 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 	if pl.match, e = stringMap(payload["hotel_labels"], "hotel_labels"); e != nil {
 		return pl, e
 	}
-	// "sealed": true is short for hotel_labels {"sealed": "true"}.
+	// "sealed": true is short for hotel_labels {"sealed": "true"}; false was
+	// refused above.
 	if v, ok := payload["sealed"]; ok && v != nil {
-		sealed, ok := v.(bool)
-		if !ok {
+		if _, ok := v.(bool); !ok {
 			return pl, &apiErr{400, "invalid_hotel_selection", "sealed must be true or false"}
 		}
-		if sealed {
-			if pl.match == nil {
-				pl.match = map[string]string{}
-			}
-			pl.match["sealed"] = "true"
+		if pl.match == nil {
+			pl.match = map[string]string{}
 		}
+		pl.match["sealed"] = "true"
 	}
 	if pl.exclude, e = stringMap(payload["exclude_hotel_labels"], "exclude_hotel_labels"); e != nil {
 		return pl, e
-	}
-	// "sealed": false asks for an unsealed hotel.
-	if v, ok := payload["sealed"].(bool); ok && !v {
-		if pl.exclude == nil {
-			pl.exclude = map[string]string{}
-		}
-		pl.exclude["sealed"] = "true"
 	}
 	// "placement": "require" (default) keeps a create on the named hotels;
 	// "prefer" lets it fall back to a hotel of the same class (fallbackFor).
@@ -494,9 +468,7 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		pl.ownHostsOnly = own
 	}
 	_, pl.registryAuth = createRegistryAuth(payload)
-	_, named := payload["hotels"]
-	_, sealedField := payload["sealed"]
-	b.scope(g, &pl, named && payload["hotels"] != nil, sealedField && payload["sealed"] != nil)
+	b.scope(g, &pl)
 	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			return pl, nil
@@ -518,39 +490,26 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 }
 
 // fallbackFor widens a "prefer" placement whose named hotels are all down or
-// full: any other hotel of the same class (sealed or not) that the rest of the
-// selection and the guest's hotel list allow. A sealed fallback needs the
-// guest's own hotel list, so a guest never lands on a sealed hotel it was not
-// given. Named hotels of mixed class, and forks, do not fall back.
+// full: any other sealed hotel that the rest of the selection and the guest's
+// hotel list or policy allow. It needs that list or policy, so a guest never
+// lands on a hotel it was not given. Forks do not fall back.
 func (b *broker) fallbackFor(pl placement) (placement, bool) {
 	if !pl.prefer || len(pl.ids) == 0 || pl.only != nil {
 		return pl, false
 	}
-	n, sealed := 0, 0
 	for id := range pl.ids {
-		h := b.hotelByID(id)
-		if h == nil {
+		if h := b.hotelByID(id); h == nil || hotelClass(h) != classSealed {
 			return pl, false
 		}
-		n++
-		if h.labels()["sealed"] == "true" {
-			sealed++
-		}
 	}
-	if sealed != 0 && sealed != n {
-		return pl, false
-	}
-	if sealed == n && len(pl.allowed) == 0 && pl.policy == nil {
+	if len(pl.allowed) == 0 && pl.policy == nil {
 		return pl, false
 	}
 	// The class is a separate rule, so the request's own hotel_labels and
-	// exclude_hotel_labels (even on the "sealed" label) still apply.
+	// exclude_hotel_labels still apply.
 	fb := pl
 	fb.ids = nil
-	fb.class = "unsealed"
-	if sealed == n {
-		fb.class = "sealed"
-	}
+	fb.class = classSealed
 	return fb, true
 }
 
@@ -577,12 +536,7 @@ func (b *broker) snapshotPlacement(ctx context.Context, g *guestState, payload m
 	if e != nil {
 		return pl, e
 	}
-	// A fork goes to its snapshot's hotel. The guest's sealed default does not
-	// stop a fork of a snapshot on an unsealed hotel.
-	if pl.sealedByDefault && h.labels()["sealed"] != "true" {
-		delete(pl.match, "sealed")
-		pl.sealedByDefault = false
-	}
+	// A fork goes to its snapshot's hotel.
 	if !pl.selects(h) {
 		return pl, &apiErr{409, "snapshot_hotel_excluded", "the hotel that holds this snapshot does not match the hotel selection"}
 	}
@@ -1126,3 +1080,7 @@ func (b *broker) handlePrefetchStatus(w http.ResponseWriter, g *guestState, id s
 	b.prefetch.mu.Unlock()
 	writeJSON(w, 200, view)
 }
+
+// errSealedOnly answers a create that asks for an unsealed room. Every hotel
+// is sealed (AB#776), so there is no class to place it on.
+var errSealedOnly = &apiErr{400, "sealed_only", `every Cathedral room is sealed; "sealed": false is not accepted (omit it or send "sealed": true)`}

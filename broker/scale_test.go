@@ -20,7 +20,10 @@ func scaleBroker(t *testing.T, n int, shape func(i int, h *hotel)) *broker {
 	t.Helper()
 	b := &broker{guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat()}
 	for i := 0; i < n; i++ {
-		h := newHotel(hotelConfig{ID: fmt.Sprintf("h%03d", i), API: "http://127.0.0.1:1", Health: "http://127.0.0.1:1", Concurrency: 4}, "k")
+		// Every hotel is sealed (AB#776); the ops escape (AB#596) admits it
+		// without an attestation, as a config hotel with "sealed_admission": "off".
+		h := newHotel(hotelConfig{ID: fmt.Sprintf("h%03d", i), API: "http://127.0.0.1:1", Health: "http://127.0.0.1:1", Concurrency: 4,
+			Sealed: true, SealedAdmission: sealedAdmissionOff}, "k")
 		h.ok, h.slots = true, 100
 		if shape != nil {
 			shape(i, h)
@@ -75,7 +78,7 @@ func TestPlacementIsFairAcross500Hotels(t *testing.T) {
 // with one policy guest, one room at a time, as creates would:
 //   - each hotel takes exactly its cap (max_slots / slots), never more;
 //   - draining, down, not-admitted, reserved and denied hotels get nothing;
-//   - the preferred class fills before the first room spills to the allowed one;
+//   - the preferred hotels fill before the first room spills to the allowed ones;
 //   - when nothing fits, pick says so (nil) and the reason counts every state.
 func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 	const n = 600
@@ -92,9 +95,9 @@ func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 		case 4:
 			return "denied" // miner label, which the policy denies
 		case 5, 6, 7:
-			return "sealed" // joined sealed, admitted
+			return "preferred" // joined sealed, admitted, in the prefer tier
 		default:
-			return "unsealed"
+			return "allowed" // config sealed hotel, in the allow tier only
 		}
 	}
 	b := scaleBroker(t, n, func(i int, h *hotel) {
@@ -111,7 +114,7 @@ func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 		case "denied":
 			h.runtime, h.cfg.Sealed, h.cfg.Labels = true, true, map[string]string{"sealed": "true", "miner": "true"}
 			h.adm.attestedAt = time.Now()
-		case "sealed":
+		case "preferred":
 			h.runtime, h.cfg.Sealed, h.cfg.Labels = true, true, map[string]string{"sealed": "true", "miner": "true", "pool": "open"}
 			h.adm.attestedAt = time.Now()
 		}
@@ -120,21 +123,21 @@ func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 	// The denied hotels are denied by id, one selector each (a deny list
 	// that grows with the pool).
 	pol := &guestPolicy{
-		Prefer: []selector{{Class: classSealed}},
-		Allow:  []selector{{Class: classUnsealed}},
+		Prefer: []selector{{Label: map[string]string{"pool": "open"}}},
+		Allow:  []selector{{Class: classSealed}},
 	}
 	want := map[string]int{}
-	var sealedCap, unsealedCap int
+	var preferCap, allowCap int
 	for i, h := range b.hotelList() {
 		switch kind(i) {
 		case "denied":
 			pol.Deny = append(pol.Deny, selector{Hotel: h.cfg.ID})
-		case "sealed":
+		case "preferred":
 			want[h.cfg.ID] = h.slots
-			sealedCap += h.slots
-		case "unsealed":
+			preferCap += h.slots
+		case "allowed":
 			want[h.cfg.ID] = h.slots
-			unsealedCap += h.slots
+			allowCap += h.slots
 		}
 	}
 	pl := placement{guest: "g", policy: pol}
@@ -148,9 +151,9 @@ func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 		}
 		tier := pol.tier(h)
 		if tier == tierAllow {
-			if !spilled && placed != sealedCap {
+			if !spilled && placed != preferCap {
 				b.mu.Unlock()
-				t.Fatalf("spilled to %s after %d rooms; the preferred class has %d", h.cfg.ID, placed, sealedCap)
+				t.Fatalf("spilled to %s after %d rooms; the preferred hotels have %d", h.cfg.ID, placed, preferCap)
 			}
 			spilled = true
 		} else if spilled {
@@ -160,14 +163,14 @@ func TestFillingA600HotelPoolRespectsEveryRule(t *testing.T) {
 		h.creating++ // the room is in flight: it counts as used
 		got[h.cfg.ID]++
 		placed++
-		if placed > sealedCap+unsealedCap {
+		if placed > preferCap+allowCap {
 			b.mu.Unlock()
 			t.Fatalf("placed more rooms than the pool has")
 		}
 	}
 	b.mu.Unlock()
-	if placed != sealedCap+unsealedCap {
-		t.Fatalf("placed %d rooms, the pool has %d", placed, sealedCap+unsealedCap)
+	if placed != preferCap+allowCap {
+		t.Fatalf("placed %d rooms, the pool has %d", placed, preferCap+allowCap)
 	}
 	for i, h := range b.hotelList() {
 		if got[h.cfg.ID] != want[h.cfg.ID] {
@@ -212,7 +215,7 @@ func TestConcurrentJoinsLeavesAndCreates(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < joins; i++ {
 			id := fmt.Sprintf("j%02d", i)
-			join := map[string]any{"id": id, "api": urls[i], "key": joinKey, "sealed": i%2 == 0}
+			join := map[string]any{"id": id, "api": urls[i], "key": joinKey, "sealed": true} // odd ids: operator hotels
 			if i%2 == 0 {
 				join["miner_hotkey"] = minerHotkey
 			}
@@ -246,7 +249,11 @@ func TestConcurrentJoinsLeavesAndCreates(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perCreator; i++ {
-				status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": i%2 == 0})
+				body := map[string]any{"image": "alpine:3.20"}
+				if i%2 == 0 {
+					body["sealed"] = true
+				}
+				status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", body)
 				switch status {
 				case 202:
 					mu.Lock()
@@ -297,7 +304,7 @@ func TestConcurrentJoinsLeavesAndCreates(t *testing.T) {
 	}
 	for _, hc := range saved {
 		var index int
-		if _, err := fmt.Sscanf(hc.ID, "j%02d", &index); err != nil || left[hc.ID] || hc.Sealed != (index%2 == 0) || (hc.MinerHotkey != "") != hc.Sealed {
+		if _, err := fmt.Sscanf(hc.ID, "j%02d", &index); err != nil || left[hc.ID] || !hc.Sealed || (hc.MinerHotkey != "") != (index%2 == 0) {
 			t.Fatalf("hotels.json entry %+v", hc)
 		}
 	}

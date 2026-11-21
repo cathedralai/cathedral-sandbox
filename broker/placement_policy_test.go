@@ -11,7 +11,7 @@ import (
 // hotels; the shared pool uses graduated miner hotels first and falls back to
 // the own fleet.
 //
-// Test chain: a is an own sealed hotel, b and c are own unsealed hotels.
+// Test chain: a, b and c are own sealed hotels (AB#776).
 // m1 and m2 are joined, attested sealed miner hotels (hotkey, guest TLS).
 
 // guestPatch sets guest g1's limits through the operator route.
@@ -66,7 +66,7 @@ func joinGradMiner(t *testing.T, tc *testChain, id string, slots int, labels map
 // no selector opts into it.
 var sharedPoolPolicy = map[string]any{
 	"prefer": []any{map[string]any{"label": map[string]any{"miner": "true", "graduated": "true"}}},
-	"allow":  []any{map[string]any{"class": "sealed"}, map[string]any{"class": "unsealed"}},
+	"allow":  []any{map[string]any{"class": "sealed"}},
 }
 
 // A reserved customer (const) with own_hosts_only never lands on a miner

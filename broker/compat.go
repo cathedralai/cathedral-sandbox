@@ -69,14 +69,10 @@ type compatImage struct {
 	CPU       float64
 	MemoryGiB float64
 	DiskGiB   float64
-	// A built image (build.go): the Dockerfile, the context and the build
-	// state on each hotel. The context is kept in state_dir, not in the state file.
+	// A built image from older state (build.go): no hotel builds now, so it
+	// is never ready. The fields stay so that state still loads and saves.
 	Build      bool
 	Dockerfile string
-	buildCtx   []byte
-	ctxMissing bool
-	builds     map[string]*buildHotel
-	failedAt   map[string]time.Time
 }
 
 type compatExec struct {
@@ -245,10 +241,7 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 			compatErr(w, 404, "image_not_found", "no image "+id, 0)
 			return
 		}
-		if img.Build {
-			b.ensureBuilds(img, g)
-		}
-		writeJSON(w, 200, b.imageView(img, g))
+		writeJSON(w, 200, b.imageView(img))
 	case p == "/v1/sandboxes" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, body []byte) { b.compatCreate(w, r, g, body) })
 	case p == "/v1/sandboxes" && r.Method == "GET":
@@ -449,6 +442,11 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
 	}
+	// A metered guest out of its allowance: refused before any hotel or build call (allowance.go).
+	if e, retry := b.meteredRefusal(g, compatCountOf(req)); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
 	if ref, _ := req["image"].(string); ref != "" {
 		if e := imageRefRefusal(ref, true); e != nil {
 			compatErr(w, e.status, e.code, e.msg, 0)
@@ -459,32 +457,29 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, e.status, e.code, e.msg, 0)
 		return
 	}
+	// Every room is sealed (AB#776): there is no unsealed class to ask for.
+	if v, ok := req["sealed"].(bool); ok && !v {
+		compatErr(w, errSealedOnly.status, errSealedOnly.code, errSealedOnly.msg, 0)
+		return
+	}
 	native := map[string]any{"labels": req["labels"]}
 	res := map[string]any{"vcpu": 1, "memory_gib": 4, "disk_gib": 10}
 	var pl placement
 	if id, _ := req["image_id"].(string); id != "" {
 		b.compat.mu.Lock()
 		img := b.compat.images[id]
-		ref := ""
-		if img != nil && img.Build {
-			// A built image is only on the hotels that built it.
-			pl.images, ref = img.builtOn()
-		} else if img != nil {
-			ref = img.Ref
-		}
 		b.compat.mu.Unlock()
 		if img == nil {
 			compatErr(w, 404, "image_not_found", "no image "+id+"; import it first", 0)
 			return
 		}
-		if ref == "" {
-			// After a restart no hotel holds the build until something asks
-			// for it; a client that only retries the create would wait forever.
-			b.ensureBuilds(img, g)
-			compatErr(w, 409, "image_not_ready", "image "+id+" is not built yet; poll /v1/images/"+id, 5)
+		if img.Build {
+			// No hotel builds (build.go), so this image never becomes ready:
+			// a retrying image_not_ready would make the client wait forever.
+			compatErr(w, 409, "shared_hotel_build_refused", buildRefusedMsg, 0)
 			return
 		}
-		native["image"] = ref
+		native["image"] = img.Ref
 		res = map[string]any{"vcpu": img.CPU, "memory_gib": img.MemoryGiB, "disk_gib": img.DiskGiB}
 	} else if ref, _ := req["image"].(string); ref != "" {
 		native["image"] = ref
@@ -529,17 +524,15 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ttl = 48 * 3600
 	}
 	native["ttl_seconds"] = ttl
-	// Hotel choice: the guest's hotel set and sealed default apply; "sealed"
-	// true or false in the request chooses explicitly.
-	sealed, sealedField := req["sealed"].(bool)
-	if sealedField {
-		if sealed {
-			pl.match = map[string]string{"sealed": "true"}
-		} else {
-			pl.exclude = map[string]string{"sealed": "true"}
-		}
+	// A metered guest: allowance, size and lifetime before any hotel call (allowance.go).
+	if e, retry := b.meteredCreate(g, native, compatCountOf(req)); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
 	}
-	b.scope(g, &pl, false, sealedField)
+	// Hotel choice: the guest's hotel set or policy applies. "sealed": false
+	// was refused above, and every hotel is sealed, so "sealed": true adds
+	// nothing.
+	b.scope(g, &pl)
 	// create_timeout_seconds (AB#862): the native rule; compat builds the
 	// hotel body field by field, so the value never reaches a hotel.
 	deadline, derr := createDeadline(req, tRecv)
@@ -552,15 +545,6 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	// in handleCreate. Only catalog images are ever marked warm, so any other
 	// ref leaves placement unchanged.
 	pl.image, _ = native["image"].(string)
-	if len(pl.images) > 0 && !b.anyHotel(pl) {
-		// Built, but not on a hotel this create may use (for example only on
-		// an unsealed hotel for a sealed create). Build it there and say so.
-		if img := b.compatImageByID(req["image_id"]); img != nil {
-			b.ensureBuilds(img, g)
-		}
-		compatErr(w, 409, "image_not_ready", "the image is not built yet on a hotel this create may use (sealed hotels unless the create says \"sealed\": false); the broker is building it there, retry", 10)
-		return
-	}
 	count := 1
 	if v, ok := req["count"]; ok && v != nil {
 		f, isNum := v.(float64)
@@ -570,7 +554,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		}
 		count = int(f)
 	}
-	if e, retry := b.admit(g, count); e != nil {
+	if e, retry := b.admitCreate(g, count, native); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
@@ -880,6 +864,17 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		}
 		if ttl > 48*3600 {
 			ttl = 48 * 3600
+		}
+		// A metered guest: the extension is a new admission, checked after
+		// the body is read and the hotel lookup is done, right before the
+		// heartbeat goes out (allowance.go).
+		maxTTL, e, retry := b.meteredExtension(g)
+		if e != nil {
+			compatErr(w, e.status, e.code, e.msg, retry)
+			return
+		}
+		if maxTTL > 0 && ttl > float64(maxTTL) {
+			ttl = float64(maxTTL)
 		}
 		hb, _ := json.Marshal(map[string]any{"ttl_seconds": int(ttl)})
 		status, hdr, out, err := rm.h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/heartbeat", nil, hb, 30*time.Second)

@@ -123,7 +123,7 @@ func TestCreateTimeoutValuesAreCheckedAndNeverSentToTheHotel(t *testing.T) {
 func TestCompatCreateTimeoutEndsASlotWait(t *testing.T) {
 	tc := newChain(t)
 	oneBusyHotel(t, tc)
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "sealed": false, "create_timeout_seconds": 1}), nil)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "create_timeout_seconds": 1}), nil)
 	if status != 503 {
 		t.Fatalf("compat: want 503, got %d %v", status, doc)
 	}
@@ -213,7 +213,7 @@ func TestCreateTimeoutEndsTheWaitForAHotelConnection(t *testing.T) {
 func TestCompatBatchCreateTimeoutAnswersTheFirstFailure(t *testing.T) {
 	tc := newChain(t)
 	oneBusyHotel(t, tc)
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "sealed": false, "count": 3, "create_timeout_seconds": 1}), nil)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "count": 3, "create_timeout_seconds": 1}), nil)
 	if d, _ := doc["detail"].(map[string]any); status != 503 || d["error"] != "create_timeout" {
 		t.Fatalf("compat count 3, no slot, deadline 1 s: %d %v", status, doc)
 	}
