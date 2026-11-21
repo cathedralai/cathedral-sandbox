@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"math"
 	"os"
@@ -2489,5 +2490,177 @@ func TestClaimJournalAppendErrorIsIndeterminate(t *testing.T) {
 			}
 			_ = j2.close()
 		})
+	}
+}
+
+// Codex review of #660: opener A looks while claims/ is absent and stops
+// between its two reads; opener B creates the journal, holds its lock and
+// appends. A must never become a second opener: while B lives A fails with
+// errClaimJournalLocked, and once B has closed A opens it correctly, locked.
+// B keeps acknowledging, and an open after both have closed is complete.
+func TestClaimJournalOpenRacingAFirstStartNeverOpensUnlocked(t *testing.T) {
+	for _, bClosesFirst := range []bool{false, true} {
+		name := "B still open when A goes on"
+		if bClosesFirst {
+			name = "B closed before A goes on"
+		}
+		t.Run(name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "state")
+			paused, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			oA := claimJournalOptions{disk: claimJournalDisk{step: func(p string) {
+				if p == "open-look-between" {
+					once.Do(func() { close(paused); <-release })
+				}
+			}}}
+			type result struct {
+				j   *claimJournal
+				err error
+			}
+			resA := make(chan result, 1)
+			go func() {
+				j, _, err := openClaimJournalWith(state, oA)
+				resA <- result{j, err}
+			}()
+			select {
+			case <-paused:
+			case <-time.After(10 * time.Second):
+				t.Fatal("opener A never reached its look")
+			}
+			jB, _, err := openClaimJournal(state)
+			if err != nil {
+				t.Fatalf("opener B: %v", err)
+			}
+			mustClaimAppend(t, jB, "b00")
+			if bClosesFirst {
+				_ = jB.close()
+			}
+			close(release)
+			var rA result
+			select {
+			case rA = <-resA:
+			case <-time.After(10 * time.Second):
+				t.Fatal("opener A never finished")
+			}
+			want := []string{"b00"}
+			if !bClosesFirst {
+				if rA.err == nil {
+					_ = rA.j.close()
+				}
+				if !errors.Is(rA.err, errClaimJournalLocked) || rA.j != nil {
+					t.Fatalf("opener A beside a live B: %v, want errClaimJournalLocked and no journal", rA.err)
+				}
+				mustClaimAppend(t, jB, "b01")
+				want = append(want, "b01")
+				_ = jB.close()
+			} else {
+				if rA.err != nil {
+					t.Fatalf("opener A after B closed: %v, want a correct open", rA.err)
+				}
+				if got := claimIDsOf(t, rA.j); !claimSame(got, want) {
+					t.Fatalf("opener A replays %v, want %v", got, want)
+				}
+				if j2, _, err := openClaimJournal(state); !errors.Is(err, errClaimJournalLocked) {
+					if err == nil {
+						_ = j2.close()
+					}
+					t.Fatalf("an open beside A: %v, want errClaimJournalLocked: A must hold the lock", err)
+				}
+				mustClaimAppend(t, rA.j, "a00")
+				want = append(want, "a00")
+				_ = rA.j.close()
+			}
+			if got := claimReplayIDs(t, state); !claimSame(got, want) {
+				t.Fatalf("after both closed: %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// A claims/ removed and made again between the look and the lock would
+// leave the lock on a dead directory. open checks that the locked
+// descriptor is the claims/ the path names, and looks again if not, so the
+// lock it keeps is on the live claims/.
+func TestClaimJournalLockSitsOnTheLiveClaimsDir(t *testing.T) {
+	state := buildClosedClaimJournal(t)
+	claims := filepath.Join(state, claimJournalDirName)
+	var once sync.Once
+	o := claimJournalOptions{disk: claimJournalDisk{step: func(p string) {
+		if p == "open-locked" {
+			once.Do(func() {
+				// A person moves claims/ away and makes an empty one.
+				if err := os.Rename(claims, claims+".moved"); err != nil {
+					t.Error(err)
+				}
+				if err := os.Mkdir(claims, 0o700); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+	}}}
+	j, _, err := openClaimJournalWith(state, o)
+	if !errors.Is(err, errClaimJournalIncomplete) || j == nil {
+		t.Fatalf("open over an emptied claims/: %v, want incomplete", err)
+	}
+	defer j.close()
+	j2, _, err2 := openClaimJournal(state)
+	if !errors.Is(err2, errClaimJournalLocked) {
+		if j2 != nil {
+			_ = j2.close()
+		}
+		t.Fatalf("a second open: %v, want errClaimJournalLocked: the first must hold the live claims/", err2)
+	}
+}
+
+// The guard: create and load refuse to run without the lock, and touch
+// nothing.
+func TestClaimJournalNothingTouchesClaimsWithoutTheLock(t *testing.T) {
+	state := buildClosedClaimJournal(t)
+	id, _ := readClaimText(filepath.Join(state, claimJournalIDName))
+	before := claimFingerprint(t, state)
+	j := newClaimJournal(state, claimJournalOptions{})
+	if got, err := j.load(id, nil); !errors.Is(err, errClaimJournalNotLocked) {
+		if got != nil {
+			_ = got.close()
+		}
+		t.Fatalf("load without the lock: %v, want errClaimJournalNotLocked", err)
+	}
+	if err := newClaimJournal(state, claimJournalOptions{}).create(); !errors.Is(err, errClaimJournalNotLocked) {
+		t.Fatalf("create without the lock: %v, want errClaimJournalNotLocked", err)
+	}
+	after := claimFingerprint(t, state)
+	if len(before) != len(after) {
+		t.Fatalf("files changed: %d before, %d after", len(before), len(after))
+	}
+	for p, sum := range before {
+		if after[p] != sum {
+			t.Fatalf("%s changed", p)
+		}
+	}
+}
+
+// The one open without the lock: a valid claims.id and no claims/, seen in
+// one look. It reports incomplete, holds no lock (so a second such open is
+// not refused), and makes no claims/.
+func TestClaimJournalClaimsIDWithoutDirTakesNoLockAndMakesNothing(t *testing.T) {
+	state := buildClosedClaimJournal(t)
+	claims := filepath.Join(state, claimJournalDirName)
+	if err := os.RemoveAll(claims); err != nil {
+		t.Fatal(err)
+	}
+	j1, _, err1 := openClaimJournal(state)
+	j2, _, err2 := openClaimJournal(state)
+	for i, err := range []error{err1, err2} {
+		if !errors.Is(err, errClaimJournalIncomplete) {
+			t.Fatalf("open %d: %v, want incomplete", i+1, err)
+		}
+	}
+	if j1.lockFile != nil || j2.lockFile != nil {
+		t.Fatal("an open of claims.id without claims/ holds a lock")
+	}
+	_ = j1.close()
+	_ = j2.close()
+	if _, err := os.Stat(claims); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("claims/ was made: %v", err)
 	}
 }

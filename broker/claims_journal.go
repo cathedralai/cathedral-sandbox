@@ -53,14 +53,31 @@
 //
 // open takes an exclusive, non-blocking flock on claims/ before it reads,
 // syncs, removes or writes anything there, and holds it until close; an open
-// that fails gives it back. On a first start claims/ is made first so that it
-// can be locked, so two first opens cannot both initialize. The read-only
-// open of an incomplete journal takes it too: every open path reads files a
-// live writer may be changing and could judge a journal in the middle of a
-// write, and one rule for every open is the one that is easy to check. When
-// claims.id names a journal whose claims/ is gone there is nothing to lock,
-// and open reports that as incomplete without making claims/. A second open
-// while a holder lives, in this process or another, fails with
+// that fails gives it back. The invariant, enforced in one place (create and
+// load start by checking the lock is held): nothing reads, writes, syncs or
+// removes inside claims/ without the lock. open decides only from a look at
+// claims.id and claims/ made after the lock is held, so an opener that looked
+// while another one was initializing decides again from what is there now.
+//
+// A look reads claims.id first and then stats claims/. claims/ is made
+// before claims.id is ever written, so a valid claims.id followed by a
+// missing claims/ means claims/ was removed, not that another open is still
+// making it. That one case, seen in one look, is the only open without the
+// lock: there is nothing to lock and nothing a writer could be using, and
+// open reports it as incomplete without making claims/. Every other open,
+// the read-only open of an incomplete journal included, takes the lock:
+// every open path reads files a live writer may be changing and could judge
+// a journal in the middle of a write. On a first start claims/ is made first
+// so that it can be locked, so two first opens cannot both initialize.
+//
+// A claims/ removed and made again between the look and the lock would leave
+// the lock on a dead directory: after locking, open checks that the locked
+// descriptor is the claims/ the path names, and looks again if not (three
+// times at most, then it fails and can be retried). A claims/ replaced while
+// the journal is open is not detected; that is a person removing a live
+// journal.
+//
+// A second open while a holder lives, in this process or another, fails with
 // errClaimJournalLocked, changes no file and can be retried once the holder
 // closes. Limits: the lock is advisory (only opens of this journal honour
 // it); it holds on one host only; a network filesystem may not honour flock;
@@ -229,6 +246,7 @@ var (
 	errClaimJournalIncomplete = errors.New("claim journal incomplete")
 	errClaimJournalClosed     = errors.New("claim journal closed")
 	errClaimJournalLocked     = errors.New("claim journal locked by another open")
+	errClaimJournalNotLocked  = errors.New("claim journal: internal error: claims/ reached without its lock")
 
 	claimGenesis   = strings.Repeat("0", 64) // prev of a generation's first line
 	claimSegmentRE = regexp.MustCompile(`^[0-9]{20}\.jsonl$`)
@@ -462,44 +480,127 @@ func openClaimJournalAt(stateDir string, o claimJournalOptions) (*claimJournal, 
 	if stateDir == "" {
 		return nil, errors.New("claim journal: no state_dir")
 	}
+	j := newClaimJournal(stateDir, o)
+	out, err := j.openLocked()
+	if out == nil {
+		j.unlock() // a failed open gives the lock back
+	}
+	return out, err
+}
+
+func newClaimJournal(stateDir string, o claimJournalOptions) *claimJournal {
 	j := &claimJournal{stateDir: stateDir, dir: filepath.Join(stateDir, claimJournalDirName),
 		disk: o.disk.withDefaults(), segmentMax: o.segmentMax, observe: o.observe}
 	if j.segmentMax <= 0 {
 		j.segmentMax = claimSegmentMaxBytes
 	}
 	j.wake = sync.NewCond(&j.mu)
-	// The lock comes before anything is read, synced, removed or written in
-	// claims/, and a failed open gives it back.
-	if err := j.lock(); err != nil {
-		return nil, err
-	}
-	out, err := j.openLocked()
-	if out == nil {
-		j.unlock()
-	}
-	return out, err
+	return j
 }
 
-// lock takes an exclusive, non-blocking flock on claims/. On a first start
-// claims/ is made first so that it can be locked; when claims.id names a
-// journal whose claims/ is gone there is nothing to lock (and nothing a
-// writer could be using), and open reports that as incomplete without
-// making anything.
-func (j *claimJournal) lock() error {
-	if _, err := os.Stat(j.dir); errors.Is(err, fs.ErrNotExist) {
-		id, idErr := readClaimText(filepath.Join(j.stateDir, claimJournalIDName))
-		if idErr == nil && claimIDRE.MatchString(id) {
-			return nil
-		}
-		if idErr != nil && !errors.Is(idErr, fs.ErrNotExist) {
-			return idErr
-		}
-		if err := os.MkdirAll(j.dir, 0o700); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
+// claimLook is one look at the two names that decide an open.
+type claimLook struct {
+	id     string
+	hasID  bool        // claims.id holds a journal id
+	dir    os.FileInfo // nil: claims/ is not there
+	dirErr error
+}
+
+// look reads claims.id and then stats claims/, in that order. claims/ is
+// made before claims.id is ever written, so a valid claims.id read before
+// claims/ is found missing means claims/ was removed, not that another
+// open is still making it.
+func (j *claimJournal) look() (claimLook, error) {
+	var lk claimLook
+	id, err := readClaimText(filepath.Join(j.stateDir, claimJournalIDName))
+	switch {
+	case err == nil && claimIDRE.MatchString(id):
+		lk.id, lk.hasID = id, true
+	case err == nil:
+		// claims.id is only ever renamed into place whole; one that does
+		// not parse counts as missing.
+		log.Printf("claim journal: state_dir/claims.id does not hold a journal id; treated as missing")
+	case !errors.Is(err, fs.ErrNotExist):
+		return lk, err
 	}
+	j.disk.step("open-look-between")
+	lk.dir, lk.dirErr = os.Stat(j.dir)
+	if lk.dirErr != nil && !errors.Is(lk.dirErr, fs.ErrNotExist) {
+		return lk, lk.dirErr
+	}
+	if lk.dirErr == nil && !lk.dir.IsDir() {
+		return lk, fmt.Errorf("claim journal: %s is not a directory", j.dir)
+	}
+	return lk, nil
+}
+
+// openLocked decides how to open. Invariant: nothing here reads, writes,
+// syncs or removes anything inside claims/ unless j.lockFile is held, and it
+// decides only from a look made after the lock was taken. The one path
+// without the lock is a look that finds a valid claims.id and no claims/: it
+// reports incomplete and touches nothing.
+func (j *claimJournal) openLocked() (*claimJournal, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		lk, err := j.look()
+		if err != nil {
+			return nil, err
+		}
+		if lk.hasID && lk.dir == nil {
+			return j.readOnly([]string{"state_dir/claims.id exists without claims/"}, nil)
+		}
+		if lk.dir == nil {
+			// A first start: claims/ is made so that it can be locked before
+			// anything else happens in it.
+			if err := os.MkdirAll(j.dir, 0o700); err != nil {
+				return nil, err
+			}
+		}
+		if err := j.lock(); err != nil {
+			return nil, err
+		}
+		j.disk.step("open-locked")
+		// Decide again from a fresh look made with the lock held, and make
+		// sure the lock sits on the claims/ the path names now: a claims/
+		// removed and made again between the look and the lock would leave
+		// it on a dead directory.
+		lk, err = j.look()
+		if err != nil {
+			return nil, err
+		}
+		if lk.dir != nil {
+			if held, serr := j.lockFile.Stat(); serr == nil && os.SameFile(held, lk.dir) {
+				return j.decide(lk)
+			}
+		}
+		log.Printf("claim journal: %s was replaced while it was being locked; looking again", j.dir)
+		j.unlock()
+	}
+	return nil, fmt.Errorf("claim journal: %s kept changing while it was being locked; open again", j.dir)
+}
+
+// decide opens from a look made with the lock held on the claims/ it saw.
+func (j *claimJournal) decide(lk claimLook) (*claimJournal, error) {
+	if !lk.hasID {
+		held, err := claimDirHoldsRecords(j.dir)
+		if err != nil {
+			return nil, err
+		}
+		if held {
+			return j.load("", []string{"state_dir/claims.id is missing while claims/ holds records"})
+		}
+		// A first start, or an initialization that stopped before claims.id:
+		// no record was ever accepted, so it is discarded and redone.
+		if err := j.create(); err != nil {
+			return nil, err
+		}
+		j.start()
+		return j, nil
+	}
+	return j.load(lk.id, nil)
+}
+
+// lock takes an exclusive, non-blocking flock on claims/, which must exist.
+func (j *claimJournal) lock() error {
 	f, err := os.Open(j.dir)
 	if err != nil {
 		return err
@@ -524,51 +625,13 @@ func (j *claimJournal) unlock() {
 	}
 }
 
-// openLocked is open once the lock is held.
-func (j *claimJournal) openLocked() (*claimJournal, error) {
-	stateDir := j.stateDir
-	id, idErr := readClaimText(filepath.Join(stateDir, claimJournalIDName))
-	if idErr != nil && !errors.Is(idErr, fs.ErrNotExist) {
-		return nil, idErr
+// requireLock is the guard create and load start with: they read, write,
+// sync and remove inside claims/, which only the holder of its lock may do.
+func (j *claimJournal) requireLock() error {
+	if j.lockFile == nil {
+		return errClaimJournalNotLocked
 	}
-	info, dirErr := os.Stat(j.dir)
-	if dirErr != nil && !errors.Is(dirErr, fs.ErrNotExist) {
-		return nil, dirErr
-	}
-	if dirErr == nil && !info.IsDir() {
-		return nil, fmt.Errorf("claim journal: %s is not a directory", j.dir)
-	}
-	if idErr == nil && !claimIDRE.MatchString(id) {
-		// claims.id is only ever renamed into place whole; one that does not
-		// parse counts as missing.
-		log.Printf("claim journal: state_dir/claims.id does not hold a journal id; treated as missing")
-		idErr = fs.ErrNotExist
-	}
-	switch hasID, hasDir := idErr == nil, dirErr == nil; {
-	case !hasID && !hasDir:
-		if err := j.create(); err != nil {
-			return nil, err
-		}
-	case !hasID:
-		held, err := claimDirHoldsRecords(j.dir)
-		if err != nil {
-			return nil, err
-		}
-		if held {
-			return j.load("", []string{"state_dir/claims.id is missing while claims/ holds records"})
-		}
-		// An initialization that stopped before claims.id: it accepted no
-		// record, so it is discarded and redone.
-		if err := j.create(); err != nil {
-			return nil, err
-		}
-	case !hasDir:
-		return j.readOnly([]string{"state_dir/claims.id exists without claims/"}, nil)
-	default:
-		return j.load(id, nil)
-	}
-	j.start()
-	return j, nil
+	return nil
 }
 
 func readClaimText(path string) (string, error) {
@@ -651,6 +714,9 @@ func (j *claimJournal) syncInitChain() error {
 // last. A crash part way leaves no claims.id and no record: the next open
 // discards it and starts again, syncing the ancestors again.
 func (j *claimJournal) create() error {
+	if err := j.requireLock(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(j.dir, 0o700); err != nil {
 		return err
 	}
@@ -879,6 +945,9 @@ type claimLoaded struct {
 // or returns it read only when it cannot be proven whole. id "": claims.id
 // is missing.
 func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
+	if err := j.requireLock(); err != nil {
+		return nil, err
+	}
 	reasons := append([]string(nil), pre...)
 	cur, err := readClaimText(filepath.Join(j.dir, claimCurrentName))
 	if errors.Is(err, fs.ErrNotExist) {
