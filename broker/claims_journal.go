@@ -28,6 +28,45 @@
 // reach a caller. append takes one record, one line: a record that carries two
 // facts (a revoked with a request's new outcome) survives whole or not at all.
 //
+// # Caller rules (read before wiring a caller)
+//
+//   - An error from append is indeterminate: the record may be durable and
+//     may come back at replay. For example, when the head file's fsync fails
+//     after the batch's write and the head file's write both landed, append
+//     reports the error, and if the process stops before a later batch
+//     withdraws those seqs, the next open replays the record and its head
+//     covers it. So a caller never frees or re-grants anything on an append
+//     error, keys every record by its claim or request id, and settles the
+//     outcome from what replay yields.
+//   - compact can return an error after it committed the new generation
+//     (CURRENT renamed, its directory not yet synced): a compaction error is
+//     indeterminate the same way.
+//   - Build a snapshot only after every earlier append has been
+//     acknowledged: compact replaces every record appended before it was
+//     called, so one still in flight that the snapshot does not hold is gone.
+//   - open holds an exclusive lock on claims/ until close (see "Lock"). A
+//     second open fails with errClaimJournalLocked, which is not incomplete:
+//     retry once the holder has closed. An incomplete journal comes back
+//     holding the lock as well; close it to give the lock back.
+//
+// # Lock
+//
+// open takes an exclusive, non-blocking flock on claims/ before it reads,
+// syncs, removes or writes anything there, and holds it until close; an open
+// that fails gives it back. On a first start claims/ is made first so that it
+// can be locked, so two first opens cannot both initialize. The read-only
+// open of an incomplete journal takes it too: every open path reads files a
+// live writer may be changing and could judge a journal in the middle of a
+// write, and one rule for every open is the one that is easy to check. When
+// claims.id names a journal whose claims/ is gone there is nothing to lock,
+// and open reports that as incomplete without making claims/. A second open
+// while a holder lives, in this process or another, fails with
+// errClaimJournalLocked, changes no file and can be retried once the holder
+// closes. Limits: the lock is advisory (only opens of this journal honour
+// it); it holds on one host only; a network filesystem may not honour flock;
+// and a process that dies gives it back, which is what a restart needs. It
+// uses flock, so the journal builds on Unix only.
+//
 // # Writing
 //
 // append queues a record under the journal's own mutex and returns a channel.
@@ -189,6 +228,7 @@ var claimHeadNames = [2]string{"ack-head-a", "ack-head-b"}
 var (
 	errClaimJournalIncomplete = errors.New("claim journal incomplete")
 	errClaimJournalClosed     = errors.New("claim journal closed")
+	errClaimJournalLocked     = errors.New("claim journal locked by another open")
 
 	claimGenesis   = strings.Repeat("0", 64) // prev of a generation's first line
 	claimSegmentRE = regexp.MustCompile(`^[0-9]{20}\.jsonl$`)
@@ -230,6 +270,7 @@ type claimJournalDisk struct {
 	readBack func(path string) (string, error)                               // CURRENT read back after a rename that reported an error
 	readHead func(path string) ([]byte, error)                               // a head file at open
 	remove   func(path string) error                                         // an empty segment that was never listed
+	onLock   func(f *os.File)                                                // nil: nothing; tests use it to drop a lock as a dying process would
 	step     func(point string)                                              // nil: nothing; names a point a crash may hit
 }
 
@@ -266,6 +307,9 @@ func (d claimJournalDisk) withDefaults() claimJournalDisk {
 	}
 	if d.remove == nil {
 		d.remove = os.Remove
+	}
+	if d.onLock == nil {
+		d.onLock = func(*os.File) {}
 	}
 	if d.step == nil {
 		d.step = func(string) {}
@@ -376,6 +420,7 @@ type claimJournal struct {
 	peer     int64 // the peer head the next head file write records
 	done     chan struct{}
 	heads    claimJournalHeads // what open found
+	lockFile *os.File          // claims/ held with an exclusive flock from open to close
 
 	// The writer's own (open's, before the writer starts).
 	gen            int64
@@ -423,6 +468,65 @@ func openClaimJournalAt(stateDir string, o claimJournalOptions) (*claimJournal, 
 		j.segmentMax = claimSegmentMaxBytes
 	}
 	j.wake = sync.NewCond(&j.mu)
+	// The lock comes before anything is read, synced, removed or written in
+	// claims/, and a failed open gives it back.
+	if err := j.lock(); err != nil {
+		return nil, err
+	}
+	out, err := j.openLocked()
+	if out == nil {
+		j.unlock()
+	}
+	return out, err
+}
+
+// lock takes an exclusive, non-blocking flock on claims/. On a first start
+// claims/ is made first so that it can be locked; when claims.id names a
+// journal whose claims/ is gone there is nothing to lock (and nothing a
+// writer could be using), and open reports that as incomplete without
+// making anything.
+func (j *claimJournal) lock() error {
+	if _, err := os.Stat(j.dir); errors.Is(err, fs.ErrNotExist) {
+		id, idErr := readClaimText(filepath.Join(j.stateDir, claimJournalIDName))
+		if idErr == nil && claimIDRE.MatchString(id) {
+			return nil
+		}
+		if idErr != nil && !errors.Is(idErr, fs.ErrNotExist) {
+			return idErr
+		}
+		if err := os.MkdirAll(j.dir, 0o700); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	f, err := os.Open(j.dir)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("%w: %s is held by another open journal", errClaimJournalLocked, j.dir)
+		}
+		return fmt.Errorf("claim journal: lock of %s: %w", j.dir, err)
+	}
+	j.lockFile = f
+	j.disk.onLock(f)
+	return nil
+}
+
+// unlock gives the lock back. Closing the descriptor releases the flock.
+func (j *claimJournal) unlock() {
+	if j.lockFile != nil {
+		_ = j.lockFile.Close()
+		j.lockFile = nil
+	}
+}
+
+// openLocked is open once the lock is held.
+func (j *claimJournal) openLocked() (*claimJournal, error) {
+	stateDir := j.stateDir
 	id, idErr := readClaimText(filepath.Join(stateDir, claimJournalIDName))
 	if idErr != nil && !errors.Is(idErr, fs.ErrNotExist) {
 		return nil, idErr
@@ -1230,8 +1334,10 @@ func checkClaimRecord(r claimRecord) (string, []byte, error) {
 
 // append queues one record (one line: every fact in it survives together).
 // The channel closes once the record is acknowledged (a receive gives nil),
-// or carries the error that kept it out. The caller waits with its own
-// deadline.
+// or carries an error. The error is indeterminate: the record may still be
+// durable and come back at replay (see "Caller rules"), so a caller never
+// frees or re-grants on it, keys records by claim or request id, and settles
+// the outcome at replay. The caller waits with its own deadline.
 func (j *claimJournal) append(rec claimRecord) <-chan error {
 	done := make(chan error, 1)
 	kind, body, err := checkClaimRecord(rec)
@@ -1246,7 +1352,10 @@ func (j *claimJournal) append(rec claimRecord) <-chan error {
 
 // compact commits snapshot whole as the next generation. It replaces every
 // record appended before this call; records appended after it go into the
-// new generation. The channel works as append's.
+// new generation. Build snapshot only after every earlier append has been
+// acknowledged. The channel works as append's, and an error is
+// indeterminate in the same way: it can come after the new generation was
+// committed.
 func (j *claimJournal) compact(snapshot []claimRecord) <-chan error {
 	done := make(chan error, 1)
 	snap := make([]claimRecord, 0, len(snapshot))
@@ -1309,6 +1418,7 @@ func (j *claimJournal) size() int64 {
 func (j *claimJournal) close() error {
 	j.mu.Lock()
 	if j.done == nil { // read only: nothing runs
+		j.unlock()
 		j.mu.Unlock()
 		return nil
 	}
@@ -1317,6 +1427,11 @@ func (j *claimJournal) close() error {
 	done := j.done
 	j.mu.Unlock()
 	<-done
+	// The writer has stopped and closed its files: only now may another open
+	// take claims/.
+	j.mu.Lock()
+	j.unlock()
+	j.mu.Unlock()
 	return nil
 }
 

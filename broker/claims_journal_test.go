@@ -196,6 +196,20 @@ type claimCrash struct {
 	armed atomic.Bool
 	seen  atomic.Int64
 	hit   chan struct{}
+	mu    sync.Mutex
+	locks []*os.File // the journal's lock on claims/; a dying process gives it back
+}
+
+// onLock records the lock the journal took, so that the crash can drop it.
+func (c *claimCrash) onLock(f *os.File) {
+	c.mu.Lock()
+	c.locks = append(c.locks, f)
+	c.mu.Unlock()
+}
+
+// disk is a claimJournalDisk that crashes at the point.
+func (c *claimCrash) disk() claimJournalDisk {
+	return claimJournalDisk{step: c.step, onLock: c.onLock}
 }
 
 func newClaimCrash(point string, nth int64) *claimCrash {
@@ -206,6 +220,11 @@ func (c *claimCrash) step(p string) {
 	if p != c.point || !c.armed.Load() || c.seen.Add(1) < c.nth {
 		return
 	}
+	c.mu.Lock()
+	for _, f := range c.locks {
+		_ = f.Close() // the process is gone: its flock goes with it
+	}
+	c.mu.Unlock()
 	close(c.hit)
 	runtime.Goexit()
 }
@@ -498,7 +517,7 @@ func runClaimBatchCrash(t *testing.T, point string, powerLoss bool) {
 		nth = 2
 	}
 	crash := newClaimCrash(point, nth)
-	o.disk.step = crash.step
+	o.disk.step, o.disk.onLock = crash.step, crash.onLock
 	j, _, err := openClaimJournalWith(state, o)
 	if err != nil {
 		t.Fatal(err)
@@ -566,7 +585,7 @@ func TestClaimJournalPowerLossDuringHeadFileWrite(t *testing.T) {
 		t.Run(sp.name, func(t *testing.T) {
 			state := t.TempDir()
 			crash := newClaimCrash("head-written", 1)
-			o := claimJournalOptions{disk: claimJournalDisk{step: crash.step}}
+			o := claimJournalOptions{disk: crash.disk()}
 			j, _, err := openClaimJournalWith(state, o)
 			if err != nil {
 				t.Fatal(err)
@@ -717,7 +736,7 @@ func TestClaimJournalCrashDuringInitialization(t *testing.T) {
 			state := filepath.Join(t.TempDir(), "state")
 			crash := newClaimCrash(s.point, 1)
 			crash.armed.Store(true)
-			o := claimJournalOptions{disk: claimJournalDisk{step: crash.step}}
+			o := claimJournalOptions{disk: crash.disk()}
 			go func() { _, _, _ = openClaimJournalWith(state, o) }()
 			crash.wait(t)
 			if s.after != nil {
@@ -1049,7 +1068,7 @@ func TestClaimJournalActiveTailLossIsIncomplete(t *testing.T) {
 			return f.Sync()
 		}
 		crash := newClaimCrash("batch-written", 1)
-		o.disk.step = crash.step
+		o.disk.step, o.disk.onLock = crash.step, crash.onLock
 		j, _, err := openClaimJournalWith(state, o)
 		if err != nil {
 			t.Fatal(err)
@@ -1188,7 +1207,7 @@ func TestClaimJournalCrashAtEveryCommitBoundary(t *testing.T) {
 		t.Run("new segment: "+name(b), func(t *testing.T) {
 			state := t.TempDir()
 			crash := newClaimCrash(b.point, max(b.nth, 1))
-			o := claimJournalOptions{segmentMax: 300, disk: claimJournalDisk{step: crash.step}}
+			o := claimJournalOptions{segmentMax: 300, disk: crash.disk()}
 			j, _, err := openClaimJournalWith(state, o)
 			if err != nil {
 				t.Fatal(err)
@@ -1227,7 +1246,7 @@ func TestClaimJournalCrashAtEveryCommitBoundary(t *testing.T) {
 		t.Run("compaction: "+name(b), func(t *testing.T) {
 			state := t.TempDir()
 			crash := newClaimCrash(b.point, max(b.nth, 1))
-			o := claimJournalOptions{segmentMax: 400, disk: claimJournalDisk{step: crash.step}}
+			o := claimJournalOptions{segmentMax: 400, disk: crash.disk()}
 			j, _, err := openClaimJournalWith(state, o)
 			if err != nil {
 				t.Fatal(err)
@@ -1995,7 +2014,7 @@ func TestClaimJournalOpenSyncsCurrentBeforeRemovingOldGeneration(t *testing.T) {
 	state := t.TempDir()
 	claims := filepath.Join(state, claimJournalDirName)
 	crash := newClaimCrash("compact-current-renamed", 1)
-	j, _, err := openClaimJournalWith(state, claimJournalOptions{disk: claimJournalDisk{step: crash.step}})
+	j, _, err := openClaimJournalWith(state, claimJournalOptions{disk: crash.disk()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2268,6 +2287,207 @@ func TestClaimJournalFailedOpenClosesHeadFiles(t *testing.T) {
 			if got := claimReplayIDs(t, state); !claimSame(got, []string{"a00", "a01"}) {
 				t.Fatalf("replay %v", got)
 			}
+		})
+	}
+}
+
+// Reviewer item 2 on #655: a second open while a writer is live must be
+// refused. Without a lock it closes the live writer's open segment as found,
+// the writer goes on appending to it, and the next open finds a closed
+// segment that changed: incomplete, and claims stay off until a person acts.
+func TestClaimJournalSecondOpenIsRefusedWhileOpen(t *testing.T) {
+	state := t.TempDir()
+	j1 := openTestClaimJournal(t, state, claimJournalOptions{})
+	mustClaimAppend(t, j1, "a00")
+	before := claimFingerprint(t, state)
+	j2, _, err := openClaimJournal(state)
+	if err == nil {
+		_ = j2.close()
+	}
+	if !errors.Is(err, errClaimJournalLocked) || errors.Is(err, errClaimJournalIncomplete) || j2 != nil {
+		t.Errorf("second open while the first is live: %v, want errClaimJournalLocked and no journal", err)
+	}
+	after := claimFingerprint(t, state)
+	for p, sum := range before {
+		if after[p] != sum {
+			t.Errorf("the refused open changed %s", p)
+		}
+	}
+	// The live writer keeps appending and acknowledging.
+	mustClaimAppend(t, j1, "a01", "a02")
+	_ = j1.close()
+	// Once it has closed, open works again and every record is there.
+	j3, _, err := openClaimJournal(state)
+	if err != nil {
+		t.Fatalf("open after the holder closed: %v", err)
+	}
+	if got := claimIDsOf(t, j3); !claimSame(got, []string{"a00", "a01", "a02"}) {
+		t.Fatalf("replay %v", got)
+	}
+	_ = j3.close()
+}
+
+// The creation path is locked too: two first opens of one state_dir cannot
+// both initialize it.
+func TestClaimJournalTwoFirstOpensCannotBothInitialize(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	paused, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	o := claimJournalOptions{disk: claimJournalDisk{step: func(p string) {
+		if p == "init-gen-dir" {
+			once.Do(func() { close(paused); <-release })
+		}
+	}}}
+	type result struct {
+		j   *claimJournal
+		err error
+	}
+	first := make(chan result, 1)
+	go func() {
+		j, _, err := openClaimJournalWith(state, o)
+		first <- result{j, err}
+	}()
+	select {
+	case <-paused:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first open never reached its initialization")
+	}
+	j2, _, err := openClaimJournal(state)
+	if err == nil {
+		_ = j2.close()
+	}
+	close(release)
+	r := <-first
+	if r.err != nil {
+		t.Fatalf("the first open: %v", r.err)
+	}
+	if !errors.Is(err, errClaimJournalLocked) {
+		t.Errorf("a second first open during the first's initialization: %v, want errClaimJournalLocked", err)
+	}
+	mustClaimAppend(t, r.j, "first")
+	_ = r.j.close()
+	if got := claimReplayIDs(t, state); !claimSame(got, []string{"first"}) {
+		t.Fatalf("replay %v", got)
+	}
+}
+
+// A failed open holds the lock while it runs and leaves none behind.
+func TestClaimJournalFailedOpenLeavesNoLock(t *testing.T) {
+	state := t.TempDir()
+	j := openTestClaimJournal(t, state, claimJournalOptions{})
+	mustClaimAppend(t, j, "a00")
+	_ = j.close() // its segment stays open in the manifest: the next open closes it
+	var duringErr error
+	ran := false
+	var o claimJournalOptions
+	o.disk.syncFile = func(f *os.File) error {
+		if strings.HasSuffix(f.Name(), ".jsonl") {
+			if !ran {
+				ran = true
+				if j2, _, err := openClaimJournal(state); err == nil {
+					_ = j2.close()
+				} else {
+					duringErr = err
+				}
+			}
+			return errors.New("fsync: input/output error")
+		}
+		return f.Sync()
+	}
+	if j2, _, err := openClaimJournalWith(state, o); err == nil || j2 != nil {
+		t.Fatalf("the injected failure did not fail the open: %v", err)
+	}
+	if !ran || !errors.Is(duringErr, errClaimJournalLocked) {
+		t.Errorf("an open while another open was running: %v, want errClaimJournalLocked", duringErr)
+	}
+	j3, _, err := openClaimJournal(state)
+	if err != nil {
+		t.Fatalf("open after a failed open: %v", err)
+	}
+	if got := claimIDsOf(t, j3); !claimSame(got, []string{"a00"}) {
+		t.Fatalf("replay %v", got)
+	}
+	_ = j3.close()
+}
+
+// The read-only open of an incomplete journal takes the lock as well: a
+// second open beside it is refused, changes no file, and works (still
+// incomplete) once the first has closed.
+func TestClaimJournalIncompleteJournalIsLockedToo(t *testing.T) {
+	state := buildClosedClaimJournal(t)
+	_ = os.Remove(claimSegPath(t, state, 1))
+	before := claimFingerprint(t, state)
+	j1, _, err := openClaimJournal(state)
+	if !errors.Is(err, errClaimJournalIncomplete) {
+		t.Fatalf("first open: %v, want incomplete", err)
+	}
+	j2, _, err2 := openClaimJournal(state)
+	if !errors.Is(err2, errClaimJournalLocked) || errors.Is(err2, errClaimJournalIncomplete) {
+		t.Errorf("second open beside a read-only one: %v, want errClaimJournalLocked", err2)
+	}
+	if j2 != nil {
+		_ = j2.close()
+	}
+	after := claimFingerprint(t, state)
+	if len(before) != len(after) {
+		t.Fatalf("files changed: %d before, %d after", len(before), len(after))
+	}
+	for p, sum := range before {
+		if after[p] != sum {
+			t.Fatalf("%s changed", p)
+		}
+	}
+	_ = j1.close()
+	requireClaimIncomplete(t, state)
+}
+
+// Reviewer item 1 on #655, pinned as today's behaviour: an error from append
+// is indeterminate. When the head file's fsync fails after the batch's write
+// and the head file's write both landed, append reports an error, yet a
+// reopen before any later batch replays the record and the head covers it. A
+// later batch withdraws the failed seqs instead.
+func TestClaimJournalAppendErrorIsIndeterminate(t *testing.T) {
+	for _, later := range []bool{false, true} {
+		name := "no later batch: the failed record comes back"
+		if later {
+			name = "a later batch: the failed seqs are withdrawn"
+		}
+		t.Run(name, func(t *testing.T) {
+			state := t.TempDir()
+			var calls atomic.Int64
+			injected := errors.New("fsync: input/output error")
+			var o claimJournalOptions
+			o.disk.syncHead = func(f *os.File) error {
+				if calls.Add(1) == 2 {
+					return injected
+				}
+				return f.Sync()
+			}
+			j, _, err := openClaimJournalWith(state, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustClaimAppend(t, j, "a00")
+			if err := claimAck(t, j.append(testClaimRec("a01"))); !errors.Is(err, injected) {
+				t.Fatalf("a01: %v, want the injected head-file fsync error", err)
+			}
+			want, acked := []string{"a00", "a01"}, int64(2)
+			if later {
+				mustClaimAppend(t, j, "a02")
+				want, acked = []string{"a00", "a02"}, 4 // seq 3 is the void line
+			}
+			_ = j.close()
+			j2, heads, err := openClaimJournal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if heads.Acked != acked {
+				t.Fatalf("head %d, want %d", heads.Acked, acked)
+			}
+			if got := claimIDsOf(t, j2); !claimSame(got, want) {
+				t.Fatalf("replay %v, want %v", got, want)
+			}
+			_ = j2.close()
 		})
 	}
 }
