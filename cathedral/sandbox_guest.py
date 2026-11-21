@@ -66,6 +66,7 @@ from cathedral.sandbox_workspaces import WorkspaceStore
 from cathedral.sandbox_quota import GIB, ROOM_IDS, QuotaUnavailable, XfsProjectQuota, pick_id
 from cathedral.sandbox_owner import owner_hash, owner_id
 from cathedral.sandbox_provider import (
+    _LEAVING,
     InMemorySandboxProvider,
     SandboxOpError,
     _parse_label_filters,
@@ -1056,6 +1057,19 @@ class DockerClient:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
         self.run(["docker", "rm", *ROOM_RM_FLAGS, container_id], timeout=60.0)
 
+    def kill_confirmed(self, container_ref: str, *, timeout: float = 10.0) -> bool:
+        """docker kill, then True only when docker inspect says the container is not running.
+
+        A kill of a container that already ended fails but still counts, as
+        the inspect decides. A timeout or an unreadable state returns False.
+        """
+        try:
+            self.run(["docker", "kill", container_ref], timeout=timeout)
+        except SandboxOpError:
+            return False
+        state = self.container_state(container_ref)
+        return state is not None and not state[0]
+
     def remove_confirmed(self, container_ref: str, *, timeout: float = 60.0) -> bool:
         """Remove a container. Return True only when it is gone.
 
@@ -1617,6 +1631,8 @@ class DockerGuestProvider:
         self._drain_lock = threading.Lock()
         self._gc_parallelism = _env_int("CATHEDRAL_SANDBOX_GC_PARALLELISM", 8, minimum=1)
         self._rm_timeout = _env_float("CATHEDRAL_SANDBOX_RM_TIMEOUT", 60.0, minimum=0.1)
+        # docker kill before docker rm (AB#863): a killed room leaves quota at once.
+        self._kill_timeout = _env_float("CATHEDRAL_SANDBOX_KILL_TIMEOUT", 10.0, minimum=0.1)
         self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
         self._last_reconcile: float | None = None
         # Image pulls. "missing" (default) pulls only when the image is not local;
@@ -2247,7 +2263,7 @@ class DockerGuestProvider:
         sandbox_id = doc["id"]
         with self._inner._lock:  # noqa: SLF001
             record = self._inner._sandboxes.get(sandbox_id)  # noqa: SLF001
-            if record is None or record.state in ("deleting", "deleted"):
+            if record is None or record.state == "deleted" or record.state in _LEAVING:
                 # An Idempotency-Key replay of a sandbox that is gone or going.
                 raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         effective_owner = owner if owner is not None else owner_id(None, None)
@@ -3167,9 +3183,11 @@ class DockerGuestProvider:
     def delete(self, sandbox_id: str) -> None:
         """DELETE is idempotent (204). The record only goes when the container is gone.
 
-        When the container removal fails, the sandbox stays "deleting": GET
-        answers 409 sandbox_deleting (not 404), still counted in quota. The
-        next sweep retries it. Never drop the API record via the in-memory
+        The container is killed first: once docker says it stopped, the
+        record is "stopped_deleting" and out of quota (AB#863). When the
+        removal fails, the record stays: GET answers 409 sandbox_deleting (not
+        404), and a room whose kill failed is still counted. The next sweep
+        retries it. Never drop the API record via the in-memory
         provider alone when a labeled container may still be running.
         """
         guest = self._guests.get(sandbox_id)
@@ -3205,7 +3223,7 @@ class DockerGuestProvider:
             targets = [
                 sid
                 for sid, s in self._inner._sandboxes.items()  # noqa: SLF001
-                if s.state != "deleting"
+                if s.state not in _LEAVING
                 and all(s.labels.get(k) == v for k, v in want.items())
                 and (caller is None or s.api_key is None or s.api_key == caller)
             ]
@@ -3304,7 +3322,7 @@ class DockerGuestProvider:
             if gone:
                 self._confirm_removed(batch[index][0])
 
-        self._remove_many([cid for _, cid in batch], on_done=done)
+        self._remove_many([cid for _, cid in batch], on_done=done, sandbox_ids=[sid for sid, _ in batch])
 
     def mark_expired(self) -> int:
         """Move every collectable sandbox to "deleting". Fast; runs no docker command."""
@@ -3314,22 +3332,41 @@ class DockerGuestProvider:
                 marked += 1
         return marked
 
-    def _remove_many(self, refs: list[str], *, on_done=None) -> list[bool]:
+    def _kill_then_remove(self, sandbox_id: str, container_ref: str) -> bool:
+        """Kill a leaving room's container, then remove it. True when it is gone.
+
+        After a confirmed kill the record moves to "stopped_deleting" and
+        leaves quota (AB#863); it is dropped only when docker rm confirms. A
+        failed kill keeps it "deleting" and counted; the next drain retries.
+        """
+        if self._inner.state_of(sandbox_id) == "deleting":
+            if self._client.kill_confirmed(container_ref, timeout=self._kill_timeout):
+                self._inner.mark_stopped(sandbox_id)
+        return self._client.remove_confirmed(container_ref, timeout=self._rm_timeout)
+
+    def _remove_many(self, refs: list[str], *, on_done=None, sandbox_ids: list[str] | None = None) -> list[bool]:
         """Remove containers with bounded parallelism. Return one result per ref.
 
         *on_done(index, gone)* runs as soon as each removal ends, not after the
         whole list. So each sandbox leaves "deleting" and quota when its own
-        container is confirmed gone.
+        container is confirmed gone. With *sandbox_ids* (one per ref) each
+        container is killed first, so its room leaves quota at the kill.
         """
         if not refs:
             return []
         results = [False] * len(refs)
         workers = min(self._gc_parallelism, len(refs))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cathedral-gc") as pool:
-            futures = {
-                pool.submit(self._client.remove_confirmed, ref, timeout=self._rm_timeout): i
-                for i, ref in enumerate(refs)
-            }
+            if sandbox_ids is None:
+                futures = {
+                    pool.submit(self._client.remove_confirmed, ref, timeout=self._rm_timeout): i
+                    for i, ref in enumerate(refs)
+                }
+            else:
+                futures = {
+                    pool.submit(self._kill_then_remove, sandbox_ids[i], ref): i
+                    for i, ref in enumerate(refs)
+                }
             for future in as_completed(futures):
                 index = futures[future]
                 try:
@@ -3368,7 +3405,7 @@ class DockerGuestProvider:
                         flush=True,
                     )
 
-            self._remove_many([cid for _, cid in batch], on_done=done)
+            self._remove_many([cid for _, cid in batch], on_done=done, sandbox_ids=[sid for sid, _ in batch])
 
     def _reconcile_locked(self) -> int:
         """Remove containers with our owner label that have no sandbox record.
