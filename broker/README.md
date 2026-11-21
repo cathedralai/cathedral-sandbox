@@ -182,6 +182,23 @@ Known limits (stage 1):
   route read waits at most 5 s for a write in progress, then answers what is
   durable without acknowledging or pruning.
 - A file that can never be synced stalls the feed (operator note above).
+- The broker trusts each hotel's room list. The sync loop adopts any room
+  a hotel lists under a guest's label and meters it as that guest's
+  billable room, with no check against a create the broker made or against
+  the hotels the guest may use. Whoever can make a hotel list such a room
+  can bill that guest: anyone holding the hotel's key, or a host that can
+  alter the hotel's answers. Today an admitted miner hotel answers over its
+  attested guest TLS from the measured guest, and its key is installed in
+  the guest so the host never holds it; operator hotels are ours. The
+  broker sets no bound on the cost: the count, size and duration of such
+  rooms come from the hotel's list, and only the ledger's balance rules
+  limit the charge. A room limit does not bound it either: adopted rooms
+  count against the guest's `max_rooms`, so they can also refuse the
+  guest's own creates. The guest sees such a room in its own list when its
+  policy reaches that hotel, and can delete it by id there; a hotel that
+  goes on listing a deleted room is metered again after 24 h. This must be
+  closed before a hotel we do not operate, or one whose host holds its key,
+  carries a metered guest.
 - A room seen again after its ended reading is logged and not metered
   again for 24 h.
 - While the disk refuses writes, readings queue in memory (about one per
