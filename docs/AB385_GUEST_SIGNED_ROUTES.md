@@ -10,9 +10,9 @@ Slices:
 |-------|------|----|
 | 1 | file GET/PUT | cathedral-sandbox#452 |
 | 2 | tar GET/PUT, process stop, snapshot, freeze, thaw, expose | cathedral-sandbox#495 |
-| 3 | every other mutating route of the room API, plus a guard test | this table |
-| reaper | TTL deletes through the front, signed with reason `ttl` | see "TTL reaper" |
-| WebSocket | terminal sockets through the front, signed open and close | see "Terminal WebSocket" |
+| 3 | every other mutating route of the room API, plus a guard test | cathedral-sandbox#644 |
+| reaper | TTL deletes through the front, signed with reason `ttl` | cathedral-sandbox#645 |
+| WebSocket | terminal sockets through the front, signed open and close | cathedral-sandbox#646 |
 
 ## Guard
 
@@ -26,7 +26,8 @@ unsigned by accident: it is signed, or it is listed with a reason.
 ## Inventory: room API routes (via the receipts front)
 
 Re-derived from cathedral-sandbox main 4d0610d (`SandboxApplication._register`,
-69 method/path rows) and `SIGNED` in `room-kit/room_receipts.py`.
+69 method/path rows) and `SIGNED` in `room-kit/room_receipts.py`; main a400930 (#642)
+added `GET /v1/images` and `DELETE /v1/images/pins/{ref}` (71 rows).
 
 ### Signed
 
@@ -68,6 +69,7 @@ Re-derived from cathedral-sandbox main 4d0610d (`SandboxApplication._register`,
 | DELETE | `/v1/secrets/{name}` | `secret_delete` | 3 |
 | POST | `/v1/images/prefetch` | `image_prefetch` | 3 |
 | POST | `/v1/images/build` | `image_build` (still owner-gated on a dedicated machine) | 3 |
+| DELETE | `/v1/images/pins/{ref}` | `image_unpin` | after #642 |
 | POST | `/v1/affline/validate-rerun` | `affline_rerun` | 3 |
 
 Served by the front itself, signed there: `POST /v1/sandboxes/{id}/sealed-secrets`
@@ -92,7 +94,7 @@ Served by the front itself, signed there: `POST /v1/sandboxes/{id}/sealed-secret
 | GET | `/v1/sandboxes/{id}/terminals/{tid}/output` | drains only the reader's buffer and is polled; what goes into a terminal is signed |
 | GET | `/v1/snapshots`, `/v1/workspaces`, `/v1/workspaces/{name}`, `/v1/workspaces/{name}/versions` | read |
 | GET | `/v1/secrets` | read: names, never values |
-| GET | `/v1/sandbox-templates`, `/v1/sandbox-templates/{uid}`, `/v1/images/{ref}` | read |
+| GET | `/v1/sandbox-templates`, `/v1/sandbox-templates/{uid}`, `/v1/images`, `/v1/images/{ref}` | read |
 | GET | `/v1/quota`, `/v1/usage`, `/v1/status`, `/v1/operations/{id}`, `/openapi.json` | read |
 
 Front-only routes that stay unsigned: `GET /room/attestation`, `POST /room/attest`,
@@ -134,15 +136,42 @@ not `tar_put` / `tar_get`.
 
 ## TTL reaper
 
-Not in slice 3. The room TTL reaper (`<ROOM_ID>-reaper.timer` in `room-kit/install.sh`)
-calls `GET http://127.0.0.1:$ROOM_API_PORT/v1/sandboxes` with the internal API key,
-not through the receipts front, and the API also sweeps in-process. Expiry deletes
-produce no delete receipt; a room the API removed gets a `room_end` at the front's
-next look.
+cathedral-sandbox#645. The room API removes a room past its limit by itself from
+`expires_at` plus its 300 s grace (`cathedral/sandbox_api.py` `GC_GRACE_SECONDS`), and
+that removal never passed the front. Now the front deletes it first:
+
+- Every `ROOM_REAP_SECONDS` (default 15, 0 off) the front lists rooms with its own key.
+  A room whose `expires_at` is at least `ROOM_REAP_AFTER_SECONDS` (default 30, max 240)
+  past is entered as a caller's delete is. If it has another request in flight it is left
+  for the next pass; otherwise it is marked reaping in the same locked step (every new
+  request but a read or a delete gets 409 `room_reaping`), read again (a heartbeat since
+  the list keeps it), and deleted with one `DELETE`.
+- Receipt: `action: "delete"`, `reason: "ttl"`, `ttl_expires_at`, status and answer hash
+  as for a caller's delete; a lost answer is signed as 502.
+- Backstop: the API's in-process GC and `<ROOM_ID>-reaper.timer` stay. A room they remove
+  (front down past the grace, idle window, revoked key) ends with a `room_end` at the
+  front's next look, not a delete receipt.
+- Receipts off: no front, no change.
 
 ## Terminal WebSocket
 
-Not in slice 3. The front strips `Upgrade` from what it forwards, so
-`GET /v1/sandboxes/{id}/terminals/{tid}/ws` through the front reaches the API as a
-plain GET (404). `GET /v1/sandboxes/{id}/desktop/ws` is refused by the broker
-(403 `desktop_disabled`, AB#121).
+cathedral-sandbox#646. Before, the front stripped `Upgrade` and forwarded
+`GET /v1/sandboxes/{id}/terminals/{tid}/ws` as a plain GET, which the API answers 404, so a
+terminal socket through the broker could not open on a sealed hotel. Now:
+
+- The front (hotel key required) opens the handshake to the API with its own key and the
+  caller's `Sec-WebSocket-*` and `X-Cathedral-Access-Ticket` headers; the API checks and
+  spends the ticket.
+- `terminal_session_open`: on a 101 with `session_id`, returned in `X-Room-Receipt` on the
+  101 (the broker copies `X-Room-*` headers); on a refusal (401 spent ticket, 404, 502 no
+  answer) with that status and the body hash.
+- `terminal_session_close`, in the room's receipt list: `session_id`,
+  `session_open_receipt_sha256`, `close_reason` (`client_closed`, `room_closed`, `idle`
+  after 900 s with nothing from the caller), `duration_ms`, `client_bytes`/`client_sha256`
+  (caller to room) and `room_bytes`/`room_sha256` (room to caller), counted per socket send
+  after the handshake.
+- An open session counts as a request in flight for the room: the look and the TTL reaper
+  leave the room alone until it closes (past its limit, the API backstop at +300 s ends it).
+- Serial rooms and unclaimed pool rooms still refuse the socket. Over the miner TLS port: 501
+  (terminals never reach miner hotels). `GET .../desktop/ws` stays refused by the broker
+  (403 `desktop_disabled`, AB#121).

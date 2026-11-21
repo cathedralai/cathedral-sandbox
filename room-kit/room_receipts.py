@@ -2812,6 +2812,7 @@ SIGNED_SLICE3 = [
     ("DELETE", re.compile(r"^/v1/secrets/[^/]+$"), "secret_delete"),
     ("POST", re.compile(r"^/v1/images/prefetch$"), "image_prefetch"),
     ("POST", re.compile(r"^/v1/images/build$"), "image_build"),
+    ("DELETE", re.compile(r"^/v1/images/pins/.+$"), "image_unpin"),
     ("POST", re.compile(r"^/v1/affline/validate-rerun$"), "affline_rerun"),
 ]
 SIGNED += SIGNED_SLICE3
