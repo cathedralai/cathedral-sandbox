@@ -275,7 +275,7 @@ EXEC_HEADER = ("schema", "algorithm", "binding_sha256", "sandbox_id", "room_crea
 EXEC_FIELDS = frozenset(EXEC_HEADER + SECRETS_ENVELOPE)
 EXEC_STRING_FIELDS = ("response_public_b64",) + SECRETS_ENVELOPE  # hashed or decoded before any other check
 # What the envelope opens to: the exec request the room API takes, less the timeout (in the header).
-EXEC_REQUEST_KEYS = frozenset({"cmd", "env", "stdin", "cwd", "user"})
+EXEC_REQUEST_KEYS = frozenset({"cmd", "env", "stdin", "cwd", "user", "required_secrets"})
 EXEC_PLAINTEXT_MAX_BYTES = 6 * 1024 * 1024  # 1 MiB of stdin and the env, with JSON escapes
 EXEC_MAX_BYTES = 9 * 1024 * 1024  # one request: base64 of the largest envelope plus the header
 # A sealed exec's answer exists only in the front's one reply (it is kept out of the room API's
@@ -822,11 +822,13 @@ def open_secret(doc: dict, private: X25519PrivateKey) -> bytes:
 class AcceptedSecret:
     """What this boot accepted for one name in one room incarnation."""
 
-    __slots__ = ("version", "envelope_sha256", "ephemeral_public_b64", "receipt")
+    __slots__ = ("version", "envelope_sha256", "ephemeral_public_b64", "receipt", "file_identity", "exec_holds")
 
-    def __init__(self, version: int, envelope_sha256: str, ephemeral_public_b64: str, receipt: dict | None):
+    def __init__(self, version: int, envelope_sha256: str, ephemeral_public_b64: str, receipt: dict | None,
+                 file_identity: tuple | None = None):
         self.version, self.envelope_sha256 = version, envelope_sha256
         self.ephemeral_public_b64, self.receipt = ephemeral_public_b64, receipt
+        self.file_identity, self.exec_holds = file_identity, 0
 
 
 class SealedSecrets:
@@ -944,6 +946,23 @@ def _secret_file_present(dir_fd: int, name: str) -> bool:
         return stat.S_ISREG(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
     except OSError:
         return False
+
+
+def _secret_file_identity(dir_fd: int, name: str) -> tuple | None:
+    """Guest-local identity only; never hash or publish a guessable secret value."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        try:
+            st = os.fstat(fd)
+            if (not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o444
+                    or st.st_nlink != 1 or st.st_uid != os.geteuid()
+                    or not 0 <= st.st_size <= SECRET_VALUE_MAX_BYTES):
+                return None
+            return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
 
 
 def _secret_file_count(dir_fd: int) -> int:
@@ -1239,6 +1258,20 @@ def _exec_request_problem(request) -> str | None:
             return "cmd"
     elif not (isinstance(cmd, list) and cmd and all(isinstance(p, str) and p for p in cmd)):
         return "cmd"
+    if "required_secrets" in request:
+        required = request["required_secrets"]
+        if not isinstance(required, list) or not 1 <= len(required) <= SECRETS_MAX_PER_ROOM:
+            return "required_secrets"
+        names = set()
+        for item in required:
+            if (not isinstance(item, dict) or set(item) != {"name", "version", "envelope_sha256"}
+                    or not isinstance(item["name"], str) or not SECRET_NAME_RE.fullmatch(item["name"])
+                    or item["name"] in names or type(item["version"]) is not int
+                    or not 1 <= item["version"] <= SECRET_VERSION_MAX
+                    or not isinstance(item["envelope_sha256"], str)
+                    or not KEY_SHA256_RE.fullmatch(item["envelope_sha256"])):
+                return "required_secrets"
+            names.add(item["name"])
     env = request.get("env")
     if env is not None and not (isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str)
                                                               for k, v in env.items())):
@@ -1842,6 +1875,8 @@ class Ledger:
                 if (held.version, held.envelope_sha256) == (version, envelope_sha256) \
                         and _secret_file_present(dir_fd, name):
                     return held
+                if held.exec_holds:
+                    raise SecretRefused(409, "sealed_secret_in_use")
                 if version <= held.version:
                     raise SecretRefused(409, "sealed_secret_replayed")
             if any(e.ephemeral_public_b64 == doc["ephemeral_public_b64"] for e in accepted.values()):
@@ -1896,7 +1931,8 @@ class Ledger:
                     traceback.print_exc()
                     receipt = None
                 secrets.record(room, incarnation, name,
-                               AcceptedSecret(version, envelope_sha256, doc["ephemeral_public_b64"], receipt))
+                               AcceptedSecret(version, envelope_sha256, doc["ephemeral_public_b64"], receipt,
+                                              _secret_file_identity(dir_fd, name)))
         finally:
             os.close(dir_fd)
         return answer("written"), receipt
@@ -2056,6 +2092,47 @@ class Ledger:
                     continue
                 if not 200 <= status < 300 and status != 404:
                     print(f"room-receipts: sealed env clear of {room} answered {status}", file=sys.stderr, flush=True)
+
+    def hold_exec_secrets(self, room: str, incarnation: str, required: list[dict]) -> tuple:
+        """Check and hold exact accepted files until confirmed command completion.
+
+        The caller has validated required inside the sealed request. No network call
+        happens under the short secrets lock. Uncertain commands retain their holds
+        until the room incarnation ends; a timeout is not proof its children ended.
+        """
+        secrets = self.secrets
+        if secrets is None:
+            raise ExecRefused(409, "sealed_exec_secret_unconfirmed")
+        with secrets.lock:
+            if self.room_incarnation(room) != incarnation:
+                raise ExecRefused(409, "sealed_exec_secret_unconfirmed")
+            try:
+                fd = secrets.room_dir(room)
+            except SecretRefused:
+                raise ExecRefused(409, "sealed_exec_secret_unconfirmed") from None
+            try:
+                held = []
+                accepted = secrets.accepted(room, incarnation)
+                for item in required:
+                    entry = accepted.get(item["name"])
+                    if (entry is None or entry.receipt is None or entry.file_identity is None
+                            or (entry.version, entry.envelope_sha256) != (item["version"], item["envelope_sha256"])
+                            or _secret_file_identity(fd, item["name"]) != entry.file_identity):
+                        raise ExecRefused(409, "sealed_exec_secret_unconfirmed")
+                    held.append(entry)
+                # Commit only after every file passes; a refusal leaves no partial holds.
+                for entry in held:
+                    entry.exec_holds += 1
+                return tuple(held)
+            finally:
+                os.close(fd)
+
+    def finish_exec_secrets(self, held: tuple) -> None:
+        """Only a completed, non-timeout reply releases holds. Retired entries are harmless."""
+        if self.secrets is not None:
+            with self.secrets.lock:
+                for entry in held:
+                    entry.exec_holds -= 1
 
     def open_sealed_exec(self, room: str, doc, now: float | None = None) -> tuple[dict, dict]:
         """POST /v1/sandboxes/<room>/sealed-exec, up to the run. Returns (header, request); raises ExecRefused.
@@ -3894,16 +3971,29 @@ class Handler(BaseHTTPRequestHandler):
         inner = canonical({"cmd": request["cmd"], "env": request.get("env") or {}, "stdin": request.get("stdin"),
                            "cwd": request.get("cwd"), "user": request.get("user"),
                            "timeout_seconds": header["timeout_seconds"]})
-        request = None
-        status, _headers, out = self.upstream(
-            self.server.api_port, inner, method="POST", path=f"/v1/sandboxes/{room}/{EXEC_API_TAIL}",
-            extra={"Content-Type": "application/json"},
-            timeout=header["timeout_seconds"] + EXEC_ANSWER_MARGIN_SECONDS)
-        inner = None
+        held = ()
+        try:
+            if "required_secrets" in request:
+                held = ledger.hold_exec_secrets(room, header["room_create_receipt_sha256"], request["required_secrets"])
+        except ExecRefused as exc:
+            # Sign and seal the refusal just like an internal API refusal; no command was dispatched.
+            status, out = exc.status, canonical({"error": {"code": exc.code, "message": "required secret not confirmed"}})
+        else:
+            status, _headers, out = self.upstream(
+                self.server.api_port, inner, method="POST", path=f"/v1/sandboxes/{room}/{EXEC_API_TAIL}",
+                extra={"Content-Type": "application/json"},
+                timeout=header["timeout_seconds"] + EXEC_ANSWER_MARGIN_SECONDS)
+        request = inner = None
         try:
             answer = json.loads(out) if out else None
         except ValueError:
             answer = None
+        if (held and status == 200 and isinstance(answer, dict)
+                and type(answer.get("exit_code")) is int and answer.get("timed_out") is False
+                and (answer.get("cancelled") is None or answer.get("cancelled") is False)
+                and isinstance(answer.get("stdout"), str) and isinstance(answer.get("stderr"), str)):
+            ledger.finish_exec_secrets(held)
+        # Any exception, malformed/failed response or timeout leaves holds in place.
         plain = {"status": status, "answer": answer}
         if answer is None and out:
             plain["answer_b64"] = b64(out)
