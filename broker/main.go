@@ -832,7 +832,8 @@ func (h *hotel) doHeadersMax(ctx context.Context, base, method, path string, que
 		req.Header[k] = v
 	}
 	req.Header.Set("Authorization", "Bearer "+h.key)
-	if body != nil {
+	// A guest port dial carries the guest's own Content-Type (guestPortHeaders).
+	if body != nil && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	// Room calls (/v1/...) take a data connection slot (hotelconns.go); the
@@ -1918,7 +1919,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		// hotel: it waits for a connection until its deadline, as before.
 		callCtx = waitForConnUntilDeadline(callCtx)
 	}
-	status, hdr, out, err := h.do(callCtx, r.Method, path, r.URL.Query(), bodyArg, timeout)
+	status, hdr, out, err := h.doHeaders(callCtx, h.cfg.API, r.Method, path, r.URL.Query(), bodyArg, timeout, guestPortHeaders(r, tail))
 	// AB#741: the same split as a create (X-Broker-Queue-Ms, X-Broker-Hotel-Ms) on
 	// every answer that went to the hotel, failures included, so a burst of execs
 	// can be split into broker and hotel time per request. Here the "queue" is the
@@ -1979,6 +1980,32 @@ func setBrokerTiming(dst http.Header, hotelID string, queue, call time.Duration)
 
 // copyRoomHeaders passes the hotel's X-Room-* headers (for example the signed
 // receipt of a sealed hotel, X-Room-Receipt) to the guest unchanged.
+// guestPortForward is what a guest port dial (POST ports/<n>/http, AB#605)
+// passes on to the hotel: the guest method and target, and the request
+// headers the API forwards to a guest (e2b_envd_proxy _FORWARD_REQUEST).
+// Credentials, cookies and Host never go on.
+var guestPortForward = []string{
+	"X-Guest-Method", "X-Guest-Target",
+	"Accept", "Accept-Encoding", "Content-Type", "Content-Encoding", "User-Agent", "Range",
+}
+
+// guestPortHeaders is the extra hotel request header set for a guest port
+// dial, nil for every other room route. Without X-Guest-Method and
+// X-Guest-Target the hotel dials GET / whatever the caller asked (AB#772).
+func guestPortHeaders(r *http.Request, tail string) http.Header {
+	parts := strings.Split(tail, "/")
+	if r.Method != "POST" || len(parts) != 3 || parts[0] != "ports" || parts[2] != "http" {
+		return nil
+	}
+	extra := http.Header{}
+	for _, k := range guestPortForward {
+		if v := r.Header.Values(k); len(v) > 0 {
+			extra[k] = v
+		}
+	}
+	return extra
+}
+
 func copyRoomHeaders(dst, src http.Header) {
 	for k, v := range src {
 		if strings.HasPrefix(k, "X-Room-") {

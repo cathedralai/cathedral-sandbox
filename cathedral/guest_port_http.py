@@ -149,7 +149,8 @@ def dial_container_loopback(
         raise SandboxOpError("invalid_port", 400, f"port must be 1..65535, got {port}")
     method = method.upper()
     inspect = subprocess.run(
-        [docker, "inspect", "--format", "{{.NetworkSettings.SandboxKey}} {{.State.Running}}", container_id],
+        [docker, "inspect", "--format",
+         "{{.NetworkSettings.SandboxKey}} {{.State.Running}} {{.HostConfig.Runtime}}", container_id],
         capture_output=True,
         text=True,
         timeout=15,
@@ -161,19 +162,60 @@ def dial_container_loopback(
     if len(parts) < 2 or parts[1].lower() != "true":
         raise SandboxOpError("sandbox_not_running", 409, "the room is not running")
     netns = parts[0]
+    runtime = parts[2] if len(parts) > 2 else ""
+    if _runtime_has_own_kernel(runtime):
+        # AB#772: gVisor (and Kata) keep the guest's network stack inside
+        # the sandbox. The Docker netns loopback is not the guest's, so a
+        # dial there is always refused. Dial from inside the room instead.
+        return _dial_in_room(
+            container_id, port, method=method, path=path, query=query,
+            headers=headers, body=body, timeout_seconds=timeout_seconds, docker=docker,
+        )
     if not netns or netns == "<no":
         raise SandboxOpError("port_unreachable", 502, "the room has no network namespace to dial")
     if not os.path.exists(netns):
         raise SandboxOpError("port_unreachable", 502, f"room netns missing: {netns}")
+    argv = [nsenter, f"--net={netns}", sys.executable, "-c", _NSENTER_SCRIPT,
+            *_script_args(port, method, path, query, headers, timeout_seconds)]
+    return _run_dial(argv, port, body=body, timeout_seconds=timeout_seconds)
+
+
+def _runtime_has_own_kernel(runtime: str) -> bool:
+    # Same rule as sandbox_guest.runtime_has_kernel_isolation, kept local so
+    # this module does not import the Docker provider.
+    name = (runtime or "").strip().lower()
+    return name.startswith("runsc") or "kata" in name
+
+
+def _script_args(port, method, path, query, headers, timeout_seconds) -> list[str]:
     target = _target(path or "/", query or "")
     forwarded = _request_headers(headers or {})
     flat: list[str] = []
     for name, value in forwarded.items():
         flat.extend([name, value])
-    argv = [
-        nsenter, f"--net={netns}", sys.executable, "-c", _NSENTER_SCRIPT,
-        str(port), method, target, str(timeout_seconds), str(len(forwarded)), *flat,
-    ]
+    return [str(port), method, target, str(timeout_seconds), str(len(forwarded)), *flat]
+
+
+def _dial_in_room(
+    container_id: str,
+    port: int,
+    *,
+    method: str,
+    path: str,
+    query: str,
+    headers: Mapping[str, str] | None,
+    body: bytes,
+    timeout_seconds: float,
+    docker: str,
+) -> GuestHttpResult:
+    """Run the dial script inside the room with the room's own python3."""
+    argv = [docker, "exec", "-i", container_id, "python3", "-c", _NSENTER_SCRIPT,
+            *_script_args(port, method, path, query, headers, timeout_seconds)]
+    return _run_dial(argv, port, body=body, timeout_seconds=timeout_seconds, in_room=True)
+
+
+def _run_dial(argv: list[str], port: int, *, body: bytes, timeout_seconds: float,
+              in_room: bool = False) -> GuestHttpResult:
     try:
         completed = subprocess.run(
             argv,
@@ -185,7 +227,14 @@ def dial_container_loopback(
     except subprocess.TimeoutExpired as exc:
         raise SandboxOpError("port_unreachable", 502, f"dial timed out on 127.0.0.1:{port}") from exc
     except FileNotFoundError as exc:
-        raise SandboxOpError("port_unreachable", 502, "nsenter is not installed on this hotel") from exc
+        tool = "docker" if in_room else "nsenter"
+        raise SandboxOpError("port_unreachable", 502, f"{tool} is not installed on this hotel") from exc
+    if in_room and completed.returncode in (126, 127):
+        # docker exec: the command could not run (no python3 in the image).
+        raise SandboxOpError(
+            "port_unreachable", 502,
+            "this room's image has no python3, which a port dial into a gVisor room needs",
+        )
     if completed.returncode != 0:
         detail = (completed.stderr or b"").decode("utf-8", "replace").strip()[:200]
         raise SandboxOpError(
