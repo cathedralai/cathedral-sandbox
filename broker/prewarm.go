@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"slices"
 	"strconv"
@@ -41,6 +42,8 @@ func (b *broker) prewarms(h *hotel) bool {
 
 // prewarmHotel pulls each distinct live catalog image on h, one at a time, and
 // marks it warm. A failed pull leaves the image cold; creates still pull it.
+// An image is skipped while h's scratch is at or over the guest prefetch line
+// (prewarmSkipsFullDisk).
 func (b *broker) prewarmHotel(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
@@ -51,6 +54,9 @@ func (b *broker) prewarmHotel(h *hotel) {
 			continue
 		}
 		seen[t.Image] = true
+		if b.prewarmSkipsFullDisk(h, t.Image) {
+			continue
+		}
 		body, _ := json.Marshal(map[string]any{"images": []string{t.Image}})
 		status, _, _, err := h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
 		if err != nil || status >= 300 {
@@ -65,6 +71,28 @@ func (b *broker) prewarmHotel(h *hotel) {
 		}
 		b.mu.Unlock()
 	}
+}
+
+// prewarmSkipsFullDisk reports whether the catalog pull of image on h waits:
+// h's scratch is at or over the guest prefetch line (prefetchDiskFull). A
+// broker restart alone starts the catalog pulls, and the extra layers would
+// fill the disk the hotel's rooms write to (AB#894, Astra r2 finding 4). The
+// skip is logged once per hotel and image. The hotel stays placeable as
+// before; the image stays cold, so a create of it pulls it as today.
+func (b *broker) prewarmSkipsFullDisk(h *hotel, image string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.prefetchDiskFull(h) {
+		return false
+	}
+	if !h.prewarmFull[image] {
+		if h.prewarmFull == nil {
+			h.prewarmFull = map[string]bool{}
+		}
+		h.prewarmFull[image] = true
+		log.Printf("hotel %s: catalog pre-pull of %s skipped: scratch %.1f%% used, at or over the admission line", h.cfg.ID, image, *h.roomDataPct)
+	}
+	return true
 }
 
 // prewarmsTemplate reports whether h may ever run a create of t. A sealed-only

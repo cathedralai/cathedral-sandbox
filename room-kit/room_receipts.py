@@ -3007,7 +3007,12 @@ TERMINAL_WS_ROUTE = re.compile("^" + ROOM + r"/terminals/(?P<tid>[^/]+)/ws$")
 WS_FORWARD_HEADERS = ("Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
                       "X-Cathedral-Access-Ticket")
 WS_SWITCH_HEADERS = ("Sec-WebSocket-Accept", "Sec-WebSocket-Protocol")
-WS_IDLE_SECONDS = 900  # no byte from the caller for this long ends the session (the API's own idle close is 600 s)
+# The hotel PTY socket closes after 600 s with nothing from the caller (PTY_WS_IDLE_SECONDS in
+# cathedral/sandbox_server.py, AB#405). The front is the backstop: 30 s later, so the hotel's own 1000 "idle"
+# close frame reaches the caller first. Frame size is the hotel's limit too: frames pass unread, and the hotel
+# closes 1009 terminal_input_too_large on an input frame over 64 KiB.
+HOTEL_PTY_IDLE_SECONDS = 600
+WS_IDLE_SECONDS = HOTEL_PTY_IDLE_SECONDS + 30
 WS_HEAD_MAX = 64 << 10
 WS_REFUSAL_MAX = 1 << 20
 WS_NO_ANSWER = b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer the terminal handshake"}}'

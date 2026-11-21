@@ -1,5 +1,6 @@
-// Compatibility layer for the published Cathedral clients (the Harbor plugin
-// and ctcli). They speak the Cathedral cloud API, not the hotel /v1 API.
+// Compatibility layer for the published Cathedral clients (the Harbor plugin,
+// ctcli and the ComputeSDK provider). They speak the Cathedral cloud API, not
+// the hotel /v1 API.
 // A request is a client request when its User-Agent starts with one of
 // compatAgents. Native /v1 callers are not affected.
 //
@@ -34,7 +35,9 @@ import (
 	"time"
 )
 
-var compatAgents = []string{"cathedral-harbor/", "ctcli/"}
+// computesdk-cathedral/ is the ComputeSDK provider (@computesdk/cathedral) in
+// front-door mode: it sends the cloud API shape straight here (AB#894).
+var compatAgents = []string{"cathedral-harbor/", "ctcli/", "computesdk-cathedral/"}
 
 const (
 	defaultMaxExecSeconds = 14400    // Harbor asks for up to 4 hours; the hotels allow it by default
