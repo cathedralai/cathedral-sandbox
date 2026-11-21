@@ -298,6 +298,25 @@ def test_https_to_the_exposed_host_reaches_the_room_port_with_the_front_key_only
     assert sent["Authorization"] == "Bearer " + KEY.decode()
     assert sent["X-Guest-Method"] == "POST" and sent["X-Guest-Target"] == "/hello?x=1"
     assert sent["X-Mine"] == "1"
+    assert sent["X-Forwarded-Host"] == HOST and sent["X-Forwarded-Proto"] == "https"
+    assert sent["X-Forwarded-For"] == "127.0.0.1"
+
+
+def test_client_forwarded_headers_are_replaced(world) -> None:
+    world["keeper"].once()
+    _expose(world)
+    _https(world["ingress"], HOST, headers={"X-Forwarded-Host": "evil.example", "X-Forwarded-For": "1.2.3.4",
+                                            "Forwarded": "for=1.2.3.4"})
+    sent = [s for s in Api.seen if "/ports/" in s[1]][-1][2]
+    assert sent["X-Forwarded-Host"] == HOST and sent["X-Forwarded-For"] == "127.0.0.1" and "Forwarded" not in sent
+
+
+def test_an_answer_over_the_cap_is_a_502(world, monkeypatch) -> None:
+    world["keeper"].once()
+    _expose(world)
+    monkeypatch.setattr(room_ingress, "MAX_ANSWER", 8)
+    (status, _h, _b), _spki, _c = _https(world["ingress"], HOST)
+    assert status == 502
 
 
 def test_unexposed_port_and_foreign_hosts_answer_404(world) -> None:

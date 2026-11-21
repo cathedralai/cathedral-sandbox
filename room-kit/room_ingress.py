@@ -45,11 +45,13 @@ DNS_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 DNS_ZONE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 ROOM_ID = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
 MAX_BODY = 16 << 20
+MAX_ANSWER = 64 << 20  # one room answer held in the front's memory at most
 UPSTREAM_TIMEOUT = 60
 # Never passed on to the room API: hop headers, and the ones the front sets itself.
 DROP_REQUEST = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
                 "proxy-authenticate", "content-length", "host", "authorization", "x-guest-method", "x-guest-target",
-                "x-cathedral-guest", "x-room-exec-handle"}
+                "x-cathedral-guest", "x-room-exec-handle", "x-forwarded-host", "x-forwarded-proto",
+                "x-forwarded-for", "forwarded"}
 DROP_RESPONSE = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
                  "proxy-authenticate", "content-length"}
 FIRST_RETRY_SECONDS = 30
@@ -308,16 +310,23 @@ class IngressHandler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in DROP_REQUEST}
         headers.update({"Authorization": "Bearer " + self.server.api_key.decode(),
                         "X-Guest-Method": self.command, "X-Guest-Target": self.path,
-                        "Content-Length": str(len(body))})
+                        "Content-Length": str(len(body)),
+                        # The dial reaches 127.0.0.1 inside the room, so the app sees that Host; these name
+                        # the public one (set here only: the client's own are dropped above).
+                        "X-Forwarded-Host": self.headers.get("Host", "").strip(), "X-Forwarded-Proto": "https",
+                        "X-Forwarded-For": self.client_address[0]})
         conn = http.client.HTTPConnection("127.0.0.1", self.server.api_port, timeout=UPSTREAM_TIMEOUT)
         try:
             conn.request("POST", f"/v1/sandboxes/{room}/ports/{port}/http", body=body, headers=headers)
             res = conn.getresponse()
-            status, out_headers, out = res.status, res.getheaders(), res.read()
+            status, out_headers, out = res.status, res.getheaders(), res.read(MAX_ANSWER + 1)
         except (http.client.HTTPException, OSError):
             return self.answer(502, b"the room did not answer\n")
         finally:
             conn.close()
+        if len(out) > MAX_ANSWER:
+            self.close_connection = True
+            return self.answer(502, b"the room's answer is larger than a Preview URL carries\n")
         keep = [(k, v) for k, v in out_headers if k.lower() not in DROP_RESPONSE]
         return self.answer(status, out, keep)
 

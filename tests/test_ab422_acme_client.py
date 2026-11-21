@@ -225,3 +225,15 @@ def test_renewal_is_two_thirds_into_the_life(world) -> None:
 def test_account_key_is_never_in_its_repr() -> None:
     k = acme.AccountKey()
     assert "PRIVATE" not in repr(k).upper() and k.jwk["kty"] == "EC" and len(k.thumbprint()) == 43
+
+
+def test_a_long_hotel_name_leaves_the_common_name_out(world) -> None:
+    from cryptography import x509
+    long_names = [f"{'h' * 45}.hotels.cathedral.computer", f"*.{'h' * 45}.hotels.cathedral.computer"]
+    key = ec.generate_private_key(ec.SECP256R1())
+    csr = x509.load_der_x509_csr(acme.make_csr(long_names, key))
+    assert len(long_names[0]) > 64 and list(csr.subject) == []
+    sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+    assert sans == long_names
+    short = x509.load_der_x509_csr(acme.make_csr(NAMES, key))
+    assert short.subject.rfc4514_string() == f"CN={NAMES[0]}"

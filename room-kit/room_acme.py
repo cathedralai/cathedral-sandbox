@@ -340,8 +340,11 @@ class AcmeClient:
 
 
 def make_csr(names: list[str], key: ec.EllipticCurvePrivateKey) -> bytes:
+    # A common name holds at most 64 bytes (RFC 5280 ub-common-name); a longer
+    # hotel name leaves it out and the SAN alone names the host, as CAs accept.
+    subject = [x509.NameAttribute(NameOID.COMMON_NAME, names[0])] if len(names[0]) <= 64 else []
     return (x509.CertificateSigningRequestBuilder()
-            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, names[0])]))
+            .subject_name(x509.Name(subject))
             .add_extension(x509.SubjectAlternativeName([x509.DNSName(n) for n in names]), critical=False)
             .sign(key, hashes.SHA256())).public_bytes(Encoding.DER)
 
