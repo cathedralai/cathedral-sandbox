@@ -14,7 +14,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -178,9 +180,22 @@ func imageStoreFull(h *hotel) map[string]any {
 // is the registry_auth of the request (nil: none); it is passed to the hotel
 // and never kept.
 func (b *broker) prefetchRef(h *hotel, g *guestState, ref string, auth any, gen int, keep bool) map[string]any {
+	return b.prefetchRefPin(h, g, ref, auth, gen, keep, 0)
+}
+
+// prefetchRefPin is prefetchRef that also asks h to pin ref when pinMax > 0
+// (AB#860): "pin": true in the body and the guest's cap in X-Pin-Max-Bytes.
+// The entry gains "pin": "pinned" when the hotel echoes ref in "pinned", or
+// "not_supported" when it pulled without pinning (a kit before AB#860).
+func (b *broker) prefetchRefPin(h *hotel, g *guestState, ref string, auth any, gen int, keep bool, pinMax int64) map[string]any {
 	hotelBody := map[string]any{"images": []string{ref}}
 	if auth != nil {
 		hotelBody["registry_auth"] = auth
+	}
+	if pinMax > 0 {
+		// Set explicitly: the body is rebuilt, so a field the broker does not
+		// name never reaches the hotel.
+		hotelBody["pin"] = true
 	}
 	body, _ := json.Marshal(hotelBody)
 	var status int
@@ -190,7 +205,11 @@ func (b *broker) prefetchRef(h *hotel, g *guestState, ref string, auth any, gen 
 	// The guest id is forwarded so the hotel grants ownership of the pulled
 	// image ids to this guest (AB#650).
 	if g != nil {
-		status, _, out, err = h.doGuest(context.Background(), g, "POST", "/v1/images/prefetch", nil, body, prefetchRefTimeout)
+		hdr := http.Header{guestHeader: {g.cfg.ID}}
+		if pinMax > 0 {
+			hdr.Set(pinMaxHeader, strconv.FormatInt(pinMax, 10))
+		}
+		status, _, out, err = h.doHeaders(context.Background(), h.cfg.API, "POST", "/v1/images/prefetch", nil, body, prefetchRefTimeout, hdr)
 	} else {
 		status, _, out, err = h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, prefetchRefTimeout)
 	}
@@ -212,6 +231,22 @@ func (b *broker) prefetchRef(h *hotel, g *guestState, ref string, auth any, gen 
 			}
 		}
 		entry["ref"], entry["state"] = ref, "done"
+		if pinMax > 0 && g != nil {
+			defer b.notePinned(h, g.cfg.ID, ref, entry)
+		}
+		if pinMax > 0 {
+			entry["pin"] = imageListNotKitted
+			if res, ok := doc["result"].(map[string]any); ok {
+				if pinned, ok := res["pinned"].([]any); ok {
+					entry["pin"] = "not_pinned"
+					for _, x := range pinned {
+						if x == ref {
+							entry["pin"] = "pinned"
+						}
+					}
+				}
+			}
+		}
 		if g != nil {
 			b.markGuestWarm(h, g.cfg.ID, ref, gen, keep && auth == nil)
 		}
@@ -282,15 +317,23 @@ func (b *broker) hotelHolds(h *hotel, g *guestState, ref string) bool {
 func (b *broker) replayGuestPrefetch(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
-	type job struct{ guest, ref string }
+	type job struct {
+		guest, ref string
+		pin        int64 // the guest's pin cap when this ref was pinned here (AB#860)
+	}
 	var jobs []job
 	for guest, want := range h.guestWant {
 		for ref, at := range want {
 			if time.Since(at) > guestWantKeep {
 				delete(want, ref)
+				delete(h.guestPinned[guest], ref)
 				continue
 			}
-			jobs = append(jobs, job{guest, ref})
+			var pin int64
+			if g := b.guests[guest]; g != nil && h.guestPinned[guest][ref] {
+				pin = g.limits.pinMaxBytes() // the cap now: Fred may have changed it
+			}
+			jobs = append(jobs, job{guest, ref, pin})
 		}
 		if len(want) == 0 {
 			delete(h.guestWant, guest)
@@ -333,8 +376,33 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 				b.markGuestWarm(h, j.guest, j.ref, gen, false)
 				return
 			}
-			b.prefetchRef(h, g, j.ref, nil, gen, false)
+			b.prefetchRefPin(h, g, j.ref, nil, gen, false, j.pin)
 		}(j)
 	}
 	wg.Wait()
+}
+
+// notePinned keeps ref in h.guestPinned for guest when entry says the hotel
+// pinned it, so replayGuestPrefetch pins it again after a reboot (review
+// HOLD on #640). An entry that is not pinned leaves the mark as it was.
+func (b *broker) notePinned(h *hotel, guest, ref string, entry map[string]any) {
+	if entry["pin"] != "pinned" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if h.guestPinned == nil {
+		h.guestPinned = map[string]map[string]bool{}
+	}
+	if h.guestPinned[guest] == nil {
+		h.guestPinned[guest] = map[string]bool{}
+	}
+	h.guestPinned[guest][ref] = true
+}
+
+// forgetPinned drops ref from h.guestPinned for guest after an unpin.
+func (b *broker) forgetPinned(h *hotel, guest, ref string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(h.guestPinned[guest], ref)
 }
