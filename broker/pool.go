@@ -609,6 +609,14 @@ func (b *broker) poolStep(ctx context.Context, h *hotel) {
 		time.Sleep(time.Until(w.createAt)) // under one tick: the create starts on its slot
 		b.mu.Lock()
 		ph := b.pool.hotel(h.cfg.ID)
+		// The spacing counts from when a create really starts: the step's
+		// reads and deletes ran since the plan, and the rate may have moved.
+		now := time.Now()
+		if rate := b.poolRateLocked(h, ph, now); rate <= 0 || now.Before(ph.lastCreate.Add(poolCreateSpacing(rate))) {
+			b.mu.Unlock()
+			return
+		}
+		ph.lastCreate = now
 		ph.inflight.Add(1)
 		b.mu.Unlock()
 		k, att := *w.create, w.att
@@ -696,6 +704,22 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 			list[i].state, list[i].why = poolStale, "over target"
 		}
 	}
+	// Above the hotel's bound (fewer slots or less memory reported, or a pool
+	// made under an older bound): the oldest ready rooms go until it holds no
+	// more than the bound, rooms already leaving counted as gone. Quarantined
+	// rooms never.
+	if bs := b.poolBoundsLocked(h); h.slots > 0 {
+		excess := p.countsLocked(h.cfg.ID).held - poolLeavingLocked(h, ph) - bs.bound
+		for _, pr := range sortedPoolRooms(ph) {
+			if excess <= 0 {
+				break
+			}
+			if pr.state == poolReady {
+				pr.state, pr.why = poolStale, fmt.Sprintf("over the hotel's pool bound of %d", bs.bound)
+				excess--
+			}
+		}
+	}
 	// Under 5% free slots the pool gives slots back to customers: ready
 	// rooms, oldest first, until 5% is free again. Quarantined rooms never go.
 	if want := int(math.Ceil(poolYieldFreeShare * float64(h.slots))); h.slots > 0 && poolFreeSlots(h)+poolLeavingLocked(h, ph) < want {
@@ -743,7 +767,6 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 				at = now
 			}
 			w.create, w.createAt = k, at
-			ph.lastCreate = w.createAt // the slot is taken now: one create per spacing
 			break
 		}
 	}

@@ -322,3 +322,63 @@ func TestPoolYieldsSlotsToCustomersNeverDeletingQuarantine(t *testing.T) {
 		t.Fatalf("after the hotel filled: %+v, want 0 ready and the 10 quarantined", c)
 	}
 }
+
+// The spacing between two pool creates counts from when a create really
+// starts: a slow delete earlier in the same step does not let the next
+// step start another create at once (codex review of #663).
+func TestPoolCreateSpacingCountsFromTheActualStart(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	pc.up("a")
+	pc.putRefill(3, 1, 1) // 1 a second
+	f.set(func(f *fakePoolHotel) { f.createTTL = 19 * time.Minute })
+	pc.step("a") // sbx-1, retired on the next step
+	f.set(func(f *fakePoolHotel) { f.createTTL, f.deleteDelay = 0, 1100*time.Millisecond })
+	poolSpacingFactor = 1.05
+	time.Sleep(1100 * time.Millisecond) // the spacing since sbx-1 has passed
+	pc.step("a")                        // deletes sbx-1 (1.1 s), then starts a create
+	pc.step("a")                        // at once: no create yet
+	s := f.createStarts()
+	if len(s) != 2 {
+		t.Fatalf("%d creates, want 2 (sbx-1 and its replacement)", len(s))
+	}
+	time.Sleep(1200 * time.Millisecond)
+	pc.step("a")
+	s = f.createStarts()
+	for i := 2; i < len(s); i++ {
+		if gap := s[i].Sub(s[i-1]); gap < time.Second {
+			t.Fatalf("creates %d and %d %s apart at 1 a second", i-1, i, gap)
+		}
+	}
+	if len(s) != 3 {
+		t.Fatalf("%d creates after the spacing passed, want 3", len(s))
+	}
+}
+
+// A pool above its hotel's bound (the hotel reports fewer slots, or targets
+// set under PR 2's target-only bound) is trimmed back to the bound: the
+// oldest ready rooms go, quarantined rooms never (codex review of #663).
+func TestPoolTrimsReadyRoomsAboveTheBound(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	f.addRoom("q1", "pool", "claim")
+	f.addRoom("q2", "pool", "claim")
+	pc.up("a")
+	pc.target(20)
+	pc.fill("a", 20)
+	f.set(func(f *fakePoolHotel) { f.slots = 50 }) // bound 10: 2 quarantined and 8 ready
+	pc.sync("a")
+	pc.steps("a", 2)
+	if c := pc.counts("a"); c.ready != 8 || c.quarantined != 2 {
+		t.Fatalf("after the bound fell to 10: %+v, want 8 ready and 2 quarantined", c)
+	}
+	dels := f.roomDeletes()
+	if len(dels) != 12 {
+		t.Fatalf("%d deletes, want the 12 oldest ready rooms", len(dels))
+	}
+	for i, d := range dels {
+		if want := "/v1/sandboxes/sbx-" + strconv.Itoa(i+1); d.path != want {
+			t.Fatalf("trim %d deleted %s, want %s", i, d.path, want)
+		}
+	}
+}

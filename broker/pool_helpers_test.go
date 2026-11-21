@@ -63,6 +63,7 @@ type fakePoolHotel struct {
 	attestFail    bool
 	deleteFail    bool
 	createFail    bool            // answer creates 503 and start no room
+	deleteDelay   time.Duration   // wait before answering a room delete
 	slots         int             // /room/health slots (default 1,000)
 	memPct        float64         // /room/health live.host_mem_used_pct (default 10, of 384 GiB)
 	memGiB        float64         // /room/health live.host_mem_used_gib (default 38.4)
@@ -308,6 +309,11 @@ func (f *fakePoolHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(200, map[string]any{"sandbox_id": id, "binding_sha256": f.binding, "count": len(list), "room_head": head, "receipts": list})
 	case strings.HasPrefix(p, "/v1/sandboxes/") && r.Method == "DELETE":
+		if d := f.deleteDelay; d > 0 {
+			f.mu.Unlock()
+			time.Sleep(d)
+			f.mu.Lock()
+		}
 		if f.deleteFail {
 			reply(500, map[string]any{"error": "delete failed"})
 			return
