@@ -163,7 +163,10 @@ func (b *broker) meterFreezeAll(w http.ResponseWriter, r *http.Request, g *guest
 		hotelID, hid, _ := strings.Cut(bid, ".")
 		h := b.hotelByID(hotelID)
 		if h == nil || !g.limitsAllow(b, hotelID) {
+			// Freezes already started write failed under mu; so must this one.
+			mu.Lock()
 			failed[bid] = "hotel_not_found"
+			mu.Unlock()
 			continue
 		}
 		wg.Add(1)
