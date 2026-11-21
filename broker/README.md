@@ -9,7 +9,7 @@ The broker does four things:
 | Function | Routes | What it does |
 |---|---|---|
 | Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
-| Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. |
+| Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. `/v1/usage` gives hours per hotel, not prices (`"cost": "not_priced_here"`, AB#870). |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
 | Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. Private: open with the view token or a share link (`POST /v1/live/shares`). |
 
@@ -40,7 +40,12 @@ Creates in flight:
   10; -1 turns it off) for a create slot moves to another eligible hotel
   with a free room. If there is none, it keeps waiting.
 - A hotel whose host memory use is at or above `mem_full_pct` (config,
-  default 90; -1 turns it off) takes no new rooms. The value is the hotel
+  default 90; -1 turns it off) takes no new rooms. A hotel may carry its own
+  `mem_full_pct` (1 to 100; config, operator join, or PATCH
+  `{"mem_full_pct": n}`, `null` back to the broker-wide value; AB#855). It
+  replaces the broker-wide value for that hotel, even when that one is -1. A
+  PATCH of a config file hotel is not saved: the file keeps the durable
+  value. Hotel docs and `/v1/broker/stats` show the limit in force. The value is the hotel
   health value `host_mem_used_pct` (MemTotal minus MemAvailable, so page
   cache does not count). Hotel slots come from an install-time sizing with
   memory overcommit, so free slots alone cannot see rooms that use their

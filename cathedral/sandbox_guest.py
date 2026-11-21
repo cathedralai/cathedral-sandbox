@@ -522,6 +522,73 @@ def _gc_last_used() -> dict[str, str]:
     return out
 
 
+class PullGate:
+    """Disk floor for image pulls (AB#861).
+
+    A pull writes to the room data volume the rooms write to. Before a pull,
+    free space on that volume, less a reservation for each pull already in
+    flight, must stay at or above the floor; otherwise the pull is refused
+    with 507 image_store_full and a burst of pulls cannot fill the volume
+    under running rooms. The in-flight count is taken under one lock, so
+    parallel pulls cannot all pass on the same reading.
+
+    CATHEDRAL_PULL_DATA_DIR: the volume (room-kit sets it to ROOM_DATA_DIR);
+    unset: no check. CATHEDRAL_PULL_MIN_FREE_GIB: the floor (default 10; 0:
+    off). CATHEDRAL_PULL_RESERVE_GIB: held per pull in flight (default 4).
+    """
+
+    def __init__(self, data_dir: str | None, min_free_gib: float, reserve_gib: float, statvfs=None) -> None:
+        self.data_dir = data_dir or None
+        self.min_free = int(max(0.0, min_free_gib) * (1 << 30))
+        self.reserve = int(max(0.0, reserve_gib) * (1 << 30))
+        self._statvfs = statvfs
+        self._lock = threading.Lock()
+        self._inflight = 0
+
+    @classmethod
+    def from_env(cls) -> "PullGate":
+        def gib(name: str, default: float) -> float:
+            try:
+                return float(os.environ.get(name, "").strip() or default)
+            except ValueError:
+                return default
+
+        return cls(
+            os.environ.get("CATHEDRAL_PULL_DATA_DIR", "").strip() or None,
+            gib("CATHEDRAL_PULL_MIN_FREE_GIB", 10.0),
+            gib("CATHEDRAL_PULL_RESERVE_GIB", 4.0),
+        )
+
+    @contextlib.contextmanager
+    def admit(self, image: str, *, refuse: bool = True):
+        """Hold a reservation for one pull. refuse=False: count it, never refuse."""
+        if self.data_dir is None or self.min_free <= 0:
+            yield
+            return
+        with self._lock:
+            try:
+                st = (self._statvfs or os.statvfs)(self.data_dir) if refuse else None
+            except OSError:
+                st = None  # no volume to read: no check, as before
+            if st is not None:
+                free = st.f_bavail * st.f_frsize
+                # The incoming pull holds a reservation too.
+                if free - (self._inflight + 1) * self.reserve < self.min_free:
+                    raise SandboxOpError(
+                        "image_store_full",
+                        507,
+                        f"hotel image store is full: {free / (1 << 30):.1f} GiB free, "
+                        f"{self._inflight} pulls in flight, floor {self.min_free / (1 << 30):.0f} GiB; "
+                        f"{image} was not pulled; retry later or on another hotel",
+                    )
+            self._inflight += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._inflight -= 1
+
+
 class DockerClient:
     """Real docker CLI only — every call hits the local daemon."""
 
@@ -531,6 +598,7 @@ class DockerClient:
         # the daemon default runtime.
         self.guest_runtime = os.environ.get("CATHEDRAL_DOCKER_RUNTIME", "").strip() or None
         self.dind = DindConfig.from_env()
+        self.pull_gate = PullGate.from_env()
 
     def default_runtime(self) -> str:
         """The daemon's default OCI runtime name, or "" when unknown."""
@@ -647,7 +715,12 @@ class DockerClient:
             shutil.rmtree(config_dir, ignore_errors=True)
 
     def pull(self, image: str, *, registry_auth: Mapping[str, str] | None = None) -> None:
-        with self._registry_env(image, registry_auth) as env:
+        # A refresh of an image already here is counted but never refused:
+        # refusing it would turn a cross-guest grant pull into a 403
+        # image_not_owned. A moved tag downloads only its changed layers; the
+        # reservation keeps new pulls from stacking on top of it (AB#861).
+        gate = self.pull_gate.admit(image, refuse=not self.image_exists(image))
+        with gate, self._registry_env(image, registry_auth) as env:
             result = self.run(["docker", "pull", image], timeout=600.0, env=env)
         if result.returncode != 0:
             raise SandboxOpError(
