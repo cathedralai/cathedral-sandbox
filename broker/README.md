@@ -165,6 +165,22 @@ limits without a restart:
 
 A runtime change stays in memory. A restart goes back to the config file.
 
+### Meter routes (AB#890)
+
+`meter_key_sha256` is the SHA-256 of a narrow key for an external meter (the
+Polaris API meters const's broker-guest rooms against a Gamma hotkey
+account). It allows the two routes below and no other route. The operator
+key, the operator read key, the miner enrollment key and guest keys get 401
+on them. Without `meter_key_sha256` both answer 404. The digest must be a
+SHA-256 hex digest and must differ from the operator key, the operator read
+key, the miner enrollment key, and every guest key, next key and view token.
+An unknown guest id gets 404 `guest_not_found`.
+
+| Route (meter key) | What it does |
+|---|---|
+| `GET /v1/broker/guests/<id>/rooms` | The guest's rooms on the hotels it may use, asked like the guest's own `GET /v1/sandboxes` (label `broker_guest=<id>`): `{"rooms": [{"id": "<hotel>.<room>", "hotel", "state", "memory_gib", "vcpu", "created_at"}], "hotel_errors": {"<hotel>": "unavailable"}}`. `state` and `created_at` are the hotel's; `memory_gib` and `vcpu` are the hotel's `resources.memory_gib` and `resources.vcpu` (whole numbers, the ones the hotel's usage multiplies), null when the hotel did not send one. A hotel that does not answer is in `hotel_errors` and its rooms are left out; the call still answers 200. |
+| `POST /v1/broker/guests/<id>/freeze-all` | Calls the hotel's `POST /v1/sandboxes/<room>/freeze` for the guest on every room of the list above in state `running`: `{"frozen": [ids], "failed": {"<id>": "<hotel error code>"}, "hotel_errors": {...}}` (`unavailable` when a hotel call got no answer). Rooms in any other state are not touched. It never deletes and never thaws; a second call freezes nothing new. A frozen room still counts in the hotel's own usage and may still be removed by the hotel's TTL or idle sweep. |
+
 ## Guest policy and capacity catalog
 
 A guest `policy` chooses hotels by selector, not by a fixed id list
@@ -654,7 +670,9 @@ view (every hotel and the admission policy) and `GET /v1/broker/miner-exits`,
 and no other route: it cannot
 read hotel documents, join, change or leave hotels, read or change guests, or
 open rooms. The digest must differ from the operator key, the miner
-enrollment key, and every guest key or view token.
+enrollment key, and every guest key or view token. `meter_key_sha256` is a
+separate key for the two meter routes (see "Meter routes" under Guest
+limits).
 The observed TLS key must match the AMD-verified binding before the broker
 sends the hotel key. Miner calls pin the guest key on both data and control
 connections. Plain HTTP, a client-supplied pin, and `verify=false` are refused.

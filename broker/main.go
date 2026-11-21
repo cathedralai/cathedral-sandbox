@@ -181,6 +181,12 @@ type config struct {
 	// hotel). It cannot join, change or leave hotels or touch guests. The
 	// admin fleet feed uses it, so a leaked feed key cannot change the fleet.
 	OperatorReadKeySHA256 string `json:"operator_read_key_sha256,omitempty"`
+	// MeterKeySHA256 is the SHA-256 of the meter key (AB#890, meter.go). It
+	// allows only GET /v1/broker/guests/{id}/rooms and POST
+	// /v1/broker/guests/{id}/freeze-all: an external meter reads one guest's
+	// rooms and freezes them when that guest's account runs out. Empty: both
+	// routes answer 404.
+	MeterKeySHA256 string `json:"meter_key_sha256,omitempty"`
 	// MinerHotkeyCaps is the operator-approved maximum number of joined hotels
 	// per miner hotkey. Miner joins without an entry are refused.
 	MinerHotkeyCaps map[string]int `json:"miner_hotkey_caps,omitempty"`
@@ -514,6 +520,15 @@ func loadBroker(path string) (*broker, error) {
 			return nil, errors.New("config: operator read key must differ from the operator key and the miner enrollment key")
 		}
 	}
+	if c.MeterKeySHA256 != "" {
+		hash, err := hex.DecodeString(c.MeterKeySHA256)
+		if err != nil || len(hash) != sha256.Size {
+			return nil, errors.New("config: meter_key_sha256 must be a SHA-256 hex digest")
+		}
+		if strings.EqualFold(c.MeterKeySHA256, c.OperatorKeySHA256) || strings.EqualFold(c.MeterKeySHA256, c.OperatorReadKeySHA256) || strings.EqualFold(c.MeterKeySHA256, c.MinerEnrollKeySHA256) {
+			return nil, errors.New("config: meter key must differ from the operator key, the operator read key and the miner enrollment key")
+		}
+	}
 	for hotkey, cap := range c.MinerHotkeyCaps {
 		if !ss58RE.MatchString(hotkey) || cap < 1 {
 			return nil, fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
@@ -621,6 +636,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if c.OperatorReadKeySHA256 != "" && (strings.EqualFold(c.OperatorReadKeySHA256, gc.KeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.ViewTokenSHA256)) {
 			return nil, errors.New("config: operator read key must differ from guest keys and view tokens")
+		}
+		if c.MeterKeySHA256 != "" && (strings.EqualFold(c.MeterKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MeterKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.MeterKeySHA256, gc.ViewTokenSHA256)) {
+			return nil, errors.New("config: meter key must differ from guest keys and view tokens")
 		}
 		if gc.ID == "" {
 			return nil, errors.New("config: a guest has no id (rooms with no broker_guest label would be its own)")
@@ -2863,6 +2881,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p == "/v1/broker/miner-exits" && r.Method == "GET" && (b.isOperator(r) || b.isOperatorReader(r)) {
 		b.handleMinerExits(w, r) // miner hotels that went down with customer rooms
+		return
+	}
+	if id, action, ok := meterRoute(p); ok {
+		b.handleMeter(w, r, id, action) // meter key only (meter.go)
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
