@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
@@ -99,6 +100,13 @@ type hotelConfig struct {
 	// is. The broker verifies the key without sending the hotel key and pins
 	// it (miner_tls.go syncGuestPin); a config file never names the pin.
 	GuestTLS bool `json:"guest_tls,omitempty"`
+	// HotelKeyInstallSigningKeyFile (AB#817): a "guest_tls" config hotel
+	// whose guest takes its hotel key only by install (room-kit
+	// SEALED_MINER=1). The file holds base64 of an Ed25519 seed (mode 600);
+	// its public key must be in the guest's SEALED_HOTEL_KEY_INSTALL_SIGNERS.
+	// The broker installs key_file's key after each new pin
+	// (hotel_key_install.go), and admission waits for it.
+	HotelKeyInstallSigningKeyFile string `json:"hotel_key_install_signing_key_file,omitempty"`
 	// Commitment: the slots and daily hours a miner hotel declares at join
 	// (commitment.go). Nil: none declared.
 	Commitment *capacityCommitment `json:"commitment,omitempty"`
@@ -327,6 +335,10 @@ type hotel struct {
 	pinCheckedAt time.Time       // last keyless guest TLS check (syncGuestPin)
 	pinErr       string          // why the last guest TLS check failed; "" after a pin
 	pinChip      string          // CHIP_ID of the pinned guest TLS key's binding; a re-pin must match it
+	keyInst      keyInstall      // hotel key install into the guest (hotel_key_install.go)
+	// installer signs hotel key installs (hotel_key_install_signing_key_file);
+	// nil: none. Set at config load only, never on a joined hotel.
+	installer ed25519.PrivateKey
 	// healthRuntime: the room runtime the hotel last reported in /room/health
 	// ("runsc"...), or "" when it reported none. Atomic because isolationDoc
 	// reads it with or without b.mu held.
@@ -617,7 +629,15 @@ func loadBroker(path string) (*broker, error) {
 		if hc.Concurrency <= 0 {
 			hc.Concurrency = 16
 		}
+		installer, err := loadInstallSigner(hc)
+		if err != nil {
+			return nil, err
+		}
 		h := newHotel(hc, strings.TrimSpace(string(k)))
+		if installer != nil {
+			h.installer = installer
+			log.Printf("config: hotel %s: broker installs its hotel key into the guest, signer %s", hc.ID, installSignerPublicB64(installer))
+		}
 		if err := b.addHotel(h); err != nil {
 			return nil, err
 		}
