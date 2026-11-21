@@ -255,6 +255,12 @@ type config struct {
 	// often while hotel lists show it (usage_meter.go). 0: 60. The meter
 	// needs state_dir; without one it is off.
 	UsageMeterEverySeconds int `json:"usage_meter_every_seconds,omitempty"`
+	// UsageMeterMinSecond: a billable run's ended reading rounds its seconds
+	// up to the next whole second, at least 1 (usage_meter.go). Off (the
+	// default): seconds are truncated, so a room used and deleted within one
+	// observed second records 0. Turning it on changes what customers pay:
+	// a pricing decision for a person.
+	UsageMeterMinSecond bool `json:"usage_meter_min_second,omitempty"`
 }
 
 func (b *broker) maxExec() int {
