@@ -32,7 +32,7 @@ func testMeter(t *testing.T, dir string, every int64) *usageMeter {
 }
 
 func sighting(run string) usageSighting {
-	return usageSighting{run: run, guest: "g1", hotel: strings.Split(run, ".")[0], vcpu: 2, memGiB: 4}
+	return usageSighting{run: run, guest: "g1", hotel: strings.Split(run, ".")[0], vcpu: 2, memGiB: 4, billable: true}
 }
 
 // listPass is one sync pass of hotel "h": the list shows runs listed, and
@@ -1470,9 +1470,10 @@ func TestUsageMeterRouteReportsPendingReadings(t *testing.T) {
 }
 
 // A sync adopts the room (billable reading), the create fails and the
-// cleanup's delete fails too; the broker restarts before another whole
-// second. The turn to not billable was written at once, so replay restores
-// the run as not billable and every later reading of it says so.
+// cleanup's delete fails too; the broker dies right after the hook returns,
+// with no flush in between, before another whole second. The turn to not
+// billable was made durable inside the hook, so replay restores the run as
+// not billable and every later reading of it says so.
 func TestUsageMeterNotBillableSurvivesARestart(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	f := tc.hotels["b"]
@@ -1502,11 +1503,12 @@ func TestUsageMeterNotBillableSurvivesARestart(t *testing.T) {
 		t.Fatal("the create succeeded")
 	}
 	run := "b." + hid
-	before := meterRunsOf(t, tc, run) // the writer flushes the turn with its next batch
+	// The disk as the crash leaves it: no flush since the hook returned.
+	before := readingsOf(logReadings(t, filepath.Join(tc.b.cfg.StateDir, usageDirName)), run)
 	if len(before) != 2 || before[0].Billable != nil || before[1].Billable == nil || *before[1].Billable || before[1].Seconds != before[0].Seconds {
-		t.Fatalf("readings before the restart %+v, want billable then not billable at the same seconds", before)
+		t.Fatalf("readings on disk at the crash %+v, want billable then not billable at the same seconds", before)
 	}
-	tc.start(t) // the new broker has no record of the failed create
+	tc.start(t) // crash and restart: the new broker has no record of the failed create
 	r := tc.b.meter.runs[run]
 	if r == nil || r.last.Billable == nil || *r.last.Billable {
 		t.Fatalf("replayed run %+v, want not billable", r)
@@ -1622,4 +1624,99 @@ func TestUsageMeterDirectorySyncFailureServesAndPrunesNothing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A replayed file whose sync fails may hold a run's newer running reading
+// or its end. A cursor read must not prune the older file with the run's
+// durable state on the strength of it: after another crash loses the
+// unsynced file, the run is still known with its start.
+func TestUsageMeterNoPruneWhileAReplayedRangeIsUnsynced(t *testing.T) {
+	for name, newer := range map[string]func(m *usageMeter){
+		"newer running reading": func(m *usageMeter) {
+			for p := 2.0; p <= 10; p += 2 {
+				listPass(m, at(p), []string{"h.L"}, "h.x")
+			}
+		},
+		"end": func(m *usageMeter) { m.end("h.L", at(5), false) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			m := testMeter(t, dir, 10)
+			m.maxLines = 2
+			m.seen(sighting("h.L"), at(0))
+			m.seen(sighting("h.x"), at(0))
+			mustFlush(t, m) // seqs 1 and 2: file 1
+			newer(m)
+			mustFlush(t, m) // seq 3: file 3
+			file1 := filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1))
+			file3 := filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 3))
+			if _, err := os.Stat(file3); err != nil {
+				t.Fatalf("no file 3: %v", err)
+			}
+			old := time.Now().Add(-8 * 24 * time.Hour)
+			_ = os.Chtimes(file1, old, old)
+
+			orig := usageSyncFile
+			usageSyncFile = func(f *os.File) error {
+				if f.Name() == file3 {
+					return errors.New("input/output error")
+				}
+				return orig(f)
+			}
+			t.Cleanup(func() { usageSyncFile = orig })
+			m2 := testMeter(t, dir, 10) // crash and restart: file 3 does not sync
+			if _, err := m2.page(2, 10, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(file1); err != nil {
+				t.Fatal("pruned the durable state while a newer replayed range is unsynced")
+			}
+			// Another crash loses the unsynced file.
+			_ = os.Remove(file3)
+			usageSyncFile = orig
+			m3 := testMeter(t, dir, 10)
+			if r := m3.runs["h.L"]; r == nil || r.last.StartedAt != meterT0.Unix() {
+				t.Fatalf("h.L after the second crash: %+v", r)
+			}
+		})
+	}
+}
+
+// A state_dir without usage/: the broker makes it, and nothing is written
+// into it (so nothing is served) until its parent directory syncs; the
+// failure counts in write_errors and the next pass retries.
+func TestUsageMeterNewUsageDirNeedsItsParentSynced(t *testing.T) {
+	state := t.TempDir()
+	dir := filepath.Join(state, usageDirName)
+	orig := usageSyncDir
+	failing := true
+	usageSyncDir = func(d string) error {
+		if failing && d == state {
+			return errors.New("sync state_dir: input/output error")
+		}
+		return orig(d)
+	}
+	t.Cleanup(func() { usageSyncDir = orig })
+	m := testMeter(t, dir, 60)
+	m.seen(sighting("h.a"), at(0))
+	if err := m.flush(); err == nil {
+		t.Fatal("flush succeeded with usage/ not durable")
+	}
+	p, _ := m.page(0, 10, time.Now())
+	if len(p.Readings) != 0 || p.Head != 0 || p.PendingReadings != 1 || p.WriteErrors < 1 {
+		t.Fatalf("while usage/ is not durable: %+v", p)
+	}
+	if files, _ := m.files(); len(files) != 0 {
+		t.Fatalf("a log file was made in a usage/ that is not durable: %+v", files)
+	}
+	failing = false
+	mustFlush(t, m)
+	if p, _ := m.page(0, 10, time.Now()); len(p.Readings) != 1 || p.Head != 1 || p.PendingReadings != 0 {
+		t.Fatalf("after the parent synced: %+v", p)
+	}
+	// A usage/ that existed at start needs no parent sync.
+	failing = true
+	m2 := testMeter(t, dir, 60)
+	m2.seen(sighting("h.b"), at(1))
+	mustFlush(t, m2)
 }

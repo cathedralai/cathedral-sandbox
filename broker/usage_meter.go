@@ -69,9 +69,12 @@
 // only when its bytes and its file's name are durable and every lower
 // issued seq is either durable or was never written for a reader (an append
 // the file could not take back; its readings carry later seqs). So the
-// route stops just below a replayed range whose sync failed, and a new file
-// gets no reading until its directory has synced. Pruning happens only
-// after everything queued is durable and acked.json's new name is durable.
+// route stops just below a replayed range whose sync failed, a new file gets
+// no reading until its directory has synced, and a usage/ this broker made
+// gets no file until its parent has synced. Pruning happens only after
+// everything queued is durable, no replayed range is unsynced, and
+// acked.json's new name is durable. A run's turn to not billable is made
+// durable before the hook that saw it returns.
 //
 // Crash loss, accepted: a batch is fsynced before it counts, so a broker
 // that dies between an append and its fsync loses at most that batch. Those
@@ -298,12 +301,13 @@ type usageMeter struct {
 	writeErrors int64
 	errLogged   time.Time
 
-	ioMu      sync.Mutex // one flush or page at a time; guards the open file
-	f         *os.File
-	fname     string
-	nameSync  bool // the open file's name is durable (its directory synced)
-	fileLines int
-	fileSize  int64
+	ioMu         sync.Mutex // one flush or page at a time; guards the open file
+	f            *os.File
+	fname        string
+	nameSync     bool // the open file's name is durable (its directory synced)
+	parentSynced bool // usage/ itself is durable: it existed at start, or its parent synced
+	fileLines    int
+	fileSize     int64
 }
 
 // openMeter starts the usage meter in state_dir/usage. No state_dir: off.
@@ -328,11 +332,15 @@ func (b *broker) openMeter() error {
 }
 
 func openUsageMeter(dir string, every int64, now time.Time) (*usageMeter, error) {
+	_, statErr := os.Stat(dir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	m := &usageMeter{dir: dir, every: every, maxLines: usageFileLines, write: appendDurable, kick: make(chan struct{}, 1),
-		runs: map[string]*usageRun{}, ended: map[string]*usageEnded{}, listedAt: map[string]time.Time{}, unobserved: map[string]bool{}, opened: now}
+		runs: map[string]*usageRun{}, ended: map[string]*usageEnded{}, listedAt: map[string]time.Time{}, unobserved: map[string]bool{}, opened: now,
+		// A usage/ made now is durable only once its parent directory
+		// syncs: until then nothing is written into it (dirDurableLocked).
+		parentSynced: statErr == nil}
 	files, err := m.files()
 	if err != nil {
 		return nil, err
@@ -462,21 +470,38 @@ func (m *usageMeter) seen(s usageSighting, at time.Time) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.seenLocked(s, at)
+	turned := m.seenLocked(s, at)
 	m.kickLocked()
+	m.mu.Unlock()
+	m.writeTurns(turned)
 }
 
-func (m *usageMeter) seenLocked(s usageSighting, at time.Time) {
+// writeTurns makes a turn to not billable durable before the hook returns:
+// a broker that dies before the next flush would otherwise restore the run
+// as billable and bill a failed create's room again. It is rare (a failed
+// or cancelled create), so the fsync on the caller's path is fine. A failed
+// write keeps the reading queued and counts in write_errors, as any flush.
+// The caller may hold b.mu; the meter never takes b.mu, so the order b.mu,
+// ioMu, mu holds.
+func (m *usageMeter) writeTurns(turned bool) {
+	if turned {
+		_ = m.flush()
+	}
+}
+
+// seenLocked reports whether the run turned not billable (a new run that
+// is not billable included): its reading must be durable before the hook
+// returns (writeTurns).
+func (m *usageMeter) seenLocked(s usageSighting, at time.Time) (turnedNotBillable bool) {
 	if s.run == "" {
-		return
+		return false
 	}
 	if e := m.ended[s.run]; e != nil {
 		if !e.noted {
 			e.noted = true
 			log.Printf("usage meter: run %s seen after its ended reading; not metered again", s.run)
 		}
-		return
+		return false
 	}
 	r := m.runs[s.run]
 	if r == nil {
@@ -484,7 +509,7 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) {
 		r.update(s)
 		m.runs[s.run] = r
 		m.queueLocked(r, "running", at)
-		return
+		return !s.billable
 	}
 	turned := r.update(s)
 	r.observe(at)
@@ -494,6 +519,7 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) {
 	if turned || at.Unix()-r.lastAt >= m.every {
 		m.queueLocked(r, "running", at)
 	}
+	return turned
 }
 
 // end writes the ended reading of a run. confirmed: the broker's own delete
@@ -551,10 +577,14 @@ func (m *usageMeter) hotelPass(hotelID string, listed []usageSighting, present m
 		return
 	}
 	m.mu.Lock()
+	turned := false
+	defer func() { m.writeTurns(turned) }() // after the unlock below
 	defer m.mu.Unlock()
 	shown := make(map[string]bool, len(listed))
 	for _, s := range listed {
-		m.seenLocked(s, at)
+		if m.seenLocked(s, at) {
+			turned = true
+		}
 		shown[s.run] = true
 	}
 	if listOK || !unplaceable {
@@ -692,6 +722,9 @@ func (m *usageMeter) flushLocked() error {
 		if len(batch) == 0 {
 			return nil
 		}
+		if err := m.dirDurableLocked(); err != nil { // no log file in a usage/ a crash can lose
+			return m.failed(err)
+		}
 		if m.f == nil || m.fileLines >= m.maxLines {
 			if err := m.rollLocked(seq); err != nil {
 				return m.failed(err)
@@ -800,9 +833,9 @@ func (m *usageMeter) retryUnsyncedLocked() {
 	var gained, failures int64
 	for _, u := range list {
 		f, err := os.OpenFile(u.path, os.O_RDWR, 0)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue // pruned
-		}
+		// A missing file (moved aside while the broker ran) is not synced
+		// either: the runs replayed from it stay as they are until a restart
+		// replays without it (README, usage meter).
 		if err == nil {
 			err = usageSyncFile(f)
 			_ = f.Close()
@@ -820,6 +853,20 @@ func (m *usageMeter) retryUnsyncedLocked() {
 	m.head = max(m.head, gained)
 	m.writeErrors += failures
 	m.mu.Unlock()
+}
+
+// dirDurableLocked syncs the parent of a usage/ this broker created, once:
+// a log file in a directory whose own name a crash can lose is not durable.
+// Caller holds ioMu.
+func (m *usageMeter) dirDurableLocked() error {
+	if m.parentSynced {
+		return nil
+	}
+	if err := usageSyncDir(filepath.Dir(m.dir)); err != nil {
+		return fmt.Errorf("sync of %s after creating %s: %w", filepath.Dir(m.dir), filepath.Base(m.dir), err)
+	}
+	m.parentSynced = true
+	return nil
 }
 
 func appendDurable(f *os.File, p []byte) error {
@@ -961,6 +1008,16 @@ func inUsageRanges(seq int64, ranges [][2]int64) bool {
 // that are older than usagePruneAge. The newest file and the open one stay.
 // Caller holds ioMu.
 func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) {
+	// A replayed reading that is not synced yet may be a run's only newer
+	// state (lastSeq) or its end (no longer an open run). It is no
+	// replacement for the durable state in an older file: prune nothing
+	// until every replayed range has synced.
+	m.mu.Lock()
+	unsynced := len(m.unsynced)
+	m.mu.Unlock()
+	if unsynced > 0 {
+		return
+	}
 	for i := 0; i+1 < len(files); i++ {
 		last := files[i+1].first - 1
 		if last > acked {
@@ -1032,6 +1089,9 @@ func (m *usageMeter) saveState() error {
 }
 
 func (m *usageMeter) writeState() error {
+	if err := m.dirDurableLocked(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	st := usageState{Acked: m.acked, Head: m.head, Issued: m.nextSeq - 1}
 	m.mu.Unlock()

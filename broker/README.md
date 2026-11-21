@@ -137,6 +137,15 @@ Readings are cumulative, so a reader keeps the largest per run.
 |---|---|
 | `GET /v1/broker/usage-meter?after=<seq>&limit=<n>` | Readings after `after` (default 0) in seq order, at most `limit` (default 500, at most 1,000): `{"readings", "next", "head", "observed_at", "write_errors", "unobserved_hotels", "pending_readings"}`. `pending_readings` counts readings observed but not durable yet (an append waiting for its retry); 0 when all is durable. `next` is the seq of the last reading returned (or `after`), so a reader never skips one. `head` is the highest seq written. `observed_at` is the oldest last answered room list among hotels with live rooms (now if none), leaving out a hotel whose latest list failed and that takes no new room (down, leaving or draining); `unobserved_hotels` counts those. Only durable (fsynced) readings are served; a file whose sync fails at start is served once a retry syncs it. The highest `after` is the acknowledged cursor, kept with the durable head and the highest issued seq in `state_dir/usage/acked.json`, so a seq is never issued twice: a file whose seqs are all at or below the cursor and that is older than 7 days is deleted, after the newest reading of each open run in it is written again under a new seq. Without `state_dir`: 404 `usage_meter_off`. |
 
+Operator note: a usage file that can never be synced (a failing disk)
+stalls the feed by design. The route serves nothing above it, so `head`
+stops, the ledger stops renewing leases and metered keys close. It shows as
+`pending_readings` staying above 0, `write_errors` growing, and the log line
+`usage meter: <file>: sync before replay failed`. Fix the disk. As a last
+resort, stop the broker, move that file out of `state_dir/usage/` and start
+the broker again: this loses only readings that were never served, in the
+customer's favour (their runs go back to their last served reading).
+
 ## Guest policy and capacity catalog
 
 A guest `policy` chooses hotels by selector, not by a fixed id list
