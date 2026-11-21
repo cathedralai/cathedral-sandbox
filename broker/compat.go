@@ -246,11 +246,8 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 	case p == "/v1/quota" && r.Method == "GET":
 		b.compatQuota(w, r, g)
 	case p == "/v1/usage" && r.Method == "GET":
-		c := &capture{hdr: http.Header{}, status: 200}
-		b.handleUsage(c, r, g)
-		var doc map[string]any
-		_ = json.Unmarshal(c.buf.Bytes(), &doc)
-		writeJSON(w, 200, map[string]any{"as_of": time.Now().UTC().Format(time.RFC3339), "groups": []any{}, "hotels": doc["hotels"]})
+		writeJSON(w, 200, map[string]any{"as_of": time.Now().UTC().Format(time.RFC3339), "groups": []any{},
+			"hotels": b.usageParts(r, g), "cost": usageCostNote, "price_doc": usagePriceDoc})
 	case strings.HasPrefix(p, "/v1/sandboxes/"):
 		b.compatRoom(w, r, g, strings.TrimPrefix(p, "/v1/sandboxes/"))
 	default:
@@ -271,7 +268,8 @@ func (b *broker) compatCatalog(w http.ResponseWriter, g *guestState) {
 			"ipv4_cidrs": true, "ipv6": false, "hostname_ports": []int{80, 443}},
 		"available": free > 0, "free_rooms": free, "max_lifetime_seconds": 23 * 3600, "cleanup_margin_seconds": 0,
 		"exec_output_limit_bytes": 16 << 20, "max_exec_seconds": b.maxExec(),
-		"templates": catalogTemplateViews(),
+		"default_exec_seconds": min(compatExecDefaultSeconds, b.maxExec()),
+		"templates":            catalogTemplateViews(),
 	})
 }
 
@@ -285,7 +283,7 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_image", "image is required", 0)
 		return
 	}
-	if e := localImageRefusal(req.Image); e != nil {
+	if e := imageRefRefusal(req.Image, true); e != nil {
 		compatErr(w, e.status, e.code, e.msg, 0)
 		return
 	}
@@ -304,14 +302,19 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	b.compat.mu.Unlock()
 	b.markDirty()
 	// Warm every hotel in the background; a create pulls a missing image anyway.
-	pf, _ := json.Marshal(map[string]any{"images": []string{img.Ref}})
+	// As the guest (AB#859): the hotel grants the image to the guest, and the
+	// guest's creates of it then prefer the hotels that hold it.
 	for _, ht := range b.hotelList() {
 		if !g.limitsAllow(b, ht.cfg.ID) { // never touch a hotel outside the guest's list
 			continue
 		}
-		go func(ht *hotel) {
-			_, _, _, _ = ht.do(context.Background(), "POST", "/v1/images/prefetch", nil, pf, 10*time.Minute)
-		}(ht)
+		b.mu.Lock()
+		full, gen := b.prefetchDiskFull(ht), ht.warmGen
+		b.mu.Unlock()
+		if full { // AB#861
+			continue
+		}
+		go b.prefetchRef(ht, g, img.Ref, nil, gen, true)
 	}
 	writeJSON(w, 200, map[string]any{"image_id": img.ID, "state": "ready", "image": img.Ref})
 }
@@ -364,14 +367,80 @@ func (b *broker) compatIdemLimit(w http.ResponseWriter, r *http.Request, g *gues
 	_, _ = w.Write(e.body)
 }
 
+// compatMaxCount bounds count on one compat create (AB#865). The call is
+// synchronous and its answer is kept for Idempotency-Key replays.
+const compatMaxCount = 1000
+
+// compatCreateErr is the client error code and message of a failed create.
+func compatCreateErr(out createResult) (string, string) {
+	code, msg := "create_failed", "the hotel refused the room"
+	if e, ok := out.doc["error"].(map[string]string); ok {
+		code, msg = e["code"], e["message"]
+	} else if len(out.body) > 0 {
+		var d map[string]any
+		if json.Unmarshal(reEnvelope(out.status, out.header, out.body), &d) == nil {
+			if dd, ok := d["detail"].(map[string]any); ok {
+				code, _ = dd["error"].(string)
+				msg, _ = dd["message"].(string)
+			}
+		}
+	}
+	return code, msg
+}
+
+// compatCreateBatch answers a compat create with count > 1 (AB#865): 201
+// with the rooms that started, a short view each (GET /v1/sandboxes/{id}
+// has the rest), and the failures counted by "<status> <code>". When none
+// started, the first failure as a single create answers it.
+func (b *broker) compatCreateBatch(w http.ResponseWriter, results []createResult) {
+	rooms := []any{}
+	errs := map[string]int{}
+	for _, out := range results {
+		if out.status != 202 {
+			code, _ := compatCreateErr(out)
+			errs[strconv.Itoa(out.status)+" "+code]++
+			continue
+		}
+		bid, _ := out.doc["id"].(string)
+		b.mu.Lock()
+		u := ""
+		if rm := b.byBID(bid); rm != nil {
+			u = rm.uuid
+		}
+		b.mu.Unlock()
+		v := map[string]any{"id": u, "hotel": out.doc["hotel"], "state": "running"}
+		if st, ok := out.doc["state"]; ok {
+			v["state"] = st
+		}
+		for _, k := range []string{"image", "expires_at", "created_at", "placement_tier"} {
+			if x, ok := out.doc[k]; ok {
+				v[k] = x
+			}
+		}
+		if ttl, ok := out.doc["ttl_seconds"]; ok {
+			v["lifetime_seconds"] = ttl
+		}
+		rooms = append(rooms, v)
+	}
+	if len(rooms) == 0 {
+		out := results[0]
+		code, msg := compatCreateErr(out)
+		ra, _ := strconv.Atoi(out.header.Get("Retry-After"))
+		compatErr(w, out.status, code, msg, ra)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"sandboxes": rooms, "count": len(rooms), "errors": errs})
+}
+
 func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestState, raw []byte) {
+	tRecv := time.Now()
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
 	}
 	if ref, _ := req["image"].(string); ref != "" {
-		if e := localImageRefusal(ref); e != nil {
+		if e := imageRefRefusal(ref, true); e != nil {
 			compatErr(w, e.status, e.code, e.msg, 0)
 			return
 		}
@@ -451,28 +520,38 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	// was refused above, and every hotel is sealed, so "sealed": true adds
 	// nothing.
 	b.scope(g, &pl)
+	// create_timeout_seconds (AB#862): the native rule; compat builds the
+	// hotel body field by field, so the value never reaches a hotel.
+	deadline, derr := createDeadline(req, tRecv)
+	if derr != nil {
+		compatErr(w, derr.status, derr.code, derr.msg, 0)
+		return
+	}
+	pl.deadline = deadline
 	// The warm preference (prewarm.go) reads pl.image; the native path sets it
 	// in handleCreate. Only catalog images are ever marked warm, so any other
 	// ref leaves placement unchanged.
 	pl.image, _ = native["image"].(string)
-	if e, retry := b.admit(g, 1); e != nil {
+	count := 1
+	if v, ok := req["count"]; ok && v != nil {
+		f, isNum := v.(float64)
+		if !isNum || f != math.Trunc(f) || f < 1 || f > compatMaxCount {
+			compatErr(w, 400, "invalid_count", "count must be a whole number from 1 to "+strconv.Itoa(compatMaxCount), 0)
+			return
+		}
+		count = int(f)
+	}
+	if e, retry := b.admit(g, count); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
-	out := b.createMany(r.Context(), g, native, 1, time.Now(), pl)[0]
+	if count > 1 {
+		b.compatCreateBatch(w, b.createMany(r.Context(), g, native, count, tRecv, pl))
+		return
+	}
+	out := b.createMany(r.Context(), g, native, 1, tRecv, pl)[0]
 	if out.status != 202 {
-		code, msg := "create_failed", "the hotel refused the room"
-		if e, ok := out.doc["error"].(map[string]string); ok {
-			code, msg = e["code"], e["message"]
-		} else if len(out.body) > 0 {
-			var d map[string]any
-			if json.Unmarshal(reEnvelope(out.status, out.header, out.body), &d) == nil {
-				if dd, ok := d["detail"].(map[string]any); ok {
-					code, _ = dd["error"].(string)
-					msg, _ = dd["message"].(string)
-				}
-			}
-		}
+		code, msg := compatCreateErr(out)
 		ra, _ := strconv.Atoi(out.header.Get("Retry-After"))
 		compatErr(w, out.status, code, msg, ra)
 		return
@@ -829,6 +908,10 @@ func spillToken(v any) (string, bool) {
 	return s, true
 }
 
+// compatExecDefaultSeconds is the time limit of a compat exec that sends no
+// timeout_seconds (AB#862).
+const compatExecDefaultSeconds = 600
+
 func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
@@ -866,7 +949,9 @@ func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 		}
 		body["spill_token"] = token
 	}
-	timeout := maxExec
+	// No timeout_seconds: 600 s, not the 14,400 s ceiling. An exec holds a
+	// hotel data connection for its whole run (AB#862).
+	timeout := min(compatExecDefaultSeconds, maxExec)
 	if v, ok := req["timeout_seconds"].(float64); ok && v > 0 {
 		timeout = int(v)
 	}

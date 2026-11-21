@@ -165,7 +165,8 @@ func TestDefaultRoomLimitIs1000(t *testing.T) {
 		h.slots = 2000
 	}
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "count": 1001})
-	if status != 429 || errCode(doc) != "room_limit" {
+	// One call above the limit can never fit: 400, not a 429 to retry (AB#865).
+	if status != 400 || errCode(doc) != "count_over_room_limit" || !strings.Contains(doc["error"].(map[string]any)["message"].(string), "1000 rooms") {
 		t.Fatalf("1,001 rooms: %d %v", status, doc)
 	}
 }

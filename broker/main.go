@@ -165,6 +165,11 @@ type config struct {
 	// terminal_hotels, an id that is not known yet is refused: a typo would
 	// leave the canary cold and its measurement would say nothing.
 	PrewarmCatalogHotels []string `json:"prewarm_catalog_hotels,omitempty"`
+	// PreferGuestWarm (default on): prefer a hotel where the create's guest
+	// prefetched the create's image (POST /v1/images/prefetch or a compat
+	// import) since the hotel last came up. false: guest prefetches pull
+	// but never steer creates (AB#859).
+	PreferGuestWarm *bool `json:"prefer_guest_warm,omitempty"`
 	// OperatorKeySHA256 is the SHA-256 of the operator key. It allows hotel
 	// join, change and leave at runtime (hotels.go). Empty: no operator routes.
 	OperatorKeySHA256 string `json:"operator_key_sha256"`
@@ -319,6 +324,7 @@ type hotel struct {
 	containers      int
 	apiRunning      int
 	apiDeleting     int
+	removingDiskGiB int // usage.removing_disk_gib: disk of killed rooms not yet removed (AB#863, disk.go); 0 from an old hotel
 	created         int
 	failed          int
 	rejected        int
@@ -345,6 +351,12 @@ type hotel struct {
 	// keeps those rooms out of the guest's rooms and retries their removal
 	// until a list shows none left (AB#338).
 	unreaped map[string]*unreapedBatch
+	// Guarded by broker.mu. guestWarm: per guest, the images that guest
+	// prefetched here since the hotel last came up. guestWant: per guest,
+	// the refs to pull again when the hotel comes back (prefetched without a
+	// login, prewarm.go). AB#859.
+	guestWarm map[string]map[string]bool
+	guestWant map[string]map[string]time.Time
 }
 
 // unreapedBatch is one create request's leftover rooms on a hotel.
@@ -878,7 +890,7 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) 
 			total += weight[i]
 		}
 	}
-	total = b.preferWarm(hotels, weight, total, pl.image)
+	total = b.preferWarm(hotels, weight, total, pl.image, pl.guest)
 	if total <= 0 {
 		return nil
 	}
@@ -963,6 +975,11 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 && createDeadlinePassed(pl) {
+			// A retry (the first hotel refused or had no free connection)
+			// would wait for a slot again past the create's own deadline.
+			return finish(createTimedOut())
+		}
 		b.mu.Lock()
 		h := b.pick(tried, pl)
 		if h == nil && !fellBack {
@@ -1000,6 +1017,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		// another eligible hotel (placement.go).
 		h = b.waitSlot(ctx, g, h, pl, tried)
 		if h == nil {
+			if ctx.Err() == nil && createDeadlinePassed(pl) {
+				return finish(createTimedOut())
+			}
 			return finish(clientGone())
 		}
 		b.mu.Lock()
@@ -1040,13 +1060,20 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 
 		// The hotel does not stop a create when the guest goes away. Keep the
 		// call open, so the broker learns the room id and can delete the room.
-		status, hdr, out, err := h.doHeaders(context.WithoutCancel(ctx), h.cfg.API, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout, ownerHeadersFrom(ctx))
+		status, hdr, out, err := h.doHeaders(withCreateDeadline(context.WithoutCancel(ctx), pl), h.cfg.API, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout, ownerHeadersFrom(ctx))
 		<-h.sem
 		tDone := time.Now()
 
 		b.mu.Lock()
 		h.creating--
 		h.holdDisk(pl, -1) // a started room counts in h.rooms from here (same b.mu hold)
+		if errors.Is(err, errCreateDeadline) {
+			// The create's deadline passed while it waited for a data
+			// connection: never sent, so as errHotelBusy nothing to reap.
+			h.release(rm)
+			b.mu.Unlock()
+			return finish(createTimedOut())
+		}
 		if errors.Is(err, errHotelBusy) {
 			// No data connection came free in time (AB#819). The create was
 			// never sent, so no room can exist there: not lost, nothing to
@@ -1460,7 +1487,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	// The object form {"image", "registry_auth"} names its reference inside:
 	// the same refusal applies to it (AB#817).
 	if ref := createImageRef(payload); ref != "" {
-		if e := localImageRefusal(ref); e != nil {
+		if e := imageRefRefusal(ref, true); e != nil {
 			writeErr(w, e.status, e.code, e.msg)
 			return
 		}
@@ -1480,6 +1507,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	payload["network"] = net
+	deadline, derr := createDeadline(payload, tRecv)
+	if derr != nil {
+		writeErr(w, derr.status, derr.code, derr.msg)
+		return
+	}
 	count := 1
 	if c, ok := payload["count"].(float64); ok {
 		count = int(c)
@@ -1505,6 +1537,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	pl.apply(payload)
 	pl.image = createImageRef(payload)
+	pl.deadline = deadline
 	if e, retry := b.admit(g, count); e != nil {
 		writeLimitErr(w, e, retry)
 		return
@@ -2076,11 +2109,59 @@ func (b *broker) handleQuota(w http.ResponseWriter, r *http.Request, g *guestSta
 	writeJSON(w, 200, total)
 }
 
-func (b *broker) handleUsage(w http.ResponseWriter, r *http.Request, g *guestState) {
+// A hotel's /v1/usage prices its hours with an illustrative rate card (cathedral/sandbox_api.py
+// Pricing), about 8x the list price on 21 Nov 2026 (AB#870). The broker holds no price, so a guest
+// gets hours only: each hotel part keeps an allowlist of fields, and the answer says where prices are.
+const usageCostNote = "not_priced_here"
+const usagePriceDoc = "https://cathedral.computer/pricing/"
+
+func usageHoursOnly(raw json.RawMessage) any {
+	var doc map[string]any
+	if json.Unmarshal(raw, &doc) != nil || doc == nil {
+		return map[string]any{"error": "unavailable"}
+	}
+	if e, ok := doc["error"]; ok {
+		return map[string]any{"error": e}
+	}
+	out := map[string]any{}
+	if v, ok := doc["group_by"].(string); ok {
+		out["group_by"] = v
+	}
+	if v, ok := doc["snapshot_gib_months"].(float64); ok {
+		out["snapshot_gib_months"] = v
+	}
+	groups := map[string]any{}
+	if gs, ok := doc["groups"].(map[string]any); ok {
+		for name, gv := range gs {
+			gm, ok := gv.(map[string]any)
+			if !ok {
+				continue
+			}
+			kept := map[string]any{}
+			for _, k := range []string{"sandbox_hours", "vcpu_hours", "gib_hours"} {
+				if v, ok := gm[k].(float64); ok {
+					kept[k] = v
+				}
+			}
+			groups[name] = kept
+		}
+	}
+	out["groups"] = groups
+	return out
+}
+
+func (b *broker) usageParts(r *http.Request, g *guestState) map[string]any {
 	q := r.URL.Query()
 	q.Add("label", guestLabel+"="+g.cfg.ID)
-	parts := b.fanout(r.Context(), g, "/v1/usage", q)
-	writeJSON(w, 200, map[string]any{"hotels": parts})
+	parts := map[string]any{}
+	for hid, raw := range b.fanout(r.Context(), g, "/v1/usage", q) {
+		parts[hid] = usageHoursOnly(raw)
+	}
+	return parts
+}
+
+func (b *broker) handleUsage(w http.ResponseWriter, r *http.Request, g *guestState) {
+	writeJSON(w, 200, map[string]any{"hotels": b.usageParts(r, g), "cost": usageCostNote, "price_doc": usagePriceDoc})
 }
 
 func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *guestState) {
@@ -2298,6 +2379,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	if cameUp && b.prewarms(h) {
 		go b.prewarmHotel(h)
 	}
+	if cameUp {
+		go b.replayGuestPrefetch(h)
+	}
 	offered := h.slots // health late: the slots placement still uses
 	slotsTrusted := herr == nil
 	if slotsTrusted {
@@ -2324,6 +2408,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	if qerr == nil {
 		h.apiRunning = int(quota.Usage["running_sandboxes"] + quota.Usage["frozen_sandboxes"])
 		h.apiDeleting = int(quota.Usage["deleting_sandboxes"])
+		h.removingDiskGiB = int(quota.Usage["removing_disk_gib"])
 	}
 	// Slot delivery credits only a trusted health report this tick (AB#331).
 	b.recordDelivery(h, offered, now, slotsTrusted) // before the room list return: a failed list does not stop the count
