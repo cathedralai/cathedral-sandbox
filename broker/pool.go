@@ -328,12 +328,31 @@ func (b *broker) poolStep(ctx context.Context, h *hotel) {
 	if w == nil {
 		return
 	}
+	for _, hid := range w.reads {
+		b.poolReadSlot(h)
+		b.poolRead(ctx, h, hid, w.att)
+	}
 	for _, hid := range w.deletes {
 		b.poolDelete(ctx, h, hid)
 	}
 	if w.create != nil {
 		b.poolCreate(ctx, h, *w.create, w.att)
 	}
+}
+
+// poolReadSlot waits for h's next receipts read slot: reads start at least
+// poolReadEvery apart, across steps, so a hotel never gets more than 20 in
+// a second.
+func (b *broker) poolReadSlot(h *hotel) {
+	b.mu.Lock()
+	ph := b.pool.hotel(h.cfg.ID)
+	at := time.Now()
+	if ph.nextRead.After(at) {
+		at = ph.nextRead
+	}
+	ph.nextRead = at.Add(poolReadEvery)
+	b.mu.Unlock()
+	time.Sleep(time.Until(at))
 }
 
 // poolPlan takes stock of h under b.mu and decides the step's work.
@@ -343,14 +362,27 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	ph := p.hotel(h.cfg.ID)
-	// Rooms the hotel no longer holds are gone.
+	// Rooms the hotel no longer holds are gone; pool-labelled rooms the
+	// manager does not hold are unverified.
 	for hid := range ph.rooms {
 		if h.rooms[hid] == nil {
 			delete(ph.rooms, hid)
 		}
 	}
+	for hid, rm := range h.rooms {
+		if rm.guest == poolGuestID && rm.state == stRunning && ph.rooms[hid] == nil {
+			ph.rooms[hid] = &poolRoom{hid: hid, state: poolUnverified, why: "not made or proven by this process"}
+		}
+	}
 	w := &poolWork{}
 	w.att, w.attOK = b.poolAttestLocked(h, ph, now)
+	if w.attOK {
+		for _, pr := range sortedPoolRooms(ph) {
+			if pr.state == poolUnverified && !now.Before(pr.retryAt) && len(w.reads) < poolReadsPerStep {
+				w.reads = append(w.reads, pr.hid)
+			}
+		}
+	}
 	ready := map[string][]*poolRoom{}
 	for _, pr := range sortedPoolRooms(ph) {
 		if pr.state == poolReady {
@@ -448,6 +480,58 @@ func (b *broker) poolLevel1(ctx context.Context, h *hotel) {
 		log.Printf("ready rooms: hotel %s: level-1 binding %s... (test rig)", h.cfg.ID, att.binding[:16])
 	}
 	ph.level1, ph.level1At, ph.reattest = att, now, false
+}
+
+// poolRead reads one unverified room's receipts through the front.
+func (b *broker) poolRead(ctx context.Context, h *hotel, hid string, att poolAttest) {
+	status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes/"+url.PathEscape(hid)+"/receipts", nil, nil, poolReadTimeout)
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ph := b.pool.hotel(h.cfg.ID)
+	pr := ph.rooms[hid]
+	if pr == nil || pr.state != poolUnverified {
+		return
+	}
+	if err != nil || status != 200 {
+		// No answer proves nothing: the room stays set aside and is read again.
+		pr.tries++
+		pr.retryAt = now.Add(poolRetry(pr.tries))
+		pr.why = fmt.Sprintf("receipts not read (status %d)", status)
+		if err != nil {
+			pr.why = "receipts not read: " + err.Error()
+		}
+		return
+	}
+	sha, image, verr := verifyPoolReceiptsPage(out, att, hid)
+	k := b.pool.keyByImage(image)
+	switch {
+	case errors.Is(verr, errPoolReceiptBinding):
+		// The front's chain is another than the attested one: read again
+		// later. Until then the room stays set aside.
+		pr.tries++
+		pr.retryAt = now.Add(poolRetry(pr.tries))
+		pr.why = "receipts read: " + verr.Error()
+		return
+	case verr != nil:
+		pr.state, pr.why = poolQuarantined, "receipts read: "+verr.Error()
+	case k == nil:
+		pr.state, pr.why = poolQuarantined, "receipts read: its image is not a ready_rooms key"
+	default:
+		pr.state, pr.why, pr.proven, pr.key, pr.att, pr.receipt1, pr.since = poolReady, "", true, k.name, att, sha, now
+		pr.expiresAt = poolExpiry(h.rooms[hid], now)
+		return
+	}
+	log.Printf("ready rooms: hotel %s room %s quarantined: %s", h.cfg.ID, hid, pr.why)
+}
+
+// poolExpiry is when a pool room's hotel lifetime ends: the listed
+// expires_at, else 4 h from now (a proven room lives at most that long).
+func poolExpiry(rm *room, now time.Time) time.Time {
+	if rm != nil && !rm.expiresAt.IsZero() {
+		return rm.expiresAt
+	}
+	return now.Add(poolTTLSeconds * time.Second)
 }
 
 // poolRetry is the wait before the next try of a failed read or delete.

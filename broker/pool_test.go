@@ -99,6 +99,72 @@ func TestPoolRoomWithoutPoolReceiptIsDeleted(t *testing.T) {
 	}
 }
 
+// After a broker restart every pool-labelled room is read through the
+// front: ready only with exactly one receipt, a verified pool receipt 1;
+// otherwise quarantined. None is deleted. Reads stay at 20 a second or less.
+func TestPoolRestartVerifiesByReceipts(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	pc.up("a")
+	pc.target(30)
+	pc.fill("a", 2) // made by this broker: sbx-1, sbx-2
+	f.addRoom("r-pool", "pool")
+	f.addRoom("r-claimed", "pool", "claim")
+	f.addRoom("r-none")
+	f.addRoom("r-create", "create")
+	for i := 0; i < 22; i++ {
+		f.addRoom("r-more-"+string(rune('a'+i)), "pool")
+	}
+	pc.start() // restart: nothing of the pool is in memory
+	pc.up("a")
+	pc.target(30)
+	pc.step("a")
+	for i := 0; i < 10 && pc.counts("a").unverified > 0; i++ {
+		pc.step("a")
+	}
+	c := pc.counts("a")
+	if c.ready < 25 || c.quarantined != 3 {
+		t.Fatalf("counts %+v, want 25 ready (2 made before, r-pool, 22 more) and 3 quarantined\n%s", c, pc.debug("a"))
+	}
+	pc.b.mu.Lock()
+	ph := pc.b.pool.hotel("a")
+	for id, want := range map[string]poolRoomState{"sbx-1": poolReady, "sbx-2": poolReady, "r-pool": poolReady,
+		"r-claimed": poolQuarantined, "r-none": poolQuarantined, "r-create": poolQuarantined} {
+		if pr := ph.rooms[id]; pr == nil || pr.state != want {
+			pc.b.mu.Unlock()
+			t.Fatalf("room %s: %v, want %s\n%s", id, pr, want, pc.debug("a"))
+		}
+	}
+	pc.b.mu.Unlock()
+	if n := len(f.roomDeletes()); n != 0 {
+		t.Fatalf("%d deletes after the restart, want 0", n)
+	}
+	reads := f.callsOf("GET", "/v1/sandboxes/")
+	var at []time.Time
+	for _, r := range reads {
+		if strings.HasSuffix(r.path, "/receipts") {
+			at = append(at, r.at)
+		}
+	}
+	if len(at) != 28 {
+		t.Fatalf("%d receipts reads, want 28 (one per room)", len(at))
+	}
+	for i := range at {
+		n := 0
+		for j := i; j < len(at) && at[j].Sub(at[i]) < time.Second; j++ {
+			n++
+		}
+		if n > 20 {
+			t.Fatalf("%d receipts reads within one second from read %d, want at most 20", n, i)
+		}
+	}
+	st, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+	ha, _ := doc["hotels"].(map[string]any)["a"].(map[string]any)
+	if st != 200 || ha["quarantined"] != float64(3) || ha["mapped"] != float64(0) || ha["claiming"] != float64(0) {
+		t.Fatalf("GET ready-rooms %d %v", st, ha)
+	}
+}
+
 // Pool creates go only to operator, shared, sealed hotels with a verified
 // attestation where the image is warm.
 func TestPoolOnlyOnOperatorSealedAttestedWarmHotels(t *testing.T) {
