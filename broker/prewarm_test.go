@@ -141,6 +141,32 @@ func TestPrewarmSkipsSealedOnlyImagesOnUnsealedHotels(t *testing.T) {
 	}
 }
 
+// AB#894: a sealed hotel pre-pulls the node-22 image once; an unsealed hotel
+// never pulls it.
+func TestPrewarmPullsNode22OnSealedHotelsOnly(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true)
+	node := pinnedImage("node", nodeDigest)
+	pulls := func(id string) int {
+		tc.b.prewarmHotel(tc.b.hotelByID(id))
+		n := 0
+		for _, req := range tc.hotels[id].prefetch {
+			for _, im := range req["images"].([]any) {
+				if im.(string) == node {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	if n := pulls("a"); n != 1 {
+		t.Fatalf("sealed hotel a pulled %s %d times, want once", node, n)
+	}
+	if n := pulls("b"); n != 0 {
+		t.Fatalf("unsealed hotel b pulled %s %d times, want never", node, n)
+	}
+}
+
 func compatWarmCreates(t *testing.T, tc *testChain, n int) map[string]int {
 	t.Helper()
 	got := map[string]int{}
