@@ -595,3 +595,33 @@ func TestPoolMemoryBoundHoldsWhenHealthNumbersMove(t *testing.T) {
 		}
 	})
 }
+
+// A listed pool room the sync first saw before the oldest create in flight
+// started cannot be that create's room: it is taken in as unverified at
+// once. One first seen after it waits (poolMaybeInFlight).
+func TestPoolTakesInARoomSeenBeforeTheOldestCreate(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	h := pc.b.hotelByID("a")
+	pc.up("a")
+	pc.b.mu.Lock()
+	ph := pc.b.pool.hotel("a")
+	start := time.Now()
+	ph.started[&room{}] = start // a create in flight
+	for hid, born := range map[string]time.Time{"before": start.Add(-time.Second), "after": start.Add(time.Second)} {
+		h.rooms[hid] = &room{hid: hid, id: "a." + hid, h: h, guest: poolGuestID, state: stRunning, born: born}
+	}
+	pc.b.mu.Unlock()
+	pc.b.poolPlan(h)
+	pc.b.mu.Lock()
+	before, after := ph.rooms["before"], ph.rooms["after"]
+	delete(h.rooms, "before")
+	delete(h.rooms, "after")
+	ph.started = map[*room]time.Time{}
+	pc.b.mu.Unlock()
+	if before == nil || before.state != poolUnverified {
+		t.Fatalf("a room first seen 1 s before the oldest create in flight: %+v, want it taken in as unverified", before)
+	}
+	if after != nil {
+		t.Fatalf("a room first seen 1 s after the oldest create in flight started: %+v, want it left to the create", after)
+	}
+}
