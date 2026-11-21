@@ -143,8 +143,9 @@ func (pl placement) selects(h *hotel) bool {
 	return true
 }
 
-// withoutDisk is pl with no disk need: the hotels pl allows by room alone.
-func (pl placement) withoutDisk() placement { pl.diskGiB = 0; return pl }
+// withoutDisk is pl with no disk check at all: the hotels pl allows by room
+// alone (disk.go noDiskCheck).
+func (pl placement) withoutDisk() placement { pl.diskGiB = noDiskCheck; return pl }
 
 func (pl placement) allows(h *hotel) bool {
 	return (pl.only == nil || pl.only == h) && pl.selects(h)
