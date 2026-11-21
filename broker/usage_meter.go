@@ -1347,21 +1347,6 @@ func (b *broker) usageMeterBulkDeleted(t usageBulkTargets) {
 	b.usageMeter.bulkDeleted(t, time.Now())
 }
 
-// sightRuns applies a sighting at at to open runs known by id.
-func (m *usageMeter) sightRuns(runs []string, at time.Time) {
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, id := range runs {
-		if r := m.runs[id]; r != nil {
-			r.observe(at)
-			r.missed = false
-		}
-	}
-}
-
 // sightListed applies a bulk delete's list at at to the runs the meter has:
 // each is observed and keeps its billable state. It returns the sightings
 // of the listed rooms it has no run for, written only if the delete succeeds
