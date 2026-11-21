@@ -20,7 +20,6 @@ package main
 // per guest, oldest dropped first.
 
 import (
-	"cmp"
 	"net/http"
 	"slices"
 	"strconv"
@@ -30,12 +29,12 @@ import (
 
 const (
 	endedKeep = 24 * time.Hour
-	// endedStreamLookback: how far back a live stream looks for records written
-	// late, after rooms held back as deleting are freed (endedSince).
-	endedStreamLookback = 15 * time.Minute
-	endedMaxPerGuest    = 50000
-	endedListMax        = 1000
-	endedListDefault    = 100
+	// endedStreamLog: how long a record stays in the stream log. A live stream
+	// reads it every second; a new one starts from the backlog window.
+	endedStreamLog   = 5 * time.Minute
+	endedMaxPerGuest = 50000
+	endedListMax     = 1000
+	endedListDefault = 100
 	// The hotel reaps at expires_at plus a grace; a room gone at most this
 	// long before its listed expiry ended by its TTL.
 	endedTTLSlack = 10 * time.Second
@@ -71,13 +70,18 @@ type endRecord struct {
 	Reason    string     `json:"reason"`
 	Detail    string     `json:"detail,omitempty"`
 	seq       uint64     // write order, for the live stream
+	written   time.Time  // when the broker wrote it (streamLog trim)
 }
 
 // guestEnded is one guest's records. order is oldest first.
 type guestEnded struct {
 	byID   map[string]*endRecord
 	byUUID map[string]*endRecord
-	order  []*endRecord
+	order  []*endRecord // by GoneAt: the list and prune
+	// streamLog is the records in write (seq) order, for live streams only:
+	// a stream reads what was written since its cursor, whatever the GoneAt
+	// (review F3 on #637). Kept endedStreamLog long, at most endedMaxPerGuest.
+	streamLog []*endRecord
 }
 
 func (r *endRecord) view() map[string]any {
@@ -124,7 +128,18 @@ func (b *broker) addEnded(rec *endRecord) {
 		i--
 	}
 	ge.order = slices.Insert(ge.order, i, rec)
-	ge.prune(time.Now())
+	now := time.Now()
+	rec.written = now
+	ge.streamLog = append(ge.streamLog, rec)
+	cut := 0
+	for cut < len(ge.streamLog) && (now.Sub(ge.streamLog[cut].written) > endedStreamLog || len(ge.streamLog)-cut > endedMaxPerGuest) {
+		cut++
+	}
+	if cut > 0 {
+		clear(ge.streamLog[:cut])
+		ge.streamLog = ge.streamLog[cut:]
+	}
+	ge.prune(now)
 	b.markDirty()
 }
 
@@ -137,6 +152,9 @@ func (ge *guestEnded) drop(rec *endRecord) {
 	}
 	if i := slices.Index(ge.order, rec); i >= 0 {
 		ge.order = slices.Delete(ge.order, i, i+1)
+	}
+	if i := slices.Index(ge.streamLog, rec); i >= 0 {
+		ge.streamLog = slices.Delete(ge.streamLog, i, i+1)
 	}
 }
 
@@ -255,23 +273,12 @@ func (b *broker) endedSince(guest string, seq uint64) ([]map[string]any, uint64)
 	if ge == nil {
 		return nil, last
 	}
-	// order is by GoneAt, so a new record can sit before older ones: a room
-	// held back as deleting is released minutes after it vanished. Look back
-	// over that window, not only the tail, and send in write order.
-	cutoff := time.Now().Add(-endedStreamLookback)
-	var picked []*endRecord
-	for i := len(ge.order) - 1; i >= 0; i-- {
-		rec := ge.order[i]
-		if rec.seq <= seq && rec.GoneAt.Before(cutoff) {
-			break
-		}
-		if rec.seq > seq {
-			picked = append(picked, rec)
-		}
+	i := len(ge.streamLog)
+	for i > 0 && ge.streamLog[i-1].seq > seq {
+		i--
 	}
-	slices.SortFunc(picked, func(a, b *endRecord) int { return cmp.Compare(a.seq, b.seq) })
 	var out []map[string]any
-	for _, rec := range picked {
+	for _, rec := range ge.streamLog[i:] {
 		out = append(out, rec.view())
 	}
 	return out, last
@@ -286,9 +293,13 @@ func (b *broker) endedStreamStart(guest string, now time.Time) uint64 {
 	if ge == nil {
 		return b.endSeq
 	}
+	// The lowest seq among records gone in the backlog window: a batch can
+	// write a newer room before an older one (review F3 on #637).
 	start := b.endSeq
-	for i := len(ge.order) - 1; i >= 0 && now.Sub(ge.order[i].GoneAt) <= endedStreamBacklog; i-- {
-		start = ge.order[i].seq - 1
+	for _, rec := range ge.streamLog {
+		if now.Sub(rec.GoneAt) <= endedStreamBacklog && rec.seq-1 < start {
+			start = rec.seq - 1
+		}
 	}
 	return start
 }

@@ -465,3 +465,18 @@ func TestEndedListStaysNewestFirstWhenWrittenOutOfOrder(t *testing.T) {
 		t.Fatalf("stream after the first two records = %v, want only the late old one", got)
 	}
 }
+
+// Review F3 on #637: a batch writes the newer room first; a stream that
+// starts after the batch still gets both inside the backlog window.
+func TestNewStreamGetsEveryRoomOfABatchRelease(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	now := time.Now()
+	tc.b.mu.Lock()
+	tc.b.addEnded(&endRecord{ID: "b.sbx_b", Guest: "g1", Hotel: "b", GoneAt: now.Add(-10 * time.Second), Reason: endUnknown})
+	tc.b.addEnded(&endRecord{ID: "b.sbx_a", Guest: "g1", Hotel: "b", GoneAt: now.Add(-20 * time.Second), Reason: endUnknown})
+	tc.b.mu.Unlock()
+	got, _ := tc.b.endedSince("g1", tc.b.endedStreamStart("g1", now))
+	if len(got) != 2 {
+		t.Fatalf("new stream after a batch got %v, want both rooms", got)
+	}
+}
