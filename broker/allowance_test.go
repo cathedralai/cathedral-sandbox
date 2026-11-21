@@ -41,6 +41,14 @@ type lifeHotel struct {
 	name          string
 	// holdDeletes, when set, holds each room DELETE until it is closed.
 	holdDeletes chan struct{}
+	// holdList, when set, takes the room list (no label filter) at once,
+	// says so on listTaken, and answers it only when holdList is closed: an
+	// answer that arrives later than the moment it describes.
+	holdList  chan struct{}
+	listTaken chan struct{}
+	// holdLabelLists: holdList applies to label-filtered lists (the orphan
+	// cleanup) instead of the plain room list.
+	holdLabelLists bool
 }
 
 type lifeCall struct {
@@ -52,7 +60,18 @@ func (l *lifeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	l.mu.Lock()
 	l.seen = append(l.seen, r.Method+" "+r.URL.Path)
 	hide, holdCreates, entered, holdDeletes := l.hideDeletes, l.holdCreates, l.enteredCreate, l.holdDeletes
+	holdList, listTaken, labelLists := l.holdList, l.listTaken, l.holdLabelLists
 	l.mu.Unlock()
+	if holdList != nil && r.Method == "GET" && r.URL.Path == "/v1/sandboxes" && (r.URL.RawQuery != "") == labelLists {
+		rec := httptest.NewRecorder()
+		l.inner.ServeHTTP(rec, r)
+		listTaken <- struct{}{}
+		<-holdList
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+		return
+	}
 	if holdDeletes != nil && r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/v1/sandboxes/") {
 		<-holdDeletes
 	}
@@ -1678,4 +1697,136 @@ func TestMeteredJoinRecountEndsAtTheFirstSuccessfulList(t *testing.T) {
 	f.mu.Unlock()
 	tc.syncAll("d")
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+}
+
+// ---------------------------------------------------------------- review round 4
+
+func TestMeteredHoldEndsOnlyOnAListAskedAfterItsDeadline(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	hotelID, batch := lostCreateNoRoom(t, tc, lives)
+	deadline := time.Now().Add(400 * time.Millisecond)
+	tc.b.mu.Lock()
+	tc.b.hotelByID(hotelID).unreaped[batch].holdUntil = deadline
+	tc.b.mu.Unlock()
+	l, f := lives[hotelID], tc.hotels[hotelID]
+	release, taken := make(chan struct{}), make(chan struct{}, 1)
+	l.mu.Lock()
+	l.holdList, l.listTaken = release, taken
+	l.mu.Unlock()
+	done := make(chan struct{})
+	go func() { tc.syncAll(hotelID); close(done) }()
+	<-taken // the hotel's list is taken before the deadline: empty
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_late", "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: batch}})
+	f.mu.Unlock() // the room starts before the deadline
+	time.Sleep(time.Until(deadline) + 50*time.Millisecond)
+	close(release) // the old empty answer arrives after the deadline
+	<-done
+	l.mu.Lock()
+	l.holdList = nil
+	l.mu.Unlock()
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create after an empty list asked for before the deadline: %d %v", status, doc)
+	}
+	// The next list shows the room: it counts until it is reaped.
+	held := make(chan struct{})
+	l.mu.Lock()
+	l.holdDeletes = held
+	l.mu.Unlock()
+	tc.syncAll(hotelID)
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create while the late room is listed: %d %v", status, doc)
+	}
+	close(held)
+	if _, creates, _ := hotelCalls(tc, lives); creates != 1 {
+		t.Fatalf("%d creates dispatched at cap 1", creates)
+	}
+}
+
+func TestMeteredHoldOutlivesItsHotelLeaving(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, createFail: 504} // the answer is lost, no room yet
+	hs := httptest.NewServer(f)
+	t.Cleanup(hs.Close)
+	tc.hotels["d"] = f
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+		t.Fatalf("join d: %d %v", status, doc)
+	}
+	setHotel(tc, "d", func(h *hotel) { h.ok, h.slots = true, 10 })
+	tc.syncAll("d")
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"d"}}); status != 504 {
+		t.Fatalf("lost create on d: %d %v", status, doc)
+	}
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/d", nil); status != 204 {
+		t.Fatalf("leave d during the hold: %d %v", status, doc) // the leave is not blocked
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create after the hotel left during the hold: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	for _, ha := range tc.b.allow.held {
+		ha.until = time.Now().Add(-time.Second) // the hold passes
+	}
+	tc.b.mu.Unlock()
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+}
+
+func TestMeteredCleanupListAskedBeforeTheDeadlineKeepsTheHold(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	for _, id := range []string{"b", "c"} {
+		f := tc.hotels[id]
+		f.mu.Lock()
+		f.createFail, f.labelListFail = 504, 503 // no room yet, and the first cleanup list fails
+		f.mu.Unlock()
+	}
+	release, taken := make(chan struct{}), make(chan struct{}, 4)
+	for _, id := range []string{"b", "c"} {
+		lives[id].mu.Lock()
+		lives[id].holdList, lives[id].listTaken, lives[id].holdLabelLists = release, taken, true
+		lives[id].mu.Unlock()
+	}
+	go func() { // the first cleanup list (it fails) passes at once
+		<-taken
+		release <- struct{}{}
+	}()
+	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 504 {
+		t.Fatalf("lost create: %d", status)
+	}
+	hotelID, batch := "", ""
+	for _, id := range []string{"b", "c"} {
+		f := tc.hotels[id]
+		f.mu.Lock()
+		f.createFail, f.labelListFail = 0, 0
+		if len(f.creates) == 1 {
+			labels, _ := f.creates[0]["labels"].(map[string]any)
+			hotelID, batch = id, labels[batchLabel].(string)
+		}
+		f.mu.Unlock()
+	}
+	<-taken // the background cleanup list is asked for: empty
+	deadline := time.Now().Add(200 * time.Millisecond)
+	tc.b.mu.Lock()
+	tc.b.hotelByID(hotelID).unreaped[batch].holdUntil = deadline
+	tc.b.mu.Unlock()
+	f := tc.hotels[hotelID]
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_late", "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: batch}})
+	f.mu.Unlock() // the room starts before the deadline
+	time.Sleep(time.Until(deadline) + 50*time.Millisecond)
+	for _, id := range []string{"b", "c"} {
+		lives[id].mu.Lock()
+		lives[id].holdList = nil
+		lives[id].mu.Unlock()
+	}
+	release <- struct{}{} // the old empty answer arrives after the deadline
+	waitRecord(t, tc, hotelID, batch, func(ub *unreapedBatch) bool { return ub == nil || !ub.busy })
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create after a cleanup list asked for before the deadline: %d %v", status, doc)
+	}
+	if _, creates, _ := hotelCalls(tc, lives); creates != 1 {
+		t.Fatalf("%d creates dispatched at cap 1", creates)
+	}
 }

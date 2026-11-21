@@ -48,9 +48,10 @@
 // uncertain_create_hold_seconds (default and minimum: the create timeout,
 // hotelCreateTimeout) has passed, in case the hotel still starts it; a room
 // it lists in that time is reaped as an orphan. A cleanup that finds no
-// room, at once or after failed tries, does not end the hold, and in a batch
-// each attempt counts on its own. Holds live in memory: a restart forgets
-// them (README, known limits). Every retry of a metered create on
+// room, at once or after failed tries, does not end the hold; only a list
+// asked for after the deadline does; in a batch each attempt counts on its
+// own; and a hold still counts after its hotel leaves, until its deadline.
+// Holds live in memory: a restart forgets them (README, known limits). Every retry of a metered create on
 // another hotel is a new admission: lease and cap with the room the failed
 // attempt may hold, and the create's ttl and memory against the allowance of
 // that moment; a retry that does not fit is not sent. Size, lifetime, lease
@@ -158,6 +159,14 @@ type allowances struct {
 	// a reap pass deleted on that hotel. attempts - removed is what the
 	// record still counts. Guarded by broker.mu.
 	removed map[string]int
+	// listedAt is orphanKey(hotel, batch) -> when the last successful
+	// cleanup list of the request was asked for: a hold ends only on a
+	// list asked for after its deadline. Guarded by broker.mu.
+	listedAt map[string]time.Time
+	// held is orphanKey(hotel, batch) -> a metered guest's hold, kept apart
+	// from the hotel, so it still counts until its deadline when the hotel
+	// leaves. Guarded by broker.mu.
+	held map[string]*heldAttempts
 	// unlisted holds hotels joined at runtime that have not answered a room
 	// list yet (metered recount only; roomsUnchecked covers hotels loaded at
 	// start). Guarded by broker.mu.
@@ -168,6 +177,15 @@ type allowances struct {
 }
 
 func orphanKey(hotelID, batchID string) string { return hotelID + "\x00" + batchID }
+
+// heldAttempts is one hold of a metered guest's lost create attempts on one
+// hotel.
+type heldAttempts struct {
+	h     *hotel
+	guest string
+	n     int // lost attempts held
+	until time.Time
+}
 
 // meteredLocked reports whether g is metered (its config says so), and its
 // allowance (nil: none yet, which is closed). Caller holds b.mu.
@@ -192,6 +210,14 @@ func (b *broker) meteredLiveLocked(g *guestState) int {
 			if ub.guest == g.cfg.ID {
 				n += b.unresolvedLocked(h, batchID)
 			}
+		}
+	}
+	now := time.Now()
+	for key, ha := range b.allow.held {
+		// A hold on a hotel that left (or was replaced under its id) counts
+		// until its deadline: no list of that hotel can resolve it now.
+		if ha.guest == g.cfg.ID && b.hotelByID(ha.h.cfg.ID) != ha.h && now.Before(ha.until) {
+			n += max(0, ha.n-b.allow.removed[key])
 		}
 	}
 	return n
@@ -386,11 +412,36 @@ func (b *broker) unresolvedLocked(h *hotel, batchID string) int {
 }
 
 // holdsLocked reports whether h's unreaped record of a create request must
-// stay: a metered guest's lost attempts are not all resolved and the hold
-// has not passed. A record without a hold (a guest that is not metered)
-// never does. Caller holds b.mu.
-func (b *broker) holdsLocked(h *hotel, batchID string, ub *unreapedBatch, now time.Time) bool {
-	return now.Before(ub.holdUntil) && b.unresolvedLocked(h, batchID) > 0
+// stay after a list that found none of its rooms: a metered guest's lost
+// attempts are not all resolved and the list was asked for before the hold
+// passed (asked is when the list request started, not when its answer came:
+// a room that started before the deadline may be missing from an older
+// answer). A record without a hold (a guest that is not metered) never
+// stays. Caller holds b.mu.
+func (b *broker) holdsLocked(h *hotel, batchID string, ub *unreapedBatch, asked time.Time) bool {
+	return asked.Before(ub.holdUntil) && b.unresolvedLocked(h, batchID) > 0
+}
+
+// noteCleanupListLocked records when a successful cleanup list of a create
+// request on h was asked for, for a metered request already held (the first
+// pass, before settleUncertain, needs none: the hold starts after it).
+// Caller holds b.mu.
+func (b *broker) noteCleanupListLocked(h *hotel, batchID string, asked time.Time) {
+	key := orphanKey(h.cfg.ID, batchID)
+	if _, held := b.allow.attempts[key]; !held {
+		return
+	}
+	if b.allow.listedAt == nil {
+		b.allow.listedAt = map[string]time.Time{}
+	}
+	b.allow.listedAt[key] = asked
+}
+
+// cleanupListedAtLocked is when the last successful cleanup list of a create
+// request on h was asked for; zero (before any deadline) when none is known.
+// Caller holds b.mu.
+func (b *broker) cleanupListedAtLocked(h *hotel, batchID string) time.Time {
+	return b.allow.listedAt[orphanKey(h.cfg.ID, batchID)]
 }
 
 // listedLocked notes the first successful room list of a hotel since it
@@ -428,11 +479,23 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 	if b.allow.removed == nil {
 		b.allow.removed = map[string]int{}
 	}
+	if b.allow.held == nil {
+		b.allow.held = map[string]*heldAttempts{}
+	}
+	now := time.Now()
+	for k, ha := range b.allow.held { // holds released, or past their deadline on a hotel that left
+		_, bid, _ := strings.Cut(k, "\x00")
+		present := b.hotelByID(ha.h.cfg.ID) == ha.h
+		if (present && ha.h.unreaped[bid] == nil) || (!present && !now.Before(ha.until)) {
+			delete(b.allow.held, k)
+		}
+	}
 	for k := range b.allow.attempts { // settled records released since
 		hotelID, bid, _ := strings.Cut(k, "\x00")
-		if h := b.hotelByID(hotelID); h == nil || h.unreaped[bid] == nil {
+		if h := b.hotelByID(hotelID); b.allow.held[k] == nil && (h == nil || h.unreaped[bid] == nil) {
 			delete(b.allow.attempts, k)
 			delete(b.allow.removed, k)
+			delete(b.allow.listedAt, k)
 		}
 	}
 	metered, _ := b.meteredLocked(g)
@@ -458,6 +521,7 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 			h.unreaped[batchID] = ub
 		}
 		ub.holdUntil = until
+		b.allow.held[key] = &heldAttempts{h: h, guest: g.cfg.ID, n: n, until: until}
 	}
 	if b.allow.uncertain[g.cfg.ID] -= total; b.allow.uncertain[g.cfg.ID] <= 0 {
 		delete(b.allow.uncertain, g.cfg.ID)
@@ -847,6 +911,8 @@ func (b *broker) loadAllowances() error {
 	b.allow.uncertain = map[string]int{}
 	b.allow.attempts = map[string]int{}
 	b.allow.removed = map[string]int{}
+	b.allow.listedAt = map[string]time.Time{}
+	b.allow.held = map[string]*heldAttempts{}
 	b.allow.unlisted = map[*hotel]bool{}
 	switch hold := b.cfg.UncertainCreateHoldSeconds; {
 	case hold == 0:

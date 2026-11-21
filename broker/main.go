@@ -1328,7 +1328,7 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 // reaped clears a recorded request once its rooms on h are confirmed gone.
 func (b *broker) reaped(h *hotel, batchID string) {
 	b.mu.Lock()
-	if ub := h.unreaped[batchID]; ub != nil && b.holdsLocked(h, batchID, ub, time.Now()) {
+	if ub := h.unreaped[batchID]; ub != nil && b.holdsLocked(h, batchID, ub, b.cleanupListedAtLocked(h, batchID)) {
 		ub.busy = false // a metered guest's lost create may still start its room (allowance.go)
 		b.mu.Unlock()
 		return
@@ -1346,6 +1346,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 	q := url.Values{}
 	q.Add("label", batchLabel+"="+batchID)
 	q.Add("label", guestLabel+"="+guestID)
+	asked := time.Now() // when the list was asked for: a hold ends only on a list asked for after it (allowance.go)
 	status, _, out, err := h.do(ctx, "GET", "/v1/sandboxes", q, nil, timeout)
 	if err != nil || status != 200 {
 		return false
@@ -1359,6 +1360,9 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 	if json.Unmarshal(out, &list) != nil {
 		return false
 	}
+	b.mu.Lock()
+	b.noteCleanupListLocked(h, batchID, asked) // allowance.go
+	b.mu.Unlock()
 	ok := true
 	for _, s := range list.Sandboxes {
 		if keep[s.ID] {
@@ -2275,6 +2279,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			Resources map[string]any `json:"resources"`
 		} `json:"sandboxes"`
 	}
+	listAsked := time.Now() // a hold ends only on a list asked for after it (allowance.go)
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
 	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
 	defer b.fillLentBaseline(ctx, h, herr == nil)
@@ -2399,7 +2404,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	for batchID, ub := range h.unreaped {
 		switch {
 		case ub.busy:
-		case !leftover[batchID] && b.holdsLocked(h, batchID, ub, now): // a lost create may still start its room (allowance.go)
+		case !leftover[batchID] && b.holdsLocked(h, batchID, ub, listAsked): // a lost create may still start its room (allowance.go)
 		case !leftover[batchID]:
 			delete(h.unreaped, batchID) // the hotel lists none of its rooms
 			log.Printf("orphan rooms on hotel %s (batch %s) no longer listed", h.cfg.ID, batchID)

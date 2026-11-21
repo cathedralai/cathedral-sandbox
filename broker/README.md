@@ -342,10 +342,12 @@ until the hotel has listed its room and the broker has removed it, or until
 a hold of `uncertain_create_hold_seconds` has passed (config; default and
 minimum 720, the broker's create timeout to a hotel, `hotelCreateTimeout`):
 a proxy may time out while the hotel goes on, so a cleanup that finds no
-room, at once or after failed tries, does not end the count early. A room
-the hotel lists in that time is reaped as an orphan. In a batch each lost
-attempt counts on its own: removing one late room does not release the
-others. Every retry of a
+room, at once or after failed tries, does not end the count early, and only
+a list asked for after the hold's deadline ends it (an older answer that
+arrives late does not). A room the hotel lists in that time is reaped as an
+orphan. In a batch each lost attempt counts on its own: removing one late
+room does not release the others. A hold still counts after its hotel
+leaves, until its deadline; the leave itself is not blocked. Every retry of a
 create on another hotel is a new admission: the lease must be fresh, the cap
 must hold the live rooms with the room the failed attempt may hold, and the
 create's `ttl_seconds` and memory must fit the allowance of that moment (409
