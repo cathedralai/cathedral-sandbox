@@ -1207,3 +1207,220 @@ func TestUsageMeterSilentHotelDoesNotStaleTheMeter(t *testing.T) {
 		t.Fatalf("recovered c still left out: %v", doc)
 	}
 }
+
+// A bulk delete whose answer comes late: two syncs drop the room and end
+// its run first. The run still keeps the time seen at the bulk delete's own
+// list, and the delete's answer writes no second ended reading.
+func TestUsageMeterSlowBulkDeleteKeepsItsSighting(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	syncNow(tc, "b")
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "labels": map[string]any{"job": "x"}})
+	time.Sleep(1100 * time.Millisecond)
+	f := tc.hotels["b"]
+	hold := make(chan struct{})
+	f.mu.Lock()
+	f.bulkDeleteHold = hold
+	f.mu.Unlock()
+	done := make(chan int, 1)
+	go func() { st, _, _ := rawCall(tc, "key1", "", "DELETE", "/v1/sandboxes?label=job=x", nil); done <- st }()
+	for i := 0; ; i++ {
+		f.mu.Lock()
+		asked := len(f.bulkDeletes)
+		f.mu.Unlock()
+		if asked > 0 {
+			break
+		}
+		if i > 500 {
+			t.Fatal("the bulk delete never reached hotel b")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	letGo(tc, "b") // two syncs release the room while the delete answer is held
+	if got := meterRunsOf(t, tc, id); len(got) != 2 || got[1].State != "ended" || got[1].Seconds < 1 {
+		close(hold)
+		t.Fatalf("readings before the delete answers %+v, want ended with at least 1 s", got)
+	}
+	close(hold)
+	if status := <-done; status != 200 {
+		t.Fatalf("bulk delete: %d", status)
+	}
+	got := meterRunsOf(t, tc, id)
+	if len(got) != 2 || got[1].State != "ended" || got[1].Seconds < 1 || got[1].Seconds > 10 {
+		t.Fatalf("readings %+v, want one ended reading with 1 to 10 s", got)
+	}
+}
+
+// The hotel starts a room and answers the create 500; the orphan cleanup
+// removes it before any sync. The room is metered: not billable, ended.
+func TestUsageMeterOrphanCleanupMetersTheRoom(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.createFail, f.createFailAfterStart = 500, true
+	f.mu.Unlock()
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); status == 202 {
+		t.Fatalf("create: %d %v", status, doc)
+	}
+	f.mu.Lock()
+	deleted, left := append([]string(nil), f.roomDeletes...), len(f.rooms)
+	f.mu.Unlock()
+	if len(deleted) != 1 || left != 0 {
+		t.Fatalf("cleanup deleted %v, %d rooms left", deleted, left)
+	}
+	got := meterRunsOf(t, tc, "b."+deleted[0])
+	if len(got) != 2 || got[1].State != "ended" {
+		t.Fatalf("readings %+v, want a first and an ended reading", got)
+	}
+	for _, r := range got {
+		if r.Billable == nil || *r.Billable || r.Guest != "g1" {
+			t.Fatalf("reading %+v, want billable false for guest g1", r)
+		}
+	}
+}
+
+// A sync adopts the room while its create is in flight (billable readings),
+// then the create fails and the cleanup removes the room: from the cleanup
+// on, the run is not billable, the ended reading included.
+func TestUsageMeterAdoptedRoomOfAFailedCreateEndsNotBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.createFail, f.createFailAfterStart, f.answerDelay = 500, true, 800*time.Millisecond
+	f.mu.Unlock()
+	done := make(chan int, 1)
+	go func() {
+		st, _, _ := rawCall(tc, "key1", "", "POST", "/v1/sandboxes", []byte(`{"image":"alpine:3.20","hotels":["b"]}`))
+		done <- st
+	}()
+	var hid string
+	for i := 0; hid == ""; i++ {
+		f.mu.Lock()
+		if len(f.rooms) > 0 {
+			hid = f.rooms[0]["id"].(string)
+		}
+		f.mu.Unlock()
+		if i > 500 {
+			t.Fatal("the hotel never started the room")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	syncNow(tc, "b") // adopted as the guest's room
+	time.Sleep(100 * time.Millisecond)
+	syncNow(tc, "b")
+	if status := <-done; status == 202 {
+		t.Fatal("the create succeeded")
+	}
+	letGo(tc, "b")
+	got := meterRunsOf(t, tc, "b."+hid)
+	if len(got) < 2 || got[0].Billable != nil || got[len(got)-1].State != "ended" {
+		t.Fatalf("readings %+v, want a billable first reading and an ended one", got)
+	}
+	last := got[len(got)-1]
+	if last.Billable == nil || *last.Billable || got[len(got)-2].State == "ended" {
+		t.Fatalf("readings %+v, want exactly one ended reading, not billable", got)
+	}
+}
+
+// The review's sequence: an old file holds acknowledged seqs 1 and 2; after
+// a restart an append fails and leaves the newest file empty; a cursor read
+// prunes the old file; another restart finds only the empty file. The next
+// seq is 3, never one a reader has seen.
+func TestUsageMeterSeqNeverRestartsAfterPruningEveryReading(t *testing.T) {
+	dir := t.TempDir()
+	m := testMeter(t, dir, 60)
+	m.seen(sighting("h.x"), at(0))
+	m.end("h.x", at(1), false)
+	mustFlush(t, m)
+	served := map[int64]string{}
+	p, _ := m.page(0, 10, time.Now())
+	for _, raw := range p.Readings {
+		var r usageReading
+		_ = json.Unmarshal(raw, &r)
+		served[r.Seq] = string(raw)
+	}
+	if len(served) != 2 {
+		t.Fatalf("served %v", served)
+	}
+
+	m2 := testMeter(t, dir, 60)
+	m2.write = func(f *os.File, b []byte) error { _, _ = f.Write(b[:3]); return errors.New("no space left on device") }
+	m2.seen(sighting("h.y"), at(10))
+	if err := m2.flush(); err == nil {
+		t.Fatal("the append did not fail")
+	}
+	newest := filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 3))
+	if st, err := os.Stat(newest); err != nil || st.Size() != 0 {
+		t.Fatalf("newest file %v %v, want empty", st, err)
+	}
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	_ = os.Chtimes(filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1)), old, old)
+	if _, err := m2.page(2, 10, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1))); err == nil {
+		t.Fatal("the acknowledged old file was not pruned")
+	}
+
+	m3 := testMeter(t, dir, 60)
+	if m3.nextSeq != 3 || m3.head != 2 {
+		t.Fatalf("after restart: next %d head %d, want 3 and 2", m3.nextSeq, m3.head)
+	}
+	m3.seen(sighting("h.z"), at(20))
+	mustFlush(t, m3)
+	p, _ = m3.page(2, 10, time.Now())
+	if len(p.Readings) != 1 || p.Next != 3 || p.Head != 3 {
+		t.Fatalf("page after 2: %+v", p)
+	}
+	for _, r := range logReadings(t, dir) {
+		if was, ok := served[r.Seq]; ok && was != "" {
+			t.Fatalf("seq %d issued again: %+v", r.Seq, r)
+		}
+	}
+}
+
+// A replayed file whose sync fails restores its runs but serves none of its
+// readings and stays out of head; the failure counts in write_errors and the
+// sync is retried; once it succeeds the readings are served.
+func TestUsageMeterReplaySyncFailureServesNothingUntilSynced(t *testing.T) {
+	dir := t.TempDir()
+	m := testMeter(t, dir, 60)
+	m.seen(sighting("h.a"), at(0))
+	m.seen(sighting("h.b"), at(0))
+	mustFlush(t, m)
+	failing := true
+	orig := usageSyncFile
+	usageSyncFile = func(f *os.File) error {
+		if failing {
+			return errors.New("input/output error")
+		}
+		return orig(f)
+	}
+	t.Cleanup(func() { usageSyncFile = orig })
+
+	m2 := testMeter(t, dir, 60)
+	if m2.head != 0 || m2.nextSeq != 3 || len(m2.runs) != 2 || m2.writeErrors != 1 {
+		t.Fatalf("replay: head %d next %d runs %d errors %d", m2.head, m2.nextSeq, len(m2.runs), m2.writeErrors)
+	}
+	p, _ := m2.page(0, 10, time.Now())
+	if len(p.Readings) != 0 || p.Head != 0 || p.WriteErrors < 2 {
+		t.Fatalf("page while unsynced %+v", p)
+	}
+	m2.seen(sighting("h.c"), at(5))
+	mustFlush(t, m2)
+	seqsOf := func(p usagePage) []int64 {
+		var out []int64
+		for _, raw := range p.Readings {
+			var r usageReading
+			_ = json.Unmarshal(raw, &r)
+			out = append(out, r.Seq)
+		}
+		return out
+	}
+	if p, _ := m2.page(0, 10, time.Now()); fmt.Sprint(seqsOf(p)) != "[3]" || p.Head != 3 {
+		t.Fatalf("served %v head %d, want only 3", seqsOf(p), p.Head)
+	}
+	failing = false
+	if p, _ := m2.page(0, 10, time.Now()); fmt.Sprint(seqsOf(p)) != "[1 2 3]" || p.Head != 3 {
+		t.Fatalf("after the sync: served %v head %d", seqsOf(p), p.Head)
+	}
+}

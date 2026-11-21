@@ -59,9 +59,24 @@
 // "after" the route was called with, kept in state_dir/usage/acked.json)
 // and it is older than 7 days; an open run whose newest reading is in it
 // gets that reading written again (new seq) first, so replay never loses
-// it. The route serves only durable readings: a seq at or below the durable
-// head, never one of an append the file could not take back. With no
-// state_dir the meter is off and the route answers 404 usage_meter_off.
+// it. Before any file goes, acked.json also records the durable head and
+// the highest seq issued (written, synced, renamed), and replay starts the
+// next seq above all of them, so a seq is never issued twice even when
+// every file that held it is gone. The route serves only durable readings:
+// a seq at or below the durable head, never one of an append the file could
+// not take back, and never one in a file whose sync failed at replay (that
+// sync is retried on every flush). With no state_dir the meter is off and
+// the route answers 404 usage_meter_off.
+//
+// Crash loss, accepted: a batch is fsynced before it counts, so a broker
+// that dies between an append and its fsync loses at most that batch. Those
+// readings were never served (head did not include them), so their seqs may
+// be issued again without any reader seeing two contents. No time already
+// in a durable reading is lost: readings are cumulative, and the run's next
+// sighting after the restart writes its seconds again under a new seq. What
+// the lost batch alone held (the observed time since the run's previous
+// durable reading, at most usage_meter_every_seconds, and a delete's tail)
+// is the front door death loss, in the customer's favour.
 //
 // These readings are the front door's observation, not proof: nothing here
 // is signed by the guest. Guest-signed checkpoints are stage 2.
@@ -217,6 +232,24 @@ type usageFile struct {
 	first int64
 }
 
+// usageUnsynced is a replayed file whose sync failed: its seqs lo to hi are
+// not durable yet.
+type usageUnsynced struct {
+	path   string
+	lo, hi int64
+}
+
+// usageSyncFile makes a replayed file durable. Tests replace it to fail.
+var usageSyncFile = func(f *os.File) error { return f.Sync() }
+
+// usageState is acked.json: the acknowledged cursor, and the durable head and
+// highest issued seq when it was written.
+type usageState struct {
+	Acked  int64 `json:"acked"`
+	Head   int64 `json:"head"`
+	Issued int64 `json:"issued"`
+}
+
 type usageMeter struct {
 	dir      string
 	every    int64 // seconds
@@ -239,7 +272,8 @@ type usageMeter struct {
 	// take no new room (down, leaving or draining). Their rooms are not
 	// metered now, by design, and they are left out of observed_at.
 	unobserved  map[string]bool
-	burned      [][2]int64 // seq ranges of appends the file could not take back: not durable, never served
+	burned      [][2]int64      // seq ranges of appends the file could not take back: not durable, never served
+	unsynced    []usageUnsynced // files whose sync failed at replay: not served until a sync succeeds
 	opened      time.Time
 	writeErrors int64
 	errLogged   time.Time
@@ -282,27 +316,39 @@ func openUsageMeter(dir string, every int64, now time.Time) (*usageMeter, error)
 	if err != nil {
 		return nil, err
 	}
+	var durable int64
 	for _, f := range files {
-		if err := m.replay(f.path); err != nil {
+		lo, hi, synced, err := m.replay(f.path)
+		if err != nil {
 			return nil, err
 		}
+		switch {
+		case hi == 0: // no reading in it
+		case synced:
+			durable = max(durable, hi)
+		default:
+			m.unsynced = append(m.unsynced, usageUnsynced{path: f.path, lo: lo, hi: hi})
+			m.writeErrors++
+		}
 	}
-	m.nextSeq = m.head + 1
-	m.pruneEndedLocked(now)
+	seen := m.head // every seq replay saw, synced or not
+	var st usageState
 	raw, err := os.ReadFile(filepath.Join(dir, usageAckedFile))
 	switch {
 	case err == nil:
-		var a struct {
-			Acked int64 `json:"acked"`
-		}
-		if json.Unmarshal(raw, &a) != nil || a.Acked < 0 {
+		if json.Unmarshal(raw, &st) != nil || st.Acked < 0 || st.Head < 0 || st.Issued < 0 {
 			log.Printf("usage meter: %s is not a cursor; starting from 0 (nothing is pruned until the route is read)", usageAckedFile)
-		} else {
-			m.acked = min(a.Acked, m.head)
+			st = usageState{}
 		}
 	case !errors.Is(err, fs.ErrNotExist):
 		return nil, err
 	}
+	// A seq is never issued twice: not one a file shows, nor one a pruned
+	// file held (acked.json keeps the head and the highest issued seq).
+	m.head = max(durable, st.Head)
+	m.nextSeq = max(seen, st.Head, st.Issued, st.Acked) + 1
+	m.acked = min(st.Acked, m.head)
+	m.pruneEndedLocked(now)
 	log.Printf("usage meter: %d files, head %d, %d open runs", len(files), m.head, len(m.runs))
 	return m, nil
 }
@@ -327,29 +373,33 @@ func (m *usageMeter) files() ([]usageFile, error) {
 	return out, nil
 }
 
-func (m *usageMeter) replay(path string) error {
+// replay reads one file into the meter and returns its lowest and highest
+// seq (0 when it holds no reading) and whether it is durable. A line the last
+// broker wrote but never synced may still be only in the page cache, so the
+// file is synced first; when that fails its readings restore the runs but
+// are not served (they stay out of head) until a later sync succeeds.
+func (m *usageMeter) replay(path string) (lo, hi int64, synced bool, err error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
-		return err
+		return 0, 0, false, err
 	}
 	defer f.Close()
-	// A line the last broker wrote but never synced may still be only in the
-	// page cache. Sync it now, before replay counts it into head and the route
-	// serves it: a served seq must survive a machine crash.
-	if err := f.Sync(); err != nil {
-		log.Printf("usage meter: %s: sync before replay: %v", path, err)
+	synced = true
+	if serr := usageSyncFile(f); serr != nil {
+		synced = false
+		log.Printf("usage meter: %s: sync before replay failed, its readings are not served until a sync succeeds: %v", path, serr)
 	}
 	rd := bufio.NewReader(f)
 	for n := 1; ; n++ {
-		line, err := rd.ReadBytes('\n')
-		if err == io.EOF {
+		line, rerr := rd.ReadBytes('\n')
+		if rerr == io.EOF {
 			if len(line) > 0 {
 				log.Printf("usage meter: %s line %d: torn last line skipped (%d bytes)", path, n, len(line))
 			}
-			return nil
+			return lo, hi, synced, nil
 		}
-		if err != nil {
-			return err
+		if rerr != nil {
+			return 0, 0, false, rerr
 		}
 		var r usageReading
 		if json.Unmarshal(line, &r) != nil || r.Schema != usageReadingSchema || r.Run == "" || (r.State != "running" && r.State != "ended") {
@@ -361,6 +411,10 @@ func (m *usageMeter) replay(path string) error {
 			continue
 		}
 		m.head = r.Seq
+		if lo == 0 {
+			lo = r.Seq
+		}
+		hi = r.Seq
 		if m.ended[r.Run] != nil {
 			continue // ended is final
 		}
@@ -606,6 +660,7 @@ func (m *usageMeter) flush() error {
 
 // flushLocked is flush for a caller that holds ioMu.
 func (m *usageMeter) flushLocked() error {
+	m.retryUnsyncedLocked()
 	for {
 		m.mu.Lock()
 		batch := append([]usageReading(nil), m.pending...)
@@ -704,6 +759,41 @@ func (m *usageMeter) rollLocked(first int64) error {
 	return nil
 }
 
+// retryUnsyncedLocked syncs again the replayed files whose sync failed; a
+// file that syncs is served from then on. Caller holds ioMu.
+func (m *usageMeter) retryUnsyncedLocked() {
+	m.mu.Lock()
+	list := append([]usageUnsynced(nil), m.unsynced...)
+	m.mu.Unlock()
+	if len(list) == 0 {
+		return
+	}
+	var still []usageUnsynced
+	var gained, failures int64
+	for _, u := range list {
+		f, err := os.OpenFile(u.path, os.O_RDWR, 0)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // pruned
+		}
+		if err == nil {
+			err = usageSyncFile(f)
+			_ = f.Close()
+		}
+		if err != nil {
+			still = append(still, u)
+			failures++
+			continue
+		}
+		gained = max(gained, u.hi)
+		log.Printf("usage meter: %s synced; seqs %d to %d are served now", filepath.Base(u.path), u.lo, u.hi)
+	}
+	m.mu.Lock()
+	m.unsynced = still
+	m.head = max(m.head, gained)
+	m.writeErrors += failures
+	m.mu.Unlock()
+}
+
 func appendDurable(f *os.File, p []byte) error {
 	if _, err := f.Write(p); err != nil {
 		return err
@@ -743,6 +833,7 @@ type usagePage struct {
 func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, error) {
 	m.ioMu.Lock()
 	defer m.ioMu.Unlock()
+	m.retryUnsyncedLocked()
 	m.mu.Lock()
 	head := m.head
 	p := usagePage{Readings: []json.RawMessage{}, Next: after, Head: head, WriteErrors: m.writeErrors}
@@ -751,10 +842,13 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 	if a := min(after, head); a > acked {
 		m.acked, acked, moved = a, a, true
 	}
-	burned := append([][2]int64(nil), m.burned...)
+	skip := append([][2]int64(nil), m.burned...)
+	for _, u := range m.unsynced {
+		skip = append(skip, [2]int64{u.lo, u.hi})
+	}
 	m.mu.Unlock()
 	if moved {
-		if err := m.saveAcked(acked); err != nil {
+		if err := m.saveState(); err != nil {
 			log.Printf("usage meter: acknowledged cursor %d not saved: %v", acked, err)
 		}
 	}
@@ -769,7 +863,7 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 		if i+1 < len(files) && files[i+1].first-1 <= after {
 			continue // every seq in it is at or below after
 		}
-		if err := readUsageFile(f.path, &p, head, limit, burned); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := readUsageFile(f.path, &p, head, limit, skip); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return p, err
 		}
 	}
@@ -829,6 +923,7 @@ func inUsageRanges(seq int64, ranges [][2]int64) bool {
 // that are older than usagePruneAge. The newest file and the open one stay.
 // Caller holds ioMu.
 func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) {
+	stateSaved := false
 	for i := 0; i+1 < len(files); i++ {
 		last := files[i+1].first - 1
 		if last > acked {
@@ -844,6 +939,14 @@ func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) 
 		if err := m.carryForwardLocked(files[i].first, last, now); err != nil {
 			log.Printf("usage meter: %s kept: open runs not carried forward: %v", filepath.Base(files[i].path), err)
 			continue
+		}
+		// The seqs this file held must stay issued after it is gone.
+		if !stateSaved {
+			if err := m.saveState(); err != nil {
+				log.Printf("usage meter: nothing pruned: %s not saved: %v", usageAckedFile, err)
+				return
+			}
+			stateSaved = true
 		}
 		if err := os.Remove(files[i].path); err != nil {
 			log.Printf("usage meter: prune %s: %v", filepath.Base(files[i].path), err)
@@ -874,16 +977,40 @@ func (m *usageMeter) carryForwardLocked(first, last int64, now time.Time) error 
 	return m.flushLocked()
 }
 
-func (m *usageMeter) saveAcked(acked int64) error {
-	raw, err := json.Marshal(map[string]int64{"acked": acked})
+// saveState writes acked.json (cursor, durable head, highest issued seq):
+// temporary file, sync, rename. Caller holds ioMu.
+func (m *usageMeter) saveState() error {
+	m.mu.Lock()
+	st := usageState{Acked: m.acked, Head: m.head, Issued: m.nextSeq - 1}
+	m.mu.Unlock()
+	raw, err := json.Marshal(st)
 	if err != nil {
 		return err
 	}
 	tmp := filepath.Join(m.dir, usageAckedFile+".tmp")
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(m.dir, usageAckedFile))
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(m.dir, usageAckedFile)); err != nil {
+		return err
+	}
+	if d, err := os.Open(m.dir); err == nil { // best effort, as in rollLocked
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // meterHotel hands one sync pass of h to the meter: a run is present while
@@ -919,12 +1046,15 @@ func usageListSighting(h *hotel, id string, labels map[string]string, resources 
 }
 
 // bulkDeleteTargets lists the rooms of h that a bulk delete with q will
-// remove, so their runs end at this sighting (a bulk delete answers no ids).
-// Nil when the meter is off or the list fails: those runs then end at their
-// last sync list.
-func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) ([]string, time.Time) {
+// remove (a bulk delete answers no ids) and applies that list as a sighting
+// of their runs at once: a sync may drop the rooms from the room map, and end
+// their runs, before the delete answers. It returns the run ids, which
+// meterBulkDeleted ends when the delete succeeds; whichever of the two comes
+// first writes the one ended reading. Nil when the meter is off or the list
+// fails: those runs then end at their last sync list.
+func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) []string {
 	if b.meter == nil {
-		return nil, time.Time{}
+		return nil
 	}
 	var list struct {
 		Sandboxes []struct {
@@ -933,10 +1063,10 @@ func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) 
 		} `json:"sandboxes"`
 	}
 	if err := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", q, &list); err != nil {
-		return nil, time.Time{}
+		return nil
 	}
 	at := time.Now()
-	var ids []string
+	var runs []string
 	for _, s := range list.Sandboxes {
 		match := true
 		for _, want := range q["label"] { // a hotel that ignores the filter must not end other runs
@@ -944,26 +1074,47 @@ func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) 
 			match = match && s.Labels[k] == v
 		}
 		if match {
-			ids = append(ids, s.ID)
+			runs = append(runs, h.cfg.ID+"."+s.ID)
 		}
 	}
-	return ids, at
+	b.meter.sightRuns(runs, at)
+	return runs
 }
 
-// meterBulkDeleted ends the runs a successful bulk delete removed, at the
-// list that showed them just before it, never later: the delete itself may
-// take minutes.
-func (b *broker) meterBulkDeleted(h *hotel, ids []string, at time.Time) {
-	if b.meter == nil || len(ids) == 0 {
+// meterBulkDeleted ends the runs a successful bulk delete removed. Their last
+// sighting is the list just before the delete, never the time the delete
+// took: it may take minutes.
+func (b *broker) meterBulkDeleted(runs []string) {
+	for _, run := range runs {
+		b.meter.end(run, time.Now(), false)
+	}
+}
+
+// sightRuns applies a sighting at at to open runs known by id.
+func (m *usageMeter) sightRuns(runs []string, at time.Time) {
+	if m == nil {
 		return
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, id := range ids {
-		if rm := h.rooms[id]; rm != nil {
-			b.meter.seen(usageSightingOf(h, rm, nil), at)
-			b.meter.end(rm.id, at, false)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range runs {
+		if r := m.runs[id]; r != nil {
+			r.observe(at)
+			r.missed = false
 		}
+	}
+}
+
+// meterOrphan records a room of a failed create that the orphan cleanup
+// listed at at: it used compute and the guest does not pay for it, so its
+// run is not billable from this reading on, also when a sync adopted it as
+// the guest's room before the create failed. removed: the cleanup deleted
+// it, so the run ends. Caller holds b.mu.
+func (b *broker) meterOrphan(h *hotel, id, guest string, at time.Time, removed bool) {
+	run := h.cfg.ID + "." + id
+	b.meter.seen(usageSighting{run: run, guest: guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey}, at)
+	if removed {
+		b.meter.end(run, at, false)
 	}
 }
 

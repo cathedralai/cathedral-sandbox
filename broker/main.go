@@ -1321,6 +1321,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 	if err != nil || status != 200 {
 		return false
 	}
+	listedAt := time.Now()
 	var list struct {
 		Sandboxes []struct {
 			ID     string         `json:"id"`
@@ -1340,6 +1341,9 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if s.Labels[batchLabel] != batchID || s.Labels[guestLabel] != guestID {
 			continue
 		}
+		b.mu.Lock()
+		b.meterOrphan(h, s.ID, guestID, listedAt, false) // not billable from here on (usage_meter.go)
+		b.mu.Unlock()
 		st, _, _, derr := h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
 		if derr != nil || (st != 204 && st != 404) {
 			ok = false
@@ -1349,6 +1353,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
 			b.release(h, rm)
 		}
+		b.meterOrphan(h, s.ID, guestID, listedAt, true)
 		b.mu.Unlock()
 		log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, guestID)
 	}
@@ -2088,10 +2093,10 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
-			gone, listedAt := b.bulkDeleteTargets(r.Context(), h, q) // the usage meter ends these runs (usage_meter.go)
+			gone := b.bulkDeleteTargets(r.Context(), h, q) // sighted now, ended on success (usage_meter.go)
 			status, busy := bulkDeleteFromHotel(r.Context(), h, q)
 			if status >= 200 && status < 300 {
-				b.meterBulkDeleted(h, gone, listedAt)
+				b.meterBulkDeleted(gone)
 			}
 			mu.Lock()
 			res[h.cfg.ID] = status
