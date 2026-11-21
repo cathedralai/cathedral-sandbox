@@ -1149,6 +1149,14 @@ class DockerClient:
         Raises SandboxOpError when the daemon cannot list. The caller must not
         treat a failed list as "no containers".
         """
+        return [(cid, sid) for cid, _state, sid in self.list_labeled_states(owner)]
+
+    def list_labeled_states(self, owner: str) -> list[tuple[str, str, str]]:
+        """(container_id, docker State, sandbox_id) for all containers with our owner label.
+
+        State is docker's word (running, exited, paused, created, dead). Raises
+        SandboxOpError when the daemon cannot list, as list_labeled does.
+        """
         result = self.run(
             [
                 "docker",
@@ -1158,7 +1166,7 @@ class DockerClient:
                 "--filter",
                 f"label={LABEL_OWNER}={owner}",
                 "--format",
-                "{{.ID}} {{.Label \"" + LABEL_SANDBOX_ID + "\"}}",
+                "{{.ID}} {{.State}} {{.Label \"" + LABEL_SANDBOX_ID + "\"}}",
             ],
             timeout=60.0,
         )
@@ -1168,11 +1176,12 @@ class DockerClient:
                 502,
                 f"docker ps failed: {(result.stderr or '').strip()[:200]}",
             )
-        out: list[tuple[str, str]] = []
+        out: list[tuple[str, str, str]] = []
         for line in (result.stdout or "").splitlines():
-            parts = line.strip().split(" ", 1)
+            parts = line.strip().split(" ", 2)
             if parts and parts[0]:
-                out.append((parts[0], parts[1].strip() if len(parts) > 1 else ""))
+                state = parts[1] if len(parts) > 1 else ""
+                out.append((parts[0], state, parts[2].strip() if len(parts) > 2 else ""))
         return out
 
     def pause(self, container_id: str) -> None:
@@ -1692,6 +1701,11 @@ class DockerGuestProvider:
         self._rm_timeout = _env_float("CATHEDRAL_SANDBOX_RM_TIMEOUT", 60.0, minimum=0.1)
         self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
         self._last_reconcile: float | None = None
+        # AB#864: docker State per room id from the last reconcile, and why a
+        # stopped room's container ended (oom_killed / container_exited). A dead
+        # room stays listed until TTL or idle; these only say why it is dead.
+        self._container_states: dict[str, str] = {}
+        self._container_ends: dict[str, str] = {}
         # Image pulls. "missing" (default) pulls only when the image is not local;
         # "always" restores the old pull-on-every-create behaviour.
         self._pull_policy = (os.environ.get("CATHEDRAL_SANDBOX_PULL_POLICY", "").strip().lower() or "missing")
@@ -2673,6 +2687,8 @@ class DockerGuestProvider:
             if death is not None:
                 room_alive = False
                 oom_killed = death[0] or death[1] == 137
+                self._container_states[sandbox_id] = "exited"
+                self._container_ends[sandbox_id] = "oom_killed" if oom_killed else "container_exited"
                 if oom_killed:
                     code = 137
                     err += "\nout of memory: the room exceeded its memory limit and was killed; the room is gone\n"
@@ -3252,7 +3268,7 @@ class DockerGuestProvider:
                     self.stop_process(sandbox_id, process_id)
                 except SandboxOpError:
                     pass
-        if self._retire(sandbox_id):
+        if self._retire(sandbox_id, "deleted"):
             self._remove_queued([sandbox_id])
             return
         # Already deleting, or no record: still try once for a labeled orphan
@@ -3282,7 +3298,7 @@ class DockerGuestProvider:
                 and all(s.labels.get(k) == v for k, v in want.items())
                 and (caller is None or s.api_key is None or s.api_key == caller)
             ]
-        retired = [sid for sid in targets if self._retire(sid)]
+        retired = [sid for sid in targets if self._retire(sid, "deleted")]
         self._remove_queued(retired)
         return len(targets)
 
@@ -3303,14 +3319,15 @@ class DockerGuestProvider:
                 return cid
         return None
 
-    def _retire(self, sandbox_id: str) -> bool:
+    def _retire(self, sandbox_id: str, reason: str) -> bool:
         """Move a sandbox to "deleting" and queue its container for removal.
 
         Return False when another caller already retired it. A record with no
         guest-map entry still hunts a labeled container before the record is
         dropped — never finish_delete while docker may still hold the room.
+        *reason* is the room's end reason (AB#864).
         """
-        if not self._inner.begin_delete(sandbox_id):
+        if not self._inner.begin_delete(sandbox_id, reason):
             return False
         # A room on its way out keeps no secrets, even while its container lingers.
         self._drop_secrets_dir(sandbox_id)
@@ -3382,8 +3399,8 @@ class DockerGuestProvider:
     def mark_expired(self) -> int:
         """Move every collectable sandbox to "deleting". Fast; runs no docker command."""
         marked = 0
-        for sid in self._inner.collectable_ids():
-            if self._retire(sid):
+        for sid, reason in self._inner.collectable_reasons().items():
+            if self._retire(sid, reason):
                 marked += 1
         return marked
 
@@ -3450,7 +3467,7 @@ class DockerGuestProvider:
         a container whose sandbox id has no record is an orphan.
         """
         try:
-            labeled = self._client.list_labeled(self._owner)
+            labeled = self._client.list_labeled_states(self._owner)
         except SandboxOpError as exc:
             print(f"cathedral-sandbox gc: reconcile skipped: {exc}", file=sys.stderr, flush=True)
             return 0
@@ -3458,9 +3475,10 @@ class DockerGuestProvider:
             queued = set(self._doomed)
         orphans = [
             cid
-            for cid, sid in labeled
+            for cid, _state, sid in labeled
             if sid not in queued and not (sid and self._inner.has_record(sid))
         ]
+        self._note_container_states(labeled, queued)
         removed = sum(1 for gone in self._remove_many(orphans) if gone)
         self._sweep_secrets_dirs()
         self._reconcile_snapshot_images()
@@ -3471,6 +3489,45 @@ class DockerGuestProvider:
                 held += list(self._doomed_nets.values()) + list(self._net_pending.values())
             self._net_pool.recount(held)
         return removed
+
+    def _note_container_states(self, labeled: list[tuple[str, str, str]], queued: set[str]) -> None:
+        """Keep each room's docker State from the reconcile list (AB#864).
+
+        A room whose container stopped gets one inspect, once, for OOM vs exit
+        (the same reading as an exec that saw the room die). No events stream.
+        """
+        states: dict[str, str] = {}
+        ends: dict[str, str] = {}
+        for cid, state, sid in labeled:
+            if not sid or sid in queued or not self._inner.has_record(sid):
+                continue
+            states[sid] = state
+            if state not in ("exited", "dead"):
+                continue
+            reason = self._container_ends.get(sid)
+            if reason is None:
+                death = self._client.container_death(cid)
+                if death is None:
+                    continue  # unreadable now; the next reconcile asks again
+                reason = "oom_killed" if death[0] or death[1] == 137 else "container_exited"
+            ends[sid] = reason
+        self._container_states = states
+        self._container_ends = ends
+
+    def _with_container(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """A room's docker State, and why its container ended when it is not running."""
+        sid = doc.get("id") if isinstance(doc, dict) else None
+        state = self._container_states.get(sid) if sid else None
+        if state is None:
+            return doc
+        doc = {**doc, "container_state": state}
+        reason = self._container_ends.get(sid)
+        if reason is not None:
+            doc["end_reason"] = reason
+        return doc
+
+    def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]:
+        return [self._with_container(d) for d in self._inner.list(labels=labels, state=state)]
 
     def room_networks(self) -> dict[str, Any] | None:
         """Port use per room network, or None when the pool is off."""
@@ -3643,7 +3700,7 @@ class DockerGuestProvider:
         return argv, overlay
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
-        return self._with_tunables(self._inner.get(sandbox_id))
+        return self._with_container(self._with_tunables(self._inner.get(sandbox_id)))
 
     def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
         return self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
