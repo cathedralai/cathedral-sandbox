@@ -181,7 +181,10 @@ func (b *broker) syncGuestPin(ctx context.Context, h *hotel) {
 	b.mu.Lock()
 	answering := !h.lastOK.IsZero() && now.Sub(h.lastOK) < guestPinRecheck
 	due := now.Sub(h.pinCheckedAt) >= guestPinRecheck
-	if (cur != "" && answering) || !due {
+	// A pinned hotel that answers is left alone, unless its key install has
+	// not been confirmed: the guest may hold the key (health answers) while
+	// the install answer was lost, and admission waits for the confirmation.
+	if (cur != "" && answering && !h.installNeeded()) || !due {
 		b.mu.Unlock()
 		return
 	}

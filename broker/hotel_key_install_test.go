@@ -328,6 +328,12 @@ func TestConfigHotelKeyInstalledOnFirstPinAndAfterEachReboot(t *testing.T) {
 	if isAdmitted(tc, h) {
 		t.Fatal("admitted before a pin and an install")
 	}
+	tc.b.mu.Lock()
+	early := h.installDoc()
+	tc.b.mu.Unlock()
+	if early["installed"] != false {
+		t.Fatalf("install doc before a pin: %v", early)
+	}
 
 	tc.b.syncHotel(ctx, h)
 	if h.pinHex() == "" || g.installed() != installHotelKeyValue {
@@ -388,7 +394,15 @@ func TestConfigHotelKeyInstallRetriesALostAnswer(t *testing.T) {
 	if isAdmitted(tc, h) || installErr(tc, h) == "" {
 		t.Fatalf("lost answer: admitted %t, err %q", isAdmitted(tc, h), installErr(tc, h))
 	}
-	expirePin(tc, h)
+	// The guest holds the key, so health answers; only time passes (lastOK
+	// stays fresh). The recheck must still retry the install.
+	tc.b.mu.Lock()
+	ok := !h.lastOK.IsZero()
+	h.pinCheckedAt = time.Time{}
+	tc.b.mu.Unlock()
+	if !ok {
+		t.Fatal("health did not answer with the installed key")
+	}
 	tc.b.syncHotel(ctx, h)
 	tc.b.syncHotel(ctx, h)
 	if !isAdmitted(tc, h) || installErr(tc, h) != "" || g.posts != 2 {

@@ -341,7 +341,7 @@ func (h *hotel) installDoc() map[string]any {
 	if h.installer == nil {
 		return nil
 	}
-	d := map[string]any{"signer_ed25519_b64": installSignerPublicB64(h.installer), "installed": !h.installNeeded()}
+	d := map[string]any{"signer_ed25519_b64": installSignerPublicB64(h.installer), "installed": h.keyInst.pin != "" && !h.installNeeded()}
 	if h.keyInst.keySHA != "" {
 		d["key_sha256_prefix"] = h.keyInst.keySHA[:12]
 	}
