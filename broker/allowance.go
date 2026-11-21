@@ -247,10 +247,12 @@ func (b *broker) dropHoldLocked(key string) {
 
 // recountPendingLocked reports whether a hotel that g may use, or has had
 // rooms on, has not answered a room list since the broker started or since
-// it joined: the guest's rooms there are not counted yet. Caller holds b.mu.
+// it joined: the guest's rooms there are not counted yet. "May use" is what
+// placement reaches (guestReaches), so a miner hotel an own-hosts-only guest
+// can never be placed on does not hold its admission. Caller holds b.mu.
 func (b *broker) recountPendingLocked(g *guestState) bool {
 	for _, h := range b.hotelList() {
-		if (h.roomsUnchecked || b.allow.unlisted[h]) && (g.allowsHotel(h) || len(b.guestRooms[g.cfg.ID][h.cfg.ID]) > 0) {
+		if (h.roomsUnchecked || b.allow.unlisted[h]) && (g.guestReaches(h) || len(b.guestRooms[g.cfg.ID][h.cfg.ID]) > 0) {
 			return true
 		}
 	}

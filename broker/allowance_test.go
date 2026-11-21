@@ -541,6 +541,25 @@ func TestMeteredRestartWaitsForEveryHotelToList(t *testing.T) {
 	tc.room(t, "key2", map[string]any{"image": "alpine:3.20"})
 }
 
+func TestMeteredOwnHostsOnlyIgnoresAnUnlistedMinerHotel(t *testing.T) {
+	tc, _ := meteredChain(t, func(c *config) {
+		c.Guests[0].OwnHostsOnly = true
+		if c.Hotels[1].Labels == nil {
+			c.Hotels[1].Labels = map[string]string{}
+		}
+		c.Hotels[1].Labels["miner"] = "true" // hotel b is a miner hotel
+	})
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	tc.start(t) // a restart; miner hotel b never answers a list
+	tc.syncAll("a", "c")
+	if v := tc.getAllowance(t, "g1"); v["recount_pending"] != false {
+		t.Fatalf("an own-hosts-only guest waits for a miner hotel it can never use: %v", v)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 202 {
+		t.Fatalf("own-hosts-only create while a miner hotel is unlisted: %d %v", status, doc)
+	}
+}
+
 func TestMeteredDeletingRoomsCountUntilReleased(t *testing.T) {
 	tc, _ := meteredChain(t, nil)
 	tc.putAllowance(t, "g1", allowanceBody(1, 2))
