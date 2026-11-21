@@ -2482,3 +2482,18 @@ func TestUsageMeterBulkDeleteKeepsANotBillableRunNotBillable(t *testing.T) {
 		}
 	}
 }
+
+// With usage_meter_min_second on (#654), a room first seen at its bulk
+// delete is not rounded up: its readings are not billable, so its ended
+// reading stays at 0 s.
+func TestUsageMeterBulkDeleteUnseenRunIsNotRoundedUp(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.usageMeter.mu.Lock()
+	tc.b.usageMeter.minSecond = true
+	tc.b.usageMeter.mu.Unlock()
+	seedListedRoom(tc.hotels["b"], "sbx_old", map[string]any{guestLabel: "g1", "job": "x"}, 2, 8)
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+		t.Fatalf("bulk delete: %d %v", status, doc)
+	}
+	notBillableFirstAndEnd(t, tc, "b.sbx_old")
+}
