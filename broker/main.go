@@ -331,6 +331,7 @@ type hotel struct {
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
 	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
 	warmGen      int             // bumped when the hotel goes down, so a stale prewarm marks nothing
+	prewarmFull  map[string]bool // catalog images whose pull was skipped for a full scratch, logged once (prewarm.go)
 	healthLate   bool            // ok only because room calls answer; health is late
 	lastOK       time.Time       // last good /room/health answer
 	downSince    time.Time       // when ok last went false; zero while ok
