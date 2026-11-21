@@ -2213,3 +2213,61 @@ func TestClaimJournalUnremovableEmptySegmentDoesNotWedge(t *testing.T) {
 	}
 	requireClaimTidy(t, state)
 }
+
+// Codex review finding 6 on #655: an open that fails after it opened the head
+// files (syncing the previous run's open segment, or writing the manifest
+// that closes it) returns no journal, so it must close those files; retries
+// through an I/O failure must not leak descriptors.
+func TestClaimJournalFailedOpenClosesHeadFiles(t *testing.T) {
+	cases := []struct {
+		name string
+		fail func(f *os.File) bool // the syncFile call to fail
+	}{
+		{"the previous open segment cannot be synced", func(f *os.File) bool { return strings.HasSuffix(f.Name(), ".jsonl") }},
+		{"the manifest that closes it cannot be written", func(f *os.File) bool { return strings.HasSuffix(f.Name(), claimManifestName+".tmp") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			state := t.TempDir()
+			j := openTestClaimJournal(t, state, claimJournalOptions{})
+			mustClaimAppend(t, j, "a00", "a01")
+			_ = j.close() // its segment stays open in the manifest: the next open closes it
+			var mu sync.Mutex
+			var opened []*os.File
+			var o claimJournalOptions
+			o.disk.open = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+				f, err := os.OpenFile(path, flag, perm)
+				if err == nil {
+					mu.Lock()
+					opened = append(opened, f)
+					mu.Unlock()
+				}
+				return f, err
+			}
+			o.disk.syncFile = func(f *os.File) error {
+				if c.fail(f) {
+					return errors.New("fsync: input/output error")
+				}
+				return f.Sync()
+			}
+			for i := 0; i < 3; i++ {
+				if j2, _, err := openClaimJournalWith(state, o); err == nil || j2 != nil {
+					t.Fatalf("open %d: %v, want a failure and no journal", i, err)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(opened) != 6 {
+				t.Fatalf("%d head files opened over 3 failed opens, want 6", len(opened))
+			}
+			for _, f := range opened {
+				if _, err := f.Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("%s is still open after a failed open", f.Name())
+				}
+			}
+			if got := claimReplayIDs(t, state); !claimSame(got, []string{"a00", "a01"}) {
+				t.Fatalf("replay %v", got)
+			}
+		})
+	}
+}

@@ -968,6 +968,12 @@ func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
 		return nil, err
 	}
 	j.adoptGeneration(gen, man, chain, headSeq, files)
+	// From here a failed open returns no journal, so it closes what it holds:
+	// a caller that retries through an I/O failure must not leak descriptors.
+	fail := func(err error) (*claimJournal, error) {
+		j.shut()
+		return nil, err
+	}
 	j.peer = head.Peer
 	j.atOpen = records
 	j.nextSeq = max(man.NextSeq, top+1)
@@ -980,19 +986,19 @@ func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
 		s := &j.man.Segments[n-1]
 		f, err := os.OpenFile(filepath.Join(genDir, s.Name), os.O_RDWR, 0)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 		err = j.disk.syncFile(f)
 		_ = f.Close()
 		if err != nil {
-			return nil, fmt.Errorf("claim journal: sync of %s before closing it: %w", s.Name, err)
+			return fail(fmt.Errorf("claim journal: sync of %s before closing it: %w", s.Name, err))
 		}
 		found := loaded[s.Name]
 		*s = claimManifestSegment{Name: s.Name, First: s.First, Closed: true, Last: found.scan.last,
 			Size: int64(len(found.raw)), SHA256: claimSHA256(found.raw)}
 		j.nextSeq = max(j.nextSeq, s.First+1)
 		if err := j.writeManifest(""); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 	log.Printf("claim journal: %s %s, %d segments, %d records, head %d, next seq %d", j.dir, cur, len(man.Segments), len(records), head.Seq, j.nextSeq)
