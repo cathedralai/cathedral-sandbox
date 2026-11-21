@@ -1246,13 +1246,32 @@ func usageListSighting(h *hotel, id string, labels map[string]string, resources 
 	return usageSighting{run: h.cfg.ID + "." + id, guest: labels[guestLabel], hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem}
 }
 
+// usageSightingOfListed is the sighting of a room that h's room list shows,
+// by the sync loop's rule (syncHotel): a room in the room map by its own
+// record (usageSightingOf), a recorded leftover of a failed create as not
+// billable (usageListSighting), and any other listed room as the guest's
+// room the sync adopts under its guest label on its next pass, which is
+// billable once adopted (register gives it a client id). Caller holds b.mu.
+func (b *broker) usageSightingOfListed(h *hotel, id string, labels map[string]string, resources any) usageSighting {
+	if rm := h.rooms[id]; rm != nil {
+		return usageSightingOf(h, rm, resources)
+	}
+	s := usageListSighting(h, id, labels, resources)
+	s.billable = !h.recordedLeftover(id, labels)
+	return s
+}
+
 // bulkDeleteTargets lists the rooms of h that a bulk delete with q will
 // remove (a bulk delete answers no ids) and applies that list as a sighting
 // of their runs at once: a sync may drop the rooms from the room map, and end
-// their runs, before the delete answers. It returns the run ids, which
-// usageMeterBulkDeleted ends when the delete succeeds; whichever of the two comes
-// first writes the one ended reading. Nil when the meter is off or the list
-// fails: those runs then end at their last sync list.
+// their runs, before the delete answers. A listed room the meter has no run
+// for (no list of h has answered since the broker started, or the room is
+// newer than the last one) gets its first reading here, built as the sync
+// builds it (usageSightingOfListed), so the delete never removes a room the
+// log never saw. It returns the run ids, which usageMeterBulkDeleted ends when
+// the delete succeeds; whichever of the two comes first writes the one ended
+// reading. Nil when the meter is off or the list fails: those runs then end
+// at their last sync list. The caller does not hold b.mu.
 func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) []string {
 	if b.usageMeter == nil {
 		return nil
@@ -1261,6 +1280,8 @@ func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) 
 		Sandboxes []struct {
 			ID     string            `json:"id"`
 			Labels map[string]string `json:"labels"`
+			// As the sync's list reads it: a map, so an odd field does not fail the list.
+			Resources map[string]any `json:"resources"`
 		} `json:"sandboxes"`
 	}
 	if err := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", q, &list); err != nil {
@@ -1268,17 +1289,24 @@ func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) 
 	}
 	at := time.Now()
 	var runs []string
+	var listed []usageSighting
+	b.mu.Lock()
 	for _, s := range list.Sandboxes {
 		match := true
-		for _, want := range q["label"] { // a hotel that ignores the filter must not end other runs
+		for _, want := range q["label"] { // a hotel that ignores the filter must not touch other runs
 			k, v, _ := strings.Cut(want, "=")
 			match = match && s.Labels[k] == v
 		}
 		if match {
 			runs = append(runs, h.cfg.ID+"."+s.ID)
+			listed = append(listed, b.usageSightingOfListed(h, s.ID, s.Labels, s.Resources))
 		}
 	}
-	b.usageMeter.sightRuns(runs, at)
+	turned := b.usageMeter.sightListed(listed, at)
+	b.mu.Unlock()
+	if turned { // a leftover's not billable first reading: durable before the delete, outside b.mu, bounded
+		b.usageMeter.awaitDurable(usageTurnWait)
+	}
 	return runs
 }
 
@@ -1291,19 +1319,34 @@ func (b *broker) usageMeterBulkDeleted(runs []string) {
 	}
 }
 
-// sightRuns applies a sighting at at to open runs known by id.
-func (m *usageMeter) sightRuns(runs []string, at time.Time) {
+// sightListed applies a bulk delete's list at at. An open run is observed,
+// as before. A run the meter does not know gets its first reading through
+// seenLocked, the sync's first sighting, so it is written once even when a
+// sync sees the room at the same time; an ended run stays ended. It reports
+// whether a new run is not billable (a recorded leftover): the caller makes
+// that reading durable once it has released b.mu (awaitDurable).
+func (m *usageMeter) sightListed(listed []usageSighting, at time.Time) (turned bool) {
 	if m == nil {
-		return
+		return false
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, id := range runs {
-		if r := m.runs[id]; r != nil {
+	queued := false
+	for _, s := range listed {
+		if r := m.runs[s.run]; r != nil {
 			r.observe(at)
 			r.missed = false
+			continue
 		}
+		if m.seenLocked(s, at) {
+			turned = true
+		}
+		queued = queued || m.runs[s.run] != nil
 	}
+	if queued {
+		m.kickLocked() // the writer flushes the first readings at once
+	}
+	return turned
 }
 
 // usageMeterOrphan records a room of a failed create that the orphan cleanup
