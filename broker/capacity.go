@@ -257,11 +257,21 @@ func (b *broker) capacityDoc(e capacityEntry, now time.Time, mb *minerBudget) ma
 		"id": h.cfg.ID, "class": hotelClass(h), "labels": labels, "up": h.ok, "drain": h.drain(),
 		"free_rooms": b.admissibleFreeIn(h, now, mb), "source": e.source, "down_since": downSince(h),
 		"reserved_for": reserved, "slots": h.slots, "admission": b.admissionDoc(h, now),
+		// last_ok_at: the last good /room/health answer. health_late: rooms
+		// answer but health is slow; the hotel is still up and placed (AB#869).
+		"last_ok_at": lastOKAt(h), "health_late": h.healthLate,
 	}
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
 	}
 	return d
+}
+
+func lastOKAt(h *hotel) any {
+	if h.lastOK.IsZero() {
+		return nil
+	}
+	return h.lastOK.UTC().Format(time.RFC3339)
 }
 
 // classTotals is one class line of the catalog: hotels, how many take rooms
@@ -331,10 +341,10 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			b.addTotals(totals, e, now, sum)
 			continue
 		}
-		t := g.tierOf(e.h)
-		if t == "" || (g.limits.OwnHostsOnly && isMinerHotel(e.h)) { // placement skips it too (scope)
+		if !g.guestReaches(e.h) { // placement skips it too (scope)
 			continue
 		}
+		t := g.tierOf(e.h)
 		b.addTotals(totals, e, now, sum)
 		d := b.capacityDoc(e, now, docs)
 		d["tier"] = t

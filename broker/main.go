@@ -2790,15 +2790,20 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			}
 			b.handleProbe(w, r, g)
 		case p == "/v1/status":
+			// A guest counts its own hotels (AB#869); an ops key the fleet.
 			b.mu.Lock()
-			up := 0
+			n, up := 0, 0
 			for _, h := range b.hotelList() {
+				if !g.cfg.Ops && !g.guestReaches(h) {
+					continue
+				}
+				n++
 				if h.ok {
 					up++
 				}
 			}
 			b.mu.Unlock()
-			writeJSON(w, 200, map[string]any{"service": "central-booking", "hotels": len(b.hotelList()), "hotels_up": up, "uptime_s": int(time.Since(b.started).Seconds())})
+			writeJSON(w, 200, map[string]any{"service": "central-booking", "hotels": n, "hotels_up": up, "uptime_s": int(time.Since(b.started).Seconds())})
 		default:
 			writeErr(w, 404, "route_not_found", "central booking does not route "+r.Method+" "+p)
 		}
