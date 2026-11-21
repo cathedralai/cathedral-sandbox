@@ -327,6 +327,14 @@ func (g *guestState) allowsHotel(h *hotel) bool {
 	return g.tierOf(h) != ""
 }
 
+// guestReaches reports whether h is one of g's hotels as placement sees them:
+// allowed, and not a miner hotel for an own-hosts-only guest. Every guest view
+// of hotels (capacity, /v1/broker/hotels, /v1/status) counts these and no
+// others (AB#869). Caller holds b.mu.
+func (g *guestState) guestReaches(h *hotel) bool {
+	return g.allowsHotel(h) && !(g.limits.OwnHostsOnly && isMinerHotel(h))
+}
+
 // tierOf is guestLimits.tierOf behind the hotel reservation: a hotel
 // reserved for another guest is out of reach, as if denied, and so is a
 // hotel lent from this guest to the pool (lend.go). Caller holds b.mu.
