@@ -235,7 +235,11 @@ type usageMeter struct {
 	head        int64                // highest durable seq
 	acked       int64                // highest "after" the route was called with, at most head
 	listedAt    map[string]time.Time // hotel id -> its last room list that answered
-	burned      [][2]int64           // seq ranges of appends the file could not take back: not durable, never served
+	// unobserved: hotels whose latest completed room list failed and that
+	// take no new room (down, leaving or draining). Their rooms are not
+	// metered now, by design, and they are left out of observed_at.
+	unobserved  map[string]bool
+	burned      [][2]int64 // seq ranges of appends the file could not take back: not durable, never served
 	opened      time.Time
 	writeErrors int64
 	errLogged   time.Time
@@ -273,7 +277,7 @@ func openUsageMeter(dir string, every int64, now time.Time) (*usageMeter, error)
 		return nil, err
 	}
 	m := &usageMeter{dir: dir, every: every, maxLines: usageFileLines, write: appendDurable, kick: make(chan struct{}, 1),
-		runs: map[string]*usageRun{}, ended: map[string]*usageEnded{}, listedAt: map[string]time.Time{}, opened: now}
+		runs: map[string]*usageRun{}, ended: map[string]*usageEnded{}, listedAt: map[string]time.Time{}, unobserved: map[string]bool{}, opened: now}
 	files, err := m.files()
 	if err != nil {
 		return nil, err
@@ -462,9 +466,10 @@ func (m *usageMeter) kickLocked() {
 // (listed), then, when the room map is known (endAbsent), the end of every
 // run of the hotel that the broker no longer holds (present: the run ids in
 // the hotel's room map). A run on a hotel the broker no longer knows ends
-// too. listOK: the room list answered at at. The caller holds b.mu, so
-// present and the create and delete hooks agree.
-func (m *usageMeter) hotelPass(hotelID string, listed []usageSighting, present map[string]bool, at time.Time, listOK, endAbsent bool) {
+// too. listOK: the room list answered at at. unplaceable: the broker places
+// no new room on the hotel now. The caller holds b.mu, so present and the
+// create and delete hooks agree.
+func (m *usageMeter) hotelPass(hotelID string, listed []usageSighting, present map[string]bool, at time.Time, listOK, endAbsent, unplaceable bool) {
 	if m == nil {
 		return
 	}
@@ -474,6 +479,11 @@ func (m *usageMeter) hotelPass(hotelID string, listed []usageSighting, present m
 	for _, s := range listed {
 		m.seenLocked(s, at)
 		shown[s.run] = true
+	}
+	if listOK || !unplaceable {
+		delete(m.unobserved, hotelID)
+	} else {
+		m.unobserved[hotelID] = true
 	}
 	if listOK {
 		m.listedAt[hotelID] = at
@@ -500,6 +510,7 @@ func (m *usageMeter) sweepLocked(now time.Time) {
 			if !m.known(r.last.Hotel) {
 				m.endLocked(id, now, false)
 				delete(m.listedAt, r.last.Hotel)
+				delete(m.unobserved, r.last.Hotel)
 			}
 		}
 	}
@@ -535,11 +546,20 @@ func (m *usageMeter) checkpoint(now time.Time) {
 
 // observedAtLocked is the oldest last answered room list among the hotels
 // with runs not ended (a hotel that has not listed since start counts from
-// the meter's start), or now when no run is open. A reader can tell from it
-// how fresh the meter is.
-func (m *usageMeter) observedAtLocked(now time.Time) int64 {
+// the meter's start), or now when none counts. A reader can tell from it
+// whether the broker's own sync has stalled. A hotel whose latest completed
+// list failed and that takes no new room is left out and counted in
+// unobserved instead: one dead miner hotel must not make the whole meter
+// look stale, and its rooms are not metered anyway. A hotel that still takes
+// rooms always counts, and so does one whose list attempt never completes.
+func (m *usageMeter) observedAtLocked(now time.Time) (observedAt int64, unobserved int) {
 	oldest := now
+	left := map[string]bool{}
 	for _, r := range m.runs {
+		if m.unobserved[r.last.Hotel] {
+			left[r.last.Hotel] = true
+			continue
+		}
 		t, ok := m.listedAt[r.last.Hotel]
 		if !ok {
 			t = m.opened
@@ -548,7 +568,7 @@ func (m *usageMeter) observedAtLocked(now time.Time) int64 {
 			oldest = t
 		}
 	}
-	return oldest.Unix()
+	return oldest.Unix(), len(left)
 }
 
 // run is the writer: it flushes when readings are queued, and on a timer so
@@ -711,8 +731,11 @@ type usagePage struct {
 	Readings    []json.RawMessage `json:"readings"`
 	Next        int64             `json:"next"`         // seq of the last reading here, or after when there is none
 	Head        int64             `json:"head"`         // highest durable seq
-	ObservedAt  int64             `json:"observed_at"`  // oldest last answered list among hotels with live rooms; now if none
+	ObservedAt  int64             `json:"observed_at"`  // oldest last answered list among counted hotels with live rooms; now if none
 	WriteErrors int64             `json:"write_errors"` // failed appends since start
+	// UnobservedHotels: hotels holding live rooms left out of observed_at
+	// (latest list failed, no new room placed there).
+	UnobservedHotels int `json:"unobserved_hotels"`
 }
 
 // page serves up to limit durable readings after seq after, records after
@@ -722,7 +745,8 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 	defer m.ioMu.Unlock()
 	m.mu.Lock()
 	head := m.head
-	p := usagePage{Readings: []json.RawMessage{}, Next: after, Head: head, ObservedAt: m.observedAtLocked(now), WriteErrors: m.writeErrors}
+	p := usagePage{Readings: []json.RawMessage{}, Next: after, Head: head, WriteErrors: m.writeErrors}
+	p.ObservedAt, p.UnobservedHotels = m.observedAtLocked(now)
 	acked, moved := m.acked, false
 	if a := min(after, head); a > acked {
 		m.acked, acked, moved = a, a, true
@@ -879,7 +903,11 @@ func (b *broker) meterHotel(h *hotel, listed []usageSighting, at time.Time, list
 	for _, s := range listed {
 		present[s.run] = true
 	}
-	b.meter.hotelPass(h.cfg.ID, listed, present, at, listOK, listOK && !h.roomsUnchecked)
+	// The broker places no new room on a hotel that is down, leaving or
+	// draining (admissibleFreeIn, capacity.go). A failed list alone does not
+	// stop placement: h.ok comes from health and room calls.
+	unplaceable := !h.ok || h.leaving || h.drain()
+	b.meter.hotelPass(h.cfg.ID, listed, present, at, listOK, listOK && !h.roomsUnchecked, unplaceable)
 }
 
 // usageListSighting is a listed room that is not in h's room map: a

@@ -46,7 +46,7 @@ func listPass(m *usageMeter, when time.Time, listed []string, present ...string)
 	for _, run := range present {
 		p[run] = true
 	}
-	m.hotelPass("h", ss, p, when, true, true)
+	m.hotelPass("h", ss, p, when, true, true, false)
 }
 
 func mustFlush(t *testing.T, m *usageMeter) {
@@ -328,7 +328,7 @@ func TestUsageMeterOutageSpanningRoomEnd(t *testing.T) {
 	// The broker dies at 21; the room ends on the hotel at 50; the broker
 	// is back at 80.
 	m2 := testMeter(t, dir, 10)
-	m2.hotelPass("h", nil, nil, at(80), false, false) // the list does not answer yet: nothing ends
+	m2.hotelPass("h", nil, nil, at(80), false, false, false) // the list does not answer yet: nothing ends
 	if len(m2.runs) != 1 {
 		t.Fatal("a failed first list ended the run")
 	}
@@ -351,13 +351,13 @@ func TestUsageMeterHotelDownStopsTheMeter(t *testing.T) {
 		listPass(m, at(p), []string{"h.a"})
 	}
 	for p := 22.0; p <= 120; p += 2 {
-		m.hotelPass("h", nil, map[string]bool{"h.a": true}, at(p), false, true) // list fails; room map unchanged
+		m.hotelPass("h", nil, map[string]bool{"h.a": true}, at(p), false, true, false) // list fails; room map unchanged
 	}
 	if s := int64(m.runs["h.a"].observed / time.Second); s != 20 {
 		t.Fatalf("seconds grew to %d while the hotel did not answer", s)
 	}
 	m.mu.Lock()
-	obs := m.observedAtLocked(at(120))
+	obs, _ := m.observedAtLocked(at(120))
 	m.mu.Unlock()
 	if obs != at(20).Unix() {
 		t.Fatalf("observed_at %d, want the last answered list %d", obs, at(20).Unix())
@@ -1103,5 +1103,107 @@ func TestUsageMeterSizeIsWholeNumbers(t *testing.T) {
 	p, _ := tc.b.meter.page(0, 10, time.Now())
 	if len(p.Readings) != 1 || !strings.Contains(string(p.Readings[0]), `"vcpu":2,"memory_gib":4,`) {
 		t.Fatalf("line %s", p.Readings)
+	}
+}
+
+// observed_at leaves out a hotel whose latest list failed and that takes no
+// new room, and counts it in unobserved_hotels; a failing hotel that still
+// takes rooms counts, a recovered one counts again, and a sync that never
+// completes a list attempt still goes stale.
+func TestUsageMeterObservedAtLeavesOutAnUnplaceableSilentHotel(t *testing.T) {
+	m := testMeter(t, t.TempDir(), 600)
+	pass := func(hotel string, when float64, listOK, unplaceable bool) {
+		run := hotel + ".r"
+		var listed []usageSighting
+		if listOK {
+			listed = []usageSighting{sighting(run)}
+		}
+		m.hotelPass(hotel, listed, map[string]bool{run: true}, at(when), listOK, listOK, unplaceable)
+	}
+	obs := func(now float64) (int64, int) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.observedAtLocked(at(now))
+	}
+	pass("a", 10, true, false)
+	pass("b", 10, true, false)
+	for p := 12.0; p <= 100; p += 2 {
+		pass("a", p, true, false)
+		pass("b", p, false, false) // the list fails, the hotel still takes rooms
+	}
+	if o, n := obs(100); o != at(10).Unix() || n != 0 {
+		t.Fatalf("placeable failing hotel: observed_at %d unobserved %d, want %d and 0", o, n, at(10).Unix())
+	}
+	pass("b", 101, false, true) // now down too: no new room goes there
+	if o, n := obs(101); o != at(100).Unix() || n != 1 {
+		t.Fatalf("silent hotel: observed_at %d unobserved %d, want %d and 1", o, n, at(100).Unix())
+	}
+	pass("a", 110, true, false)
+	pass("b", 110, true, false) // recovered
+	if o, n := obs(110); o != at(110).Unix() || n != 0 {
+		t.Fatalf("recovered: observed_at %d unobserved %d, want %d and 0", o, n, at(110).Unix())
+	}
+	// The sync loop stalls: no list attempt completes on any hotel.
+	if o, n := obs(400); o != at(110).Unix() || n != 0 {
+		t.Fatalf("stalled sync: observed_at %d unobserved %d, want the stale %d and 0", o, n, at(110).Unix())
+	}
+	// With every hotel holding rooms left out, observed_at is now.
+	pass("a", 401, false, true)
+	pass("b", 401, false, true)
+	if o, n := obs(402); o != at(402).Unix() || n != 2 {
+		t.Fatalf("all left out: observed_at %d unobserved %d", o, n)
+	}
+}
+
+// Through the broker: hotel c holds a room and goes silent (health, room
+// calls and list fail), so placement skips it; the route's observed_at
+// stays fresh from hotel b and unobserved_hotels is 1. A failed list alone
+// (health answers) keeps c counted, and so does its recovery.
+func TestUsageMeterSilentHotelDoesNotStaleTheMeter(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}})
+	syncNow(tc, "b")
+	syncNow(tc, "c")
+	meterPage := func() map[string]any {
+		t.Helper()
+		status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter", nil)
+		if status != 200 {
+			t.Fatalf("route: %d %v", status, doc)
+		}
+		return doc
+	}
+	fc := tc.hotels["c"]
+	setFail := func(health, list bool) {
+		fc.mu.Lock()
+		fc.healthFail, fc.listFail = health, list
+		fc.mu.Unlock()
+	}
+
+	setFail(false, true) // the list fails, health answers: c still takes rooms
+	syncNow(tc, "c")
+	if doc := meterPage(); doc["unobserved_hotels"].(float64) != 0 {
+		t.Fatalf("placeable hotel left out: %v", doc)
+	}
+
+	setFail(true, true)
+	setHotel(tc, "c", func(h *hotel) {
+		h.lastOK = time.Now().Add(-time.Minute)
+		h.lastAnswer.Store(time.Now().Add(-time.Minute).UnixNano())
+	})
+	syncNow(tc, "c")
+	syncNow(tc, "b")
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status == 202 {
+		t.Fatalf("a room was placed on the silent hotel: %v", doc)
+	}
+	doc := meterPage()
+	if obs := int64(doc["observed_at"].(float64)); obs < time.Now().Unix()-5 || doc["unobserved_hotels"].(float64) != 1 {
+		t.Fatalf("silent c: observed_at %d unobserved %v, want fresh and 1", obs, doc["unobserved_hotels"])
+	}
+
+	setFail(false, false)
+	syncNow(tc, "c")
+	if doc := meterPage(); doc["unobserved_hotels"].(float64) != 0 {
+		t.Fatalf("recovered c still left out: %v", doc)
 	}
 }
