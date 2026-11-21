@@ -143,6 +143,15 @@ class ImageOwnerStore:
                 "provenance": prov if prov in PROVENANCE else "registry",
                 "refs": [str(r) for r in (entry.get("refs") or []) if isinstance(r, str)][:32],
             }
+            raw_refs = entry.get("owner_refs")
+            if isinstance(raw_refs, dict):
+                owner_refs = {
+                    scope: [r for r in refs if isinstance(r, str)][-32:]
+                    for scope, refs in raw_refs.items()
+                    if scope in cleaned and isinstance(refs, list)
+                }
+                if owner_refs:
+                    out[nid]["owner_refs"] = owner_refs
         self._grants = out
 
     def _commit_locked(self, grants: dict[str, dict[str, Any]]) -> None:
@@ -223,11 +232,48 @@ class ImageOwnerStore:
                 entry["owners"] = sorted([*entry["owners"], scope])
             if ref and ref not in entry["refs"]:
                 entry["refs"] = [*entry["refs"], ref][-32:]
+            if ref:
+                mine = entry.setdefault("owner_refs", {}).get(scope, [])
+                if ref not in mine:
+                    entry["owner_refs"][scope] = [*mine, ref][-32:]
             # Prefer the stronger local provenance when a snapshot overwrites a pull.
             if provenance == "snapshot" or entry.get("provenance") not in PROVENANCE:
                 entry["provenance"] = provenance
             self._commit_locked(grants)
         return nid
+
+    def note_ref(self, image_id: str, owner: str, ref: str) -> None:
+        """Remember that *owner* named its image *image_id* by *ref* (AB#860 list).
+
+        Only for an image the owner already owns; a new ref writes the table.
+        """
+        nid = normalize_image_id(image_id)
+        if nid is None or not ref:
+            return
+        scope = self._scope(owner)
+        with self._lock:
+            entry = self._grants.get(nid)
+            if entry is None or scope not in entry["owners"] or ref in entry.get("owner_refs", {}).get(scope, []):
+                return
+            grants = copy.deepcopy(self._grants)
+            refs = grants[nid].setdefault("owner_refs", {})
+            refs[scope] = [*refs.get(scope, []), ref][-32:]
+            self._commit_locked(grants)
+
+    def owned_refs(self, owner: str) -> dict[str, list[str]]:
+        """Image id -> the refs *owner* named it by, for each image it owns.
+
+        Refs other owners used for the same image are not included. A grant
+        written before AB#860 has no refs per owner; it shows once the owner
+        pulls or starts the image again.
+        """
+        scope = self._scope(owner)
+        with self._lock:
+            return {
+                nid: list(entry.get("owner_refs", {}).get(scope, []))
+                for nid, entry in self._grants.items()
+                if scope in entry["owners"]
+            }
 
     def drop_owner(self, image_id: str, owner: str) -> None:
         nid = normalize_image_id(image_id)
@@ -244,6 +290,7 @@ class ImageOwnerStore:
                 grants.pop(nid, None)
             else:
                 entry["owners"] = owners
+                entry.get("owner_refs", {}).pop(scope, None)
             self._commit_locked(grants)
 
 

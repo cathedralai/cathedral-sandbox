@@ -53,6 +53,12 @@ EOV
   # Option A — refuse hotel-side builds on shared sealed hotels.
   if [ -n "${ROOM_DATA_DIR:-}" ]; then
     echo "CATHEDRAL_IMAGE_OWNERS_PATH=$ROOM_DATA_DIR/image-owners/image-owners.json"
+    # AB#860: the image list reads the GC state; pins go where the GC reads
+    # them, capped at ROOM_IMAGE_PIN_MAX_PCT of the data volume.
+    echo "CATHEDRAL_IMAGE_PINS_PATH=/var/lib/pool-room-$ROOM_ID-image-gc/pins.json"
+    echo "CATHEDRAL_IMAGE_GC_STATE=/var/lib/pool-room-$ROOM_ID-image-gc/state.json"
+    echo "CATHEDRAL_IMAGE_DATA_DIR=$ROOM_DATA_DIR"
+    echo "ROOM_IMAGE_PIN_MAX_PCT=${ROOM_IMAGE_PIN_MAX_PCT:-50}"
   fi
   if [ "${ROOM_RECEIPTS:-0}" = 1 ] || [ "${ROOM_SHARED_HOTEL_BUILDS:-}" = "refuse" ]; then
     echo "CATHEDRAL_SHARED_HOTEL_BUILDS=${ROOM_SHARED_HOTEL_BUILDS:-refuse}"

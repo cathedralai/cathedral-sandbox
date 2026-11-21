@@ -19,7 +19,10 @@ An image is removed only when ALL of these hold:
   room's labels, pushed or not;
 - no container uses it, running or stopped;
 - no container used it, and it was not first seen, within --min-idle-minutes;
-- it is not on the keep list (the health probe image).
+- it is not on the keep list (the health probe image);
+- no owner pinned it (--keep-file, the hotel API's pins file, AB#860): a ref
+  or an image id in the file is kept like --keep. A missing or broken file
+  keeps nothing extra and never stops a run.
 Removal never forces: Docker itself refuses an image a container uses.
 """
 from __future__ import annotations
@@ -91,8 +94,27 @@ def save_state(path: Path, images: dict[str, dict[str, float]]) -> None:
     os.replace(tmp, path)
 
 
+def load_pins(path: str | None) -> set[str]:
+    """Refs and image ids in the pins file. Missing: none. Broken: none, said once."""
+    if not path:
+        return set()
+    try:
+        pins = json.loads(Path(path).read_text()).get("pins")
+        if not isinstance(pins, list) or not all(isinstance(p, dict) for p in pins):
+            raise ValueError("no list of pins")
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, AttributeError) as exc:
+        log(f"pins file {path} is unreadable, no pins kept this run: {exc}")
+        return set()
+    out = set()
+    for p in pins:
+        out |= {v for v in (p.get("ref"), p.get("image_id")) if isinstance(v, str) and v}
+    return out
+
+
 def removable(img: dict, used: set[str], seen: dict[str, float], keep: set[str], now: float, min_idle: float) -> bool:
-    if img["Id"] in used or not img.get("RepoDigests"):
+    if img["Id"] in used or img["Id"] in keep or not img.get("RepoDigests"):
         return False
     if OWNER_LABEL in ((img.get("Config") or {}).get("Labels") or {}):
         return False
@@ -117,7 +139,8 @@ def run_once(args: argparse.Namespace, docker: Docker, fill=fill_pct, now: float
     before = fill(args.data_dir)
     if before < args.high_pct:
         return 0
-    keep = set(args.keep)
+    pinned = load_pins(getattr(args, "keep_file", None))
+    keep = set(args.keep) | pinned
     candidates = [img for img in images if removable(img, used, state[img["Id"]], keep, now, args.min_idle_minutes * 60)]
     # Least recently used first; of two, the bigger one first.
     candidates.sort(key=lambda i: (max(state[i["Id"]].get("first_seen", now), state[i["Id"]].get("last_used", 0.0)), -i.get("Size", 0)))
@@ -146,6 +169,11 @@ def run_once(args: argparse.Namespace, docker: Docker, fill=fill_pct, now: float
         fill_now = fill(args.data_dir)
         log(f"removed {name} ({img.get('Size', 0) / 1e9:.2f} GB); volume {fill_now:.1f}%")
     save_state(state_path, state)
+    if fill_now >= args.low_pct and pinned:
+        held = [img for img in images if img["Id"] in state and (
+            img["Id"] in pinned or (set(img.get("RepoTags") or []) | set(img.get("RepoDigests") or [])) & pinned)]
+        if held:
+            log(f"pinned images keep {sum(i.get('Size', 0) for i in held) / 1e9:.2f} GB; the volume stays above the low mark")
     log(f"done: {removed} removed, {before:.1f}% to {fill_now:.1f}% (low mark {args.low_pct}%)")
     return 0
 
@@ -159,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--low-pct", type=float, default=70.0)
     ap.add_argument("--min-idle-minutes", type=float, default=60.0)
     ap.add_argument("--keep", action="append", default=[], help="an image reference never removed (repeatable)")
+    ap.add_argument("--keep-file", help="the hotel API's pins file: its refs and image ids are kept like --keep")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--off", action="store_true", help="ROOM_IMAGE_GC=0: do nothing")
     args = ap.parse_args(argv)

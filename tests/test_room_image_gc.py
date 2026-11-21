@@ -61,7 +61,7 @@ class FakeDocker:
 
 def args(tmp_path: Path, **kw) -> argparse.Namespace:
     base = {"sock": "/s", "data_dir": "/d", "state": str(tmp_path / "state.json"), "high_pct": 85.0, "low_pct": 70.0,
-            "min_idle_minutes": 60.0, "keep": ["alpine:3.20"], "dry_run": False, "off": False}
+            "min_idle_minutes": 60.0, "keep": ["alpine:3.20"], "keep_file": None, "dry_run": False, "off": False}
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -154,3 +154,38 @@ def test_a_broken_state_file_starts_over(tmp_path: Path, bad: str) -> None:
     gc.run_once(args(tmp_path), d, fill=d.fill(), now=NOW)
     assert d.removed == []  # first seen now
     assert "a" in json.loads((tmp_path / "state.json").read_text())["images"]
+
+
+def pins(tmp_path: Path, *entries: dict) -> str:
+    path = tmp_path / "pins.json"
+    path.write_text(json.dumps({"version": 1, "pins": list(entries)}))
+    return str(path)
+
+
+def test_pinned_images_are_kept_like_the_keep_list(tmp_path: Path, capsys) -> None:
+    """AB#860: refs and image ids in the pins file stay; the GC logs once that pins hold the volume up."""
+    d = FakeDocker([image("old", "swe/old:1", 30), image("mid", "swe/mid:1", 30), image("new", "swe/new:1", 30)])
+    seen(tmp_path, old=9, mid=5, new=2)
+    keep_file = pins(tmp_path, {"ref": "swe/old:1", "image_id": "x", "owner": "o1"}, {"ref": "gone:1", "image_id": "mid", "owner": "o2"})
+    gc.run_once(args(tmp_path, keep_file=keep_file), d, fill=d.fill(other_gb=20), now=NOW)  # 110%, 80% after
+    assert set(d.images) == {"old", "mid"}
+    out = capsys.readouterr().out
+    assert out.count("pinned images keep") == 1
+
+
+@pytest.mark.parametrize("bad", ["", "{not json", '{"pins": {}}', '{"pins": [1, "x"]}', None])
+def test_a_missing_or_broken_pins_file_keeps_nothing_extra_and_gc_goes_on(tmp_path: Path, bad, capsys) -> None:
+    path = tmp_path / "pins.json"
+    if bad is not None:
+        path.write_text(bad)
+    d = FakeDocker([image("a", "swe/a:1", 90)])
+    seen(tmp_path, a=9)
+    assert gc.run_once(args(tmp_path, keep_file=str(path)), d, fill=d.fill(), now=NOW) == 0
+    assert d.images == {}
+    out = capsys.readouterr().out
+    assert out.count("pins file") == (0 if bad is None else 1)
+
+
+def test_keep_file_is_a_cli_option(tmp_path: Path) -> None:
+    common = ["--sock", "/nonexistent", "--data-dir", str(tmp_path), "--state", str(tmp_path / "s.json")]
+    assert gc.main([*common, "--keep-file", str(tmp_path / "pins.json"), "--off"]) == 0
