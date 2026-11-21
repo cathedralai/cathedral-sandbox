@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1353,21 +1354,31 @@ func TestUsageMeterSeqNeverRestartsAfterPruningEveryReading(t *testing.T) {
 		t.Fatalf("newest file %v %v, want empty", st, err)
 	}
 	old := time.Now().Add(-8 * 24 * time.Hour)
-	_ = os.Chtimes(filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1)), old, old)
+	oldFile := filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1))
+	_ = os.Chtimes(oldFile, old, old)
 	if _, err := m2.page(2, 10, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1))); err == nil {
+	if _, err := os.Stat(oldFile); err != nil {
+		t.Fatal("pruned while a reading was still queued")
+	}
+	// The broker dies with h.y still queued. The next one prunes (nothing is
+	// queued), then dies too; the one after finds only the empty file.
+	m3 := testMeter(t, dir, 60)
+	if _, err := m3.page(2, 10, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldFile); err == nil {
 		t.Fatal("the acknowledged old file was not pruned")
 	}
 
-	m3 := testMeter(t, dir, 60)
-	if m3.nextSeq != 3 || m3.head != 2 {
-		t.Fatalf("after restart: next %d head %d, want 3 and 2", m3.nextSeq, m3.head)
+	m4 := testMeter(t, dir, 60)
+	if m4.nextSeq != 3 || m4.head != 2 {
+		t.Fatalf("after restart: next %d head %d, want 3 and 2", m4.nextSeq, m4.head)
 	}
-	m3.seen(sighting("h.z"), at(20))
-	mustFlush(t, m3)
-	p, _ = m3.page(2, 10, time.Now())
+	m4.seen(sighting("h.z"), at(20))
+	mustFlush(t, m4)
+	p, _ = m4.page(2, 10, time.Now())
 	if len(p.Readings) != 1 || p.Next != 3 || p.Head != 3 {
 		t.Fatalf("page after 2: %+v", p)
 	}
@@ -1416,12 +1427,15 @@ func TestUsageMeterReplaySyncFailureServesNothingUntilSynced(t *testing.T) {
 		}
 		return out
 	}
-	if p, _ := m2.page(0, 10, time.Now()); fmt.Sprint(seqsOf(p)) != "[3]" || p.Head != 3 {
-		t.Fatalf("served %v head %d, want only 3", seqsOf(p), p.Head)
+	// Seq 3 is durable but lies above the unsynced 1 and 2: a reader whose
+	// cursor passed 3 would never get them, so nothing is served or acked.
+	p, _ = m2.page(0, 10, time.Now())
+	if len(p.Readings) != 0 || p.Head != 0 || p.Next != 0 || m2.acked != 0 {
+		t.Fatalf("served %v head %d next %d acked %d, want nothing", seqsOf(p), p.Head, p.Next, m2.acked)
 	}
 	failing = false
-	if p, _ := m2.page(0, 10, time.Now()); fmt.Sprint(seqsOf(p)) != "[1 2 3]" || p.Head != 3 {
-		t.Fatalf("after the sync: served %v head %d", seqsOf(p), p.Head)
+	if p2, _ := m2.page(p.Next, 10, time.Now()); fmt.Sprint(seqsOf(p2)) != "[1 2 3]" || p2.Head != 3 || p2.Next != 3 {
+		t.Fatalf("after the sync, from next %d: served %v head %d next %d", p.Next, seqsOf(p2), p2.Head, p2.Next)
 	}
 }
 
@@ -1452,5 +1466,160 @@ func TestUsageMeterRouteReportsPendingReadings(t *testing.T) {
 	mustFlush(t, m)
 	if doc := read(); doc["pending_readings"].(float64) != 0 || doc["head"].(float64) != 2 {
 		t.Fatalf("after recovery: %v", doc)
+	}
+}
+
+// A sync adopts the room (billable reading), the create fails and the
+// cleanup's delete fails too; the broker restarts before another whole
+// second. The turn to not billable was written at once, so replay restores
+// the run as not billable and every later reading of it says so.
+func TestUsageMeterNotBillableSurvivesARestart(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.createFail, f.createFailAfterStart, f.answerDelay, f.roomDeleteFail = 500, true, 300*time.Millisecond, 500
+	f.mu.Unlock()
+	done := make(chan int, 1)
+	go func() {
+		st, _, _ := rawCall(tc, "key1", "", "POST", "/v1/sandboxes", []byte(`{"image":"alpine:3.20","hotels":["b"]}`))
+		done <- st
+	}()
+	var hid string
+	for i := 0; hid == ""; i++ {
+		f.mu.Lock()
+		if len(f.rooms) > 0 {
+			hid = f.rooms[0]["id"].(string)
+		}
+		f.mu.Unlock()
+		if i > 500 {
+			t.Fatal("the hotel never started the room")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	syncNow(tc, "b") // adopted: a billable first reading
+	mustFlush(t, tc.b.meter)
+	if status := <-done; status == 202 {
+		t.Fatal("the create succeeded")
+	}
+	run := "b." + hid
+	before := meterRunsOf(t, tc, run) // the writer flushes the turn with its next batch
+	if len(before) != 2 || before[0].Billable != nil || before[1].Billable == nil || *before[1].Billable || before[1].Seconds != before[0].Seconds {
+		t.Fatalf("readings before the restart %+v, want billable then not billable at the same seconds", before)
+	}
+	tc.start(t) // the new broker has no record of the failed create
+	r := tc.b.meter.runs[run]
+	if r == nil || r.last.Billable == nil || *r.last.Billable {
+		t.Fatalf("replayed run %+v, want not billable", r)
+	}
+	syncNow(tc, "b") // re-adopted as the guest's room
+	f.mu.Lock()
+	f.rooms, f.roomDeleteFail = nil, 0
+	f.mu.Unlock()
+	letGo(tc, "b")
+	got := meterRunsOf(t, tc, run)
+	if len(got) < 3 || got[len(got)-1].State != "ended" {
+		t.Fatalf("readings %+v, want an ended reading after the restart", got)
+	}
+	for _, x := range got[1:] {
+		if x.Billable == nil || *x.Billable {
+			t.Fatalf("reading %+v after the turn is billable", x)
+		}
+	}
+}
+
+// A run's last durable state is in an old acknowledged file and its ended
+// reading is still queued when a cursor read prunes: the prune writes the
+// queue first, so after a crash the ended reading is there.
+func TestUsageMeterPruneWritesAQueuedEndFirst(t *testing.T) {
+	dir := t.TempDir()
+	m := testMeter(t, dir, 60)
+	m.maxLines = 2
+	m.seen(sighting("h.quiet"), at(0)) // seq 1: file 1
+	m.seen(sighting("h.x"), at(1))     // seq 2: file 1
+	mustFlush(t, m)
+	m.seen(sighting("h.y"), at(2)) // seq 3: file 3
+	mustFlush(t, m)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	_ = os.Chtimes(filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1)), old, old)
+	m.end("h.quiet", at(5), false) // queued, not flushed: the run is out of the open-run map
+	if _, err := m.page(3, 10, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1))); err == nil {
+		t.Fatal("file 1 was not pruned")
+	}
+	// crash: m is dropped
+	m2 := testMeter(t, dir, 60)
+	if m2.ended["h.quiet"] == nil || m2.runs["h.quiet"] != nil {
+		t.Fatal("after the crash h.quiet is neither ended nor known")
+	}
+	got := readingsOf(logReadings(t, dir), "h.quiet")
+	if len(got) == 0 || got[len(got)-1].State != "ended" || got[len(got)-1].StartedAt != meterT0.Unix() {
+		t.Fatalf("h.quiet readings %+v", got)
+	}
+}
+
+// A new log file whose directory does not sync (open or sync failure) gets
+// no reading, so nothing is served from a file a crash could lose; a later
+// pass retries. A cursor read whose acked.json rename cannot be made
+// durable prunes nothing. Every failure counts in write_errors.
+func TestUsageMeterDirectorySyncFailureServesAndPrunesNothing(t *testing.T) {
+	for name, failure := range map[string]error{
+		"open": &fs.PathError{Op: "open", Path: "usage", Err: fs.ErrPermission},
+		"sync": errors.New("sync usage: input/output error"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			orig := usageSyncDir
+			failing := true
+			usageSyncDir = func(d string) error {
+				if failing {
+					return failure
+				}
+				return orig(d)
+			}
+			t.Cleanup(func() { usageSyncDir = orig })
+
+			m := testMeter(t, dir, 60)
+			m.seen(sighting("h.a"), at(0))
+			if err := m.flush(); err == nil {
+				t.Fatal("flush succeeded with the directory not synced")
+			}
+			p, _ := m.page(0, 10, time.Now())
+			if len(p.Readings) != 0 || p.Head != 0 || p.PendingReadings != 1 || p.WriteErrors < 1 {
+				t.Fatalf("while the name is not durable: %+v", p)
+			}
+			if raw, _ := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1))); len(raw) != 0 {
+				t.Fatalf("a reading went into a file whose name is not durable: %q", raw)
+			}
+			failing = false
+			mustFlush(t, m) // seq 1 in file 1
+			m.maxLines = 1
+			m.end("h.a", at(1), false)
+			mustFlush(t, m) // seq 2 in file 2; no run is open, so a prune carries nothing
+			m.maxLines = 10
+			old := time.Now().Add(-8 * 24 * time.Hour)
+			file1 := filepath.Join(dir, fmt.Sprintf("%020d.jsonl", 1))
+			_ = os.Chtimes(file1, old, old)
+
+			failing = true
+			errs := m.writeErrors
+			if _, err := m.page(1, 10, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(file1); err != nil {
+				t.Fatal("pruned with acked.json not durable")
+			}
+			if m.writeErrors <= errs {
+				t.Fatalf("write_errors %d, want above %d", m.writeErrors, errs)
+			}
+			failing = false
+			if _, err := m.page(1, 10, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(file1); err == nil {
+				t.Fatal("not pruned once the directory syncs")
+			}
+		})
 	}
 }

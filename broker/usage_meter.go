@@ -62,11 +62,16 @@
 // it. Before any file goes, acked.json also records the durable head and
 // the highest seq issued (written, synced, renamed), and replay starts the
 // next seq above all of them, so a seq is never issued twice even when
-// every file that held it is gone. The route serves only durable readings:
-// a seq at or below the durable head, never one of an append the file could
-// not take back, and never one in a file whose sync failed at replay (that
-// sync is retried on every flush). With no state_dir the meter is off and
+// every file that held it is gone. With no state_dir the meter is off and
 // the route answers 404 usage_meter_off.
+//
+// The durability rule every path keeps: a seq is served (and acknowledged)
+// only when its bytes and its file's name are durable and every lower
+// issued seq is either durable or was never written for a reader (an append
+// the file could not take back; its readings carry later seqs). So the
+// route stops just below a replayed range whose sync failed, and a new file
+// gets no reading until its directory has synced. Pruning happens only
+// after everything queued is durable and acked.json's new name is durable.
 //
 // Crash loss, accepted: a batch is fsynced before it counts, so a broker
 // that dies between an append and its fsync loses at most that batch. Those
@@ -169,10 +174,13 @@ type usageSighting struct {
 
 var usageNotBillable = false
 
-func (r *usageRun) update(s usageSighting) {
+// update takes the identity and size of a sighting. It reports whether the
+// run just turned not billable, which must be written at once.
+func (r *usageRun) update(s usageSighting) (turnedNotBillable bool) {
 	r.last.Guest, r.last.Hotel, r.last.MinerHotkey = s.guest, s.hotel, s.miner
-	if !s.billable {
+	if !s.billable && r.last.Billable == nil {
 		r.last.Billable = &usageNotBillable
+		turnedNotBillable = true
 	}
 	if s.vcpu > 0 {
 		r.last.VCPU = s.vcpu
@@ -180,6 +188,7 @@ func (r *usageRun) update(s usageSighting) {
 	if s.memGiB > 0 {
 		r.last.MemoryGiB = s.memGiB
 	}
+	return turnedNotBillable
 }
 
 // usageSightingOf is a sighting of a room in h's room map. A registered room
@@ -242,6 +251,17 @@ type usageUnsynced struct {
 // usageSyncFile makes a replayed file durable. Tests replace it to fail.
 var usageSyncFile = func(f *os.File) error { return f.Sync() }
 
+// usageSyncDir makes the names in the usage directory durable: a new log
+// file, or acked.json after its rename. Tests replace it to fail.
+var usageSyncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 // usageState is acked.json: the acknowledged cursor, and the durable head and
 // highest issued seq when it was written.
 type usageState struct {
@@ -281,6 +301,7 @@ type usageMeter struct {
 	ioMu      sync.Mutex // one flush or page at a time; guards the open file
 	f         *os.File
 	fname     string
+	nameSync  bool // the open file's name is durable (its directory synced)
 	fileLines int
 	fileSize  int64
 }
@@ -465,10 +486,12 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) {
 		m.queueLocked(r, "running", at)
 		return
 	}
-	r.update(s)
+	turned := r.update(s)
 	r.observe(at)
 	r.missed = false
-	if at.Unix()-r.lastAt >= m.every {
+	// A run that turns not billable gets a reading now, whatever the
+	// interval: replay must restore it as not billable.
+	if turned || at.Unix()-r.lastAt >= m.every {
 		m.queueLocked(r, "running", at)
 	}
 }
@@ -674,6 +697,15 @@ func (m *usageMeter) flushLocked() error {
 				return m.failed(err)
 			}
 		}
+		// A file fsync keeps the lines, not the file's name: a reading in a
+		// file whose name a crash can lose is not durable. Nothing goes into
+		// a new file until its directory has synced; retried every flush.
+		if !m.nameSync {
+			if err := usageSyncDir(m.dir); err != nil {
+				return m.failed(fmt.Errorf("sync of the usage directory for %s: %w", filepath.Base(m.fname), err))
+			}
+			m.nameSync = true
+		}
 		n := min(len(batch), m.maxLines-m.fileLines)
 		var buf bytes.Buffer
 		for i := range batch[:n] {
@@ -749,13 +781,9 @@ func (m *usageMeter) rollLocked(first int64) error {
 	if err != nil {
 		return err
 	}
-	// Best effort: the file's own fsync holds its lines; a directory that
-	// cannot sync (some file systems) must not stop the meter.
-	if d, derr := os.Open(m.dir); derr == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	m.f, m.fname, m.fileLines, m.fileSize = f, name, 0, 0
+	// Its name is durable only once the directory syncs (flushLocked):
+	// nothing is appended to it before that.
+	m.f, m.fname, m.fileLines, m.fileSize, m.nameSync = f, name, 0, 0, false
 	return nil
 }
 
@@ -839,17 +867,21 @@ func (m *usageMeter) page(after int64, limit int, now time.Time) (usagePage, err
 	defer m.ioMu.Unlock()
 	m.retryUnsyncedLocked()
 	m.mu.Lock()
+	// Never serve or acknowledge a seq above a range that is not durable yet:
+	// a reader whose cursor passed it would never get it once it syncs.
 	head := m.head
+	for _, u := range m.unsynced {
+		head = min(head, u.lo-1)
+	}
 	p := usagePage{Readings: []json.RawMessage{}, Next: after, Head: head, WriteErrors: m.writeErrors}
 	p.ObservedAt, p.UnobservedHotels = m.observedAtLocked(now)
 	acked, moved := m.acked, false
 	if a := min(after, head); a > acked {
 		m.acked, acked, moved = a, a, true
 	}
-	skip := append([][2]int64(nil), m.burned...)
+	skip := append([][2]int64(nil), m.burned...) // never written as far as a reader goes: their readings have later seqs
 	p.PendingReadings = int64(len(m.pending))
 	for _, u := range m.unsynced {
-		skip = append(skip, [2]int64{u.lo, u.hi})
 		p.PendingReadings += u.hi - u.lo + 1
 	}
 	m.mu.Unlock()
@@ -929,7 +961,6 @@ func inUsageRanges(seq int64, ranges [][2]int64) bool {
 // that are older than usagePruneAge. The newest file and the open one stay.
 // Caller holds ioMu.
 func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) {
-	stateSaved := false
 	for i := 0; i+1 < len(files); i++ {
 		last := files[i+1].first - 1
 		if last > acked {
@@ -946,13 +977,11 @@ func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) 
 			log.Printf("usage meter: %s kept: open runs not carried forward: %v", filepath.Base(files[i].path), err)
 			continue
 		}
-		// The seqs this file held must stay issued after it is gone.
-		if !stateSaved {
-			if err := m.saveState(); err != nil {
-				log.Printf("usage meter: nothing pruned: %s not saved: %v", usageAckedFile, err)
-				return
-			}
-			stateSaved = true
+		// The seqs this file held must stay issued after it is gone, and the
+		// carry forward may have issued more: save after every carry.
+		if err := m.saveState(); err != nil {
+			log.Printf("usage meter: nothing more pruned: %s not saved: %v", usageAckedFile, err)
+			return
 		}
 		if err := os.Remove(files[i].path); err != nil {
 			log.Printf("usage meter: prune %s: %v", filepath.Base(files[i].path), err)
@@ -965,27 +994,44 @@ func (m *usageMeter) pruneLocked(files []usageFile, acked int64, now time.Time) 
 // carryForwardLocked writes again, under new seqs, the newest reading of
 // every open run whose newest durable reading has a seq in [first, last], so
 // deleting the file that holds it loses no run's start or seconds. The
-// reading's seconds are the run's own; only seq and at are new. Caller holds
-// ioMu.
+// reading's seconds are the run's own; only seq and at are new. It then
+// flushes every queued reading, carried or not: an ended reading queued for
+// a run whose last durable state is in that file must be durable before the
+// file goes. Caller holds ioMu.
 func (m *usageMeter) carryForwardLocked(first, last int64, now time.Time) error {
 	m.mu.Lock()
-	n := 0
 	for _, r := range m.runs {
 		if r.lastSeq >= first && r.lastSeq <= last {
 			m.queueLocked(r, "running", now)
-			n++
 		}
 	}
 	m.mu.Unlock()
-	if n == 0 {
-		return nil
+	if err := m.flushLocked(); err != nil {
+		return err
 	}
-	return m.flushLocked()
+	m.mu.Lock()
+	queued := len(m.pending)
+	m.mu.Unlock()
+	if queued > 0 {
+		return fmt.Errorf("%d readings still queued", queued)
+	}
+	return nil
 }
 
 // saveState writes acked.json (cursor, durable head, highest issued seq):
-// temporary file, sync, rename. Caller holds ioMu.
+// temporary file, sync, rename, directory sync. A failure counts in
+// write_errors; nothing is pruned on it. Caller holds ioMu.
 func (m *usageMeter) saveState() error {
+	err := m.writeState()
+	if err != nil {
+		m.mu.Lock()
+		m.writeErrors++
+		m.mu.Unlock()
+	}
+	return err
+}
+
+func (m *usageMeter) writeState() error {
 	m.mu.Lock()
 	st := usageState{Acked: m.acked, Head: m.head, Issued: m.nextSeq - 1}
 	m.mu.Unlock()
@@ -1012,9 +1058,9 @@ func (m *usageMeter) saveState() error {
 	if err := os.Rename(tmp, filepath.Join(m.dir, usageAckedFile)); err != nil {
 		return err
 	}
-	if d, err := os.Open(m.dir); err == nil { // best effort, as in rollLocked
-		_ = d.Sync()
-		_ = d.Close()
+	// The new name must be durable before any prune trusts it.
+	if err := usageSyncDir(m.dir); err != nil {
+		return fmt.Errorf("sync of the usage directory after %s: %w", usageAckedFile, err)
 	}
 	return nil
 }
