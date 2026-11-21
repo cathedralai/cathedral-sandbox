@@ -2926,6 +2926,18 @@ EXEC_HANDLE_HEADER = "X-Room-Exec-Handle"
 EXEC_STATE_HEADER = "X-Room-Exec-State"
 EXEC_HANDLE = re.compile(r"[0-9a-f]{32}")
 EXEC_RESULT_ROUTE = re.compile("^" + ROOM + r"/exec/result$")
+# Terminal WebSocket through the front (AB#385). The front strips Upgrade from what it forwards, so before this a
+# terminal socket never reached the room API through it. Now the front opens the same handshake to the API itself,
+# signs terminal_session_open on the API's answer (the 101 carries X-Room-Receipt), passes raw bytes both ways
+# and signs terminal_session_close at the end with the byte count and sha256 of each direction as on the wire.
+TERMINAL_WS_ROUTE = re.compile("^" + ROOM + r"/terminals/(?P<tid>[^/]+)/ws$")
+WS_FORWARD_HEADERS = ("Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
+                      "X-Cathedral-Access-Ticket")
+WS_SWITCH_HEADERS = ("Sec-WebSocket-Accept", "Sec-WebSocket-Protocol")
+WS_IDLE_SECONDS = 900  # no byte from the caller for this long ends the session (the API's own idle close is 600 s)
+WS_HEAD_MAX = 64 << 10
+WS_REFUSAL_MAX = 1 << 20
+WS_NO_ANSWER = b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer the terminal handshake"}}'
 EXEC_RESULT_KEEP_SECONDS = 3600  # a finished answer nobody dropped ages out after this
 EXEC_RESULT_MAX = 256  # answers kept, running and finished
 EXEC_RESULT_MAX_BYTES = 64 << 20  # body bytes of finished answers kept
@@ -3133,6 +3145,48 @@ def parse_expires_at(value, now: float) -> float | None:
     epoch = moment.timestamp()
     return epoch if now < epoch <= now + EXPIRES_MAX_SECONDS else None
 
+
+def wants_websocket(headers) -> bool:
+    """Whether a request asks for a WebSocket: Upgrade: websocket and an upgrade token in Connection."""
+    if (headers.get("Upgrade") or "").strip().lower() != "websocket":
+        return False
+    return any(tok.strip().lower() == "upgrade" for v in headers.get_all("Connection", []) for tok in v.split(","))
+
+
+def read_ws_answer(sock: socket.socket) -> tuple[int, dict, bytes]:
+    """The API's answer to a WebSocket handshake: (status, lower-case headers, rest).
+
+    *rest* is what came after the head: for a 101, the first bytes of the socket (the API may send output at
+    once); otherwise the body, bounded. Raises ValueError for an answer that is not HTTP.
+    """
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > WS_HEAD_MAX:
+            raise ValueError("handshake answer head too large")
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ValueError("no handshake answer")
+        buf += chunk
+    raw, rest = buf.split(b"\r\n\r\n", 1)
+    status_line, *header_lines = raw.decode("latin-1").split("\r\n")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[0].startswith("HTTP/1.") or not parts[1].isdigit():
+        raise ValueError("not an HTTP answer")
+    head = {}
+    for line in header_lines:
+        name, sep, value = line.partition(":")
+        if sep:
+            head[name.strip().lower()] = value.strip()
+    status = int(parts[1])
+    if status != 101:
+        want = min(int(head.get("content-length", "0") or 0), WS_REFUSAL_MAX)
+        while len(rest) < want:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            rest += chunk
+        rest = rest[:want]
+    return status, head, rest
 
 class Turn:
     """One authorized request between Ledger.enter and Ledger.leave."""
@@ -3465,6 +3519,9 @@ class Handler(BaseHTTPRequestHandler):
         m = CLAIM_ROUTE.match(path)
         if m:
             return self.handle_claim(ledger, m["id"], body)
+        m = TERMINAL_WS_ROUTE.match(path)
+        if m and self.command == "GET" and wants_websocket(self.headers):
+            return self.handle_terminal_ws(ledger, m["id"], m["tid"], forward_path)
         if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (path, unquote(path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
             # its env-sealed route sets a room's env from an envelope this front opened; neither
@@ -3564,6 +3621,122 @@ class Handler(BaseHTTPRequestHandler):
             if track is not None and not kept:
                 # Whatever went wrong after the mark, the entry ends: a running entry is never evicted.
                 self.server.exec_results.finish(*track, 502, {}, EXEC_RESULT_FRONT_FAILED, "application/json")
+
+    def handle_terminal_ws(self, ledger: "Ledger", room: str, terminal: str, forward_path: str):
+        """A terminal WebSocket: signed open, raw bytes both ways, signed close. The API checks the ticket."""
+        self.close_connection = True
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if isinstance(self.connection, ssl.SSLSocket):
+            # Raw bytes are passed by two threads, which one TLS socket does not allow. Terminals never reach a
+            # miner hotel (the broker's terminalsRefused), the one front that serves TLS.
+            return self.reply(501, b'{"error":{"code":"websocket_unsupported","message":"no terminal socket over this port"}}')
+        base = {"target": f"GET {forward_path}", "sandbox_id": room, "terminal_id": terminal,
+                "customer_request_sha256": sha(b""), "command_sha256": None, "image": None, "image_digest": None}
+        lines = [f"GET {forward_path} HTTP/1.1", f"Host: 127.0.0.1:{self.server.api_port}", "Upgrade: websocket",
+                 "Connection: Upgrade", "Authorization: Bearer " + self.server.api_key.decode()]
+        for name in WS_FORWARD_HEADERS:
+            lines += [f"{name}: {v}" for v in self.headers.get_all(name, []) if not set(v) & {"\r", "\n"}]
+        if self.turn is not None:
+            self.turn.called = True
+        up = None
+        try:
+            up = socket.create_connection(("127.0.0.1", self.server.api_port), timeout=30)
+            up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+            status, head, rest = read_ws_answer(up)
+        except (OSError, ValueError, UnicodeEncodeError):
+            if up is not None:
+                up.close()
+            up, status, head, rest = None, 502, {}, WS_NO_ANSWER
+            if self.turn is not None:
+                self.turn.lost = True
+        if status != 101:
+            if up is not None:
+                up.close()
+            extra = {}
+            try:
+                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign({
+                    **base, "action": "terminal_session_open", "status": status, "result_sha256": sha(rest)}))).decode()
+            except Exception as exc:  # noqa: BLE001 nothing was opened: answer, and say the receipt is missing
+                traceback.print_exc()
+                extra["X-Room-Receipt-Error"] = type(exc).__name__
+            return self.reply(status, rest, extra, head.get("content-type", "application/json"))
+        session = uuid.uuid4().hex
+        try:
+            opened = ledger.sign({**base, "action": "terminal_session_open", "status": 101,
+                                  "result_sha256": sha(b""), "session_id": session})
+        except Exception:  # noqa: BLE001 a session with no open receipt must not run
+            traceback.print_exc()
+            up.close()
+            return self.reply(503, b'{"error":{"code":"receipt_failed","message":"the terminal session was not opened"}}')
+        self.close_connection = True
+        reply = ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade"]
+        reply += [f"{k}: {head[k.lower()]}" for k in WS_SWITCH_HEADERS if k.lower() in head]
+        reply.append("X-Room-Receipt: " + base64.urlsafe_b64encode(canonical(opened)).decode())
+        started = time.monotonic()
+        streams = {"client": [0, hashlib.sha256()], "room": [0, hashlib.sha256()]}
+        ended: list[str] = []
+
+        def note(side: str, data: bytes) -> None:
+            streams[side][0] += len(data)
+            streams[side][1].update(data)
+
+        def end(reason: str) -> None:
+            if not ended:
+                ended.append(reason)
+            for sock in (up, self.connection):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        def from_client() -> None:
+            # Through rfile, so bytes already read past the handshake are kept.
+            try:
+                while True:
+                    data = self.rfile.read1(65536)
+                    if not data:
+                        return end("client_closed")
+                    note("client", data)
+                    up.sendall(data)
+            except TimeoutError:
+                end("idle")
+            except (OSError, ValueError):
+                end("client_closed")
+
+        reader = None
+        try:
+            self.wfile.write(("\r\n".join(reply) + "\r\n\r\n").encode("latin-1"))
+            self.connection.settimeout(WS_IDLE_SECONDS)
+            up.settimeout(None)
+            reader = threading.Thread(target=from_client, daemon=True, name="room-terminal-ws")
+            reader.start()
+            if rest:
+                note("room", rest)
+                self.wfile.write(rest)
+            while True:
+                data = up.recv(65536)
+                if not data:
+                    end("room_closed")
+                    break
+                note("room", data)
+                self.wfile.write(data)
+        except OSError:
+            end("room_closed")
+        finally:
+            end("room_closed")
+            if reader is not None:
+                reader.join(5)
+            up.close()
+            try:
+                ledger.sign({**base, "action": "terminal_session_close", "status": None, "result_sha256": None,
+                             "session_id": session, "session_open_receipt_sha256": opened["receipt_sha256"],
+                             "close_reason": ended[0], "duration_ms": int((time.monotonic() - started) * 1000),
+                             "client_bytes": streams["client"][0], "client_sha256": streams["client"][1].hexdigest(),
+                             "room_bytes": streams["room"][0], "room_sha256": streams["room"][1].hexdigest()})
+            except Exception:  # noqa: BLE001 the session already ran; its open receipt stands
+                traceback.print_exc()
+            self.release_turn()
 
     def handle_exec_result(self, room: str):
         """GET: a kept exec's answer (running, or the signed answer as it was) by handle. DELETE: drop it."""
