@@ -88,6 +88,10 @@ type placement struct {
 	// encrypted to the room runtime matches (encryptedCreateLeg), on every
 	// retry, fallback and queue move too.
 	registryAuth bool
+	// deadline: the create's create_timeout_seconds as a time (zero: none,
+	// AB#862). A create still waiting for a hotel create slot at this time
+	// ends with 503 create_timeout; one already sent to a hotel is not cut.
+	deadline time.Time
 }
 
 func (pl placement) selects(h *hotel) bool {

@@ -973,6 +973,11 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 && createDeadlinePassed(pl) {
+			// A retry (the first hotel refused or had no free connection)
+			// would wait for a slot again past the create's own deadline.
+			return finish(createTimedOut())
+		}
 		b.mu.Lock()
 		h := b.pick(tried, pl)
 		if h == nil && !fellBack {
@@ -1010,6 +1015,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		// another eligible hotel (placement.go).
 		h = b.waitSlot(ctx, g, h, pl, tried)
 		if h == nil {
+			if ctx.Err() == nil && createDeadlinePassed(pl) {
+				return finish(createTimedOut())
+			}
 			return finish(clientGone())
 		}
 		b.mu.Lock()
@@ -1050,13 +1058,20 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 
 		// The hotel does not stop a create when the guest goes away. Keep the
 		// call open, so the broker learns the room id and can delete the room.
-		status, hdr, out, err := h.doHeaders(context.WithoutCancel(ctx), h.cfg.API, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout, ownerHeadersFrom(ctx))
+		status, hdr, out, err := h.doHeaders(withCreateDeadline(context.WithoutCancel(ctx), pl), h.cfg.API, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout, ownerHeadersFrom(ctx))
 		<-h.sem
 		tDone := time.Now()
 
 		b.mu.Lock()
 		h.creating--
 		h.holdDisk(pl, -1) // a started room counts in h.rooms from here (same b.mu hold)
+		if errors.Is(err, errCreateDeadline) {
+			// The create's deadline passed while it waited for a data
+			// connection: never sent, so as errHotelBusy nothing to reap.
+			h.release(rm)
+			b.mu.Unlock()
+			return finish(createTimedOut())
+		}
 		if errors.Is(err, errHotelBusy) {
 			// No data connection came free in time (AB#819). The create was
 			// never sent, so no room can exist there: not lost, nothing to
@@ -1490,6 +1505,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	payload["network"] = net
+	deadline, derr := createDeadline(payload, tRecv)
+	if derr != nil {
+		writeErr(w, derr.status, derr.code, derr.msg)
+		return
+	}
 	count := 1
 	if c, ok := payload["count"].(float64); ok {
 		count = int(c)
@@ -1515,6 +1535,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	pl.apply(payload)
 	pl.image = createImageRef(payload)
+	pl.deadline = deadline
 	if e, retry := b.admit(g, count); e != nil {
 		writeLimitErr(w, e, retry)
 		return
