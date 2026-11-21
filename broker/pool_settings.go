@@ -48,6 +48,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -140,7 +141,7 @@ func (b *broker) loadReadyRooms() error {
 	if len(rc.Keys) == 0 {
 		return errors.New("config: ready_rooms.keys needs at least one key")
 	}
-	p := &readyRooms{}
+	p := &readyRooms{hotels: map[string]*poolHotel{}}
 	for _, k := range rc.Keys {
 		t, ok := templateByName(k.Template)
 		if !ok {
@@ -411,6 +412,37 @@ func (b *broker) readyRoomsViewLocked(now time.Time) map[string]any {
 	for _, k := range p.keys {
 		per[k.name] = p.settings.target(k.name)
 	}
+	totals := map[string]int{}
+	hotels := map[string]any{}
+	ids := []string{}
+	for _, h := range b.hotelList() {
+		ids = append(ids, h.cfg.ID)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		h := b.hotelByID(id)
+		if h == nil {
+			continue
+		}
+		c := p.countsLocked(id)
+		why := b.poolCreateRefusalLocked(h, p.hotel(id), now)
+		d := map[string]any{"ready": c.ready, "claiming": 0, "stale": c.stale, "quarantined": c.quarantined,
+			"unverified": c.unverified, "creating": c.creating, "mapped": 0, "bound": p.boundLocked(),
+			"pool_creates": why == "", "listed_since_start": p.hotel(id).listed}
+		if why != "" {
+			d["why_no_creates"] = why
+		}
+		if a := p.hotel(id).alarm; a != "" {
+			d["alarm"] = a
+		}
+		hotels[id] = d
+		totals["ready"] += c.ready
+		totals["stale"] += c.stale
+		totals["quarantined"] += c.quarantined
+		totals["unverified"] += c.unverified
+		totals["creating"] += c.creating
+	}
+	totals["claiming"], totals["mapped"] = 0, 0
 	journal := map[string]any{"state": p.journalState}
 	if p.journalWhy != "" {
 		journal["why"] = p.journalWhy
@@ -419,6 +451,6 @@ func (b *broker) readyRoomsViewLocked(now time.Time) map[string]any {
 		"guest": poolGuestID, "keys": keys,
 		"settings": map[string]any{"per_hotel": per, "refill_per_second": p.settings.RefillPerSecond,
 			"refill_during_claims": p.settings.RefillDuringClaims, "reserve_share": p.settings.ReserveShare},
-		"journal": journal,
+		"creates_per_second_per_hotel_max": 1, "journal": journal, "hotels": hotels, "totals": totals,
 	}
 }

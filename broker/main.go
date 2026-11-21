@@ -3164,6 +3164,7 @@ func main() {
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
+	go b.runPool(ctx) // after the sync loops: it waits for each hotel's first list (pool.go)
 	handler := b.handler()
 	// No WriteTimeout: an exec may run for hours. IdleTimeout closes kept-alive
 	// connections that send nothing, so they cannot pile up to the fd limit.
