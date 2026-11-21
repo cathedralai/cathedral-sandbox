@@ -811,7 +811,7 @@ receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `rooms_in_use` (rooms the broker holds there plus queued and in-flight creates; what a guest TLS re-seal waits to reach 0), `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested, and `hotel_key_install` on a hotel the broker installs the key into), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
 
@@ -954,6 +954,21 @@ binding (`tls_spki_sha256`), with the hotel key installed inside the guest
 - The hotel key must be installed in the guest (`POST /room/hotel-key`)
   before the hotel answers keyed calls, and again after every reboot (the
   guest keeps it in memory). Until then the hotel is down (401).
+- `"hotel_key_install_signing_key_file"` (AB#817, needs `"guest_tls": true`)
+  makes the broker do that install. The file holds base64 of a 32-byte
+  Ed25519 seed, mode 600 or 640 (root:<broker group>, as the hotel key files), one per broker host; its public key (logged at
+  start, and `admission.hotel_key_install.signer_ed25519_b64` in the hotel
+  documents) must be in the guest build's `SEALED_HOTEL_KEY_INSTALL_SIGNERS`.
+  Right after the broker pins a new guest key it reads
+  `GET /room/hotel-key-install-key` over the pinned client (statement signed
+  by the binding's receipt key, for this binding, naming the binding's
+  install key), seals `key_file`'s key to it (the room-kit envelope, AAD
+  `hotel-key-install:<binding_sha256>`) and posts a signed
+  `cathedral_hotel_key_install_v1` request. `installed` or `unchanged` is
+  done. Anything else (a refusal code, a lost answer) is logged once by code
+  and tried again on the 5 s pin recheck. The hotel is not admitted until an
+  install on its current pin succeeded. No log line names the key or the seed.
+  Make a seed: `head -c 32 /dev/urandom | base64 > <file>; chmod 640 <file>; chgrp <broker group> <file>`.
 - `"require_sealed_guest_tls": true` (top level, default off) makes this
   every sealed hotel: a sealed config entry without `"guest_tls": true`
   stops the config from loading, and a sealed join must pass the same

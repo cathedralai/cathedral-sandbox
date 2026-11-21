@@ -913,7 +913,10 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
 		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice(),
-		"mem_pct": h.memPct, "mem_full_pct": b.memFullLimit(h), "mem_full": b.memFull(h)}
+		// rooms_in_use: rooms the broker holds on the hotel, plus creates queued or in flight. A
+		// guest TLS hotel's host has no key to count them, so a re-seal waits for 0 here (AB#817).
+		"rooms_in_use": h.used(),
+		"mem_pct":      h.memPct, "mem_full_pct": b.memFullLimit(h), "mem_full": b.memFull(h)}
 	diskDoc(h, d)
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
