@@ -141,10 +141,57 @@ Operator note: a usage file that can never be synced (a failing disk)
 stalls the feed by design. The route serves nothing above it, so `head`
 stops, the ledger stops renewing leases and metered keys close. It shows as
 `pending_readings` staying above 0, `write_errors` growing, and the log line
-`usage meter: <file>: sync before replay failed`. Fix the disk. As a last
-resort, stop the broker, move that file out of `state_dir/usage/` and start
-the broker again: this loses only readings that were never served, in the
-customer's favour (their runs go back to their last served reading).
+`usage meter: <file>: sync before replay failed`. Fix the disk first. Only
+if that fails, as a last resort, stop the broker, move that file out of
+`state_dir/usage/` and start the broker again. What that does:
+
+- No served seq is reused: `acked.json` holds the highest issued seq,
+  saved before any page served it.
+- Every reading in that file leaves the log, also ones already served (the
+  ledger has those).
+- A run whose newest state was in that file goes back to its last reading
+  in another file, or to zero seconds if it has none. The ledger already
+  holds a higher mark for it, so it charges nothing more for that run until
+  the run passes that mark (the customer's favour).
+- An ended run whose end was in that file may never show its final reading.
+
+Known limits (stage 1):
+
+- The readings are the front door's observation, not proof: nothing is
+  guest-signed (stage 2).
+- A front door crash loses the observed time since each run's last durable
+  reading (at most `usage_meter_every_seconds`, plus a delete's tail), in
+  the customer's favour. Nothing in a durable reading is lost.
+- A delete can count the time from the last sighting to the delete for a
+  room that vanished in between: at most one sync interval (2 s) while
+  lists answer, at most 30 s when its hotel's lists fail in between.
+- If the broker dies between learning that a create failed or was cancelled
+  and that reading reaching the disk (milliseconds: the writer is woken at
+  once and the path waits up to 3 s for it, outside the broker lock), the
+  restarted broker has no record of the failure. It adopts the surviving
+  room under the guest's label and meters it as billable until it leaves:
+  at most that one room's remaining lifetime, and the room is in the
+  guest's own list, so the guest can delete it. Persisting create outcomes
+  is a follow-up.
+- A room a sync adopted while its create was in flight has billable
+  readings until the orphan cleanup lists it, which is as soon as the
+  request's creates end (each bounded by the 12 minute create timeout);
+  from then on it is `billable: false`.
+- A hung disk stalls no broker work: no disk I/O happens under the broker
+  lock, a path that saw a turn to not billable waits at most 3 s, and a
+  route read waits at most 5 s for a write in progress, then answers what is
+  durable without acknowledging or pruning.
+- A file that can never be synced stalls the feed (operator note above).
+- A room seen again after its ended reading is logged and not metered
+  again for 24 h.
+- While the disk refuses writes, readings queue in memory (about one per
+  live room per minute); `pending_readings` counts them.
+- If the whole `usage/` is lost, `acked.json` with it, seq restarts at 1: a
+  reader whose cursor is above `head` must treat that as an alarm.
+- A hotel left out of `observed_at` holds rooms whose seconds are not
+  growing; `unobserved_hotels` counts such hotels, not their rooms.
+- Replay reads and syncs every retained file at start; its time grows with
+  the readings kept (7 days plus whatever is unacknowledged).
 
 ## Guest policy and capacity catalog
 

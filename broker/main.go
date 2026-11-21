@@ -1342,8 +1342,11 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 			continue
 		}
 		b.mu.Lock()
-		b.meterOrphan(h, s.ID, guestID, listedAt, false) // not billable from here on (usage_meter.go)
+		turned := b.meterOrphan(h, s.ID, guestID, listedAt, false) // not billable from here on (usage_meter.go)
 		b.mu.Unlock()
+		if turned { // durable before the delete, outside b.mu, bounded
+			b.meter.awaitDurable(usageTurnWait)
+		}
 		st, _, _, derr := h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
 		if derr != nil || (st != 204 && st != 404) {
 			ok = false
@@ -2246,13 +2249,21 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		}
 	}()
 
+	// A run this pass turned not billable is made durable after b.mu is
+	// released, with a bound (usage_meter.go): no disk I/O under b.mu.
+	meterTurned := false
+	defer func() {
+		if meterTurned {
+			b.meter.awaitDurable(usageTurnWait)
+		}
+	}()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	// The usage meter sees the rooms this list showed, then ends the runs
 	// the room map no longer holds. Deferred after the lock, so it runs
 	// under b.mu once every change below is made (usage_meter.go).
 	var listed []usageSighting
-	defer func() { b.meterHotel(h, listed, listedAt, lerr == nil) }()
+	defer func() { meterTurned = b.meterHotel(h, listed, listedAt, lerr == nil) }()
 	now := time.Now()
 	h.lastErr = ""
 	if err := errors.Join(herr, qerr, lerr); err != nil {

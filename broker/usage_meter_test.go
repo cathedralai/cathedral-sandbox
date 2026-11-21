@@ -1720,3 +1720,153 @@ func TestUsageMeterNewUsageDirNeedsItsParentSynced(t *testing.T) {
 	m2.seen(sighting("h.b"), at(1))
 	mustFlush(t, m2)
 }
+
+// A hung write never stalls the broker: a cancelled create's reap that
+// turns a run not billable waits for the disk outside b.mu and only up to
+// usageTurnWait; meanwhile an unrelated create and a sync pass finish, and
+// a route read answers within usageReadWait.
+func TestUsageMeterHungDiskStallsNothing(t *testing.T) {
+	oldTurn, oldRead := usageTurnWait, usageReadWait
+	usageTurnWait, usageReadWait = 300*time.Millisecond, 300*time.Millisecond
+	t.Cleanup(func() { usageTurnWait, usageReadWait = oldTurn, oldRead })
+	tc := newChainState(t, t.TempDir())
+	syncNow(tc, "b")
+	mustFlush(t, tc.b.meter)
+	hung := make(chan struct{})
+	t.Cleanup(func() { close(hung) })
+	tc.b.meter.write = func(f *os.File, p []byte) error { <-hung; return errors.New("disk hung") }
+
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_cancelled", "state": "running", "labels": map[string]any{guestLabel: "g1"}})
+	f.mu.Unlock()
+	h := tc.b.hotelByID("b")
+	reaped := make(chan time.Duration, 1)
+	go func() {
+		t0 := time.Now()
+		tc.b.reapRoom(h, &room{h: h, guest: "g1", hid: "sbx_cancelled", id: "b.sbx_cancelled", slot: -1})
+		reaped <- time.Since(t0)
+	}()
+	time.Sleep(50 * time.Millisecond) // the reap's flush now holds the hung write
+
+	t0 := time.Now()
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}})
+	syncNow(tc, "c")
+	if d := time.Since(t0); d > 2*time.Second {
+		t.Fatalf("a create and a sync pass took %s with the disk hung", d)
+	}
+	t0 = time.Now()
+	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter", nil)
+	if d := time.Since(t0); status != 200 || d > 2*time.Second {
+		t.Fatalf("route read: %d after %s: %v", status, d, doc)
+	}
+	if doc["pending_readings"].(float64) < 1 {
+		t.Fatalf("route read with the disk hung: %v", doc)
+	}
+	select {
+	case d := <-reaped:
+		if d > 3*time.Second {
+			t.Fatalf("the reap waited %s for the disk", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reap never carried on past the hung disk")
+	}
+}
+
+// Known limit, pinned: the broker dies after learning that a create failed
+// and before that turn's reading is durable. The restarted broker has no
+// record of the failure: replay restores the run from its last billable
+// reading, and a sync that adopts the surviving room meters it as billable
+// until it leaves (at most the room's remaining lifetime; the guest sees
+// the room in its own list and can delete it).
+func TestUsageMeterKnownLimitCrashBeforeTheTurnIsDurable(t *testing.T) {
+	dir := t.TempDir()
+	m := testMeter(t, dir, 10)
+	m.seen(sighting("h.orphan"), at(0)) // adopted by a sync: billable
+	mustFlush(t, m)
+	if !m.seen(usageSighting{run: "h.orphan", guest: "g1", hotel: "h"}, at(1)) {
+		t.Fatal("no turn to not billable")
+	}
+	// crash: the turn is queued, never written
+	m2 := testMeter(t, dir, 10)
+	if r := m2.runs["h.orphan"]; r == nil || r.last.Billable != nil {
+		t.Fatalf("replayed run %+v: the documented limit no longer holds, update the README", r)
+	}
+	listPass(m2, at(30), []string{"h.orphan"})
+	listPass(m2, at(32), []string{"h.orphan"})
+	m2.end("h.orphan", at(33), true)
+	mustFlush(t, m2)
+	for _, r := range readingsOf(logReadings(t, dir), "h.orphan") {
+		if r.Billable != nil {
+			t.Fatalf("reading %+v: the documented limit no longer holds, update the README", r)
+		}
+	}
+}
+
+// A served seq is never issued again: acked.json holds the highest issued
+// seq before a page serves it, so losing the log file afterwards (a disk
+// fault, or the operator's last resort) cannot bring a served seq back.
+func TestUsageMeterServedSeqSurvivesALostLogFile(t *testing.T) {
+	dir := t.TempDir()
+	m := testMeter(t, dir, 60)
+	m.seen(sighting("h.a"), at(0))
+	m.end("h.a", at(1), false)
+	mustFlush(t, m)
+	p, _ := m.page(0, 10, time.Now()) // served through after=0, no cursor move
+	if len(p.Readings) != 2 || m.acked != 0 {
+		t.Fatalf("page %+v acked %d", p, m.acked)
+	}
+	files, _ := m.files()
+	for _, f := range files {
+		_ = os.Remove(f.path)
+	}
+	m2 := testMeter(t, dir, 60)
+	if m2.nextSeq != 3 {
+		t.Fatalf("next seq after losing the log %d, want 3 (above the served 2)", m2.nextSeq)
+	}
+	m2.seen(sighting("h.b"), at(5))
+	mustFlush(t, m2)
+	if p, _ := m2.page(2, 10, time.Now()); len(p.Readings) != 1 || p.Next != 3 {
+		t.Fatalf("page after 2: %+v", p)
+	}
+}
+
+// A state_dir the broker has to create, two levels down: every directory
+// that gains a new entry syncs, top down, before any file is made, and a
+// failure on the way serves nothing until a retry succeeds.
+func TestUsageMeterNewStateDirSyncsEveryNewAncestor(t *testing.T) {
+	base := t.TempDir()
+	state := filepath.Join(base, "a", "b")
+	dir := filepath.Join(state, usageDirName)
+	orig := usageSyncDir
+	var synced []string
+	failing := true
+	usageSyncDir = func(d string) error {
+		if failing && d == filepath.Join(base, "a") {
+			return errors.New("sync a: input/output error")
+		}
+		synced = append(synced, d)
+		return orig(d)
+	}
+	t.Cleanup(func() { usageSyncDir = orig })
+	m := testMeter(t, dir, 60)
+	m.seen(sighting("h.a"), at(0))
+	if err := m.flush(); err == nil {
+		t.Fatal("flush succeeded with a new ancestor not durable")
+	}
+	if p, _ := m.page(0, 10, time.Now()); len(p.Readings) != 0 || p.Head != 0 || p.WriteErrors < 1 {
+		t.Fatalf("while an ancestor is not durable: %+v", p)
+	}
+	if files, _ := m.files(); len(files) != 0 {
+		t.Fatalf("a log file was made: %+v", files)
+	}
+	failing = false
+	mustFlush(t, m)
+	if p, _ := m.page(0, 10, time.Now()); len(p.Readings) != 1 {
+		t.Fatalf("after the ancestors synced: %+v", p)
+	}
+	want := []string{base, filepath.Join(base, "a"), state}
+	if len(synced) < 3 || fmt.Sprint(synced[:3]) != fmt.Sprint(want) {
+		t.Fatalf("synced %v, want %v first", synced, want)
+	}
+}
