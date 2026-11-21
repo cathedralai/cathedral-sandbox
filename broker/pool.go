@@ -684,7 +684,8 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	pl := placement{diskGiB: k.diskGiB}
 	b.mu.Lock()
 	ph := p.hotel(h.cfg.ID)
-	if why := b.poolCreateRefusalLocked(h, ph, time.Now()); why != "" || !h.warm[k.image] {
+	// Read again at dispatch: the step's reads and deletes ran since the plan.
+	if why := b.poolCreateRefusalLocked(h, ph, time.Now()); why != "" || !h.warm[k.image] || !b.diskFits(h, k.diskGiB) {
 		b.mu.Unlock()
 		<-h.sem
 		return

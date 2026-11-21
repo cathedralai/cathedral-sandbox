@@ -748,3 +748,30 @@ func TestPoolColdKeyDoesNotStopAWarmKey(t *testing.T) {
 		t.Fatalf("GET hotel a: %v", ha)
 	}
 }
+
+// The disk rule is read again just before a pool create is sent: a hotel
+// whose room disk crossed its admission line after the step's plan gets no
+// pool create (codex review of #658).
+func TestPoolCreateRechecksDiskBeforeItIsSent(t *testing.T) {
+	limit := 80.0
+	pc := newPoolChain(t, []string{"a"}, func(c *config) { c.Hotels[0].DiskAdmitUsedPct = &limit })
+	f := pc.hotels["a"]
+	h := pc.b.hotelByID("a")
+	pc.up("a")
+	pc.target(1)
+	w := pc.b.poolPlan(h)
+	if w == nil || w.create == nil {
+		t.Fatal("the plan made no create")
+	}
+	full := 90.0
+	pc.b.mu.Lock()
+	h.roomDataPct = &full // the room disk crossed the line after the plan
+	pc.b.mu.Unlock()
+	pc.b.poolCreate(context.Background(), h, *w.create, w.att)
+	if n := len(f.creates()); n != 0 {
+		t.Fatalf("%d pool creates on a hotel over its disk line, want 0", n)
+	}
+	if c := pc.counts("a"); c.held != 0 {
+		t.Fatalf("pool holds %+v", c)
+	}
+}
