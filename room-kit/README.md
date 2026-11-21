@@ -211,6 +211,28 @@ signed request at a time, so the order of its receipts is the order things ran.
 
 An ordinary room runs requests side by side, as before.
 
+### Terminal sockets (AB#385)
+
+`GET /v1/sandboxes/<id>/terminals/<tid>/ws` with a WebSocket handshake passes
+through the front (before, the front dropped `Upgrade` and the API answered a
+plain GET with 404). The front needs the hotel key, sends the same handshake to
+the room API with its own key and the caller's `Sec-WebSocket-*` and
+`X-Cathedral-Access-Ticket` headers (the API checks and spends the ticket), and
+signs `terminal_session_open` on the API's answer: on a 101 with a `session_id`,
+in `X-Room-Receipt` on the 101; on a refusal with its status and the hash of
+its body. Then it passes raw bytes both ways, frames unread. When either side
+ends (or the caller sends nothing for 900 s), it signs `terminal_session_close`
+with the same `session_id`, `session_open_receipt_sha256`, `close_reason`,
+`duration_ms`, and per direction the byte count and sha256 of the bytes after
+the handshake, counted as the front wrote them to the other side's socket
+(`client_bytes`/`client_sha256` from the caller to the room,
+`room_bytes`/`room_sha256` from the room to the caller; a send cut short counts
+only what went out). The close receipt is in the room's receipt
+list. The session counts as a request in flight for the room, so the front's
+look leaves the room alone while it is open. Serial rooms and
+unclaimed pool rooms refuse the socket as before. Not over the miner hotel's TLS
+port (501): terminals never reach a miner hotel.
+
 ### Receipts when a room ends without a request
 
 The front keeps a table of live rooms (a room enters with its 2xx create and
