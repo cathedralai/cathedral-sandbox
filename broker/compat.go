@@ -308,14 +308,19 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	b.compat.mu.Unlock()
 	b.markDirty()
 	// Warm every hotel in the background; a create pulls a missing image anyway.
-	pf, _ := json.Marshal(map[string]any{"images": []string{img.Ref}})
+	// As the guest (AB#859): the hotel grants the image to the guest, and the
+	// guest's creates of it then prefer the hotels that hold it.
 	for _, ht := range b.hotelList() {
 		if !g.limitsAllow(b, ht.cfg.ID) { // never touch a hotel outside the guest's list
 			continue
 		}
-		go func(ht *hotel) {
-			_, _, _, _ = ht.do(context.Background(), "POST", "/v1/images/prefetch", nil, pf, 10*time.Minute)
-		}(ht)
+		b.mu.Lock()
+		full, gen := b.prefetchDiskFull(ht), ht.warmGen
+		b.mu.Unlock()
+		if full { // AB#861
+			continue
+		}
+		go b.prefetchRef(ht, g, img.Ref, nil, gen, true)
 	}
 	writeJSON(w, 200, map[string]any{"image_id": img.ID, "state": "ready", "image": img.Ref})
 }
