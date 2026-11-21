@@ -47,6 +47,20 @@ Creates in flight:
   full memory limit. Such a hotel shows 0 free rooms, and the operator stats
   show `mem_full: true`. When every eligible hotel is full this way, a
   create gets 429 `no_free_rooms`.
+- Disk budget (AB#831, `disk.go`). A room's disk is its
+  `resources.disk_gib` (hotel default 10 GiB). A hotel with
+  `"disk_extra_gib": N` in its config entry takes a room above 10 GiB only
+  while the extra of its rooms (`disk_gib - 10` each, rooms queued and
+  creating included) plus the new room's extra is at most N, and while its
+  last health `live.room_data_used_pct` is under 80 (no reading yet passes).
+  `0`: rooms of 10 GiB or less only. Absent: no disk limit and no
+  `room_data_used_pct` check (the behaviour before AB#831). Rooms of 10 GiB
+  or less are never affected. The broker learns each room's disk from the
+  create and from the hotel room list, so a restart keeps the count; until
+  a hotel's first room list answers after a start, it takes no room above
+  10 GiB. When a
+  hotel would take the room but none has the disk, the create gets 429
+  `disk_sold_out` with `Retry-After: 60` (native and compat).
 
 ## Hotel choice
 
@@ -240,8 +254,9 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 `GET /v1/broker/capacity`:
 
 - Operator key: every hotel with `id`, `class`, `labels`, `up`, `drain`,
-  `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`
-  and `admission`, plus `classes`: for the one class (`sealed`) the totals
+  `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`,
+  `admission`, `disk_extra_gib` (null: no disk limit), `disk_extra_used_gib`
+  and `room_data_used_pct` (null: no reading yet), plus `classes`: for the one class (`sealed`) the totals
   `hotels`, `joined`, `up`, `placeable`, `pending_admission`, `draining`,
   `slots` and `free_rooms`.
 - Guest key: only the hotels the guest can reach, each with `tier`
@@ -276,6 +291,7 @@ still omit commands, files, and outputs. One room's own receipts are
 | Route (guest key) | What it does |
 |---|---|
 | `POST /v1/hotels/<id>/attest` `{"report_data_hex": "<128 hex>"}` | Passes the body to the hotel's `POST /room/attest` and returns the hotel's status, JSON and `Retry-After` unchanged: a fresh SEV-SNP report whose REPORT_DATA is those 64 bytes verbatim (see room-kit README). A hotel outside the guest's hotel list answers 404, as for receipts. Body cap 4096 bytes (413). An optional `"sandbox_id"` must name a room of this guest on that hotel (404 `room_not_found` otherwise) and goes to the hotel as the hotel's room id. |
+| `POST /v1/sandboxes/<hotel>.<room>/release-proof` | For an owned room on an allowed hotel, wraps the JSON challenge body as `{"sandbox_id":"<local-room>","challenge":...}` and sends it to the hotel's Health front at `/room/release-proof`. The local room comes only from the owned URL. Request cap 2048 bytes, reply cap 8192 bytes, 10-second guest deadline. Exact route and POST only. No redirects or application retries. Existing hotel credential and attested-TLS gate apply. The response is unverified guest evidence for the release service, not delivery or command permission. Requires a guest image implementing this endpoint. |
 
 A hotel signs receipts only for calls that pass through its receipt front
 (room kit, `127.0.0.1:18092` on a shared hotel; `:18090` in a sealed
@@ -571,7 +587,7 @@ receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested) and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). Every hotel must set `"sealed": true` (AB#776); a join without it gets 400 `invalid_hotel`. For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation; `"verify": false` is refused (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
 
@@ -752,11 +768,40 @@ Config (all optional):
 `pending` or `refused` (with `reason`). `GET /v1/broker/hotels` (guest key) lists all
 hotels with labels and free rooms.
 
+## Preview URL certificates (DNS-01 challenge service)
+
+AB#423. One Let's Encrypt wildcard per sealed hotel, `*.<hotel id>.<zone>`,
+with the private key made in the guest. The guest's ACME client proves the
+name over DNS-01 through the broker, which lets each hotel set only its own
+record: `_acme-challenge.<hotel id>.<zone>`.
+
+`PUT /v1/broker/acme-challenge` takes no Bearer key. Body:
+
+```json
+{"purpose": "cathedral-acme-dns01-v1", "zone": "<zone>", "hotel": "<hotel id>",
+ "binding_sha256": "<current binding>", "values": ["<43 char base64url>"], "ts": <unix seconds>}
+```
+
+Header `X-Cathedral-Hotel-Signature`: standard base64 of the Ed25519
+signature, by the receipt key the hotel's binding names, over
+`cathedral-acme-dns01-v1\n` followed by the raw body. The broker uses the key
+it stored at admission, and only when the AMD chain passed for that binding,
+the measurement is on `sealed_measurements` and the hotel is admitted now.
+Every untrusted request gets the same `403 forbidden`. After that: up to 2
+values (the wildcard and the bare name share the record), `[]` removes the
+record, `ts` within 120 s of the broker clock and later than the last accepted
+one from that hotel. The record is replaced as a whole (TTL 60).
+
+| Key | Meaning |
+|---|---|
+| `acme_dns` | Absent: the route answers `404 not_enabled`. `{"zone": "hotels.example.com", "cloudflare_zone_id": "<32 hex>", "token_file": "<path>"}`. The zone must hold hotel names only (miners choose their hotel id). The token needs DNS edit on that zone only; it is read at each call and never logged. Hotel ids must be one lower-case DNS label to get a name. |
+
 ## Alerts
 
 - First missed heartbeat: the first `/room/health` call that fails after a
   hotel has answered health once sends `[OPERATOR-ALERT]` to the hotel's
-  `alert_chat_id` (the miner operator). One per miss streak; the streak ends
+  `alert_chat_id` (the miner operator), or to `alerts.hotel_chat_id` when the
+  hotel has none. One per miss streak; the streak ends
   at the next good health answer. A late health while room calls still answer
   counts as a miss.
 - Customer-affecting drop: a hotel that was up goes down while it holds guest
@@ -765,7 +810,9 @@ hotels with labels and free rooms.
 - Each audience also waits 10 minutes between two alerts about one hotel, so
   a flapping hotel does not spam.
 - Delivery: `"alerts": {"webhook_url_file": "<file with the https URL>",
-  "ops_chat_id": "<chat>"}`. The URL is a Telegram
+  "ops_chat_id": "<chat>", "hotel_chat_id": "<chat>"}`. One chat for every
+  hotel (the Core Engineering group): set `hotel_chat_id` and `ops_chat_id`
+  to the same id and leave `alert_chat_id` unset. The URL is a Telegram
   `https://api.telegram.org/bot<token>/sendMessage`; the broker POSTs
   `{"chat_id", "text"}`, never logs the URL, and logs a failed delivery by
   kind only. Without a URL or a chat the alert is a log line only.

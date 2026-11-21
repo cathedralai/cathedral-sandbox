@@ -98,6 +98,44 @@ func TestPrewarmMarksCatalogImagesWarmAndDownClearsThem(t *testing.T) {
 	}
 }
 
+// 20 Nov 2026 broker swap smoke: prewarm pulled the sealed-only LFM images onto
+// the unsealed hotel c46 and filled its room volume. Since AB#776 every hotel
+// is sealed, so every hotel gets the sealed-only images and the warm image.
+func TestPrewarmSendsSealedOnlyImagesToEverySealedHotel(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true)
+	sealedOnly := map[string]bool{}
+	for _, tp := range catalogTemplates {
+		if tp.Live && tp.SealedOnly && tp.Image != "" {
+			sealedOnly[tp.Image] = true
+		}
+	}
+	if len(sealedOnly) == 0 {
+		t.Fatal("fixture: the catalog has no live sealed-only image")
+	}
+	pulled := func(id string) map[string]bool {
+		tc.b.prewarmHotel(tc.b.hotelByID(id))
+		got := map[string]bool{}
+		for _, req := range tc.hotels[id].prefetch {
+			for _, im := range req["images"].([]any) {
+				got[im.(string)] = true
+			}
+		}
+		return got
+	}
+	for _, id := range []string{"a", "b"} {
+		got := pulled(id)
+		for im := range sealedOnly {
+			if !got[im] {
+				t.Fatalf("sealed hotel %s did not pull sealed-only image %s", id, im)
+			}
+		}
+		if !got[warmImage] {
+			t.Fatalf("sealed hotel %s did not pull %s: %v", id, warmImage, got)
+		}
+	}
+}
+
 func compatWarmCreates(t *testing.T, tc *testChain, n int) map[string]int {
 	t.Helper()
 	got := map[string]int{}

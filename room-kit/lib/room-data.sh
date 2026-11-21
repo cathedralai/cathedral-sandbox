@@ -1,5 +1,5 @@
 #!/bin/bash
-# Room data volume. Usage: room-data.sh up|down /etc/pool-room/room.env
+# Room data volume. Usage: room-data.sh up|down|grow /etc/pool-room/room.env
 # xfs with project quota (Docker --storage-opt size=), mounted WITHOUT nodev
 # (Docker disables overlay2 quota on a nodev mount).
 # With ROOM_WORKSPACES=1, $ROOM_DATA_DIR/workspaces is a bind mount of itself
@@ -23,6 +23,9 @@ case "${1:?up|down}" in
       fi
       mount -o prjquota,noatime "$SRC" "$ROOM_DATA_DIR"
     fi
+    # A loop image the installer grew (ROOM_DATA_SIZE_GB) while it was not
+    # mounted: fill the file now. A no-op when the file system already does.
+    [ -n "${ROOM_DATA_DEVICE:-}" ] || "$0" grow "$2"
     if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then
       WS=$ROOM_DATA_DIR/workspaces
       mkdir -p "$WS"
@@ -34,6 +37,15 @@ case "${1:?up|down}" in
       mountpoint -q "$WS" || mount --bind "${SRC:-$WS}" "$WS"
       mount -o remount,bind,nosuid,nodev,noexec "$WS"
     fi
+    ;;
+  grow)
+    # Online grow of a loop image after install.sh made the file larger
+    # (AB#819): the loop device rereads the file size, then xfs fills it. xfs
+    # cannot shrink, so the installer never makes the file smaller.
+    [ -z "${ROOM_DATA_DEVICE:-}" ] || exit 0
+    mountpoint -q "$ROOM_DATA_DIR" || exit 0
+    for d in $(losetup -j "$ROOM_DATA_IMG" | cut -d: -f1); do losetup -c "$d"; done
+    xfs_growfs "$ROOM_DATA_DIR" >/dev/null
     ;;
   down)
     if mountpoint -q "$ROOM_DATA_DIR/workspaces"; then umount "$ROOM_DATA_DIR/workspaces"; fi

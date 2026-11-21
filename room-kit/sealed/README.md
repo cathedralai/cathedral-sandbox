@@ -435,7 +435,9 @@ plane treats that as a new boot: drain, then a fresh join with a new key.
 `host-net.sh` (run by the unit) adds, in miner mode only:
 
 - a DNAT of `SEALED_MINER_PUBLIC_PORT` on this host's own addresses to the
-  guest's HTTPS port;
+  guest's HTTPS port, in nat PREROUTING (connections from elsewhere) and nat
+  OUTPUT (connections this host opens, such as a broker on the same host,
+  AB#822);
 - a FORWARD accept for new connections to that port;
 - the answers on those connections.
 
@@ -446,8 +448,10 @@ also do the following:
   group, a router port-forward, or an nftables forward chain with a drop
   policy.
 - Have a public IPv4 address.
-- Check from the host itself with `https://<guest ip>:<SEALED_MINER_TLS_PORT>`.
-  The host's own connections to its public address are not forwarded.
+- Check from the host itself with `https://<guest ip>:<SEALED_MINER_TLS_PORT>`
+  or the public origin; both reach the guest. A guest TLS key on the public
+  origin does not prove the port is open from outside (the cloud firewall is
+  not on this path): check that from another machine.
 
 `install-sealed.sh` cannot count rooms in a running miner guest, because the
 host has no key. A restart needs `SEALED_RESTART_WITH_ROOMS=1`, after the
@@ -505,6 +509,36 @@ uses it to keep the hotel key off the host too:
   `--tls-spki-sha256 <peer>` to the `amd_verifier` command.
 - **`admission_policy`.** The broker must report it in operator capacity
   (#1588 checklist).
+
+## Preview URL ingress on the host (AB#423)
+
+`SEALED_GUEST_INGRESS=1` in `sealed.env` makes `host-net.sh` add, the same
+way as the miner port:
+
+- a DNAT of `SEALED_INGRESS_PUBLIC_PORT` (default 443) on this host's own
+  addresses to the guest's ingress port `SEALED_INGRESS_TLS_PORT` (default
+  8443);
+- a FORWARD accept for new connections to that port, and the answers on them.
+
+Host side only: not measured, no re-seal. TLS ends in the guest, with a key
+made there; the certificate is the hotel's Let's Encrypt wildcard, proven over
+DNS-01 through the broker (broker README, "Preview URL certificates"). Before
+turning it on: nothing else on the host may need port 443 on its own
+addresses, the port must be open in any outer firewall, and `*.<hotel
+id>.<zone>` must point at this host. `down` removes every port forward tagged
+for this hotel, whatever `sealed.env` says now, so turning ingress off or
+editing the public port leaves no old forward behind; `up` and `check` drop
+such a leftover too (`check` only once the guest unit is inactive or failed,
+never while it is activating or deactivating), and `down` (or `check` for a
+stopped guest) exits non-zero if it could not. A forward matches every local address, so `up`
+refuses a public port that another sealed hotel on this host already
+forwards, and refuses to add one when it cannot list the rules. The check and
+the add hold a host-wide lock (`/run/lock/sealed-hotel-dnat.lock`), so two
+hotels starting together cannot both take one port.
+
+Still open: the guest side (an nft accept for the ingress port, the server on
+it, the ACME client that signs its challenge with the receipt key). It is in
+the measured image and needs a re-seal.
 
 ## Remove
 

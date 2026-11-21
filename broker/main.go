@@ -54,6 +54,12 @@ type hotelConfig struct {
 	KeyFile     string `json:"key_file"`
 	Concurrency int    `json:"concurrency"` // creates in flight at this hotel
 	Drain       bool   `json:"drain"`       // true: no new rooms here; existing rooms keep working
+	// DataConns: data connections to the hotel (room calls; each exec holds
+	// one for its run). 0: concurrency + 64. DataConnWaitSeconds: how long a
+	// call waits for a free one before 503 sold_out; 0: 10 s, -1: until the
+	// call's own deadline (hotelconns.go, AB#819).
+	DataConns           int `json:"data_conns,omitempty"`
+	DataConnWaitSeconds int `json:"data_conn_wait_seconds,omitempty"`
 	// Labels describe the hotel, for example {"sealed": "true"}. A guest can
 	// ask for rooms only on hotels with (or without) some labels.
 	Labels   map[string]string `json:"labels"`
@@ -99,6 +105,16 @@ type hotelConfig struct {
 	// AlertChatID: the miner operator's Telegram chat for the first missed
 	// heartbeat of this hotel (alerts.go). Empty: a log line only.
 	AlertChatID string `json:"alert_chat_id,omitempty"`
+	// DiskExtraGiB: the disk this hotel may give rooms above the base 10 GiB
+	// each, summed over its rooms (disk.go, AB#831). Nil: no disk limit.
+	// 0: rooms of 10 GiB or less only.
+	DiskExtraGiB *int `json:"disk_extra_gib,omitempty"`
+	// DiskAdmitUsedPct: admit by the scratch the hotel really uses, not by
+	// the rooms' disk limits (disk.go, AB#831 50 GiB default). Set, the hotel
+	// takes any room of any disk while its room_data_used_pct is under this
+	// value and none at or above it; disk_extra_gib is not counted. Nil: the
+	// disk_extra_gib rule above.
+	DiskAdmitUsedPct *float64 `json:"disk_admit_used_pct,omitempty"`
 }
 
 type guestConfig struct {
@@ -205,6 +221,9 @@ type config struct {
 	// Room terminal routes reach only these hotels. Empty: no hotel. A miner
 	// hotel never gets them, listed or not (terminalsRefused).
 	TerminalHotels []string `json:"terminal_hotels,omitempty"`
+	// ACMEDNS turns on the DNS-01 challenge service for Preview URL
+	// certificates (acme_dns.go, AB#423). Absent: off.
+	ACMEDNS *acmeDNSConfig `json:"acme_dns,omitempty"`
 	// Alerts: where the missed heartbeat and customer drop alerts go
 	// (alerts.go). Absent: log lines only.
 	Alerts *alertsConfig `json:"alerts,omitempty"`
@@ -239,6 +258,7 @@ type room struct {
 	slot     int // index in the hotel grid, -1 if not drawn
 	since    time.Time
 	vanished time.Time
+	diskGiB  int // resources.disk_gib; 0: unknown, the hotel default (disk.go)
 	// deleteSent: the guest asked for the delete. A room marked deleting by
 	// the sync loop alone may be listed again (a late list) and come back.
 	deleteSent bool
@@ -257,6 +277,7 @@ type hotel struct {
 	guestPin atomic.Pointer[[sha256.Size]byte]
 	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem      chan struct{}
+	conns    *connGate // data connection slots (hotelconns.go)
 
 	// Guarded by broker.mu.
 	slots        int
@@ -264,6 +285,7 @@ type hotel struct {
 	rooms        map[string]*room // by hotel room id
 	queued       int
 	creating     int
+	diskPending  int // extra disk GiB of the creates in queued and creating (disk.go)
 	backoffUntil time.Time
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
 	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
@@ -287,6 +309,7 @@ type hotel struct {
 	cpuPct          float64
 	memPct          float64
 	memGiB          float64
+	roomDataPct     *float64 // live.room_data_used_pct of the last good health; nil: no reading (disk.go)
 	load1           float64
 	containers      int
 	apiRunning      int
@@ -344,6 +367,7 @@ type broker struct {
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
+	acmeDNS          acmeDNSState             // DNS-01 challenge records (acme_dns.go)
 	hotelsMutationMu sync.Mutex               // keeps runtime mutations and their saves in order (hotels.json and hotel-lends.json)
 	stateSaveMu      sync.Mutex               // one client-state save at a time, snapshot through rename (state.go)
 	guests           map[string]*guestState
@@ -525,6 +549,12 @@ func loadBroker(path string) (*broker, error) {
 		if !validAlertChat(hc.AlertChatID) {
 			return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
 		}
+		if err := checkDataConnConfig(hc); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
+		}
+		if err := checkDiskConfig(hc); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
+		}
 		k, err := os.ReadFile(hc.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("hotel %s key: %w", hc.ID, err)
@@ -599,6 +629,9 @@ func loadBroker(path string) (*broker, error) {
 	if err := c.AMDVerifier.validate(); err != nil {
 		return nil, fmt.Errorf("config: amd_verifier: %w", err)
 	}
+	if err := c.ACMEDNS.validate(); err != nil {
+		return nil, fmt.Errorf("config: acme_dns: %w", err)
+	}
 	for _, h := range b.hotelList() {
 		if r := h.cfg.ReservedFor; r != "" && b.guests[r] == nil {
 			return nil, fmt.Errorf("config: hotel %q is reserved_for unknown guest %q", h.cfg.ID, r)
@@ -638,9 +671,10 @@ var errAnswerTooLarge = errors.New("the hotel answer is over its size limit")
 // answerRead bounds one answer read (AB#752): at most maxBytes (0: no limit),
 // and, with a pool, only once the answer's size is reserved in it for owner.
 type answerRead struct {
-	maxBytes int64
-	pool     *answerPool
-	owner    string
+	noRedirect bool // one destination only; no redirect or cookie replay
+	maxBytes   int64
+	pool       *answerPool
+	owner      string
 }
 
 // doHeadersMax is doHeaders under an answerRead. A longer answer is an error,
@@ -668,7 +702,25 @@ func (h *hotel) doHeadersMax(ctx context.Context, base, method, path string, que
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := h.client.Do(req)
+	// Room calls (/v1/...) take a data connection slot (hotelconns.go); the
+	// /room/... calls (attestation, receipts, escape nonce) go to the Health
+	// port, which has its own connections, and are not gated. The slot is held
+	// until the body below is read and closed (defers run last in, first out).
+	if !strings.HasPrefix(path, "/room/") {
+		releaseConn, err := h.conns.acquire(ctx, h.cfg.ID)
+		if err != nil {
+			return 0, nil, nil, noop, err
+		}
+		defer releaseConn()
+	}
+	client := h.client
+	if lim.noRedirect {
+		copy := *client
+		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		copy.Jar = nil
+		client = &copy
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, noop, err
 	}
@@ -810,7 +862,7 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) 
 	total := 0.0
 	weight := make([]float64, len(hotels))
 	for i, h := range hotels {
-		if exclude[h] || !pl.allows(h) {
+		if exclude[h] || !pl.allows(h) || !b.diskFits(h, pl.diskGiB) {
 			continue
 		}
 		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
@@ -916,15 +968,24 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			if last.status >= 500 {
 				g.failed++
 			}
+			// A hotel would take the room but for its disk: sold out of disk,
+			// not of rooms.
+			// The disk extra is held on the hotel (holdDisk) from pick until
+			// the room is known or the create ends (disk.go).
+			diskOnly := last.status == 0 && b.pick(tried, pl.withoutDisk()) != nil
 			b.mu.Unlock()
 			if last.status != 0 {
 				return finish(last)
+			}
+			if diskOnly {
+				return finish(diskSoldOut(pl.diskGiB))
 			}
 			return finish(b.noRoom(asked))
 		}
 		tried[h] = true
 		h.queued++
 		g.queued++
+		h.holdDisk(pl, 1)
 		b.mu.Unlock()
 
 		// Wait for a create slot. A create that waits too long moves to
@@ -940,6 +1001,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		if h.leaving || !b.admitted(h, time.Now()) {
 			h.queued--
 			g.queued--
+			h.holdDisk(pl, -1)
 			b.mu.Unlock()
 			<-h.sem
 			continue
@@ -950,6 +1012,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// waited for a slot: start no room.
 			h.queued--
 			g.queued--
+			h.holdDisk(pl, -1)
 			b.mu.Unlock()
 			<-h.sem
 			if gone {
@@ -959,7 +1022,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		}
 		b.mu.Unlock()
 		tDispatch := time.Now()
-		rm := &room{h: h, guest: g.cfg.ID, state: stCreating, since: tDispatch}
+		rm := &room{h: h, guest: g.cfg.ID, state: stCreating, since: tDispatch, diskGiB: pl.diskGiB}
 		b.mu.Lock()
 		h.queued--
 		g.queued--
@@ -975,6 +1038,17 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 
 		b.mu.Lock()
 		h.creating--
+		h.holdDisk(pl, -1) // a started room counts in h.rooms from here (same b.mu hold)
+		if errors.Is(err, errHotelBusy) {
+			// No data connection came free in time (AB#819). The create was
+			// never sent, so no room can exist there: not lost, nothing to
+			// reap, and the hotel is not resting. Try another hotel.
+			h.release(rm)
+			b.mu.Unlock()
+			last = createResult{status: 503, header: http.Header{"Retry-After": {strconv.Itoa(hotelBusyRetryAfter)}},
+				doc: errDoc("sold_out", "hotel "+h.cfg.ID+hotelBusyMessage)}
+			continue
+		}
 		var doc map[string]any
 		if err == nil {
 			_ = json.Unmarshal(out, &doc)
@@ -1074,7 +1148,10 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// registry says the image is missing or denied; a hotel that
 			// cannot reach the registry (DNS, network, rate limit, disk) is
 			// at fault and must rest so the create moves on.
-			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" && guestImageFault(out)
+			// With the guest's own registry login, the registry's rate limit is
+			// the guest's quota, not the hotel's (AB#817).
+			guestImage := status == 502 && errCodeOf(out) == "image_pull_failed" &&
+				(guestImageFault(out) || (pl.registryAuth && registryRateLimited(out)))
 			// A dedicated machine refusing a create the owner did not sign
 			// (owner_signature_*) is the guest's error, not a broken hotel.
 			ownerRefused := status == 403 && strings.HasPrefix(errCodeOf(out), "owner_signature_")
@@ -1128,6 +1205,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 	labels[batchLabel] = batchID
 	payload["labels"] = labels
 	delete(payload, "count")
+	pl.diskGiB = diskGiBOf(payload["resources"])
 	body, _ := json.Marshal(payload)
 	results := make([]createResult, count)
 	if count == 1 {
@@ -1261,7 +1339,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if s.Labels[batchLabel] != batchID || s.Labels[guestLabel] != guestID {
 			continue
 		}
-		st, _, _, derr := h.do(ctx, "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
+		st, _, _, derr := h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
 		if derr != nil || (st != 204 && st != 404) {
 			ok = false
 			continue
@@ -1371,11 +1449,18 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if ref, _ := payload["image"].(string); ref != "" {
+	// The object form {"image", "registry_auth"} names its reference inside:
+	// the same refusal applies to it (AB#817).
+	if ref := createImageRef(payload); ref != "" {
 		if e := localImageRefusal(ref); e != nil {
 			writeErr(w, e.status, e.code, e.msg)
 			return
 		}
+	}
+	authErr, withAuth := createRegistryAuth(payload)
+	if authErr != nil {
+		writeErr(w, authErr.status, authErr.code, authErr.msg)
+		return
 	}
 	if e := applyCatalogTemplate(payload); e != nil {
 		writeErr(w, e.status, e.code, e.msg)
@@ -1400,13 +1485,18 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "create_request_batch_unsupported", "the create bytes can be returned for a single create only (count 1)")
 		return
 	}
+	if wantBytes && withAuth {
+		// The bytes hold the registry login: they never travel back.
+		writeErr(w, 400, "create_request_with_registry_auth", "the create bytes are not returned for a create with registry_auth")
+		return
+	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
-		writeErr(w, perr.status, perr.code, perr.msg)
+		writeAPIErr(w, perr)
 		return
 	}
 	pl.apply(payload)
-	pl.image, _ = payload["image"].(string)
+	pl.image = createImageRef(payload)
 	if e, retry := b.admit(g, count); e != nil {
 		writeLimitErr(w, e, retry)
 		return
@@ -1435,7 +1525,11 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	status := 202
 	if len(docs) == 0 {
 		status = results[0].status
-		if status == 429 {
+		if ra := results[0].header.Get("Retry-After"); status == 503 && ra != "" {
+			w.Header().Set("Retry-After", ra) // sold_out: no hotel connection (AB#819)
+		} else if e, _ := results[0].doc["error"].(map[string]string); status == 429 && e["code"] == "disk_sold_out" {
+			w.Header().Set("Retry-After", strconv.Itoa(diskSoldOutRetryAfter))
+		} else if status == 429 {
 			w.Header().Set("Retry-After", "5")
 		}
 	}
@@ -1550,6 +1644,12 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
 		return
 	}
+	// The proof lives on the guest's receipts front, not its sandbox API.
+	// Resolve the route's room under this guest before selecting that endpoint.
+	if gate == "release-proof" {
+		b.handleRoomReleaseProof(w, r, g, h, hid, tail)
+		return
+	}
 	// A terminal WebSocket goes to the hotel as a raw byte pump (terminal_ws.go),
 	// after the allowlist and ownership checks above. A plain GET on the same
 	// path takes the normal route below.
@@ -1600,7 +1700,13 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		bodyArg = body
 	}
 	tDispatch := time.Now()
-	status, hdr, out, err := h.do(r.Context(), r.Method, path, r.URL.Query(), bodyArg, timeout)
+	callCtx := r.Context()
+	if r.Method == "DELETE" && tail == "" {
+		// A room delete that gave up would leave the room running on a full
+		// hotel: it waits for a connection until its deadline, as before.
+		callCtx = waitForConnUntilDeadline(callCtx)
+	}
+	status, hdr, out, err := h.do(callCtx, r.Method, path, r.URL.Query(), bodyArg, timeout)
 	// AB#741: the same split as a create (X-Broker-Queue-Ms, X-Broker-Hotel-Ms) on
 	// every answer that went to the hotel, failures included, so a burst of execs
 	// can be split into broker and hotel time per request. Here the "queue" is the
@@ -1609,7 +1715,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	// before the hotel was asked.
 	setBrokerTiming(w.Header(), h.cfg.ID, tDispatch.Sub(tRecv), time.Since(tDispatch))
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	if r.Method == "DELETE" && tail == "" && (status == 204 || status == 404) {
@@ -1769,8 +1875,12 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 	}
 	status, hdr, out, err := h.doBase(r.Context(), h.cfg.Health, "GET", "/room/"+doc, r.URL.Query(), nil, time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
+	}
+	if status == 200 && doc == "receipts" {
+		after, _ := strconv.Atoi(r.URL.Query().Get("after"))
+		b.archiveHotelPage(h, after, out)
 	}
 	if v := hdr.Get("Content-Type"); v != "" {
 		w.Header().Set("Content-Type", v)
@@ -1780,9 +1890,10 @@ func (b *broker) handleHotelDoc(w http.ResponseWriter, r *http.Request, rest str
 	_, _ = w.Write(out)
 }
 
-// hotelAttestBodyMax caps POST /v1/hotels/<id>/attest. The body is one
-// field of 128 hex characters.
-const hotelAttestBodyMax = 4096
+// hotelAttestBodyMax caps POST /v1/hotels/<id>/attest. The body is 128 hex
+// characters, plus for an Escape rd-claims-v1 report the receipt claims in
+// escape_claims_b64 (the hotel takes up to 12 KiB of claims, about 2 KiB today).
+const hotelAttestBodyMax = 20480
 
 // handleHotelAttest passes POST /v1/hotels/<id>/attest to the hotel's
 // POST /room/attest: a fresh SEV-SNP report whose REPORT_DATA is the 64
@@ -1796,7 +1907,7 @@ func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *ho
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hotelAttestBodyMax))
 	if err != nil {
-		writeErr(w, 413, "body_too_large", "attest body over 4096 bytes")
+		writeErr(w, 413, "body_too_large", "attest body over 20480 bytes")
 		return
 	}
 	// "sandbox_id" asks for that room's signed create receipt too. Only a
@@ -1813,7 +1924,7 @@ func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *ho
 		http.Header{guestHeader: {g.cfg.ID}},
 	)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	for _, k := range []string{"Content-Type", "Retry-After"} {
@@ -2009,7 +2120,7 @@ func bulkDeleteFromHotel(ctx context.Context, h *hotel, q url.Values) (int, bool
 	deadline := time.Now().Add(12 * time.Second)
 	sawClaimBusy := false
 	for {
-		status, _, body, err := h.do(ctx, "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
+		status, _, body, err := h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes", q, nil, 30*time.Minute)
 		if err != nil {
 			if sawClaimBusy {
 				return 409, true
@@ -2057,6 +2168,8 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 	if r.Method == "POST" {
 		for _, h := range b.hotelList() {
 			h.created, h.failed, h.rejected, h.lat = 0, 0, 0, latencies{}
+			h.conns.waits.Store(0)
+			h.conns.refused.Store(0)
 		}
 		for _, x := range b.guests {
 			x.created, x.failed, x.rejected = 0, 0, 0
@@ -2079,6 +2192,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1, "mem_full": b.memFull(h),
 			"created": h.created, "failed": h.failed, "rejected_429": h.rejected,
 			"hotel_ms": pct(h.lat.hotel), "queue_ms": pct(h.lat.queue), "overhead_ms": pct(h.lat.overhead),
+			"conns": h.conns.stats(),
 		})
 	}
 	writeJSON(w, 200, map[string]any{"guest": g.cfg.ID, "created": g.created, "failed": g.failed, "rejected_429": g.rejected, "hotels": hotels})
@@ -2096,6 +2210,8 @@ type healthDoc struct {
 		MemPct float64  `json:"host_mem_used_pct"`
 		MemGiB float64  `json:"host_mem_used_gib"`
 		Load1  float64  `json:"load1"`
+		// RoomDataPct: use of the scratch that holds the room disks (disk.go).
+		RoomDataPct *float64 `json:"room_data_used_pct"`
 	} `json:"live"`
 }
 
@@ -2114,6 +2230,8 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			ID     string            `json:"id"`
 			State  string            `json:"state"`
 			Labels map[string]string `json:"labels"`
+			// A map, so a hotel that sends an odd field does not fail the list.
+			Resources map[string]any `json:"resources"`
 		} `json:"sandboxes"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
@@ -2185,6 +2303,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			h.cpuPct = *hd.Live.CPU
 		}
 		h.memPct, h.memGiB, h.load1 = hd.Live.MemPct, hd.Live.MemGiB, hd.Live.Load1
+		h.roomDataPct = hd.Live.RoomDataPct
 		if hd.SandboxesRunning != nil {
 			h.containers = *hd.SandboxesRunning
 		}
@@ -2218,6 +2337,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			continue
 		}
 		if rm := h.rooms[s.ID]; rm != nil {
+			if d := diskGiBOf(s.Resources); d > 0 {
+				rm.diskGiB = d
+			}
 			if rm.state == stDeleting && !rm.deleteSent {
 				// A list that missed the room (built before its create landed)
 				// marked it deleting; the hotel lists it, so it runs.
@@ -2228,7 +2350,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			}
 			continue
 		}
-		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now}
+		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now, diskGiB: diskGiBOf(s.Resources)}
 		h.rooms[s.ID] = rm
 		b.register(rm)
 		h.place(rm)
@@ -2566,7 +2688,16 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(p, "/v1/broker/bindings/") && r.Method == "GET" && b.isOperator(r) {
-		b.handleBindingGet(w, strings.TrimPrefix(p, "/v1/broker/bindings/")) // operator key only
+		id := strings.TrimPrefix(p, "/v1/broker/bindings/")
+		if sha, ok := strings.CutSuffix(id, "/receipts"); ok {
+			b.handleChainGet(w, sha) // operator key only
+			return
+		}
+		b.handleBindingGet(w, id) // operator key only
+		return
+	}
+	if p == "/v1/broker/acme-challenge" {
+		b.handleACMEChallenge(w, r) // signed by the hotel's attested receipt key, no Bearer key
 		return
 	}
 	if p == "/v1/broker/miner-exits" && r.Method == "GET" && (b.isOperator(r) || b.isOperatorReader(r)) {
@@ -2785,6 +2916,17 @@ func errCodeOf(body []byte) string {
 
 // guestImageFault reports whether a hotel's image_pull_failed message names
 // a missing or denied image (the guest's error) rather than a hotel fault.
+// registryRateLimited reports a pull the registry refused for its rate limit.
+func registryRateLimited(body []byte) bool {
+	var doc struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	return strings.Contains(strings.ToLower(doc.Error.Message), "toomanyrequests")
+}
+
 func guestImageFault(body []byte) bool {
 	var doc struct {
 		Error struct {

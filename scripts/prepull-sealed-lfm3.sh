@@ -18,7 +18,7 @@ BROKER="${BROKER%/}"
 KEY="${CATHEDRAL_API_KEY:?set CATHEDRAL_API_KEY}"
 
 # Live 1.7B pin from broker/catalog.go. Add more digests after each publish.
-DEFAULT_IMAGES='["ghcr.io/cathedralai/room-lfm3-1.7b@sha256:7d0aa94f7bf7d0356a02c65adfc2f3d08f6a26bf750d6d3127780ff8f68d54cb"]'
+DEFAULT_IMAGES='["ghcr.io/cathedralai/room-lfm3-1.7b@sha256:0c5757f472f61228e66e34555cda07f7ac5e2eb8a4edf1707b3a6810242398d2"]'
 IMAGES_JSON="${IMAGES:-$DEFAULT_IMAGES}"
 
 body=$(printf '{"images":%s,"sealed":true}' "$IMAGES_JSON")

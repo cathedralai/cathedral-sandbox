@@ -23,8 +23,8 @@ Checks before signing (a failure exits 1 and signs nothing):
 Hotkey: --hotkey-file reads a Bittensor hotkey file (plaintext JSON with
 "secretSeed") or a file holding the 32-byte seed as 0x hex. An encrypted
 keyfile is refused: export the seed on this host instead. The file must not be
-readable by group or others. Needs py-sr25519-bindings (pip install
-py-sr25519-bindings==0.2.2); the guest does not need it.
+readable by group or others. Needs py-sr25519-bindings and cryptography (pip install
+py-sr25519-bindings==0.2.2 cryptography); the guest does not need them.
 
 Usage:
   hotel_offer.py --origin https://203.0.113.9:9443 --hotkey-file ~/.bittensor/wallets/w/hotkeys/h
@@ -59,6 +59,10 @@ SIGNING_DOMAIN = b"cathedral-hotel-offer-v1\x00"
 HARDWARE_DOMAIN = b"cathedral.amd-sev-snp.hardware-v1\x00"
 ATTESTATION_ROUTE = "/room/attestation"
 ATTESTATION_MAX_BYTES = 64 * 1024
+# Cloudflare in front of the Polaris API answers 403 "error code: 1010" to urllib's
+# default "Python-urllib/x.y" agent, so an offer sent without its own agent never
+# reaches the API.
+USER_AGENT = "cathedral-hotel-offer/1"
 SNP_REPORT_BYTES = 1184
 REPORT_DATA_OFFSET = 0x50
 CHIP_ID_OFFSET = 0x1A0
@@ -131,9 +135,10 @@ def check_origin(origin: str) -> str:
 def check_fetch_url(url: str) -> str:
     """Where to read the attestation from: https://<ip>:<port>, no path. Any address, private included.
 
-    On a miner using sealed/host-net.sh the host cannot reach its own public
-    address (the forward is PREROUTING only), so the fetch address is the guest's
-    (https://<guest ip>:<SEALED_MINER_TLS_PORT>) while the offer advertises the public origin.
+    On a miner using sealed/host-net.sh the guest address
+    (https://<guest ip>:<SEALED_MINER_TLS_PORT>) is the direct path while the offer
+    advertises the public origin. host-net.sh releases before AB#822 forwarded the
+    public port in PREROUTING only, so there the host cannot reach its own public address.
     """
     try:
         parsed = urlsplit(url)
@@ -153,8 +158,11 @@ def fetch_attestation(origin: str, timeout: float = 10.0):
     Returns (document, sha256 of the TLS peer's SPKI). The caller compares the
     SPKI with the binding, which is what makes the missing CA check safe.
     """
-    from cryptography import x509
-    from cryptography.hazmat.primitives import serialization
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+    except ImportError:
+        raise OfferError("cryptography is not installed (pip install cryptography)") from None
     parsed = urlsplit(origin)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
@@ -253,7 +261,8 @@ def build_offer(*, seed: bytes, network: str, netuid: int, origin: str, binding_
 
 def post(url: str, document: dict, timeout: float = 20.0) -> str:
     body = canonical(document)
-    request = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    request = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return f"HTTP {response.status} {response.read(65536).decode('utf-8', 'replace')}"

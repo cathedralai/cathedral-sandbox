@@ -71,11 +71,16 @@ func newHotel(hc hotelConfig, key string) *hotel {
 		hc.Concurrency = 16
 	}
 	hc.Labels = fixedLabels(hc, hc.Labels)
-	tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: hc.Concurrency + 64, MaxConnsPerHost: hc.Concurrency + 64, IdleConnTimeout: 90 * time.Second}
+	// The data pool is capped by h.conns (hotelconns.go), which logs, counts and
+	// bounds the wait for a free connection; the transport cap is a backstop.
+	conns := dataConns(hc)
+	// +16: Go frees a closed connection's count a moment after the call ends,
+	// and /room/ calls on a shared port are not gated.
+	tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: conns, MaxConnsPerHost: conns + 16, IdleConnTimeout: 90 * time.Second}
 	// The sync loop (health, quota, list) uses its own small pool: when one
 	// guest's long execs hold every data connection, the hotel must not look down.
 	ctl := &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 8, IdleConnTimeout: 90 * time.Second}
-	h := &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+	h := &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, conns: newConnGate(hc), sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
 	h.tlsPinErr = pinMinerHotel(h)
 	return h
 }
@@ -373,7 +378,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	hc := req.hotelConfig
 	if enroller {
 		if hc.MinerHotkey == "" || !hc.Sealed || (req.Verify != nil && !*req.Verify) ||
-			hc.ReservedFor != "" || hc.Labels != nil ||
+			hc.ReservedFor != "" || hc.Labels != nil || hc.DataConns != 0 || hc.DataConnWaitSeconds != 0 ||
 			!strings.HasPrefix(hc.API, "https://") || (hc.Health != "" && !strings.HasPrefix(hc.Health, "https://")) {
 			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
 			return
@@ -413,6 +418,12 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
+		return
+	case checkDataConnConfig(hc) != nil:
+		writeErr(w, 400, "invalid_hotel", checkDataConnConfig(hc).Error())
+		return
+	case checkDiskConfig(hc) != nil:
+		writeErr(w, 400, "invalid_hotel", checkDiskConfig(hc).Error())
 		return
 	case !validAlertChat(hc.AlertChatID):
 		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
@@ -866,6 +877,7 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
 		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice()}
+	diskDoc(h, d)
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
 	}

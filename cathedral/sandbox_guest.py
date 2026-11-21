@@ -106,6 +106,12 @@ LABEL_OWNER = "cathedral.sandbox.owner"
 LABEL_SANDBOX_ID = "cathedral.sandbox.id"
 # Customer-sealed secrets inside a room (AB#417); room-kit room_receipts.SECRETS_IN_ROOM.
 SECRETS_IN_ROOM = "/run/secrets"
+# -v also removes the room's anonymous volumes. An image that declares VOLUME
+# (docker:dind has VOLUME /var/lib/docker) gets one per room on the hotel data
+# disk, outside the room's quota. Without -v every deleted DinD room left its
+# whole image store behind until the next boot (c46-sealed-2, 19 Nov 2026:
+# 99 of 100 GiB). Named volumes are never removed by -v; rooms get none.
+ROOM_RM_FLAGS = ("-f", "-v")
 SECRETS_DROP_TRIES = 5  # rmtree again while a write of the receipts front races a retire
 
 
@@ -675,6 +681,29 @@ class DockerClient:
         """
         if not refresh and self.image_exists(image):
             return False
+        direct = hub_direct_ref(image) if registry_auth is not None else None
+        if direct is not None:
+            # The guest's own Docker Hub login (AB#817): pull from Hub itself.
+            # dockerd sends a login to every endpoint it tries, its
+            # registry-mirrors (ROOM_REGISTRY_MIRRORS) first, and applies them
+            # to docker.io only, so the registry-1.docker.io name skips them.
+            # Digest refs use the same rewrite: a plain Hub digest would still
+            # hit the mirror and hand the customer credential to Google.
+            self.pull(direct, registry_auth=registry_auth)
+            if "@" in image:
+                # docker tag cannot target a digest reference; the pull already
+                # made the content local under the registry-1.docker.io name.
+                return True
+            # The alias tag stays: removing it would race a parallel create of
+            # the same image, and the per-owner grant covers it.
+            tagged = self.run(["docker", "tag", direct, image], timeout=30.0)
+            if tagged.returncode != 0:
+                raise SandboxOpError(
+                    "image_pull_failed",
+                    502,
+                    f"docker tag failed for {image}: {(tagged.stderr or '').strip()[:300]}",
+                )
+            return True
         mirrored = mirror_ref(mirror, image) if mirror and registry_auth is None else None
         if mirrored is not None:
             try:
@@ -1025,7 +1054,7 @@ class DockerClient:
 
     def remove(self, container_id: str) -> None:
         """Best-effort removal. The result is not checked; use remove_confirmed for GC."""
-        self.run(["docker", "rm", "-f", container_id], timeout=60.0)
+        self.run(["docker", "rm", *ROOM_RM_FLAGS, container_id], timeout=60.0)
 
     def remove_confirmed(self, container_ref: str, *, timeout: float = 60.0) -> bool:
         """Remove a container. Return True only when it is gone.
@@ -1034,7 +1063,7 @@ class DockerClient:
         "No such container" counts as gone.
         """
         try:
-            result = self.run(["docker", "rm", "-f", container_ref], timeout=timeout)
+            result = self.run(["docker", "rm", *ROOM_RM_FLAGS, container_ref], timeout=timeout)
         except SandboxOpError:
             return False
         if result.returncode == 0:
@@ -1152,8 +1181,35 @@ def mirror_ref(mirror: str, image: str) -> str | None:
     return f"{mirror}/{name}"
 
 
+HUB_REGISTRY_HOST = "registry-1.docker.io"
+
+
+def hub_direct_ref(image: str) -> str | None:
+    """Return the registry-1.docker.io name of a Docker Hub *image*, else None.
+
+    "alpine:3.20" -> "registry-1.docker.io/library/alpine:3.20".
+    "acme/private@sha256:…" -> "registry-1.docker.io/acme/private@sha256:…".
+    Images on another registry are not Hub images. Digest refs are rewritten
+    too: a plain Hub digest pull would still use dockerd's registry-mirrors
+    and send the guest login there (AB#817 Fred HOLD).
+    """
+    name, digest = image, ""
+    if "@" in image:
+        name, digest_part = image.split("@", 1)
+        if not digest_part.startswith("sha256:") or len(digest_part) != len("sha256:") + 64:
+            return None
+        digest = "@" + digest_part
+    mirrored = mirror_ref(HUB_REGISTRY_HOST, name)
+    if mirrored is None:
+        return None
+    return mirrored + digest
+
+
 def _registry_host(image: str) -> str:
     first = image.split("/", 1)[0]
+    if "/" in image and first in ("docker.io", "index.docker.io"):
+        # The docker CLI looks a Hub login up under the index key, never "docker.io".
+        return "https://index.docker.io/v1/"
     if "." in first or ":" in first or first == "localhost":
         return first
     return "https://index.docker.io/v1/"
@@ -1695,7 +1751,7 @@ class DockerGuestProvider:
                 self._ensure_image(image, registry_auth=registry_auth, refresh=True)
                 # Refresh may land a newer Id under the same tag; grant that Id
                 # so the post-authorize require() on the run Id can pass.
-                refreshed = self._image_id_of(image)
+                refreshed = self._image_id_after_auth(image, registry_auth=registry_auth)
                 if refreshed is None:
                     raise SandboxOpError(
                         "image_pull_failed", 502, f"image {image} has no docker id after pull"
@@ -1739,7 +1795,7 @@ class DockerGuestProvider:
                     "this guest cannot use that image on this hotel",
                 ) from None
             raise
-        image_id = self._image_id_of(image)
+        image_id = self._image_id_after_auth(image, registry_auth=registry_auth)
         if image_id is None:
             raise SandboxOpError("image_pull_failed", 502, f"image {image} has no docker id after pull")
         # A pull that still resolves to a snapshot/build id did not authorize it.
@@ -1753,6 +1809,18 @@ class DockerGuestProvider:
             )
         self._image_owners.grant(image_id, owner, provenance="registry", ref=image)
         return image_id
+
+    def _image_id_after_auth(
+        self, image: str, *, registry_auth: Mapping[str, str] | None = None
+    ) -> str | None:
+        """Immutable id of *image*, falling back to its Hub-direct digest pull."""
+        image_id = self._image_id_of(image)
+        if image_id is not None or registry_auth is None:
+            return image_id
+        direct = hub_direct_ref(image)
+        if direct and direct != image:
+            return self._image_id_of(direct)
+        return None
 
     def _require_credentials_support(self, credentials) -> None:
         if credentials and self._egress is None:
@@ -2064,7 +2132,24 @@ class DockerGuestProvider:
             if registry_auth is not None:
                 self._auth_pulled.add(image)
                 _save_auth_pulled(self._auth_pulled)
-            inspected = self._client.image_inspect(image)
+            inspected = self._inspect_pulled_image(image, registry_auth=registry_auth)
+        return inspected
+
+    def _inspect_pulled_image(
+        self, image: str, *, registry_auth: Mapping[str, str] | None = None
+    ) -> dict[str, Any]:
+        """Inspect *image*, or its Hub-direct digest form after an auth pull.
+
+        A Hub digest with registry_auth is pulled as registry-1.docker.io/…@…
+        (ensure_image); the short digest name may not resolve until we look at
+        that direct ref (AB#817 Fred HOLD).
+        """
+        inspected = self._client.image_inspect(image)
+        if inspected.get("Id") or registry_auth is None:
+            return inspected
+        direct = hub_direct_ref(image)
+        if direct and direct != image:
+            return self._client.image_inspect(direct)
         return inspected
 
     def _pull_anonymous_once(self, image: str, *, refresh: bool) -> None:
@@ -2182,7 +2267,7 @@ class DockerGuestProvider:
             # inspect afterwards fills the create receipt. Do not call
             # _ensure_image again here — that double-pulled after AB#597/#426.
             self._authorize_image(image, effective_owner, registry_auth=request.image.registry_auth)
-            inspected = self._client.image_inspect(image)
+            inspected = self._inspect_pulled_image(image, registry_auth=request.image.registry_auth)
             self._inner._images[image] = {  # noqa: SLF001
                 "ref": image,
                 "cached": True,
@@ -2201,7 +2286,8 @@ class DockerGuestProvider:
                 "digest": request.build.content_hash,
             }
         dind = is_dind_image(image)
-        inspected = self._client.image_inspect(image)
+        auth = request.image.registry_auth if request.image is not None else None
+        inspected = self._inspect_pulled_image(image, registry_auth=auth)
         # Pin docker run to the inspected Id. Allowlist / start:image decisions
         # were made against this inspect; running the mutable tag would race a
         # retag between inspect and create (AB#709 HOLD).
@@ -2416,10 +2502,21 @@ class DockerGuestProvider:
                 self._inner._touch(self._inner._sandboxes[sandbox_id])  # noqa: SLF001
         return self._enrich_doc(doc, self._guests[sandbox_id])
 
+    def _refuse_without_guest(self, sandbox_id: str) -> SandboxOpError:
+        """The refusal for a command on a room that has no started container.
+
+        The inner provider runs a command as a host process, so this provider never hands one to it: a room
+        that is still being made (or has no container for any other reason) is 409, and the inner record's
+        own state answer (404, deleting, frozen, stopped) comes first.
+        """
+        with self._inner._lock:  # noqa: SLF001
+            sandbox = self._inner._require_running(sandbox_id)  # noqa: SLF001
+        return SandboxOpError("sandbox_not_running", 409, f"sandbox {sandbox_id} is {sandbox.state}; it has no started room yet")
+
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         guest = self._guests.get(sandbox_id)
         if guest is None:
-            return self._inner.exec(sandbox_id, request)
+            raise self._refuse_without_guest(sandbox_id)
         cwd = request.cwd or "/work"
         argv = list(request.argv)
         # Portable shell: ExecRequest maps string cmds to bash -c; many customer images
@@ -2709,7 +2806,7 @@ class DockerGuestProvider:
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         guest = self._guests.get(sandbox_id)
         if guest is None:
-            return self._inner.start_process(sandbox_id, request)
+            raise self._refuse_without_guest(sandbox_id)
         pid = "proc_" + uuid.uuid4().hex[:10]
         log_guest = f"/work/.process-{pid}.log"
         log_host = guest.work_mount / f".process-{pid}.log"

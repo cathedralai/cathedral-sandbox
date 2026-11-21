@@ -130,7 +130,7 @@ def test_bad_report_data_is_a_400(sealed, body) -> None:
 def test_attest_needs_the_hotel_key(sealed, key) -> None:
     port, _ledger, tsm = sealed
     before = len(tsm.inputs)
-    status, _h, _doc = _attest(port, {"report_data_hex": "00" * 64}, key=key)
+    status, _h, _doc = _attest(port, {"report_data_hex": "01" * 64}, key=key)
     assert status == 401 and len(tsm.inputs) == before
 
 
@@ -155,7 +155,7 @@ def test_reports_over_the_limit_get_429(tmp_path, monkeypatch) -> None:
     port = server.server_address[1]
     try:
         for i in range(3):
-            assert _attest(port, {"report_data_hex": f"{i:02x}" * 64})[0] == 200
+            assert _attest(port, {"report_data_hex": f"{i + 1:02x}" * 64})[0] == 200
         status, headers, doc = _attest(port, {"report_data_hex": "ff" * 64})
         assert status == 429 and doc == {"error": "attest_rate_limit"}
         assert 1 <= int(headers["Retry-After"]) <= 61
@@ -228,3 +228,140 @@ def test_a_changed_measurement_is_refused(sealed, monkeypatch) -> None:
     monkeypatch.setattr(rr, "_read_tsm_aux", other)
     status, _h, doc = _attest(port, {"report_data_hex": "22" * 64})
     assert status == 500 and doc["error"] == "attest_failed"
+
+
+@pytest.mark.parametrize("head", [bytes(32), hashlib.sha256(b"a forged binding").digest()])
+def test_binding_shaped_report_data_is_refused(sealed, head) -> None:
+    """sha256(binding) || 32 zero bytes is the boot binding's shape: never signed on request (AB#392)."""
+    port, ledger, tsm = sealed
+    before = len(tsm.inputs)
+    status, _h, doc = _attest(port, {"report_data_hex": (head + bytes(32)).hex()})
+    assert status == 400 and doc["error"] == "report_data_reserved"
+    assert len(tsm.inputs) == before
+    with pytest.raises(ValueError):
+        ledger.attest(head + bytes(32))
+    assert len(tsm.inputs) == before
+
+
+def test_one_nonzero_byte_in_the_tail_is_accepted(sealed) -> None:
+    port, _ledger, tsm = sealed
+    rd = hashlib.sha256(b"x").digest() + bytes(31) + b"\x01"
+    status, _h, _doc = _attest(port, {"report_data_hex": rd.hex()})
+    assert status == 200 and tsm.inputs[-1] == rd
+
+
+# An Escape challenge receipt v1.1 (gt-challenge-sealed-sandbox receipt.py, binding rd-claims-v1) as the API
+# builds it (polariscomputer services/cathedral_challenge_capacity.py build_attestation): REPORT_DATA is
+# sha256(CLAIMS_DOMAIN || canonical(claims)) || 32 zero bytes, the boot binding's shape (AB#392 HOLD on #597).
+ESCAPE_CLAIMS = {
+    "attestation_digest": "57a6c7a63bcdefcf402fccf67bf04920c450f1c114950cfc603b8c0d31c3f005",
+    "challenge": {
+        "challenge_id": "sealed-sandbox-tti",
+        "config_sha256": "d30988eb540a12f821dcaa8544fe9219f9010c8ad60ecc7ca0be075937c5f60c",
+        "main_commit": "7316dbf0eb94d7b1e211c5fe161ef73072edf9f7",
+        "module": "gt_challenge_sealed_sandbox",
+        "package": "gt-challenge-sealed-sandbox @ git+https://github.com/cathedralai/gt-challenge-sealed-sandbox"
+                   "@7316dbf0eb94d7b1e211c5fe161ef73072edf9f7",
+        "repo": "cathedralai/gt-challenge-sealed-sandbox",
+        "seeds": 25,
+        "tier": "standard",
+    },
+    "evaluator": {
+        "cpu_model": "AMD EPYC 9354P 32-Core Processor",
+        "egress": "none",
+        "entrypoint": ["polaris.services.cathedral_challenge_capacity"],
+        "image": "ghcr.io/cathedralai/gt-challenge-sealed-sandbox@sha256:" + "cd" * 32,
+        "machine": "snp:c46-sealed",
+        "memory_mib": 4096,
+        "runner": "polaris-api-in-process",
+        "solver_cpus": 2,
+        "vcpus": 2,
+    },
+    "outputs": {
+        "challenger_valid": 25,
+        "crown": True,
+        "king_valid": 25,
+        "result_sha256": "4f19161b97b0a9afc92760d1d28de29ab79f5e309e5143c5df225b8fa732fdf7",
+        "seed_log_sha256": "335fd79cd238341abc4392bbd6a6cb9c6cd32e5755ed61e26bf5fa7222f7edaa",
+    },
+    "run": {
+        "attempt": 1,
+        "exit_code": 0,
+        "finished_at": "2026-11-19T12:37:45.677975Z",
+        "network": "finney",
+        "run_id": "21a01c84-887b-4c52-8cc1-14a46fb0dad2",
+        "run_nonce": "ebb552bcf6faee8841154b0d90376b35",
+        "seed_block": 4242424,
+        "seed_block_hash": "ab" * 32,
+        "seed_policy": "latest_finalized_at_accept",
+        "started_at": "2026-11-19T12:31:02.565323Z",
+        "wall_seconds": 403,
+    },
+    "submission": {
+        "challenger_path": "solvers/bateesatobi/1",
+        "challenger_tree_sha": "e3cfef0c92fa19ff775960921d9b3e2857ae5e88",
+        "github_id": 1234567,
+        "github_login": "bateesatobi",
+        "hotkey": "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX",
+        "hotkey_signature": "0x" + "9f" * 64,
+        "king_path": "baselines/default",
+        "king_tree_sha": "b83b51c14925903cc4d36716ba81ef5606304d97",
+    },
+}
+# gt-challenge-sealed-sandbox receipt.py CLAIMS_DOMAIN and canonical(): kept literal so a drift fails here.
+GT_CLAIMS_DOMAIN = b"cathedral-challenge-receipt-v1/claims\0"
+
+
+def _escape_report_data(claims: dict) -> tuple[bytes, bytes]:
+    canon = json.dumps(claims, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(GT_CLAIMS_DOMAIN + canon).digest() + bytes(32), canon
+
+
+def test_escape_rd_claims_v1_report_is_signed_with_its_claims(sealed) -> None:
+    """The HOLD on #597: an Escape v1.1 receipt still gets its report, so receipts keep verifying after the roll."""
+    port, ledger, tsm = sealed
+    assert rr.ESCAPE_CLAIMS_DOMAIN == GT_CLAIMS_DOMAIN
+    rd, canon = _escape_report_data(ESCAPE_CLAIMS)
+    assert rr.binding_shaped(rd)
+    body = {"report_data_hex": rd.hex(), "escape_claims_b64": base64.b64encode(canon).decode()}
+    # The broker caps the attest body (broker/main.go hotelAttestBodyMax, 20480): a real body fits with room.
+    assert len(json.dumps(body)) < 8192
+    status, _h, doc = _attest(port, body)
+    assert status == 200 and tsm.inputs[-1] == rd
+    report = base64.b64decode(doc["report_b64"])
+    # What gt-challenge's _check_snp compares: REPORT_DATA == expected_report_data('rd-claims-v1', claims).
+    assert parse_snp_report(report).report_data == rd
+    assert ledger.attest(rd, canon)["report_b64"]
+    # Without its claims the same bytes stay reserved.
+    before = len(tsm.inputs)
+    status, _h, doc = _attest(port, {"report_data_hex": rd.hex()})
+    assert status == 400 and doc["error"] == "report_data_reserved" and len(tsm.inputs) == before
+
+
+def test_escape_claims_cannot_carry_a_forged_binding(sealed) -> None:
+    """The exemption needs the Escape domain preimage, so it never yields sha256(canonical(binding)) || 0."""
+    port, ledger, tsm = sealed
+    before = len(tsm.inputs)
+    forged = json.dumps({"receipt_pubkey": "ab" * 32, "measurement": "cd" * 48}, sort_keys=True,
+                        separators=(",", ":")).encode()
+    rd = hashlib.sha256(forged).digest() + bytes(32)
+    # The binding bytes themselves, or the binding with the domain glued on, do not match its digest.
+    for claims in (forged, GT_CLAIMS_DOMAIN + forged):
+        status, _h, doc = _attest(port, {"report_data_hex": rd.hex(), "escape_claims_b64": base64.b64encode(claims).decode()})
+        assert status == 400 and doc["error"] == "escape_claims_mismatch"
+        with pytest.raises(ValueError):
+            ledger.attest(rd, claims)
+    # Real Escape claims next to someone else's digest are a mismatch too.
+    _rd, canon = _escape_report_data(ESCAPE_CLAIMS)
+    status, _h, doc = _attest(port, {"report_data_hex": rd.hex(), "escape_claims_b64": base64.b64encode(canon).decode()})
+    assert status == 400 and doc["error"] == "escape_claims_mismatch"
+    assert len(tsm.inputs) == before
+
+
+@pytest.mark.parametrize("value", [7, "not base64!", base64.b64encode(b"x" * (12 * 1024 + 1)).decode(), ""])
+def test_bad_escape_claims_are_a_400(sealed, value) -> None:
+    port, _ledger, tsm = sealed
+    before = len(tsm.inputs)
+    rd, _canon = _escape_report_data(ESCAPE_CLAIMS)
+    status, _h, doc = _attest(port, {"report_data_hex": rd.hex(), "escape_claims_b64": value})
+    assert status == 400 and len(tsm.inputs) == before

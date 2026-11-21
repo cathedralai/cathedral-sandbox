@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -72,6 +73,14 @@ type placement struct {
 	// matches, whatever the guest policy says, so no retry, fallback or
 	// queue move can reach one either.
 	ownHostsOnly bool
+	// diskGiB: the create's resources.disk_gib (0: the hotel default). Above
+	// the base disk it must fit a hotel's disk budget (disk.go).
+	diskGiB int
+	// registryAuth: the create carries the guest's own registry login
+	// (image.registry_auth, AB#817). Only a hotel whose create leg is
+	// encrypted to the room runtime matches (encryptedCreateLeg), on every
+	// retry, fallback and queue move too.
+	registryAuth bool
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -79,6 +88,9 @@ func (pl placement) selects(h *hotel) bool {
 		return false
 	}
 	if pl.ownHostsOnly && isMinerHotel(h) {
+		return false
+	}
+	if pl.registryAuth && !encryptedCreateLeg(h) {
 		return false
 	}
 	if len(pl.allowed) > 0 && !pl.allowed[h.cfg.ID] {
@@ -116,6 +128,10 @@ func (pl placement) selects(h *hotel) bool {
 	}
 	return true
 }
+
+// withoutDisk is pl with no disk check at all: the hotels pl allows by room
+// alone (disk.go noDiskCheck).
+func (pl placement) withoutDisk() placement { pl.diskGiB = noDiskCheck; return pl }
 
 func (pl placement) allows(h *hotel) bool {
 	return (pl.only == nil || pl.only == h) && pl.selects(h)
@@ -228,6 +244,53 @@ type apiErr struct {
 }
 
 func (e *apiErr) Error() string { return e.code + ": " + e.msg }
+
+// encryptedCreateLeg reports whether a create body sent to h is encrypted all
+// the way to the room runtime that reads it. Only guest TLS qualifies: TLS
+// terminates inside the sealed guest on a key its SNP attestation names
+// (miner_tls.go), so the host never sees registry_auth. Sealed hotels without
+// guest TLS may terminate on the host; unsealed https still exposes the body
+// to the hotel process. AB#817: sealed-only — no unsealed create leg.
+func encryptedCreateLeg(h *hotel) bool {
+	return h.guestTLS()
+}
+
+// createImageRef is the image reference of a create: the string form, or the
+// "image" of the object form {"image", "registry_auth"} (AB#817). "" for none.
+func createImageRef(payload map[string]any) string {
+	switch v := payload["image"].(type) {
+	case string:
+		return v
+	case map[string]any:
+		ref, _ := v["image"].(string)
+		return ref
+	}
+	return ""
+}
+
+// createRegistryAuth checks the registry login of an object form image. It
+// reports whether the create carries one. The login goes to the hotel in the
+// create bytes and nowhere else: no message here names a value.
+func createRegistryAuth(payload map[string]any) (*apiErr, bool) {
+	img, ok := payload["image"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	raw, ok := img["registry_auth"]
+	if !ok || raw == nil {
+		return nil, false
+	}
+	auth, ok := raw.(map[string]any)
+	if !ok || len(auth) != 2 {
+		return &apiErr{400, "invalid_registry_auth", "registry_auth needs exactly username and password"}, true
+	}
+	for _, k := range []string{"username", "password"} {
+		if s, _ := auth[k].(string); s == "" {
+			return &apiErr{400, "invalid_registry_auth", "registry_auth needs non-empty username and password"}, true
+		}
+	}
+	return nil, true
+}
 
 // localImageRefusal refuses an image reference a guest sends that names a
 // hotel-local artifact instead of a registry image. A hotel keeps every
@@ -359,10 +422,20 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 		pl.ownHostsOnly = own
 	}
+	_, pl.registryAuth = createRegistryAuth(payload)
 	b.scope(g, &pl)
 	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			return pl, nil
+		}
+	}
+	if pl.registryAuth {
+		open := pl
+		open.registryAuth = false
+		for _, h := range b.hotelList() {
+			if open.selects(h) {
+				return pl, &apiErr{409, "registry_auth_needs_encrypted_hotel", "a create with registry_auth goes only to a sealed hotel with attested guest TLS; none matches the hotel selection"}
+			}
 		}
 	}
 	if b.lentAway(pl) {
@@ -512,7 +585,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		}
 		list, err := b.hotelSnapshots(ctx, g, h)
 		if err != nil {
-			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
+			return nil, "", hotelAPIErr(h, err)
 		}
 		if sid := matchSnapshot(g, list, rest); sid != "" {
 			return h, sid, nil
@@ -526,6 +599,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	}
 	var mu sync.Mutex
 	var hits []hit
+	var busy []string
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
 		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
@@ -535,6 +609,12 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		go func(h *hotel) {
 			defer wg.Done()
 			list, err := b.hotelSnapshots(ctx, g, h)
+			if errors.Is(err, errHotelBusy) {
+				mu.Lock()
+				busy = append(busy, h.cfg.ID)
+				mu.Unlock()
+				return
+			}
 			if err != nil {
 				return
 			}
@@ -550,6 +630,10 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	case 1:
 		return hits[0].h, hits[0].sid, nil
 	case 0:
+		// A busy hotel was never asked; it may hold the snapshot (AB#819).
+		if len(busy) > 0 {
+			return nil, "", busyHotelsErr(busy)
+		}
 		return nil, "", notFound
 	default:
 		return nil, "", &apiErr{409, "snapshot_ambiguous", "several hotels have a snapshot " + ref + "; use the id <hotel>.<snapshot id>"}
@@ -575,7 +659,7 @@ func (b *broker) roomSnapshot(w http.ResponseWriter, r *http.Request, g *guestSt
 	out, _ := json.Marshal(payload)
 	status, hdr, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	// The machine's signed receipt travels in X-Room-* headers, as on every other room route.
@@ -638,7 +722,7 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	h, sid, e := b.findSnapshot(r.Context(), g, ref)
 	if e != nil {
-		writeErr(w, e.status, e.code, e.msg)
+		writeAPIErr(w, e)
 		return
 	}
 	path := "/v1/snapshots/" + url.PathEscape(sid)
@@ -652,7 +736,7 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 	// Delete and push are owner-scoped on the hotel too (AB#650).
 	status, hdr, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
 	copyRoomHeaders(w.Header(), hdr)
@@ -777,7 +861,8 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
 	st.FinishedAt = &now
 	switch {
 	case err != nil:
-		st.State, st.Error = "failed", map[string]any{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}
+		e := hotelAPIErr(h, err)
+		st.State, st.Error = "failed", map[string]any{"code": e.code, "message": e.msg}
 	case status == 200 || status == 202:
 		st.State = "done"
 		if res, ok := doc["result"].(map[string]any); ok {
