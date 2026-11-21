@@ -88,8 +88,11 @@ settings in the table come from the same place.
 receipts off. The installer starts `<ROOM_ID>-receipts.service`
 (`room_receipts.py`).
 
-What it turns on: an Ed25519 receipt chain for create, exec, background
-process start, delete and network policy changes. The process listens on
+What it turns on: an Ed25519 receipt chain for every route that changes a
+room, the hotel or an account: create, exec, processes, delete, network
+policy, files, tar, directories, terminals, ports, snapshots, workspaces,
+secrets and images (the list and the routes left unsigned, each with its
+reason: `docs/AB385_GUEST_SIGNED_ROUTES.md`). The process listens on
 `ROOM_RECEIPTS_LISTEN` (default `127.0.0.1:18092`). That port is not
 `ROOM_API_PORT` and not `ROOM_HEALTH_PORT`. It proxies those calls to the
 room API on `127.0.0.1:ROOM_API_PORT`. When receipts are on, Caddy sends
@@ -179,7 +182,9 @@ signed request at a time, so the order of its receipts is the order things ran.
   `/terminals`, a process's `/logs`, `sealed-secrets`, `sealed-env`, `/entries`)
   pass without a token and leave no receipt. Every other route that is not a
   signed route or a delete, the front's own sealed secrets and sealed exec
-  included, is refused with 409 `room_serial_unsigned`.
+  included, is refused with 409 `room_serial_unsigned`. Terminal routes and
+  access tickets stay refused although they are signed: a terminal runs
+  commands that no receipt orders.
 - On a serial room each request is sent to the API once, a read or a signed
   GET included (an ordinary room retries a GET whose answer was lost). A read
   whose answer is lost answers 502, signs nothing and does not break the room
@@ -205,6 +210,28 @@ signed request at a time, so the order of its receipts is the order things ran.
   workspace and references no hotel secret.
 
 An ordinary room runs requests side by side, as before.
+
+### Terminal sockets (AB#385)
+
+`GET /v1/sandboxes/<id>/terminals/<tid>/ws` with a WebSocket handshake passes
+through the front (before, the front dropped `Upgrade` and the API answered a
+plain GET with 404). The front needs the hotel key, sends the same handshake to
+the room API with its own key and the caller's `Sec-WebSocket-*` and
+`X-Cathedral-Access-Ticket` headers (the API checks and spends the ticket), and
+signs `terminal_session_open` on the API's answer: on a 101 with a `session_id`,
+in `X-Room-Receipt` on the 101; on a refusal with its status and the hash of
+its body. Then it passes raw bytes both ways, frames unread. When either side
+ends (or the caller sends nothing for 900 s), it signs `terminal_session_close`
+with the same `session_id`, `session_open_receipt_sha256`, `close_reason`,
+`duration_ms`, and per direction the byte count and sha256 of the bytes after
+the handshake, counted as the front wrote them to the other side's socket
+(`client_bytes`/`client_sha256` from the caller to the room,
+`room_bytes`/`room_sha256` from the room to the caller; a send cut short counts
+only what went out). The close receipt is in the room's receipt
+list. The session counts as a request in flight for the room, so the front's
+look leaves the room alone while it is open. Serial rooms and
+unclaimed pool rooms refuse the socket as before. Not over the miner hotel's TLS
+port (501): terminals never reach a miner hotel.
 
 ### Receipts when a room ends without a request
 

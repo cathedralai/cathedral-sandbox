@@ -272,6 +272,19 @@ type room struct {
 	// deleteSent: the guest asked for the delete. A room marked deleting by
 	// the sync loop alone may be listed again (a late list) and come back.
 	deleteSent bool
+	// End record inputs (ended.go, AB#864). born: when the broker first had
+	// the room. reaped: a refused or cancelled create the guest never had.
+	// labels, expiresAt, hotelDeath (a listed dead container's end_reason)
+	// and hotelEnd (the hotel's "ended" entry) come from the hotel list;
+	// hotelRestarted: the room went with a hotel API restart.
+	born           time.Time
+	reaped         bool
+	labels         map[string]string
+	expiresRaw     string
+	expiresAt      time.Time
+	hotelDeath     string
+	hotelEnd       string
+	hotelRestarted bool
 }
 
 type latencies struct{ hotel, queue, overhead []float64 }
@@ -314,6 +327,7 @@ type hotel struct {
 	healthRuntime   atomic.Value // string
 	kernelIsolation *bool        // kernel_isolation of the last good /room/health; nil when absent
 	listOK          bool         // last room list answered
+	apiStartedAt    string       // the hotel API's start time from its list (AB#864); "": not sent
 	lastErr         string
 	caps            map[string]any // capability probe results (probe.go)
 	cpuPct          float64
@@ -420,6 +434,11 @@ type broker struct {
 	// minerExits: miner hotels that went down holding customer rooms
 	// (miner_exits.go). Guarded by b.mu.
 	minerExits []*minerExit
+
+	// ended is guest id -> end records of its rooms (ended.go); endSeq
+	// numbers them in write order. Guarded by b.mu.
+	ended  map[string]*guestEnded
+	endSeq uint64
 
 	// shares is sha256(share token) -> live view share link (live_share.go).
 	// In memory only. Guarded by b.mu.
@@ -1114,7 +1133,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		}
 		switch {
 		case started:
-			rm.hid, rm.id, rm.state, rm.since = hid, h.cfg.ID+"."+hid, stRunning, tDone
+			rm.hid, rm.id, rm.state, rm.since, rm.born = hid, h.cfg.ID+"."+hid, stRunning, tDone, tDone
 			if old := h.rooms[hid]; old != nil && old != rm { // the sync loop saw it first
 				b.release(h, old)
 			}
@@ -1671,8 +1690,13 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	}
 	hotelID, hid, ok := strings.Cut(bid, ".")
 	h := b.hotelByID(hotelID)
+	// A room of this guest that ended answers 410 with why (ended.go); a
+	// wrong id or another guest's room stays 404. After the exec poll above,
+	// so exec results of a gone room still read.
 	if !ok || h == nil {
-		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
+		if !b.writeGone(w, g, bid) {
+			writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
+		}
 		return
 	}
 	b.mu.Lock()
@@ -1680,7 +1704,9 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 	owned := rm != nil && rm.guest != "" && rm.guest == g.cfg.ID // an unlabeled room belongs to no guest
 	b.mu.Unlock()
 	if !owned {
-		writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
+		if !b.writeGone(w, g, bid) {
+			writeErr(w, 404, "sandbox_not_found", "no sandbox "+bid)
+		}
 		return
 	}
 	// The proof lives on the guest's receipts front, not its sandbox API.
@@ -2319,7 +2345,18 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			Labels map[string]string `json:"labels"`
 			// A map, so a hotel that sends an odd field does not fail the list.
 			Resources map[string]any `json:"resources"`
+			// AB#864: end record inputs. EndReason is set by a hotel with
+			// Change B on a listed room whose container died.
+			ExpiresAt string `json:"expires_at"`
+			EndReason string `json:"end_reason"`
 		} `json:"sandboxes"`
+		// AB#864 Change B: rooms the hotel ended lately, and when its API
+		// started. A hotel without them sends neither.
+		Ended []struct {
+			ID        string `json:"id"`
+			EndReason string `json:"end_reason"`
+		} `json:"ended"`
+		APIStartedAt string `json:"api_started_at"`
 	}
 	lerr := h.getJSON(ctx, h.cfg.API, "/v1/sandboxes", nil, &list)
 	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
@@ -2415,6 +2452,12 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	}
 	seen := make(map[string]bool, len(list.Sandboxes))
 	leftover := map[string]bool{} // recorded unreaped requests that still list a room
+	// A new API start time means the hotel API restarted and forgot its
+	// rooms: those this list misses went with it (AB#864).
+	apiRestarted := list.APIStartedAt != "" && h.apiStartedAt != "" && list.APIStartedAt != h.apiStartedAt
+	if list.APIStartedAt != "" {
+		h.apiStartedAt = list.APIStartedAt
+	}
 	for _, s := range list.Sandboxes {
 		seen[s.ID] = true
 		// A room a failed create left behind is not the guest's room: the
@@ -2431,20 +2474,23 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			if d := diskGiBOf(s.Resources); d > 0 {
 				rm.diskGiB = d
 			}
+			rm.noteListed(s.Labels, s.ExpiresAt, s.EndReason)
 			if rm.state == stDeleting && !rm.deleteSent {
 				// A list that missed the room (built before its create landed)
 				// marked it deleting; the hotel lists it, so it runs.
-				rm.state, rm.since, rm.vanished = stRunning, now, time.Time{}
+				rm.state, rm.since, rm.vanished, rm.hotelRestarted = stRunning, now, time.Time{}, false
 				if rm.slot < 0 {
 					h.place(rm)
 				}
 			}
 			continue
 		}
-		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now, diskGiB: diskGiBOf(s.Resources)}
+		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now, born: now, diskGiB: diskGiBOf(s.Resources)}
+		rm.noteListed(s.Labels, s.ExpiresAt, s.EndReason)
 		h.rooms[s.ID] = rm
 		b.register(rm)
 		h.place(rm)
+		b.forgetEnded(rm.guest, rm.id) // a late list: the room is back
 	}
 	for batchID, ub := range h.unreaped {
 		switch {
@@ -2466,10 +2512,23 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		}
 	}
 	b.checkMinerExitRooms(h, seen)
+	var hotelEnded map[string]string
+	for _, e := range list.Ended {
+		if hotelEndReasons[e.EndReason] {
+			if hotelEnded == nil {
+				hotelEnded = map[string]string{}
+			}
+			hotelEnded[e.ID] = e.EndReason
+		}
+	}
 	var deleting []*room
 	for hid, rm := range h.rooms {
 		if !seen[hid] && rm.state == stRunning && now.Sub(rm.since) > 5*time.Second {
 			rm.state, rm.vanished = stDeleting, now
+			rm.hotelRestarted = apiRestarted
+		}
+		if why := hotelEnded[hid]; why != "" {
+			rm.hotelEnd = why
 		}
 		if rm.state == stDeleting {
 			deleting = append(deleting, rm)
@@ -2484,6 +2543,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			continue // DELETE sent, record still listed
 		}
 		if i >= h.apiDeleting && now.Sub(rm.vanished) > 2*time.Second {
+			b.endOfVanished(h, rm, now)
 			b.release(h, rm)
 		}
 	}
@@ -2737,6 +2797,7 @@ func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState, s
 	w.Header().Set("X-Accel-Buffering", "no")
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
+	endSeq := b.endedStreamStart(g.cfg.ID, time.Now())
 	for {
 		if shareHash != "" && b.shareFor(shareHash, g.cfg.ID) == nil {
 			return
@@ -2744,6 +2805,15 @@ func (b *broker) stream(w http.ResponseWriter, r *http.Request, g *guestState, s
 		data, _ := json.Marshal(b.snapshot(g))
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 			return
+		}
+		// One room_gone per end record since the last tick (AB#864).
+		var gone []map[string]any
+		gone, endSeq = b.endedSince(g.cfg.ID, endSeq)
+		for _, ev := range gone {
+			raw, _ := json.Marshal(ev)
+			if _, err := fmt.Fprintf(w, "event: room_gone\ndata: %s\n\n", raw); err != nil {
+				return
+			}
 		}
 		fl.Flush()
 		select {
@@ -2841,6 +2911,10 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.handleList(w, r, g)
 		case p == "/v1/sandboxes" && r.Method == "DELETE":
 			b.handleBulkDelete(w, r, g)
+		case p == "/v1/sandboxes/ended" && r.Method == "GET":
+			// Before the room route. No room id collides: a broker id is
+			// always <hotel>.<hotel room id>, with a dot.
+			b.handleEnded(w, r, g)
 		case strings.HasPrefix(p, "/v1/sandboxes/"):
 			b.handleRoom(w, r, g, strings.TrimPrefix(p, "/v1/sandboxes/"))
 		case strings.HasPrefix(p, "/v1/hotels/"):

@@ -4,6 +4,7 @@
 //   - finished Idempotency-Key answers, so a repeated create after a restart
 //     returns the first answer and starts no new room;
 //   - deleted-room tombstones;
+//   - room end records (ended.go);
 //   - imported and built images. A build context is a separate file in
 //     state_dir/build-contexts.
 //
@@ -45,6 +46,7 @@ type savedState struct {
 	Images     map[string]*compatImage               `json:"images"`
 	GuestRooms map[string]map[string]map[string]bool `json:"guest_rooms"` // guest -> hotel -> room id
 	MinerExits []minerExit                           `json:"miner_exits"` // miner_exits.go
+	EndedRooms []endRecord                           `json:"ended_rooms"` // ended.go
 }
 
 func (b *broker) markDirty() { b.dirty.Store(true) }
@@ -118,6 +120,7 @@ func (b *broker) saveCompat() error {
 		}
 	}
 	st.MinerExits = b.minerExitsSnapshot()
+	st.EndedRooms = b.endedSnapshot(time.Now())
 	b.mu.Unlock()
 	now := time.Now()
 	b.compat.mu.Lock()
@@ -219,7 +222,7 @@ func (b *broker) loadCompat() error {
 	var st savedState
 	var bad []string
 	for name, into := range map[string]any{"uuids": &st.UUIDs, "idempotency": &st.Idem, "tombstones": &st.Tombs,
-		"images": &st.Images, "guest_rooms": &st.GuestRooms, "miner_exits": &st.MinerExits} {
+		"images": &st.Images, "guest_rooms": &st.GuestRooms, "miner_exits": &st.MinerExits, "ended_rooms": &st.EndedRooms} {
 		if v, ok := sections[name]; ok && len(v) > 0 {
 			if err := json.Unmarshal(v, into); err != nil {
 				bad = append(bad, name)
@@ -232,6 +235,7 @@ func (b *broker) loadCompat() error {
 	}
 	b.mu.Lock()
 	b.restoreMinerExits(st.MinerExits, time.Now())
+	b.restoreEnded(st.EndedRooms, time.Now())
 	b.savedUUIDs = map[string]string{}
 	for u, bid := range st.UUIDs {
 		b.savedUUIDs[bid] = u
