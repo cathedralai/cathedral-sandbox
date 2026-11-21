@@ -21,10 +21,10 @@
 //
 // The one way past the gate is "sealed_admission": "off" on an operator
 // hotel's entry in the config file, an emergency escape for ops. The config
-// loader refuses it on a miner hotel, an unsealed hotel or a
-// require_attestation hotel, and a join refuses it: a joined hotel and a
-// miner hotel are always gated. The top-level "sealed_admission": "off",
-// which ungated joined operator hotels, is refused at load.
+// loader refuses it on a miner hotel or a require_attestation hotel, and a
+// join refuses it: a joined hotel and a miner hotel are always gated. The
+// top-level "sealed_admission": "off", which ungated joined operator hotels,
+// is refused at load.
 //
 // What the broker checks is the check verify_receipts.py makes before the AMD
 // signature: binding_sha256 is the SHA-256 of the binding as served, the
@@ -158,8 +158,6 @@ func validateSealedAdmission(hc hotelConfig) error {
 	switch {
 	case hc.MinerHotkey != "":
 		return fmt.Errorf(`config: hotel %q: sealed_admission "off" is refused for a miner hotel: a miner hotel is always gated`, hc.ID)
-	case !hc.Sealed:
-		return fmt.Errorf(`config: hotel %q: sealed_admission "off" needs "sealed": true (an unsealed hotel has no gate to skip)`, hc.ID)
 	case hc.RequireAttestation:
 		return fmt.Errorf(`config: hotel %q: sealed_admission "off" and require_attestation contradict each other; remove one`, hc.ID)
 	}
@@ -202,9 +200,9 @@ func (b *broker) admitted(h *hotel, now time.Time) bool {
 	if strictAttestation(h) && len(b.cfg.SealedMeasurements) == 0 {
 		return false
 	}
-	// Older state may contain an unsealed miner or a runtime hotel that claimed
-	// a sealed label. Keep both out of placement after a restart as well.
-	if h.cfg.MinerHotkey != "" && !h.cfg.Sealed {
+	// Older state may hold a hotel that joined unsealed (before AB#776).
+	// Placement never takes it, whatever its labels say.
+	if !h.cfg.Sealed {
 		return false
 	}
 	if h.guestTLS() && (h.tlsPinErr != nil || h.guestPin.Load() == nil) {
@@ -212,9 +210,6 @@ func (b *broker) admitted(h *hotel, now time.Time) bool {
 	}
 	if h.installNeeded() {
 		return false // the guest has no hotel key yet: every keyed call would answer 401
-	}
-	if h.runtime && !h.cfg.Sealed && h.labels()["sealed"] == "true" {
-		return false
 	}
 	if !b.needsAttestation(h) {
 		return true

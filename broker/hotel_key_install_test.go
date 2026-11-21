@@ -556,3 +556,34 @@ func TestHotelDocCountsRoomsInUse(t *testing.T) {
 		t.Fatalf("rooms_in_use %v, want 3", tc.b.hotelDoc(h)["rooms_in_use"])
 	}
 }
+
+// AB#776: merging the sealed-only gate with the key installer must keep both
+// refusals, even while a previous attestation is still fresh.
+func TestSealedOnlyAdmissionRequiresCurrentHotelKeyInstall(t *testing.T) {
+	signerFile, signer, _ := installSeedFile(t, 0o600)
+	tc := newChainState(t, t.TempDir())
+	g := newInstallGuest(t, "ct", signer)
+	h := installHotel(t, tc, signerFile, g)
+	tc.b.syncHotel(context.Background(), h)
+	tc.b.syncHotel(context.Background(), h)
+	if !isAdmitted(tc, h) {
+		t.Fatal("installed sealed hotel not admitted")
+	}
+
+	tc.b.mu.Lock()
+	defer tc.b.mu.Unlock()
+	installedPin := h.keyInst.pin
+	h.keyInst.pin = "" // no confirmed install for the current pin
+	if tc.b.admitted(h, time.Now()) {
+		t.Fatal("fresh attestation bypassed missing key installation")
+	}
+	h.keyInst.pin = installedPin
+	h.cfg.Sealed = false // old unsealed state must stay out despite the pin
+	if tc.b.admitted(h, time.Now()) {
+		t.Fatal("key installation bypassed the sealed-only gate")
+	}
+	h.cfg.Sealed = true
+	if !tc.b.admitted(h, time.Now()) {
+		t.Fatal("restored sealed hotel was not admitted")
+	}
+}

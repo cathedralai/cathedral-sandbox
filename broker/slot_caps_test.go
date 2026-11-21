@@ -27,7 +27,7 @@ func capsBroker(t *testing.T, own int, miners []string, slots int) *broker {
 	b.cfg.SealedMeasurements = []string{strings.Repeat("ab", 48)}
 	add := func(id string, fn func(h *hotel)) {
 		h := newHotel(hotelConfig{ID: id, API: "http://127.0.0.1:1", Health: "http://127.0.0.1:1", Concurrency: 4,
-			Labels: map[string]string{"sealed": "true"}}, "k")
+			Sealed: true, SealedAdmission: sealedAdmissionOff}, "k")
 		h.ok, h.slots = true, slots
 		if fn != nil {
 			fn(h)
@@ -54,7 +54,7 @@ func capsBroker(t *testing.T, own int, miners []string, slots int) *broker {
 func minerPolicy() placement {
 	return placement{guest: "g", policy: &guestPolicy{
 		Prefer: []selector{{Label: map[string]string{"miner": "true"}}},
-		Allow:  []selector{{Class: classSealed}, {Class: classUnsealed}},
+		Allow:  []selector{{Class: classSealed}},
 	}}
 }
 
@@ -299,8 +299,8 @@ func TestQueuedMoveBetweenMinerHotelsKeepsItsRoom(t *testing.T) {
 // concurrent POST /v1/sandboxes from a guest that prefers miner hotels.
 func TestMinerRoomCapHoldsUnderConcurrentCreates(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 10, nil)
-	joinMiner(t, tc, "m2", true, 10, nil)
+	joinMiner(t, tc, "m1", 10, nil)
+	joinMiner(t, tc, "m2", 10, nil)
 	admitNow(t, tc, "m1")
 	admitNow(t, tc, "m2")
 	optInMiner(t, tc, "g1")

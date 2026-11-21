@@ -9,7 +9,7 @@ import (
 // none), the room runtime, and that no room is attested on its own. A guest
 // reads it from the document, never from the hotel id.
 func TestRoomAnswersCarryIsolation(t *testing.T) {
-	tc := limitedChain(t, guestLimits{DefaultSealed: true}) // hotel a sealed
+	tc := limitedChain(t, guestLimits{DefaultSealed: true}) // every hotel sealed (AB#776)
 
 	check := func(t *testing.T, where string, doc map[string]any, wantSealed bool) {
 		t.Helper()
@@ -38,17 +38,17 @@ func TestRoomAnswersCarryIsolation(t *testing.T) {
 		}
 	}
 
-	// Native create: sealed by default, unsealed when asked.
+	// Native create: every room is sealed, plain or on a named hotel.
 	status, sealedDoc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"})
 	if status != 202 {
 		t.Fatalf("sealed create: %d %v", status, sealedDoc)
 	}
-	check(t, "native create sealed", sealedDoc, true)
-	status, plainDoc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": false})
+	check(t, "native create", sealedDoc, true)
+	status, namedDoc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	if status != 202 {
-		t.Fatalf("unsealed create: %d %v", status, plainDoc)
+		t.Fatalf("named create: %d %v", status, namedDoc)
 	}
-	check(t, "native create unsealed", plainDoc, false)
+	check(t, "native create on b", namedDoc, true)
 
 	// Native get and list carry the same block.
 	sid, _ := sealedDoc["id"].(string)
@@ -68,21 +68,21 @@ func TestRoomAnswersCarryIsolation(t *testing.T) {
 	for _, r := range rooms {
 		d := r.(map[string]any)
 		hotel, _ := d["hotel"].(string)
-		check(t, "native list "+hotel, d, hotel == "a")
+		check(t, "native list "+hotel, d, true)
 	}
 
 	// Harbor (compat) create and get carry it too, with the hotel named.
-	status, cdoc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20", "sealed": false}), nil)
+	status, cdoc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20"}), nil)
 	if status != 201 {
 		t.Fatalf("compat create: %d %v", status, cdoc)
 	}
-	check(t, "compat create", cdoc, false)
+	check(t, "compat create", cdoc, true)
 	cid, _ := cdoc["id"].(string)
 	status, cget := tc.clientCall(t, "GET", "/v1/sandboxes/"+cid, nil, nil)
 	if status != 200 {
 		t.Fatalf("compat get: %d %v", status, cget)
 	}
-	check(t, "compat get", cget, false)
+	check(t, "compat get", cget, true)
 	if cget["hotel"] == nil {
 		t.Fatalf("compat get names no hotel: %v", cget)
 	}
@@ -138,7 +138,7 @@ func TestNativeCreateWithoutNetworkIsDenyAll(t *testing.T) {
 // room_runtime falls back to the runtime the hotel reports in /room/health,
 // because the hotel's room documents carry none.
 func TestRoomRuntimeFromHotelHealth(t *testing.T) {
-	tc := limitedChain(t, guestLimits{DefaultSealed: true}) // hotel a sealed
+	tc := limitedChain(t, guestLimits{DefaultSealed: true})
 	tc.hotels["a"].healthRuntime = "runsc"
 	tc.b.syncHotel(context.Background(), tc.b.hotelByID("a"))
 	runtimeOf := func(t *testing.T, where string, doc map[string]any) string {
@@ -154,7 +154,7 @@ func TestRoomRuntimeFromHotelHealth(t *testing.T) {
 		}
 	}
 
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}})
 	if status != 202 {
 		t.Fatalf("create: %d %v", status, doc)
 	}
@@ -169,8 +169,15 @@ func TestRoomRuntimeFromHotelHealth(t *testing.T) {
 			want(t, "native list", d, "runsc")
 		}
 	}
-	// Compat create and get (hotel a is chosen by the sealed default).
-	status, cdoc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}}), nil)
+	// Compat create and get on hotel a: the client route has no hotel
+	// choice, so the guest's hotel list keeps it there.
+	setGuestHotels := func(ids ...string) {
+		tc.b.mu.Lock()
+		tc.b.guests["g1"].limits.Hotels = ids
+		tc.b.mu.Unlock()
+	}
+	setGuestHotels("a")
+	status, cdoc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image": "alpine:3.20"}), nil)
 	if status != 201 {
 		t.Fatalf("compat create: %d %v", status, cdoc)
 	}
@@ -178,9 +185,10 @@ func TestRoomRuntimeFromHotelHealth(t *testing.T) {
 	cid, _ := cdoc["id"].(string)
 	_, cget := tc.clientCall(t, "GET", "/v1/sandboxes/"+cid, nil, nil)
 	want(t, "compat get", cget, "runsc")
+	setGuestHotels()
 
 	// A hotel that reports no runtime stays unknown.
-	status, plain := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": false})
+	status, plain := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	if status != 202 {
 		t.Fatalf("plain create: %d %v", status, plain)
 	}

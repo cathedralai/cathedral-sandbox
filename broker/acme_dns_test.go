@@ -113,6 +113,8 @@ func newACMETest(t *testing.T) *acmeTest {
 	tc.b.acmeDNS.client = srv.Client()
 	h := tc.b.hotelByID("a")
 	h.cfg.Sealed = true
+	// The sealed-only fixture (AB#776) joins hotels with the admission escape; this hotel is gated.
+	h.cfg.SealedAdmission = sealedAdmissionGate
 	h.adm.receiptKey = append([]byte(nil), pub...)
 	h.adm.bindingSHA = acmeTestBind
 	h.adm.measurement = strings.Repeat("ab", 48)

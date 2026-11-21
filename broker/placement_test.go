@@ -210,7 +210,7 @@ func failOnMiner(t *testing.T, status int, afterStart bool) (*testChain, int, ma
 	t.Helper()
 	tc := newChainState(t, t.TempDir())
 	optInMiner(t, tc, "g1")
-	m := joinMiner(t, tc, "m1", true, 5, nil)
+	m := joinMiner(t, tc, "m1", 5, nil)
 	m.mu.Lock()
 	m.createFail, m.createFailAfterStart = status, afterStart
 	m.mu.Unlock()
@@ -335,7 +335,7 @@ func TestFailoverWithUnconfirmedReapRecordsTheOrphan(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			tc := newChainState(t, t.TempDir())
 			optInMiner(t, tc, "g1")
-			joinMiner(t, tc, "m1", true, 5, nil)
+			joinMiner(t, tc, "m1", 5, nil)
 			m := tc.hotels["m1"]
 			m.mu.Lock()
 			m.createFail, m.createFailAfterStart = 500, true

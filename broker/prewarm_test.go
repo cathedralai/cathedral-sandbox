@@ -99,10 +99,9 @@ func TestPrewarmMarksCatalogImagesWarmAndDownClearsThem(t *testing.T) {
 }
 
 // 20 Nov 2026 broker swap smoke: prewarm pulled the sealed-only LFM images onto
-// the unsealed hotel c46 at every restart, filled its room volume and a plain
-// create there failed with ENOSPC. An unsealed hotel gets no sealed-only image;
-// a sealed hotel still gets all of them.
-func TestPrewarmSkipsSealedOnlyImagesOnUnsealedHotels(t *testing.T) {
+// the unsealed hotel c46 and filled its room volume. Since AB#776 every hotel
+// is sealed, so every hotel gets the sealed-only images and the warm image.
+func TestPrewarmSendsSealedOnlyImagesToEverySealedHotel(t *testing.T) {
 	tc := newChain(t)
 	warmUp(tc, true)
 	sealedOnly := map[string]bool{}
@@ -124,26 +123,21 @@ func TestPrewarmSkipsSealedOnlyImagesOnUnsealedHotels(t *testing.T) {
 		}
 		return got
 	}
-	plain := pulled("b")
-	for im := range sealedOnly {
-		if plain[im] {
-			t.Fatalf("unsealed hotel b was asked to pull sealed-only image %s", im)
+	for _, id := range []string{"a", "b"} {
+		got := pulled(id)
+		for im := range sealedOnly {
+			if !got[im] {
+				t.Fatalf("sealed hotel %s did not pull sealed-only image %s", id, im)
+			}
 		}
-	}
-	if !plain[warmImage] {
-		t.Fatalf("unsealed hotel b did not pull %s: %v", warmImage, plain)
-	}
-	sealed := pulled("a")
-	for im := range sealedOnly {
-		if !sealed[im] {
-			t.Fatalf("sealed hotel a did not pull sealed-only image %s", im)
+		if !got[warmImage] {
+			t.Fatalf("sealed hotel %s did not pull %s: %v", id, warmImage, got)
 		}
 	}
 }
 
-// AB#894: a sealed hotel pre-pulls the node-22 image once; an unsealed hotel
-// never pulls it.
-func TestPrewarmPullsNode22OnSealedHotelsOnly(t *testing.T) {
+// AB#894 plus AB#776: every configured hotel is sealed and pre-pulls node-22 once.
+func TestPrewarmPullsNode22OnEverySealedHotel(t *testing.T) {
 	tc := newChain(t)
 	warmUp(tc, true)
 	node := pinnedImage("node", nodeDigest)
@@ -162,8 +156,8 @@ func TestPrewarmPullsNode22OnSealedHotelsOnly(t *testing.T) {
 	if n := pulls("a"); n != 1 {
 		t.Fatalf("sealed hotel a pulled %s %d times, want once", node, n)
 	}
-	if n := pulls("b"); n != 0 {
-		t.Fatalf("unsealed hotel b pulled %s %d times, want never", node, n)
+	if n := pulls("b"); n != 1 {
+		t.Fatalf("sealed hotel b pulled %s %d times, want once", node, n)
 	}
 }
 
@@ -172,6 +166,8 @@ func TestPrewarmPullsNode22OnSealedHotelsOnly(t *testing.T) {
 // still takes creates; a hotel under the line pulls.
 func TestPrewarmSkipsCatalogPullOnAFullScratchAndStaysPlaceable(t *testing.T) {
 	tc := newChain(t)
+	setHotelOK(tc, "b", false) // only a is eligible; all fixture hotels are sealed now
+	setHotelOK(tc, "c", false)
 	warmUp(tc, true)
 	logs := captureLog(t)
 	node := pinnedImage("node", nodeDigest)

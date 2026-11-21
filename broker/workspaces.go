@@ -134,12 +134,6 @@ func (b *broker) workspacePlacement(ctx context.Context, g *guestState, payload 
 	if pl.only != nil && pl.only != h {
 		return pl, &apiErr{409, "workspace_snapshot_conflict", "the snapshot and the workspace are on different hotels"}
 	}
-	// Like a fork: the guest's sealed default does not stop a room next to
-	// a workspace on an unsealed hotel.
-	if pl.sealedByDefault && h.cfg.Labels["sealed"] != "true" {
-		delete(pl.match, "sealed")
-		pl.sealedByDefault = false
-	}
 	if !pl.selects(h) {
 		return pl, &apiErr{409, "workspace_hotel_excluded", "the hotel that holds this workspace does not match the hotel selection"}
 	}

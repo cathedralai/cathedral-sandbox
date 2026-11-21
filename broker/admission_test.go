@@ -242,22 +242,15 @@ func chipOf(id string) byte {
 	return s
 }
 
-// joinMiner joins a sealed miner, or an unsealed operator hotel used by legacy
-// placement tests, stops its background sync loop and runs one sync step. The
+// joinMiner joins a sealed miner hotel, stops its background sync loop and
+// runs one sync step. The
 // test then owns the hotel's sync: syncNow is its only sync step, so a loop
 // step cannot store a health answer after the test has aged the hotel.
-func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, extra map[string]any) *minerHotel {
+func joinMiner(t *testing.T, tc *testChain, id string, slots int, extra map[string]any) *minerHotel {
 	t.Helper()
-	var att []byte
-	if sealed {
-		att = snpAttestation(t, attestOpts{chip: chipOf(id)})
-	}
-	m, url := newMinerHotel(t, slots, att)
+	m, url := newMinerHotel(t, slots, snpAttestation(t, attestOpts{chip: chipOf(id)}))
 	tc.hotels[id] = m.fakeHotel
-	body := map[string]any{"id": id, "api": url, "key": joinKey, "sealed": sealed}
-	if sealed {
-		body["miner_hotkey"] = minerHotkey
-	}
+	body := map[string]any{"id": id, "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
 	for k, v := range extra {
 		body[k] = v
 	}
@@ -266,6 +259,21 @@ func joinMiner(t *testing.T, tc *testChain, id string, sealed bool, slots int, e
 	}
 	stopSyncLoop(t, tc, id)
 	syncNow(tc, id)
+	return m
+}
+
+// joinOperatorSealed joins a sealed operator hotel (no hotkey) through the
+// operator route and admits it.
+func joinOperatorSealed(t *testing.T, tc *testChain, id string, slots int) *minerHotel {
+	t.Helper()
+	m, url := newOperatorHotel(t, slots, snpAttestation(t, attestOpts{chip: chipOf(id)}))
+	tc.hotels[id] = m.fakeHotel
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": id, "api": url, "key": joinKey, "sealed": true}); status != 201 {
+		t.Fatalf("join %s: %d %v", id, status, doc)
+	}
+	stopSyncLoop(t, tc, id)
+	syncNow(tc, id)
+	admitNow(t, tc, id)
 	return m
 }
 
@@ -331,7 +339,7 @@ func setPolicy(t *testing.T, tc *testChain, guest string, policy map[string]any)
 func optInMiner(t *testing.T, tc *testChain, guest string) {
 	setPolicy(t, tc, guest, map[string]any{
 		"prefer": []any{map[string]any{"label": map[string]string{"miner": "true"}}},
-		"allow":  []any{map[string]any{"class": "sealed"}, map[string]any{"class": "unsealed"}},
+		"allow":  []any{map[string]any{"class": "sealed"}},
 	})
 }
 
@@ -355,7 +363,7 @@ func admissionOf(t *testing.T, tc *testChain, id string) map[string]any {
 func TestJoinedMinerHotelPersistsAcrossRestartAndMustPassAgain(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	joinMiner(t, tc, "m1", true, 5, map[string]any{"max_slots": 3, "reserved_for": "g1"})
+	joinMiner(t, tc, "m1", 5, map[string]any{"max_slots": 3, "reserved_for": "g1"})
 	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/hotels/m1", nil)
 	labels, _ := doc["labels"].(map[string]any)
 	if status != 200 || doc["class"] != "sealed" || labels["miner"] != "true" || labels["miner_hotkey"] != minerHotkey || doc["slots"] != float64(3) {
@@ -663,7 +671,7 @@ func TestVerifyAttestationKeepsTheReceiptKey(t *testing.T) {
 func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	optInMiner(t, tc, "g1")
-	m := joinMiner(t, tc, "m1", true, 5, nil)
+	m := joinMiner(t, tc, "m1", 5, nil)
 	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}}
 	tc.room(t, "key1", onM1)
 	h := tc.b.hotelByID("m1")
@@ -708,20 +716,6 @@ func TestUnhealthyOrExpiredHotelLeavesPlacementAndComesBack(t *testing.T) {
 	if id := tc.room(t, "key1", onM1); !strings.HasPrefix(id, "m1.") {
 		t.Fatalf("after a new pass: %s", id)
 	}
-
-	// An unsealed joined hotel needs health only, and leaves and returns with it.
-	u := joinMiner(t, tc, "u1", false, 5, nil)
-	onU1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"u1"}}
-	tc.room(t, "key1", onU1)
-	healthDown(tc, u, "u1")
-	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", onU1); status != 503 {
-		t.Fatalf("down unsealed hotel took a room: %d", status)
-	}
-	u.setHealthFail(false)
-	syncNow(tc, "u1")
-	if id := tc.room(t, "key1", onU1); !strings.HasPrefix(id, "u1.") {
-		t.Fatalf("unsealed after return: %s", id)
-	}
 }
 
 // TestAStepInFlightAtStopCannotBringTheHotelBack: the join's sync loop read
@@ -765,19 +759,21 @@ func TestAStepInFlightAtStopCannotBringTheHotelBack(t *testing.T) {
 
 // ---------------------------------------------------------------- spill and reasons
 
+// sealedFirst prefers hotel a and the miner hotels and allows every other
+// hotel (all sealed, AB#776).
 var sealedFirst = map[string]any{
-	"prefer": []any{map[string]any{"class": "sealed"}, map[string]any{"label": map[string]string{"miner": "true"}}},
-	"allow":  []any{map[string]any{"class": "unsealed"}},
+	"prefer": []any{map[string]any{"hotel": "a"}, map[string]any{"label": map[string]string{"miner": "true"}}},
+	"allow":  []any{map[string]any{"class": "sealed"}},
 }
 
-func TestSpillFromJoinedSealedToUnsealedAndClearReasons(t *testing.T) {
+func TestSpillFromPreferredToAllowedAndClearReasons(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	setPolicy(t, tc, "g1", sealedFirst)
-	setHotel(tc, "a", func(h *hotel) { h.slots = 1 }) // config sealed (label)
+	setHotel(tc, "a", func(h *hotel) { h.slots = 1 })
 	setHotel(tc, "b", func(h *hotel) { h.slots = 1 })
 	setHotel(tc, "c", func(h *hotel) { h.slots = 1 })
-	joinMiner(t, tc, "m1", true, 1, nil)
-	joinMiner(t, tc, "m2", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
+	joinMiner(t, tc, "m2", 1, nil)
 	// A joined sealed hotel that has not passed admission: never a candidate.
 	addPendingSealed(t, tc, "m3", 10, nil)
 	syncNow(tc, "m3")
@@ -786,11 +782,11 @@ func TestSpillFromJoinedSealedToUnsealedAndClearReasons(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		h, tier, _ := createdOn(t, tc, plain)
 		if tier != "prefer" || seen[h] || (h != "a" && h != "m1" && h != "m2") {
-			t.Fatalf("sealed create %d: %s %s", i, h, tier)
+			t.Fatalf("preferred create %d: %s %s", i, h, tier)
 		}
 		seen[h] = true
 	}
-	// Every sealed room is taken: spill to the allowed class.
+	// Every preferred room is taken: spill to the allowed hotels.
 	for i := 0; i < 2; i++ {
 		h, tier, _ := createdOn(t, tc, plain)
 		if tier != "allow" || (h != "b" && h != "c") {
@@ -829,7 +825,7 @@ func TestSpillFromJoinedSealedToUnsealedAndClearReasons(t *testing.T) {
 
 func TestMinerPlacementRequiresExplicitGuestOptIn(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 2, nil)
+	joinMiner(t, tc, "m1", 2, nil)
 	onM1 := map[string]any{"image": "alpine:3.20", "hotels": []string{"m1"}, "sealed": true}
 	for _, policy := range []map[string]any{
 		nil,
@@ -855,13 +851,12 @@ func TestMinerPlacementRequiresExplicitGuestOptIn(t *testing.T) {
 func TestMinerHotelIsolationDenyAndReserve(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	optInMiner(t, tc, "g1")
-	joinMiner(t, tc, "m1", true, 10, nil)
-	joinMiner(t, tc, "m2", true, 10, nil)
+	joinMiner(t, tc, "m1", 10, nil)
+	joinMiner(t, tc, "m2", 10, nil)
 	// g2 denies miner hotels. Its only other hotels are draining: a miner
 	// hotel is the only free room, and it must still not get g2's create.
 	setPolicy(t, tc, "g2", map[string]any{
 		"prefer": []any{map[string]any{"class": "sealed"}},
-		"allow":  []any{map[string]any{"class": "unsealed"}},
 		"deny":   []any{map[string]any{"label": map[string]string{"miner": "true"}}},
 	})
 	for _, id := range []string{"a", "b", "c"} {
@@ -936,21 +931,20 @@ func createdOn2(t *testing.T, tc *testChain, body map[string]any) (string, strin
 
 func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 7, nil)
-	joinMiner(t, tc, "m2", false, 4, nil)
+	joinMiner(t, tc, "m1", 7, nil)
 	addPendingSealed(t, tc, "m3", 9, nil) // joined sealed, not admitted
 	syncNow(tc, "m3")
 	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/capacity", nil)
 	classes, _ := doc["classes"].(map[string]any)
 	sealed, _ := classes["sealed"].(map[string]any)
-	unsealed, _ := classes["unsealed"].(map[string]any)
-	// Config: a sealed (100 slots), b and c unsealed (100 each).
-	if status != 200 || sealed["hotels"] != float64(3) || sealed["joined"] != float64(2) || sealed["pending_admission"] != float64(1) ||
-		sealed["placeable"] != float64(2) || sealed["free_rooms"] != float64(107) || sealed["slots"] != float64(116) {
+	// Config: a, b and c (100 slots each); joined: m1 (7) and pending m3 (9).
+	if status != 200 || sealed["hotels"] != float64(5) || sealed["joined"] != float64(2) || sealed["pending_admission"] != float64(1) ||
+		sealed["placeable"] != float64(4) || sealed["free_rooms"] != float64(307) || sealed["slots"] != float64(316) {
 		t.Fatalf("sealed totals: %d %v", status, sealed)
 	}
-	if unsealed["hotels"] != float64(3) || unsealed["joined"] != float64(1) || unsealed["free_rooms"] != float64(204) {
-		t.Fatalf("unsealed totals: %v", unsealed)
+	// AB#776: sealed is the only class.
+	if _, ok := classes["unsealed"]; ok || len(classes) != 1 {
+		t.Fatalf("capacity classes %v, want sealed only", classes)
 	}
 	if e, _ := catalogEntry(doc, "m1"); e["source"] != "join" {
 		t.Fatalf("m1 source: %v", e)
@@ -963,8 +957,7 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 	_, doc = tc.call(t, "key2", "GET", "/v1/broker/capacity", nil)
 	classes, _ = doc["classes"].(map[string]any)
 	sealed, _ = classes["sealed"].(map[string]any)
-	unsealed, _ = classes["unsealed"].(map[string]any)
-	if sealed["hotels"] != float64(2) || sealed["pending_admission"] != float64(1) || sealed["free_rooms"] != float64(100) || unsealed["hotels"] != float64(0) {
+	if sealed["hotels"] != float64(4) || sealed["pending_admission"] != float64(1) || sealed["free_rooms"] != float64(300) || len(classes) != 1 {
 		t.Fatalf("guest totals: %v", classes)
 	}
 }
@@ -974,7 +967,7 @@ func TestCapacityClassTotalsIncludeJoinedHotels(t *testing.T) {
 func TestQueuedCreateDoesNotStartOnAHotelThatLostAdmission(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	optInMiner(t, tc, "g1")
-	m := joinMiner(t, tc, "m1", true, 5, nil)
+	m := joinMiner(t, tc, "m1", 5, nil)
 	m.mu.Lock()
 	m.createDelay = 500 * time.Millisecond
 	m.mu.Unlock()

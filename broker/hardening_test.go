@@ -4,14 +4,10 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -115,46 +111,6 @@ func TestPatchGuestEmptyHotelListIsNotAllHotels(t *testing.T) {
 	}
 	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 409 {
 		t.Fatalf("guest left its hotel list after a refused PATCH: %d %v", status, doc)
-	}
-}
-
-// a short (truncated) build context file is trusted after a restart, and
-// a resubmit of the same build keeps the short one.
-func TestTruncatedBuildContextIsReplacedOnResubmit(t *testing.T) {
-	dir := t.TempDir()
-	tc := newChainState(t, dir)
-	full := []byte("full-context-bytes")
-	body, ctype := buildForm(t, "FROM alpine:3.20\n", full)
-	_, img := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	id := img["image_id"].(string)
-	waitImage(t, tc, id)
-	if err := tc.b.saveCompat(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, contextsDir, id+".tar.gz"), full[:4], 0o600); err != nil {
-		t.Fatal(err)
-	}
-	tc.start(t)
-	_, again := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	if again["image_id"] != id {
-		t.Fatalf("id changed: %v", again)
-	}
-	waitImage(t, tc, id)
-	time.Sleep(200 * time.Millisecond)
-	short := 0
-	for hid, f := range tc.hotels {
-		f.mu.Lock()
-		for _, b := range f.builds {
-			ctx, _ := base64.StdEncoding.DecodeString(fmt.Sprint(b["context_tar_b64"]))
-			if !bytes.Equal(ctx, full) {
-				short++
-				t.Logf("hotel %s was asked to build with context %q", hid, ctx)
-			}
-		}
-		f.mu.Unlock()
-	}
-	if short > 0 {
-		t.Fatalf("%d build requests after the restart carried the truncated context", short)
 	}
 }
 

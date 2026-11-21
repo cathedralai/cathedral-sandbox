@@ -115,6 +115,11 @@ rebuild; a hotel without them gives `deleted`, `ttl_expired`,
 
 ## Hotel choice
 
+Every hotel is sealed (AB#776): there is no unsealed hotel class. The config
+loader refuses a hotel without `"sealed": true`, a join without it gets 400
+`invalid_hotel`, and a create (native or client path) with `"sealed": false`
+gets 400 `sealed_only`. `"sealed": true` is accepted and changes nothing.
+
 A create can limit the hotels it may use. The broker removes these fields
 before it calls the hotel.
 
@@ -124,7 +129,7 @@ before it calls the hotel.
 | `"hotel_labels": {"sealed": "true"}` | Only hotels with every pair. |
 | `"exclude_hotel_labels": {"sealed": "true"}` | No hotel with any pair. |
 | `"placement": "require"` | The default. A create that names hotels uses only those hotels. |
-| `"placement": "prefer"` | Try the named hotels first. If all of them are down, full or fail the create, use another hotel of the same class: sealed for sealed, unsealed for unsealed. The other label rules and the guest's hotel list still apply. A sealed create falls back only when the guest has its own hotel list. A fork and a mix of sealed and unsealed hotels never fall back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
+| `"placement": "prefer"` | Try the named hotels first. If all of them are down, full or fail the create, use another sealed hotel. The other label rules and the guest's hotel list or policy still apply. A create falls back only when the guest has its own hotel list or a policy. A fork never falls back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
 | `"own_hosts_only": true` | Only Cathedral's own hotels: never a miner hotel (one with `miner_hotkey`, the label `miner=true`, or an id that starts with `miner-`), even when the guest policy opts into miner hotels. It holds on every retry, `"prefer"` fallback and queue move. With no own hotel left the create gets the usual 409, 429 or 503. A fork or workspace whose hotel is a miner hotel gets 409. `false` or absent: no limit. Any other value: 400 `invalid_hotel_selection`. |
 
 Hotel labels come from the `labels` object of each hotel in the config.
@@ -133,7 +138,7 @@ hotel matches, the broker answers 409 `no_matching_hotel`. When the
 matching hotels are full, it answers 429 `no_free_rooms`. If matching hotels
 are down or draining (not full), it answers 503 `hotels_unavailable` instead of
 claiming they are full. It never uses
-a hotel outside the choice, except a `"prefer"` fallback inside the same class.
+a hotel outside the choice, except a `"prefer"` fallback.
 Each hotel in `GET /v1/broker/hotels` has `down_since`: the time the broker last
 saw it go down, or null while it is up. The broker logs each change between
 down and up.
@@ -146,9 +151,9 @@ Each guest in the config can have limits (`guests.go`):
 |---|---|
 | `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. A single `count` above the limit itself can never fit: 400 `count_over_room_limit`. |
 | `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. A single `count` above the limit itself: 400 `count_over_rate_limit` (send at most that many in one call). |
-| `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
+| `default_sealed` | Kept for existing configs and echoed by `GET /v1/quota` and the guest views; it no longer changes placement, since every hotel is sealed (AB#776). |
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
-| `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
+| `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels`. See "Guest policy and capacity catalog". |
 | `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
 | `pin_max_gib` | Image bytes the guest may pin on each hotel (prefetch `"pin": true`). Absent or 0: no pins; a pin gets 403 `pins_not_enabled`. Config only. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
@@ -298,15 +303,15 @@ with no config edit.
 
 ```json
 "policy": {
-  "prefer": [{"class": "sealed"}],
-  "allow":  [{"class": "unsealed"}],
+  "prefer": [{"label": {"region": "eu"}}],
+  "allow":  [{"class": "sealed"}],
   "deny":   [{"hotel": "nc-sealed"}]
 }
 ```
 
 | Part | Meaning |
 |---|---|
-| Selector | Exactly one of `{"class": "sealed"\|"unsealed"}`, `{"hotel": "<id>"}` or `{"label": {"k": "v"}}` (every pair). Class is `sealed` when the hotel has the label `sealed=true` (every `"sealed": true` hotel has it). A hotel id need not exist yet. |
+| Selector | Exactly one of `{"class": "sealed"}`, `{"hotel": "<id>"}` or `{"label": {"k": "v"}}` (every pair). `sealed` is the only class (AB#776); any other class is refused (`invalid_policy`, or a config load error). A hotel id need not exist yet. |
 | `prefer` | Tried first. |
 | `allow` | Tried only when no preferred hotel has a free room. |
 | `deny` | Never used. Wins over `prefer`, `allow` and named `hotels`. |
@@ -316,10 +321,6 @@ with no config edit.
   free room, else to an allowed hotel. Inside a tier the pick is the usual
   weighted random pick. The answer has `"placement_tier": "prefer"|"allow"`
   and the header `X-Broker-Placement-Tier` (client routes too).
-- The policy is the class choice: a plain create may land on a sealed or an
-  unsealed hotel only when the policy reaches that class. `"sealed": true`
-  still stays on sealed hotels (429 `no_free_rooms` when they are full, never
-  an unsealed room), and `"sealed": false` stays on unsealed hotels.
 - Named `hotels` must be in the policy's reach (prefer or allow, minus deny),
   else 409 `unknown_hotel`. Tiers still apply among them.
 - `max_rooms` is still the cap: at the cap a create gets 429 `room_limit`.
@@ -329,15 +330,14 @@ with no config edit.
   protects existing customer and Escape guests from newly joined miners.
   Do not opt a customer guest in until the miner-host data isolation and
   attested guest TLS path are proven.
-- A guest with no policy keeps `hotels` and `default_sealed` for non-miner hotels.
+- A guest with no policy keeps `hotels` for non-miner hotels.
 
-Example: `polaris-sealed` gets sealed rooms first, unsealed rooms when sealed
-is full, never `nc-sealed`, at most 10 rooms:
+Example: `polaris-sealed` gets any sealed hotel except `nc-sealed`, at most
+10 rooms:
 
 ```json
 {"id": "polaris-sealed", "max_rooms": 10,
- "policy": {"prefer": [{"class": "sealed"}], "allow": [{"class": "unsealed"}],
-            "deny": [{"hotel": "nc-sealed"}]}}
+ "policy": {"prefer": [{"class": "sealed"}], "deny": [{"hotel": "nc-sealed"}]}}
 ```
 
 ### Placement policy for miner hotels (AB#336)
@@ -432,7 +432,7 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 - Operator key: every hotel with `id`, `class`, `labels`, `up`, `drain`,
   `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`,
   `admission`, `disk_extra_gib` (null: no disk limit), `disk_extra_used_gib`
-  and `room_data_used_pct` (null: no reading yet), plus `classes`: per class (`sealed`, `unsealed`) the totals
+  and `room_data_used_pct` (null: no reading yet), plus `classes`: for the one class (`sealed`) the totals
   `hotels`, `joined`, `up`, `placeable`, `pending_admission`, `draining`,
   `slots` and `free_rooms`.
 - Guest key: only the hotels the guest can reach, each with `tier`
@@ -733,7 +733,7 @@ and the client routes) carries an `isolation` object:
 ```
 
 `hotel_sealed` is true when the room's hotel is a sealed (SEV-SNP) guest;
-`hotel_tee` is the TEE kind, or null on an unsealed hotel. `room_runtime` is
+`hotel_tee` is the TEE kind: `amd_sev_snp`, or the hotel label `tee` when set. `room_runtime` is
 the `runtime` of the room document when it has one, else the runtime the
 hotel last reported in `/room/health` (`runsc`, `docker`, `kata`), else
 `unknown`. The broker never guesses it; a failed health fetch keeps the last
@@ -877,15 +877,15 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
   `invalid_exec`. The native `/v1` route reads `cmd` only and runs a string
   through `sh -c`. Exec output is capped by the hotel at 16 MiB per stream;
   the response includes `"truncated": true` when that happens.
-- Image build (client path): `POST /v1/images/build` takes the Dockerfile
-  and the build context. The broker asks each hotel that takes new rooms
-  to build it. The image is `ready` when one hotel has it, and a create
-  with it goes only to hotels that have it. A failed build gives state
-  `failed` with error `image_build_failed`.
+- Image build (client path): `POST /v1/images/build` answers 409
+  `shared_hotel_build_refused`. Every hotel is a shared sealed hotel, and a
+  shared hotel never builds (AB#650, AB#776): a Dockerfile could reach
+  another guest's local snapshot on the hotel's Docker store. Push the image
+  to a registry and create from it. A built image left in older state reads
+  as `failed` with the same error, and a create from it gets the same 409.
 - With `state_dir` set, the broker keeps client room ids, Idempotency-Key
   answers (48 hours), deleted-room tombstones, room end records (24 hours),
-  images, and guest→hotel→room mappings in `state_dir/client-state.json` (mode 0600), and build contexts
-  in `state_dir/build-contexts/`. After a restart, a repeated create with
+  images, and guest→hotel→room mappings in `state_dir/client-state.json` (mode 0600). After a restart, a repeated create with
   the same key returns the first answer, a room keeps its client id, and
   `GET /v1/hotels/<id>/receipts` still filters correctly for each guest
   (the room→guest mapping is persisted, so a reload does not expose another
@@ -935,8 +935,8 @@ receive this policy document.
 | Route (operator key) | What it does |
 |---|---|
 | `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `rooms_in_use` (rooms the broker holds there plus queued and in-flight creates; what a guest TLS re-seal waits to reach 0), `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested, and `hotel_key_install` on a hotel the broker installs the key into), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
-| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). Every hotel must set `"sealed": true` (AB#776); a join without it gets 400 `invalid_hotel`. For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation; `"verify": false` is refused (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
 
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
 | `GET /v1/broker/miner-exits` | Also for the read-only operator key. Miner hotels that went down holding customer rooms, oldest first: `hotel`, `miner_hotkey`, `down_at`, `drained_at_down`, `ended` (`up` when the same guest answered again, `forgotten` after a forget, absent while down), `ended_at`, `rooms_checked` and `rooms` (`id`, `uuid`, `guest`, `lost`: null until known, then whether the room was gone when the hotel came back; every room of a forgotten exit is lost). `?since=<RFC 3339>` keeps records that went down at or after that time. Kept in the client state file for 8 days, at most 50 per hotel and 1,000 in all. It is the input for forfeiting the miner's delivered hours for that window (AB#329); the broker itself forfeits and re-creates nothing. `drained_at_down` is not proof of notice: the miner's enroll key can set drain. |
@@ -1006,7 +1006,7 @@ curl -s "$BROKER/v1/broker/hotels/miner-a" -H "Authorization: Bearer $ENROLL_KEY
 Every sealed hotel (`"sealed": true`) takes rooms only after it passes
 admission (`admission.go`), whether it came from the config file or a
 runtime join, and every miner hotel is sealed (AB#596). It is the check
-miner hotels have always taken. Unsealed hotels are not gated.
+miner hotels have always taken.
 
 - Health: a good `/room/health` answer. A hotel that goes down leaves
   placement and must pass again (attestation too).
@@ -1047,7 +1047,7 @@ list is the emergency ops escape: that hotel skips the gate, as config
 hotels did before AB#596. The broker logs one line for it at start, its
 hotel document shows `admission.sealed_admission: "off"`, and the operator
 capacity view lists it in `admission_policy.sealed_admission_off`. The
-config loader refuses `"off"` on a miner hotel, an unsealed hotel or a
+config loader refuses `"off"` on a miner hotel or a
 `require_attestation` hotel, and any value other than `"gate"` or `"off"`.
 A join refuses it, and a joined hotel is gated even if `state_dir` says
 otherwise. The top-level `"sealed_admission": "off"`, which ungated joined

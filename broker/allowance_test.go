@@ -1147,11 +1147,11 @@ func TestMeteredFailedSaveClosesTheGuest(t *testing.T) {
 func TestMeteredRuntimeJoinWaitsForItsFirstList(t *testing.T) {
 	tc, _ := meteredChain(t, nil)
 	tc.putAllowance(t, "g1", allowanceBody(1, 5))
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, listFail: true} // holds back its first list
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{}), listFail: true} // holds back its first list
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels["d"] = f
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey, "sealed": true}); status != 201 {
 		t.Fatalf("join d: %d %v", status, doc)
 	}
 	t.Cleanup(func() { stopSyncLoop(t, tc, "d") }) // no background sync logs into a later test
@@ -1166,35 +1166,26 @@ func TestMeteredRuntimeJoinWaitsForItsFirstList(t *testing.T) {
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 }
 
-func TestMeteredUnreadyImageAtCapZeroRefusedBeforeBuilds(t *testing.T) {
-	tc, _ := meteredChain(t, nil)
+func TestMeteredImportedImageAtCapZeroRefusedWithoutHotelCalls(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	// Shared-hotel builds no longer exist. Use an imported image so the
+	// allowance gate remains reachable, and verify it precedes every hotel call.
+	const imgID = "img_metered_import"
+	tc.b.compat.mu.Lock()
+	tc.b.compat.images[imgID] = &compatImage{ID: imgID, Ref: "alpine:3.20", CPU: 1, MemoryGiB: 4, DiskGiB: 10}
+	tc.b.compat.mu.Unlock()
+	tc.putAllowance(t, "g1", allowanceBody(1, 0))
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID, "count": 1}), nil)
+	if _, creates, _ := hotelCalls(tc, lives); status != 402 || anyCode(doc) != "allowance_exhausted" || creates != 0 {
+		t.Fatalf("imported image over allowance: %d %v, %d creates", status, doc, creates)
+	}
 	for _, f := range tc.hotels {
 		f.mu.Lock()
-		f.failBuild = true
+		builds := len(f.builds)
 		f.mu.Unlock()
-	}
-	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
-	_, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	imgID, _ := doc["image_id"].(string)
-	if imgID == "" {
-		t.Fatalf("build: %v", doc)
-	}
-	waitImage(t, tc, imgID)
-	tc.putAllowance(t, "g1", allowanceBody(1, 0))
-	builds := func() int {
-		n := 0
-		for _, f := range tc.hotels {
-			f.mu.Lock()
-			n += len(f.builds)
-			f.mu.Unlock()
+		if builds != 0 {
+			t.Fatalf("refused create caused %d hotel builds", builds)
 		}
-		return n
-	}
-	before := builds()
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID}), nil)
-	time.Sleep(100 * time.Millisecond) // a build the create started would have reached a hotel
-	if status != 402 || anyCode(doc) != "allowance_exhausted" || builds() != before {
-		t.Fatalf("cap 0 create of an unready image: %d %v, %d new builds", status, doc, builds()-before)
 	}
 }
 
@@ -1485,11 +1476,11 @@ func TestMeteredJoinedHotelKeepsNonMeteredAdmission(t *testing.T) {
 	tc, _ := meteredChain(t, nil)
 	tc.putAllowance(t, "g1", allowanceBody(1, 5))
 	join := func(id string, extra map[string]any) {
-		f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, listFail: true} // health answers, room lists fail
+		f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{}), listFail: true} // health answers, room lists fail
 		hs := httptest.NewServer(f)
 		t.Cleanup(hs.Close)
 		tc.hotels[id] = f
-		body := map[string]any{"id": id, "api": hs.URL, "key": joinKey}
+		body := map[string]any{"id": id, "api": hs.URL, "key": joinKey, "sealed": true}
 		for k, v := range extra {
 			body[k] = v
 		}
@@ -1707,11 +1698,11 @@ func TestMeteredHiddenRoomsAreNotCountedWithoutARestart(t *testing.T) {
 func TestMeteredJoinRecountEndsAtTheFirstSuccessfulList(t *testing.T) {
 	tc, _ := meteredChain(t, nil)
 	tc.putAllowance(t, "g1", allowanceBody(1, 5))
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{})}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels["d"] = f
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey, "sealed": true}); status != 201 {
 		t.Fatalf("join d: %d %v", status, doc)
 	}
 	stopSyncLoop(t, tc, "d")
@@ -1771,11 +1762,11 @@ func TestMeteredHoldEndsOnlyOnAListAskedAfterItsDeadline(t *testing.T) {
 func TestMeteredHoldOutlivesItsHotelLeaving(t *testing.T) {
 	tc, _ := meteredChain(t, nil)
 	tc.putAllowance(t, "g1", allowanceBody(1, 1))
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, createFail: 504} // the answer is lost, no room yet
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{}), createFail: 504} // the answer is lost, no room yet
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels["d"] = f
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey, "sealed": true}); status != 201 {
 		t.Fatalf("join d: %d %v", status, doc)
 	}
 	setHotel(tc, "d", func(h *hotel) { h.ok, h.slots = true, 10 })
@@ -2005,10 +1996,10 @@ func TestMeteredRemovedRoomCountsOnce(t *testing.T) {
 func TestMeteredRejectedJoinsLeaveNothingBehind(t *testing.T) {
 	tc, _ := meteredChain(t, nil)
 	for i := 0; i < 5; i++ {
-		if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": fmt.Sprintf("x%d", i), "api": "http://127.0.0.1:1", "key": joinKey}); status != 502 {
+		if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": fmt.Sprintf("x%d", i), "api": "http://127.0.0.1:1", "key": joinKey, "sealed": true}); status != 502 {
 			t.Fatalf("join of an unreachable hotel: %d", status)
 		}
-		if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "b", "api": "http://127.0.0.1:1", "key": joinKey}); status != 409 {
+		if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "b", "api": "http://127.0.0.1:1", "key": joinKey, "sealed": true}); status != 409 {
 			t.Fatalf("join under an existing id: %d", status)
 		}
 	}
@@ -2078,32 +2069,26 @@ func TestMeteredCompatCountLostAnswersAreHeld(t *testing.T) {
 	}
 }
 
-func TestMeteredCompatCountOverCapRefusedBeforeBuilds(t *testing.T) {
-	tc, _ := meteredChain(t, nil)
+func TestMeteredCompatCountOverCapRefusedWithoutHotelCalls(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	// Shared-hotel builds no longer exist. Use an imported image so the
+	// allowance gate remains reachable, and verify it precedes every hotel call.
+	const imgID = "img_metered_import"
+	tc.b.compat.mu.Lock()
+	tc.b.compat.images[imgID] = &compatImage{ID: imgID, Ref: "alpine:3.20", CPU: 1, MemoryGiB: 4, DiskGiB: 10}
+	tc.b.compat.mu.Unlock()
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID, "count": 5}), nil)
+	if _, creates, _ := hotelCalls(tc, lives); status != 402 || anyCode(doc) != "allowance_exhausted" || creates != 0 {
+		t.Fatalf("imported image over allowance: %d %v, %d creates", status, doc, creates)
+	}
 	for _, f := range tc.hotels {
 		f.mu.Lock()
-		f.failBuild = true
+		builds := len(f.builds)
 		f.mu.Unlock()
-	}
-	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
-	_, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	imgID, _ := doc["image_id"].(string)
-	waitImage(t, tc, imgID)
-	tc.putAllowance(t, "g1", allowanceBody(1, 3))
-	builds := func() int {
-		n := 0
-		for _, f := range tc.hotels {
-			f.mu.Lock()
-			n += len(f.builds)
-			f.mu.Unlock()
+		if builds != 0 {
+			t.Fatalf("refused create caused %d hotel builds", builds)
 		}
-		return n
-	}
-	before := builds()
-	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID, "count": 5}), nil)
-	time.Sleep(100 * time.Millisecond) // a build the create started would have reached a hotel
-	if status != 402 || anyCode(doc) != "allowance_exhausted" || builds() != before {
-		t.Fatalf("compat count 5 at cap 3 of an unready image: %d %v, %d new builds", status, doc, builds()-before)
 	}
 }
 
@@ -2370,11 +2355,11 @@ func TestMeteredExtensionAtCapBeforeTheSettle(t *testing.T) {
 // marked unlisted for the metered recount (hotels.go markUnlisted).
 func joinMinerHotel(t *testing.T, tc *testChain, listFail bool) *fakeHotel {
 	t.Helper()
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, listFail: listFail}
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{}), listFail: listFail}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
 	tc.hotels["miner-d"] = f
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "miner-d", "api": hs.URL, "key": joinKey}); status != 201 {
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "miner-d", "api": hs.URL, "key": joinKey, "sealed": true}); status != 201 {
 		t.Fatalf("join miner-d: %d %v", status, doc)
 	}
 	t.Cleanup(func() { stopSyncLoop(t, tc, "miner-d") }) // no background sync logs into a later test

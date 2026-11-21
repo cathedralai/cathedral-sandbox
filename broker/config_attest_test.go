@@ -422,7 +422,7 @@ func TestConfigHotelOptInFailsClosed(t *testing.T) {
 		if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "require_attestation needs") {
+		if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), `every hotel must be "sealed": true`) {
 			t.Fatalf("unsealed require_attestation hotel loaded: %v", err)
 		}
 	})
