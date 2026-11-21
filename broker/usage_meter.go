@@ -523,8 +523,8 @@ func (m *usageMeter) awaitDurable(d time.Duration) {
 }
 
 // seenLocked reports whether the run turned not billable (a new run that
-// is not billable included): its reading must be durable before the hook
-// returns (writeTurns).
+// is not billable included): the caller makes that reading durable once it
+// has released b.mu (awaitDurable).
 func (m *usageMeter) seenLocked(s usageSighting, at time.Time) (turnedNotBillable bool) {
 	if s.run == "" {
 		return false
