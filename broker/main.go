@@ -331,6 +331,7 @@ type hotel struct {
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
 	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
 	warmGen      int             // bumped when the hotel goes down, so a stale prewarm marks nothing
+	pullsOwed    bool            // came up before its hotel key install: syncHotel starts the come-up pulls once it lands (AB#896)
 	prewarmFull  map[string]bool // catalog images whose pull was skipped for a full scratch, logged once (prewarm.go)
 	healthLate   bool            // ok only because room calls answer; health is late
 	lastOK       time.Time       // last good /room/health answer
@@ -2493,10 +2494,23 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	if cameUp {
 		b.noteMinerUp(h, now)
 	}
-	if cameUp && b.prewarms(h) {
+	pull := cameUp
+	if cameUp && h.installNeeded() {
+		// The guest holds no hotel key yet, so every pull would answer 401.
+		// Hold them until the install lands (AB#896).
+		h.pullsOwed, pull = true, false
+	}
+	if h.pullsOwed && herr == nil && !h.installNeeded() {
+		// The install landed after the come-up and health answered with
+		// the key. Started here, as at a come-up, the pulls read the disk
+		// use this pass stores below, not the one from before the reboot.
+		h.pullsOwed, pull = false, true
+		log.Printf("hotel %s: starting the image pulls held for the key install", h.cfg.ID)
+	}
+	if pull && b.prewarms(h) {
 		go b.prewarmHotel(h)
 	}
-	if cameUp {
+	if pull {
 		go b.replayGuestPrefetch(h)
 	}
 	offered := h.slots // health late: the slots placement still uses
