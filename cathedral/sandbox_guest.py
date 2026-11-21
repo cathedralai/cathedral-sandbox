@@ -537,18 +537,20 @@ class PullGate:
         )
 
     @contextlib.contextmanager
-    def admit(self, image: str):
+    def admit(self, image: str, *, refuse: bool = True):
+        """Hold a reservation for one pull. refuse=False: count it, never refuse."""
         if self.data_dir is None or self.min_free <= 0:
             yield
             return
         with self._lock:
             try:
-                st = (self._statvfs or os.statvfs)(self.data_dir)
+                st = (self._statvfs or os.statvfs)(self.data_dir) if refuse else None
             except OSError:
                 st = None  # no volume to read: no check, as before
             if st is not None:
                 free = st.f_bavail * st.f_frsize
-                if free - self._inflight * self.reserve < self.min_free:
+                # The incoming pull holds a reservation too.
+                if free - (self._inflight + 1) * self.reserve < self.min_free:
                     raise SandboxOpError(
                         "image_store_full",
                         507,
@@ -690,9 +692,11 @@ class DockerClient:
             shutil.rmtree(config_dir, ignore_errors=True)
 
     def pull(self, image: str, *, registry_auth: Mapping[str, str] | None = None) -> None:
-        # A refresh of an image already here needs almost no disk, and
-        # refusing it would turn a grant pull into image_not_owned (AB#861).
-        gate = contextlib.nullcontext() if self.image_exists(image) else self.pull_gate.admit(image)
+        # A refresh of an image already here is counted but never refused:
+        # refusing it would turn a cross-guest grant pull into a 403
+        # image_not_owned. A moved tag downloads only its changed layers; the
+        # reservation keeps new pulls from stacking on top of it (AB#861).
+        gate = self.pull_gate.admit(image, refuse=not self.image_exists(image))
         with gate, self._registry_env(image, registry_auth) as env:
             result = self.run(["docker", "pull", image], timeout=600.0, env=env)
         if result.returncode != 0:

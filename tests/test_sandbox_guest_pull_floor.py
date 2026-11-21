@@ -34,11 +34,11 @@ def test_pull_refused_under_the_floor() -> None:
 
 
 def test_pull_allowed_over_the_floor_and_releases_its_reservation() -> None:
-    gate = PullGate("/data", 10, 4, statvfs=vfs(15))
+    gate = PullGate("/data", 10, 4, statvfs=vfs(19))
     with gate.admit("a:1"):
-        # 15 free, one pull in flight holds 4: 11 >= 10, a second pull passes.
+        # 19 free: a holds 4, b would bring it to 8 held: 11 >= 10, b passes.
         with gate.admit("b:1"):
-            # Two in flight hold 8: 7 < 10, a third is refused.
+            # c would hold 12: 7 < 10, refused.
             with pytest.raises(SandboxOpError):
                 with gate.admit("c:1"):
                     pass
@@ -46,8 +46,28 @@ def test_pull_allowed_over_the_floor_and_releases_its_reservation() -> None:
         pass
 
 
+def test_the_incoming_pull_counts_in_its_own_check() -> None:
+    # 11 free, floor 10, reserve 4: one pull could take it to 7, so refuse.
+    with pytest.raises(SandboxOpError):
+        with PullGate("/data", 10, 4, statvfs=vfs(11)).admit("a:1"):
+            pass
+    with PullGate("/data", 10, 4, statvfs=vfs(14)).admit("a:1"):
+        pass
+
+
+def test_a_local_refresh_is_counted_but_never_refused() -> None:
+    gate = PullGate("/data", 10, 4, statvfs=vfs(15))
+    with gate.admit("local:1", refuse=False):
+        with gate.admit("also-local:1", refuse=False):
+            pass
+        # 15 free, the refresh holds 4, a new pull would hold 8: 7 < 10.
+        with pytest.raises(SandboxOpError):
+            with gate.admit("new:1"):
+                pass
+
+
 def test_parallel_pulls_cannot_all_pass_on_one_reading() -> None:
-    gate = PullGate("/data", 10, 4, statvfs=vfs(19))
+    gate = PullGate("/data", 10, 4, statvfs=vfs(23))
     started, release = threading.Barrier(9), threading.Event()
     outcome: list[str] = []
 
@@ -68,7 +88,7 @@ def test_parallel_pulls_cannot_all_pass_on_one_reading() -> None:
     release.set()
     for t in threads:
         t.join(5)
-    # 19 free: 19, 15, 11 pass; the 4th sees 7 < 10.
+    # 23 free: holds of 4, 8, 12 leave 19, 15, 11; a 4th would leave 7 < 10.
     assert outcome.count("ok") == 3 and outcome.count("refused") == 5
 
 
