@@ -57,7 +57,12 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # Pinned 2026-11-19 to eedd025: main after the AB#812 security fix, #599 (a room's anonymous volumes
 # go with the room, AB#815) and #595 (aws_kms signer method names, AB#382). Same make-dist.sh; the
 # bdfd6bf tarball rebuilds to its pinned sha 0b703817... with the same tool.
-CATHEDRAL_COMMIT=eedd025
-CATHEDRAL_TARBALL=dist/cathedral-eedd025.tar.gz
-CATHEDRAL_TARBALL_SHA256=dea3072a1eacc0f34c9b69a1125b33ab60b430591178c5231008b2fb48ac3ec4
+# Pinned 2026-11-21 to 59e8658: main after #619 (per-create registry login carried into the sealed
+# guest, AB#817), #617 (volume shred hardening, AB#825), #633 and #641 (image pull disk floor and a
+# Hub-login pull of a cached image is a refresh, AB#861), #636 (room end reasons, AB#864) and #638
+# (quota freed at kill, AB#863). Same make-dist.sh; the eedd025 tarball rebuilds to its pinned sha
+# dea3072a... with the same tool.
+CATHEDRAL_COMMIT=59e8658
+CATHEDRAL_TARBALL=dist/cathedral-59e8658.tar.gz
+CATHEDRAL_TARBALL_SHA256=9ab8a72ba5822b46a58e9506b8abd79536d5319ef61cbf6ee94e7426bfeb1e31
 PROBE_IMAGE=alpine:3.20
