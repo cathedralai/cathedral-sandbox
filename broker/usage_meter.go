@@ -1250,7 +1250,7 @@ func usageListSighting(h *hotel, id string, labels map[string]string, resources 
 // remove (a bulk delete answers no ids) and applies that list as a sighting
 // of their runs at once: a sync may drop the rooms from the room map, and end
 // their runs, before the delete answers. It returns the run ids, which
-// meterBulkDeleted ends when the delete succeeds; whichever of the two comes
+// usageMeterBulkDeleted ends when the delete succeeds; whichever of the two comes
 // first writes the one ended reading. Nil when the meter is off or the list
 // fails: those runs then end at their last sync list.
 func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) []string {
