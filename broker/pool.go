@@ -158,6 +158,7 @@ type poolHotel struct {
 	busy       bool                 // a step runs
 	creating   map[string]int       // creates in flight, by key
 	started    map[*room]time.Time  // creates in flight: when each started
+	memMiB     float64              // the largest memory its health answers gave since start
 	lastCreate time.Time            // the last pool create's start
 	backoff    time.Time            // a create failed: none before this
 	claims     int                  // claims in flight (poolClaimBegin)
@@ -349,24 +350,27 @@ type poolBounds struct{ bound, bySlots, byMemory int }
 func (b *broker) poolBoundsLocked(h *hotel) poolBounds {
 	bs := poolBounds{bySlots: int(math.Floor(poolSlotShare * float64(max(h.slots, 0)))), byMemory: -1}
 	bs.bound = bs.bySlots
-	if mib := poolHotelMemMiB(h); mib > 0 {
+	if mib := poolHotelMemMiB(h, b.pool.hotel(h.cfg.ID)); mib > 0 {
 		bs.byMemory = int(math.Floor(poolMemShare * mib / poolIdleRoomMiB))
 		bs.bound = min(bs.bound, bs.byMemory)
 	}
 	return bs
 }
 
-// poolHotelMemMiB is h's memory: from its last health answer (used GiB over
-// used percent), else its config ram_gib, else 0 (unknown). Caller holds
+// poolHotelMemMiB is h's memory: its config ram_gib, else the largest its
+// health answers gave since start (used GiB over used percent), else 0
+// (unknown). The hotel rounds both numbers to 0.1 (room_health.py), so one
+// answer to the next moves the ratio by a few percent; the largest seen holds
+// the bound still, where a trim to a lower one is never undone. Caller holds
 // b.mu.
-func poolHotelMemMiB(h *hotel) float64 {
-	if h.memPct > 0 && h.memGiB > 0 {
-		return h.memGiB * 100 / h.memPct * 1024
-	}
+func poolHotelMemMiB(h *hotel, ph *poolHotel) float64 {
 	if h.cfg.RAMGiB > 0 {
 		return float64(h.cfg.RAMGiB) * 1024
 	}
-	return 0
+	if h.memPct > 0 && h.memGiB > 0 {
+		ph.memMiB = max(ph.memMiB, h.memGiB*100/h.memPct*1024)
+	}
+	return ph.memMiB
 }
 
 // oldestCreate is when ph's oldest pool create in flight started; zero when
