@@ -331,8 +331,8 @@ type usageMeter struct {
 	fileSize   int64
 }
 
-// openMeter starts the usage meter in state_dir/usage. No state_dir: off.
-func (b *broker) openMeter() error {
+// loadUsageMeter starts the usage meter in state_dir/usage. No state_dir: off.
+func (b *broker) loadUsageMeter() error {
 	if b.cfg.UsageMeterEverySeconds < 0 {
 		return errors.New("usage_meter_every_seconds must be 0 (the default, 60) or more")
 	}
@@ -348,7 +348,7 @@ func (b *broker) openMeter() error {
 		return err
 	}
 	m.known = func(id string) bool { return b.hotelByID(id) != nil }
-	b.meter = m
+	b.usageMeter = m
 	return nil
 }
 
@@ -1214,14 +1214,14 @@ func (m *usageMeter) writeState() (issued int64, err error) {
 	return st.Issued, nil
 }
 
-// meterHotel hands one sync pass of h to the meter: a run is present while
+// usageMeterHotel hands one sync pass of h to the meter: a run is present while
 // h's room map holds it or this list showed it (a recorded leftover is never
 // in the room map). Runs end only on a pass whose list answered, and not
 // before a room list has answered since start: until then the room map is
 // empty because nobody looked, not because the rooms are gone. Caller holds
 // b.mu.
-func (b *broker) meterHotel(h *hotel, listed []usageSighting, at time.Time, listOK bool) (turned bool) {
-	if b.meter == nil {
+func (b *broker) usageMeterHotel(h *hotel, listed []usageSighting, at time.Time, listOK bool) (turned bool) {
+	if b.usageMeter == nil {
 		return false
 	}
 	present := make(map[string]bool, len(h.rooms)+len(listed))
@@ -1235,7 +1235,7 @@ func (b *broker) meterHotel(h *hotel, listed []usageSighting, at time.Time, list
 	// draining (admissibleFreeIn, capacity.go). A failed list alone does not
 	// stop placement: h.ok comes from health and room calls.
 	unplaceable := !h.ok || h.leaving || h.drain()
-	return b.meter.hotelPass(h.cfg.ID, listed, present, at, listOK, listOK && !h.roomsUnchecked, unplaceable)
+	return b.usageMeter.hotelPass(h.cfg.ID, listed, present, at, listOK, listOK && !h.roomsUnchecked, unplaceable)
 }
 
 // usageListSighting is a listed room that is not in h's room map: a
@@ -1254,7 +1254,7 @@ func usageListSighting(h *hotel, id string, labels map[string]string, resources 
 // first writes the one ended reading. Nil when the meter is off or the list
 // fails: those runs then end at their last sync list.
 func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) []string {
-	if b.meter == nil {
+	if b.usageMeter == nil {
 		return nil
 	}
 	var list struct {
@@ -1278,16 +1278,16 @@ func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) 
 			runs = append(runs, h.cfg.ID+"."+s.ID)
 		}
 	}
-	b.meter.sightRuns(runs, at)
+	b.usageMeter.sightRuns(runs, at)
 	return runs
 }
 
-// meterBulkDeleted ends the runs a successful bulk delete removed. Their last
+// usageMeterBulkDeleted ends the runs a successful bulk delete removed. Their last
 // sighting is the list just before the delete, never the time the delete
 // took: it may take minutes.
-func (b *broker) meterBulkDeleted(runs []string) {
+func (b *broker) usageMeterBulkDeleted(runs []string) {
 	for _, run := range runs {
-		b.meter.end(run, time.Now(), false)
+		b.usageMeter.end(run, time.Now(), false)
 	}
 }
 
@@ -1306,16 +1306,16 @@ func (m *usageMeter) sightRuns(runs []string, at time.Time) {
 	}
 }
 
-// meterOrphan records a room of a failed create that the orphan cleanup
+// usageMeterOrphan records a room of a failed create that the orphan cleanup
 // listed at at: it used compute and the guest does not pay for it, so its
 // run is not billable from this reading on, also when a sync adopted it as
 // the guest's room before the create failed. removed: the cleanup deleted
 // it, so the run ends. Caller holds b.mu.
-func (b *broker) meterOrphan(h *hotel, id, guest string, at time.Time, removed bool) (turned bool) {
+func (b *broker) usageMeterOrphan(h *hotel, id, guest string, at time.Time, removed bool) (turned bool) {
 	run := h.cfg.ID + "." + id
-	turned = b.meter.seen(usageSighting{run: run, guest: guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey}, at)
+	turned = b.usageMeter.seen(usageSighting{run: run, guest: guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey}, at)
 	if removed {
-		b.meter.end(run, at, false)
+		b.usageMeter.end(run, at, false)
 	}
 	return turned
 }
@@ -1330,7 +1330,7 @@ func (b *broker) handleUsageMeter(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 405, "method_not_allowed", "the usage meter is read with GET")
 		return
 	}
-	if b.meter == nil {
+	if b.usageMeter == nil {
 		writeErr(w, 404, "usage_meter_off", "this broker has no state_dir, so it keeps no usage meter")
 		return
 	}
@@ -1352,7 +1352,7 @@ func (b *broker) handleUsageMeter(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = min(n, usagePageMax)
 	}
-	p, err := b.meter.page(after, limit, time.Now())
+	p, err := b.usageMeter.page(after, limit, time.Now())
 	if err != nil {
 		log.Printf("usage meter: read: %v", err)
 		writeErr(w, 500, "usage_meter_read_failed", "the usage log could not be read")

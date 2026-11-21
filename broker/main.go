@@ -457,9 +457,9 @@ type broker struct {
 	// In memory only. Guarded by b.mu.
 	shares map[string]*liveShare
 
-	// meter writes the usage readings of every room (usage_meter.go). nil:
+	// usageMeter writes the usage readings of every room (usage_meter.go). nil:
 	// no state_dir, metering is off.
-	meter *usageMeter
+	usageMeter *usageMeter
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -711,7 +711,7 @@ func loadBroker(path string) (*broker, error) {
 	if err := b.loadConfigLends(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
 	}
-	if err := b.openMeter(); err != nil {
+	if err := b.loadUsageMeter(); err != nil {
 		return nil, fmt.Errorf("usage meter: %w", err)
 	}
 	return b, nil
@@ -1171,7 +1171,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			}
 			h.rooms[hid] = rm
 			b.register(rm)
-			b.meter.seen(usageSightingOf(h, rm, createdResources(doc, body)), tDone) // the run's first reading (usage_meter.go)
+			b.usageMeter.seen(usageSightingOf(h, rm, createdResources(doc, body)), tDone) // the run's first reading (usage_meter.go)
 			h.created++
 			g.created++
 			g.recent = append(g.recent, tDone)
@@ -1426,10 +1426,10 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 			continue
 		}
 		b.mu.Lock()
-		turned := b.meterOrphan(h, s.ID, guestID, listedAt, false) // not billable from here on (usage_meter.go)
+		turned := b.usageMeterOrphan(h, s.ID, guestID, listedAt, false) // not billable from here on (usage_meter.go)
 		b.mu.Unlock()
 		if turned { // durable before the delete, outside b.mu, bounded
-			b.meter.awaitDurable(usageTurnWait)
+			b.usageMeter.awaitDurable(usageTurnWait)
 		}
 		st, _, _, derr := h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes/"+url.PathEscape(s.ID), nil, nil, timeout)
 		if derr != nil || (st != 204 && st != 404) {
@@ -1440,7 +1440,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
 			b.release(h, rm)
 		}
-		b.meterOrphan(h, s.ID, guestID, listedAt, true)
+		b.usageMeterOrphan(h, s.ID, guestID, listedAt, true)
 		b.mu.Unlock()
 		log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, guestID)
 	}
@@ -1831,7 +1831,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			rm.state, rm.vanished = stDeleting, time.Now()
 		}
 		rm.deleteSent = true
-		b.meter.end(rm.id, time.Now(), status == 204 && live) // the run's ended reading (usage_meter.go)
+		b.usageMeter.end(rm.id, time.Now(), status == 204 && live) // the run's ended reading (usage_meter.go)
 		b.mu.Unlock()
 	}
 	for _, k := range []string{"Content-Type", "Content-Range", "Content-Length", "Retry-After", "Accept-Ranges"} {
@@ -2256,7 +2256,7 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 			gone := b.bulkDeleteTargets(r.Context(), h, q) // sighted now, ended on success (usage_meter.go)
 			status, busy := bulkDeleteFromHotel(r.Context(), h, q)
 			if status >= 200 && status < 300 {
-				b.meterBulkDeleted(gone)
+				b.usageMeterBulkDeleted(gone)
 			}
 			mu.Lock()
 			res[h.cfg.ID] = status
@@ -2419,10 +2419,10 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 
 	// A run this pass turned not billable is made durable after b.mu is
 	// released, with a bound (usage_meter.go): no disk I/O under b.mu.
-	meterTurned := false
+	usageMeterTurned := false
 	defer func() {
-		if meterTurned {
-			b.meter.awaitDurable(usageTurnWait)
+		if usageMeterTurned {
+			b.usageMeter.awaitDurable(usageTurnWait)
 		}
 	}()
 	b.mu.Lock()
@@ -2431,7 +2431,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	// the room map no longer holds. Deferred after the lock, so it runs
 	// under b.mu once every change below is made (usage_meter.go).
 	var listed []usageSighting
-	defer func() { meterTurned = b.meterHotel(h, listed, listedAt, lerr == nil) }()
+	defer func() { usageMeterTurned = b.usageMeterHotel(h, listed, listedAt, lerr == nil) }()
 	now := time.Now()
 	h.lastErr = ""
 	if err := errors.Join(herr, qerr, lerr); err != nil {
@@ -3124,7 +3124,7 @@ func main() {
 		close(saved)
 	}()
 	go b.alerts.run(ctx)
-	go b.meter.run(ctx)
+	go b.usageMeter.run(ctx)
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
@@ -3147,8 +3147,8 @@ func main() {
 		b.drainNativeExecs(nativeExecDrain) // background execs get time to finish and be saved
 		stopLoops()
 		<-saved // saveLoop writes dirty state on its way out
-		b.meter.checkpoint(time.Now())
-		if err := b.meter.flush(); err != nil {
+		b.usageMeter.checkpoint(time.Now())
+		if err := b.usageMeter.flush(); err != nil {
 			log.Printf("usage meter: readings not written at stop: %v", err)
 		}
 		os.Exit(0)
