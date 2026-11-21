@@ -4596,7 +4596,11 @@ def main() -> int:
             env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
     if ledger.sealed and ledger.ingress is not None and ledger.ingress.zone:
         import room_ingress  # installed beside this file; only a sealed guest with a zone loads it
-        room_ingress.start(ledger, env, args[1], api_key, store)
+        try:
+            room_ingress.start(ledger, env, args[1], api_key, store)
+        except (ValueError, OSError) as exc:
+            # The hotel keeps serving rooms; expose goes to the API (501) as with the flag off.
+            print(f"room-receipts: guest ingress NOT serving: {exc}", flush=True)
     if miner is None:
         srv = Server((host, int(port)), *args, look_seconds=look or None)
         srv.serve_forever()

@@ -443,3 +443,22 @@ def test_a_serial_room_is_never_exposed(world) -> None:
     assert status == 409 and json.loads(body)["error"]["code"] == "room_serial_unsigned"
     assert "expose_url" not in _receipt(headers)["statement"]
     assert _https(world["ingress"], HOST)[0][0] == 404
+
+
+def test_start_turns_serving_on_only_when_configured_and_bound(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "tsm_provider", lambda: "sev_guest")
+    monkeypatch.setattr(rr, "snp_report", _fake_report)
+    monkeypatch.setattr(room_ingress.CertKeeper, "start", lambda self: None)
+    ledger = rr.Ledger(HOTEL, str(tmp_path / "store"), ingress=rr.GuestIngress(HOTEL, zone=ZONE))
+    assert room_ingress.start(ledger, {}, 1, KEY, str(tmp_path)) is None and ledger.ingress.serving is None
+    busy = socket.socket()
+    busy.bind(("127.0.0.1", 0))
+    busy.listen()
+    env = {"ROOM_INGRESS_ZONE": ZONE, "ROOM_INGRESS_BROKER_URL": "https://b.example",
+           "ROOM_INGRESS_TLS_LISTEN": f"127.0.0.1:{busy.getsockname()[1]}"}
+    with pytest.raises(OSError):
+        room_ingress.start(ledger, env, 1, KEY, str(tmp_path))
+    assert ledger.ingress.serving is None  # expose stays the API's
+    busy.close()  # the same port, now free
+    state = room_ingress.start(ledger, env, 1, KEY, str(tmp_path), log=lambda *a, **k: None)
+    assert ledger.ingress.serving is state and not state.ready

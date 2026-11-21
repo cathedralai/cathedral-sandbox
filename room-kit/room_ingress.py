@@ -332,8 +332,8 @@ def start(ledger, env, api_port: int, api_key: bytes, private_dir: str, log=prin
     if config is None:
         return None
     state = IngressState(ledger.ingress, ledger.hotel, config, private_dir)
-    ledger.ingress.serving = state
     srv = IngressServer(config.listen, state, api_port, api_key)
+    ledger.ingress.serving = state  # only once the port is bound: until then expose stays the API's
     threading.Thread(target=srv.serve_forever, daemon=True, name="ingress").start()
     CertKeeper(state, ledger.key, ledger.binding_sha256, log=log).start()
     log(f"room-receipts: guest ingress serving https on {config.listen[0]}:{config.listen[1]} for "
