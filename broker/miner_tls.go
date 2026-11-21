@@ -201,7 +201,20 @@ func (b *broker) syncGuestPin(ctx context.Context, h *hotel) {
 		return
 	}
 	if peerSPKI == cur {
-		return // the same verified key: the hotel is down or slow for another reason
+		b.mu.Lock()
+		retry := h.installNeeded()
+		b.mu.Unlock()
+		if !retry {
+			return // the same verified key: the hotel is down or slow for another reason
+		}
+		// Pinned, but the key is not in the guest yet (a refusal, or an
+		// install whose answer was lost). The body is new: check it again.
+		if err := b.verifyMinerBootstrap(ctx, raw, peerSPKI); err != nil {
+			fail(err)
+			return
+		}
+		b.installHotelKey(ctx, h, raw, peerSPKI)
+		return
 	}
 	if err := b.verifyMinerBootstrap(ctx, raw, peerSPKI); err != nil {
 		fail(err)
@@ -248,6 +261,8 @@ func (b *broker) syncGuestPin(ctx context.Context, h *hotel) {
 	} else {
 		log.Printf("hotel %s: guest TLS key changed %s... -> %s... (new boot, verified); pinned", h.cfg.ID, cur[:16], peerSPKI[:16])
 	}
+	// A new guest key is a guest with no hotel key: install it now (AB#817).
+	b.installHotelKey(ctx, h, raw, peerSPKI)
 }
 
 // validateGuestTLS checks a config file hotel entry against "guest_tls" and

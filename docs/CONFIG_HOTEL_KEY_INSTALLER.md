@@ -1,7 +1,9 @@
 # Config hotel key installer (AB#817, AB#378 "Still open")
 
-Status: spec, not built. Blocks the guest TLS re-seal of const's hotels
-(nc-sealed, chi-sealed) and with it const's Docker Hub login (AB#817).
+Status: built (broker/hotel_key_install.go, tests in
+broker/hotel_key_install_test.go). It unblocks the guest TLS re-seal of
+const's hotels (nc-sealed, chi-sealed) and with it const's Docker Hub login
+(AB#817).
 
 ## The gap
 
@@ -25,8 +27,11 @@ learns the key.
 1. Config: per hotel `"hotel_key_install_signing_key_file"` (Ed25519 seed,
    base64, mode 600, beside `key_file`). Allowed only with `"guest_tls": true`.
 2. Trigger: right after `syncGuestPin` stores a new pin (a reboot or a
-   receipts restart makes a new TLS key, so both land here), and when a keyed
-   call on the current pin answers 401 (an install whose answer was lost).
+   receipts restart makes a new TLS key, so both land here), and on every
+   pin recheck (5 s) while the current pin has no good install (a refusal,
+   or an install whose answer was lost). The guest keeps the key in memory
+   and loses it only with its TLS key, so a good install on the current pin
+   stays good; a 401 with no new key is a guest down for another reason.
 3. Over the pinned client:
    - `GET /room/hotel-key-install-key`. Check `purpose`, `algorithm`,
      `binding_sha256` = sha256(canonical(binding)) of the attestation just
@@ -50,8 +55,7 @@ learns the key.
   install key, so a leak of one does not install keys into the other's hotels.
 - Its public key goes into `SEALED_HOTEL_KEY_INSTALL_SIGNERS` of each config
   hotel build. That is measured: decide it before the kit is built.
-- Decision for Toby: this (recommended) or the control plane signing for
-  config hotels too.
+- Decided (Toby 21 Nov 12:41Z brief): the broker side installs, with this ops key.
 
 ## Also needed before the const re-seal
 
