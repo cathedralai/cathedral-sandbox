@@ -229,6 +229,7 @@ CPU_OVERCOMMIT=16
 MEM_OVERCOMMIT=20
 DISK_OVERCOMMIT=1000
 ROOM_MAX_SLOTS=$SEALED_ROOM_MAX_SLOTS
+ROOM_QUOTA_VCPU=pool
 ROOM_CREATES_PER_MINUTE=6000
 ROOM_GC_PARALLELISM=16
 ROOM_DIND_DOCKERD_ARGS="--iptables=false --ip6tables=false --bridge=none --default-network-opt bridge=com.docker.network.advertise_addr_nmsgs=0 --default-address-pool base=10.200.0.0/14,size=24"
