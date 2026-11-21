@@ -2244,3 +2244,193 @@ func TestMeteredComputeSDKCreateMeetsTheAllowance(t *testing.T) {
 		t.Fatalf("a second ComputeSDK room at cap 1: %d %v", status, doc)
 	}
 }
+
+// ---------------------------------------------------------------- Bugbot on #623
+
+// lostOnTwoHotels starts a create of g1 that loses its answer on hotel a,
+// retries on b and loses it there too, with both hotels' cleanup lists held,
+// so the first reap pass of each runs into its 3 s bound. It waits until the
+// first hotel's unreaped record exists while settleUncertain has not run (the
+// window between reapOrphans and the settle) and returns the create's answer
+// channel and a release for the held lists.
+func lostOnTwoHotels(t *testing.T, tc *testChain, lives map[string]*lifeHotel) (<-chan int, func()) {
+	t.Helper()
+	hold := make(chan struct{})
+	for _, id := range []string{"a", "b"} {
+		f := tc.hotels[id]
+		f.mu.Lock()
+		f.createFail = 504 // the answer is lost; no room starts
+		f.mu.Unlock()
+		lives[id].mu.Lock()
+		lives[id].holdList, lives[id].listTaken, lives[id].holdLabelLists = hold, make(chan struct{}, 64), true
+		lives[id].mu.Unlock()
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	done := make(chan int, 1)
+	go func() {
+		status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a", "b"}})
+		done <- status
+	}()
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the first record before the settle never appeared")
+		}
+		tc.b.mu.Lock()
+		records := len(tc.b.hotelByID("a").unreaped) + len(tc.b.hotelByID("b").unreaped)
+		settled := len(tc.b.allow.attempts)
+		uncertain := tc.b.allow.uncertain["g1"]
+		tc.b.mu.Unlock()
+		if records > 0 && settled == 0 {
+			if uncertain != 2 {
+				t.Fatalf("in the window: uncertain %d, want the 2 lost attempts", uncertain)
+			}
+			return done, release
+		}
+	}
+}
+
+// A lost attempt whose hotel's first reap pass failed is counted once in the
+// window before settleUncertain, not twice: a create at cap 3 with 2 lost
+// attempts is admitted. Fails on 69c725e (live 3, 402).
+func TestMeteredLostAttemptCountsOnceBeforeTheSettle(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	done, _ := lostOnTwoHotels(t, tc, lives)
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 2.0 {
+		t.Fatalf("live_rooms in the window: %v, want 2", v["live_rooms"])
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 202 {
+		t.Fatalf("create at cap 3 with 2 lost attempts in the window: %d %v", status, doc)
+	}
+	if status := <-done; status < 500 {
+		t.Fatalf("the lost create answered %d", status)
+	}
+}
+
+// The opposite guard: in the same window each lost attempt still counts, so
+// a guest at cap is refused (never counted zero times).
+func TestMeteredLostAttemptStillCountsBeforeTheSettle(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 2))
+	done, _ := lostOnTwoHotels(t, tc, lives)
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create at cap 2 with 2 lost attempts in the window: %d %v", status, doc)
+	}
+	<-done
+	if _, creates, _ := hotelCalls(tc, lives); creates != 2 {
+		t.Fatalf("%d creates dispatched, want the 2 lost attempts only", creates)
+	}
+}
+
+// After the settle the two lost attempts count once each through their
+// records: live_rooms 2, one more room at cap 3 is admitted, the next is
+// refused.
+func TestMeteredLostAttemptsSettledCounts(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	done, release := lostOnTwoHotels(t, tc, lives)
+	<-done
+	release()
+	tc.b.mu.Lock()
+	settled, uncertain := len(tc.b.allow.attempts), tc.b.allow.uncertain["g1"]
+	tc.b.mu.Unlock()
+	if settled != 2 || uncertain != 0 {
+		t.Fatalf("after the settle: %d settled records, uncertain %d; want 2 and 0", settled, uncertain)
+	}
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 2.0 {
+		t.Fatalf("live_rooms after the settle: %v, want 2", v["live_rooms"])
+	}
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}})
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("a fourth room at cap 3: %d %v", status, doc)
+	}
+}
+
+// A lifetime extension in the same window, for a guest exactly at cap (one
+// running room and two lost attempts at cap 3), is allowed: live is 3, not
+// 4. Fails on 69c725e (402).
+func TestMeteredExtensionAtCapBeforeTheSettle(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}})
+	done, _ := lostOnTwoHotels(t, tc, lives)
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 3.0 {
+		t.Fatalf("live_rooms in the window: %v, want 3", v["live_rooms"])
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/heartbeat", map[string]any{"ttl_seconds": 600}); status != 200 {
+		t.Fatalf("heartbeat at cap in the window: %d %v", status, doc)
+	}
+	<-done
+}
+
+// joinMinerHotel joins hotel miner-d at runtime with the operator key, as a
+// miner hotel by its id. listFail holds back its room lists, so it stays
+// marked unlisted for the metered recount (hotels.go markUnlisted).
+func joinMinerHotel(t *testing.T, tc *testChain, listFail bool) *fakeHotel {
+	t.Helper()
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, listFail: listFail}
+	hs := httptest.NewServer(f)
+	t.Cleanup(hs.Close)
+	tc.hotels["miner-d"] = f
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "miner-d", "api": hs.URL, "key": joinKey}); status != 201 {
+		t.Fatalf("join miner-d: %d %v", status, doc)
+	}
+	t.Cleanup(func() { stopSyncLoop(t, tc, "miner-d") }) // no background sync logs into a later test
+	if h := tc.b.hotelByID("miner-d"); h == nil || !isMinerHotel(h) {
+		t.Fatal("miner-d is not a miner hotel")
+	}
+	return f
+}
+
+// The outside-miner case of the Codex finding fixed in 5ea360d: a miner
+// hotel joined at runtime that never answers a room list does not hold an
+// own-hosts-only metered guest that cannot be placed there and never had a
+// room there. Fails on 27a5bdb (503 allowance_recount).
+func TestMeteredOwnHostsOnlyIgnoresAJoinedMinerThatNeverLists(t *testing.T) {
+	tc, _ := meteredChain(t, func(c *config) { c.Guests[0].OwnHostsOnly = true })
+	tc.putAllowance(t, "g1", allowanceBody(1, 2))
+	joinMinerHotel(t, tc, true)
+	if v := tc.getAllowance(t, "g1"); v["recount_pending"] != false {
+		t.Fatalf("an own-hosts-only guest waits for a joined miner hotel: %v", v)
+	}
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+}
+
+// The historical half is kept: a guest with a room on that miner hotel (its
+// own_hosts_only switched on by PATCH while the room runs there) still waits
+// for the hotel's list, then is admitted.
+func TestMeteredOwnHostsOnlyStillWaitsForAMinerHotelItHasRoomsOn(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	joinMinerHotel(t, tc, false)
+	tc.syncAll("miner-d")
+	setHotel(tc, "miner-d", func(h *hotel) { h.ok, h.slots = true, 100 })
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"miner-d"}})
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"own_hosts_only": true}); status != 200 {
+		t.Fatalf("own_hosts_only on while the guest has a room on a miner hotel: %d %v", status, doc)
+	}
+	tc.b.markUnlisted(tc.b.hotelByID("miner-d")) // as at its join: not listed yet
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 503 || errCode(doc) != "allowance_recount" {
+		t.Fatalf("create while a miner hotel with the guest's room is unlisted: %d %v", status, doc)
+	}
+	tc.syncAll("miner-d")
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+}
+
+// A guest without own_hosts_only is unchanged: a joined miner hotel it may
+// use holds its metered creates at 503 until the hotel lists.
+func TestMeteredGuestWithoutOwnHostsOnlyWaitsForAJoinedMinerHotel(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 2))
+	f := joinMinerHotel(t, tc, true)
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 503 || errCode(doc) != "allowance_recount" {
+		t.Fatalf("create while a miner hotel the guest may use is unlisted: %d %v", status, doc)
+	}
+	f.mu.Lock()
+	f.listFail = false
+	f.mu.Unlock()
+	tc.syncAll("miner-d")
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+}

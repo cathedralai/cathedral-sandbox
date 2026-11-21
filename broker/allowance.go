@@ -201,7 +201,10 @@ func (b *broker) meteredLocked(g *guestState) (bool, *guestAllowance) {
 // admitted and not yet placed or failed, every room the broker still has for
 // it (rooms being removed included, until the sync loop lets them go), create
 // attempts whose answer was lost, and the orphans of those attempts that a
-// reap pass has not confirmed gone (h.unreaped). Caller holds b.mu.
+// reap pass has not confirmed gone (h.unreaped). Between a create losing its
+// answer and its attempt being resolved, the attempt is counted exactly once:
+// in uncertain before settleUncertain, through its unreaped record after it,
+// and the move is one b.mu step. Caller holds b.mu.
 func (b *broker) meteredLiveLocked(g *guestState) int {
 	n := g.pending + b.allow.uncertain[g.cfg.ID]
 	for _, h := range b.hotelList() {
@@ -462,12 +465,18 @@ func (b *broker) noteOrphanRemovedLocked(h *hotel, batchID, roomID string) {
 
 // unresolvedLocked is what h's unreaped record of a create request counts
 // against its metered guest: lost attempts whose rooms have not been listed
-// and removed (1 while settleUncertain has not counted them yet). Caller
-// holds b.mu.
+// and removed. Between a create losing its answer and its attempt being
+// resolved, the attempt is counted exactly once: in uncertain before
+// settleUncertain (the record, unsettled, counts 0), through this record
+// after it, and the move is one b.mu step. A settled record with no attempts
+// entry still counts 1. Caller holds b.mu.
 func (b *broker) unresolvedLocked(h *hotel, batchID string) int {
 	key := orphanKey(h.cfg.ID, batchID)
 	n, known := b.allow.attempts[key]
 	if !known {
+		if ub := h.unreaped[batchID]; ub != nil && ub.unsettled {
+			return 0 // its lost attempts count in uncertain until the settle
+		}
 		return 1
 	}
 	return max(0, n-len(b.allow.removed[key]))
@@ -565,6 +574,9 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 	for h, n := range lostOn {
 		key := orphanKey(h.cfg.ID, batchID)
 		ub := h.unreaped[batchID]
+		if ub != nil {
+			ub.unsettled = false // uncertain gives these attempts up below, in this b.mu step
+		}
 		if !metered || len(b.allow.removed[key]) >= n {
 			// Not metered: as before. Metered and every attempt's room listed
 			// and removed: nothing is left to count.

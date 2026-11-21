@@ -412,6 +412,10 @@ type unreapedBatch struct {
 	// holdUntil: a metered guest's lost create whose reap found no room; the
 	// record stays, unlisted, until then (allowance.go settleUncertain).
 	holdUntil time.Time
+	// unsettled: reapOrphans recorded the request before settleUncertain
+	// counted its lost attempts, which still count in uncertain until then
+	// (allowance.go unresolvedLocked).
+	unsettled bool
 }
 
 type guestState struct {
@@ -1414,7 +1418,7 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 	if h.unreaped == nil {
 		h.unreaped = map[string]*unreapedBatch{}
 	}
-	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true}
+	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true}
 	h.unreaped[batchID] = ub
 	b.mu.Unlock()
 	go func() {
