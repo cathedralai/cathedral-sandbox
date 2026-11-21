@@ -581,7 +581,7 @@ run_tool() { # name arguments-json: prints the result the model reads
 # fit CONTEXT_CHARS (whole turns, oldest dropped first), this message with its
 # media, and the tool calls of this turn so far. Without new media, the last
 # picture or clip goes back on the message that brought it, if that is kept.
-build_body() { # with-tools [max-tokens] [sampling]
+build_body() { # with-tools [max-tokens] [sampling] [stream]
   local n=${2:-$MAX_TOKENS} sampling=${3:-$SAMPLING}
   local media=$MEDIA_FILE
   [ -s "$media" ] || media=$work/no_media
@@ -590,7 +590,7 @@ build_body() { # with-tools [max-tokens] [sampling]
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
     --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$n" \
     --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$sampling" --argjson examples "$EXAMPLES" \
-    --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" --arg final_line "$FINAL_LINE" '
+    --argjson stream "${4:-false}" --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" --arg final_line "$FINAL_LINE" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
       | if $i == null then [] else .[($i + 1):] end;
     def fit($room): if length == 0 or (tojson | length) <= $room then . else (drop_turn | fit($room)) end;
@@ -610,7 +610,8 @@ build_body() { # with-tools [max-tokens] [sampling]
       }
     + $sampling
     + (if $with_tools == "1" then {tools: $tools} else {} end)
-    + (if $json == "1" then {response_format: $format} else {} end)' >"$work/body"
+    + (if $json == "1" then {response_format: $format} else {} end)
+    + (if $stream then {stream: true} else {} end)' >"$work/body"
 }
 
 normalize_reply() { # $work/out holds a chat completion: the reply message goes to $work/msg
@@ -1046,8 +1047,8 @@ wait_for_server_events() {
 
 ask_model_stream() { # with-tools [sampling]: the reply message goes to $work/msg, delta lines to stdout
   local line rc code
-  build_body "$1" "" "${2:-}"
-  jq '. + {stream: true}' "$work/body" >"$work/body.stream"
+  # Set streaming while constructing the body, avoiding a second jq startup.
+  build_body "$1" "" "${2:-}" true
   rm -f "$work/end" "$work/curl_rc" "$work/hdr" "$work/raw"
   while IFS= read -r line; do
     case "$line" in
@@ -1056,7 +1057,7 @@ ask_model_stream() { # with-tools [sampling]: the reply message goes to $work/ms
     esac
   done < <({ curl -sS -N -D "$work/hdr" --max-time "${LFM3_TIMEOUT:-600}" \
       -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
-      --data-binary @"$work/body.stream" "$BASE_URL/chat/completions" 2>/dev/null
+      --data-binary @"$work/body" "$BASE_URL/chat/completions" 2>/dev/null
     echo "$?" >"$work/curl_rc"; } | tee "$work/raw" | jq -n -R -c -a --unbuffered --argjson round "$ev_round" "$SECRETS_JQ $STREAM_JQ")
   rc=$(cat "$work/curl_rc" 2>/dev/null || echo 1)
   code=$(grep -a '^HTTP/' "$work/hdr" 2>/dev/null | tail -n 1 | cut -d' ' -f2 | tr -d '\r' || true)
@@ -1083,13 +1084,18 @@ one_turn() { # message
   if [ -z "$text" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
     usage
   fi
-  jq -n --arg t "$text" --slurpfile names "$work/names" '
+  # Prepare stored metadata and sent media in one jq process. Compact JSON
+  # escapes embedded newlines, so each array occupies exactly one physical line.
+  jq -cn --arg t "$text" --slurpfile names "$work/names" --slurpfile parts "$work/parts" '
     ($names[0] | map("[" + . + "]") | join(" ")) as $n
-    | [{role: "user", content: ([$n, $t] | map(select(. != "")) | join(" "))}
-       + (if $n == "" then {} else {media: true} end)]' >"$work/user_stored"
-  jq -n --arg t "$text" --slurpfile parts "$work/parts" '
-    [{role: "user", content: (if ($parts[0] | length) == 0 then $t
-      else $parts[0] + (if $t == "" then [] else [{type: "text", text: $t}] end) end)}]' >"$work/user_sent"
+    | ([{role: "user", content: ([$n, $t] | map(select(. != "")) | join(" "))}
+        + (if $n == "" then {} else {media: true} end)]),
+      ([{role: "user", content: (if ($parts[0] | length) == 0 then $t
+        else $parts[0] + (if $t == "" then [] else [{type: "text", text: $t}] end) end)}])' >"$work/user_pair"
+  local stored sent
+  { IFS= read -r stored && IFS= read -r sent; } <"$work/user_pair"
+  printf '%s\n' "$stored" >"$work/user_stored"
+  printf '%s\n' "$sent" >"$work/user_sent"
   echo '[]' >"$work/turn"
 
   ask=ask_model
