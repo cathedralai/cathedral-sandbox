@@ -592,7 +592,9 @@ func (b *broker) poolRead(ctx context.Context, h *hotel, hid string, att poolAtt
 	case verr != nil:
 		pr.state, pr.why = poolQuarantined, "receipts read: "+verr.Error()
 	case k == nil:
-		pr.state, pr.why = poolQuarantined, "receipts read: its image is not a ready_rooms key"
+		// Proven never claimed, but of no key: deleted, as an over-target room.
+		pr.state, pr.why, pr.proven, pr.att, pr.since = poolStale, "receipts read: its image is not a ready_rooms key", true, att, now
+		return
 	default:
 		pr.state, pr.why, pr.proven, pr.key, pr.att, pr.receipt1, pr.since = poolReady, "", true, k.name, att, sha, now
 		pr.expiresAt = poolExpiry(h.rooms[hid], now)
@@ -702,6 +704,7 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	}
 	hid, _ := doc["id"].(string)
 	if err != nil || (status != 200 && status != 201 && status != 202) || hid == "" {
+		ph.nextCreate = time.Now().Add(max(poolCreateEvery, poolRetryFirst)) // a failing hotel is not asked every second
 		h.release(rm)
 		b.mu.Unlock()
 		// A lost answer may have started a room: its pool label brings it

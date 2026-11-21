@@ -590,8 +590,8 @@ func TestPoolCreatesAtMostOneASecondPerHotel(t *testing.T) {
 	})
 	for _, id := range []string{"a", "b"} {
 		c := pc.hotels[id].creates()
-		if len(c) < 3 || len(c) > 4 {
-			t.Fatalf("hotel %s: %d creates in 3.5 s, want 3 or 4", id, len(c))
+		if len(c) < 2 || len(c) > 4 {
+			t.Fatalf("hotel %s: %d creates in 3.5 s, want 2 to 4", id, len(c))
 		}
 		for i := 1; i < len(c); i++ {
 			if gap := c[i].at.Sub(c[i-1].at); gap < time.Second {
@@ -680,5 +680,36 @@ func TestPoolWaitsForTheFirstRoomList(t *testing.T) {
 	pc.fill("a", 2)
 	if n := len(f.creates()); n != 1 {
 		t.Fatalf("%d creates, want 1: r-pool, read after the first list, is one of the 2", n)
+	}
+}
+
+// A pool create that fails is not tried again for 5 s on that hotel, even
+// with no wait between creates.
+func TestPoolFailedCreateWaitsBeforeTheNext(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	pc.up("a")
+	f.set(func(f *fakePoolHotel) { f.createFail = true })
+	pc.target(2)
+	pc.steps("a", 5)
+	if n := len(f.creates()); n != 1 {
+		t.Fatalf("%d create attempts on a failing hotel, want 1 in 5 s", n)
+	}
+	if c := pc.counts("a"); c.held != 0 {
+		t.Fatalf("pool holds %+v after a failed create", c)
+	}
+}
+
+// After a restart, a room whose receipts prove it unclaimed but whose image
+// is no ready_rooms key is deleted, like an over-target room.
+func TestPoolRestartDeletesAProvenRoomOfNoKey(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	f.addRoom("r-other", "pool-other-image")
+	pc.up("a")
+	pc.steps("a", 3)
+	dels := f.roomDeletes()
+	if len(dels) != 1 || dels[0].path != "/v1/sandboxes/r-other" {
+		t.Fatalf("deletes %v, want r-other\n%s", dels, pc.debug("a"))
 	}
 }

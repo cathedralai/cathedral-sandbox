@@ -62,6 +62,7 @@ type fakePoolHotel struct {
 	listFail      bool
 	attestFail    bool
 	deleteFail    bool
+	createFail    bool // answer creates 503 and start no room
 	readFail      bool
 	prefetchGate  chan struct{} // non-nil: a prefetch waits for it
 }
@@ -119,8 +120,9 @@ func (f *fakePoolHotel) createStatement(id, image string, pool bool) map[string]
 
 // addRoom puts a pool-labelled room on the hotel, as one left from before
 // a broker restart. receipts: "pool" (its receipt 1), "claim" (a claim
-// after it), "create" (a create not signed pool). None: the front's chain
-// holds nothing for it.
+// after it), "create" (a create not signed pool), "pool-other-image" (a pool
+// receipt 1 of an image that is no key). None: the front's chain holds
+// nothing for it.
 func (f *fakePoolHotel) addRoom(id string, receipts ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -129,6 +131,8 @@ func (f *fakePoolHotel) addRoom(id string, receipts ...string) {
 		switch kind {
 		case "pool", "create":
 			r.receipts = append(r.receipts, f.receipt(f.priv, f.createStatement(id, nodeImage(), kind == "pool")))
+		case "pool-other-image":
+			r.receipts = append(r.receipts, f.receipt(f.priv, f.createStatement(id, "alpine:3.20", true)))
 		case "claim":
 			prev := sha256.Sum256(r.receipts[len(r.receipts)-1])
 			r.receipts = append(r.receipts, f.receipt(f.priv, map[string]any{"schema": sealedReceiptSchema, "binding_sha256": f.binding,
@@ -230,6 +234,8 @@ func (f *fakePoolHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"resources": map[string]any{"vcpu": 1, "memory_gib": 4, "disk_gib": 10}, "expires_at": rm.expires.UTC().Format(time.RFC3339)})
 		}
 		reply(200, map[string]any{"sandboxes": list})
+	case p == "/v1/sandboxes" && r.Method == "POST" && f.createFail:
+		reply(503, map[string]any{"error": map[string]any{"code": "pool_state_unknown"}})
 	case p == "/v1/sandboxes" && r.Method == "POST":
 		var doc struct {
 			Image  string            `json:"image"`
