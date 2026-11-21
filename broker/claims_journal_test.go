@@ -1853,10 +1853,15 @@ func TestClaimJournalNoAckInOldGenerationAfterCommit(t *testing.T) {
 					return err
 				}
 				if armed.Load() && filepath.Base(newpath) == claimCurrentName {
-					_ = os.Chmod(newpath, 0)
 					return injected
 				}
 				return nil
+			}
+			o.disk.readBack = func(path string) (string, error) {
+				if armed.Load() {
+					return "", injected
+				}
+				return readClaimText(path)
 			}
 		}},
 	}
@@ -1864,7 +1869,6 @@ func TestClaimJournalNoAckInOldGenerationAfterCommit(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			state := t.TempDir()
 			current := filepath.Join(state, claimJournalDirName, claimCurrentName)
-			t.Cleanup(func() { _ = os.Chmod(current, 0o600) })
 			var armed atomic.Bool
 			release := make(chan struct{})
 			var o claimJournalOptions
@@ -1898,7 +1902,6 @@ func TestClaimJournalNoAckInOldGenerationAfterCommit(t *testing.T) {
 				acked = append(acked, "x10")
 			}
 			_ = j.close()
-			_ = os.Chmod(current, 0o600)
 			cur, _ := readClaimText(current)
 			var want []string
 			switch c.want {

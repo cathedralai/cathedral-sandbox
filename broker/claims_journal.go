@@ -222,6 +222,7 @@ type claimJournalDisk struct {
 	syncDir  func(dir string) error
 	open     func(path string, flag int, perm os.FileMode) (*os.File, error) // a head file
 	rename   func(oldpath, newpath string) error                             // a temporary file into place
+	readBack func(path string) (string, error)                               // CURRENT read back after a rename that reported an error
 	step     func(point string)                                              // nil: nothing; names a point a crash may hit
 }
 
@@ -249,6 +250,9 @@ func (d claimJournalDisk) withDefaults() claimJournalDisk {
 	}
 	if d.rename == nil {
 		d.rename = os.Rename
+	}
+	if d.readBack == nil {
+		d.readBack = readClaimText
 	}
 	if d.step == nil {
 		d.step = func(string) {}
@@ -1670,7 +1674,7 @@ func (j *claimJournal) compactNow(snap []claimRecord) error {
 		// The rename reported failure. Read CURRENT back rather than trust
 		// that: adopt whichever generation it names, or, when it cannot be
 		// read, stop writing altogether.
-		cur, rerr := readClaimText(filepath.Join(j.dir, claimCurrentName))
+		cur, rerr := j.disk.readBack(filepath.Join(j.dir, claimCurrentName))
 		switch {
 		case rerr == nil && cur == claimGenName(j.gen):
 			for _, f := range files {
