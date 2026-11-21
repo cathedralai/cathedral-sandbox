@@ -368,6 +368,71 @@ func (b *broker) compatIdemLimit(w http.ResponseWriter, r *http.Request, g *gues
 	_, _ = w.Write(e.body)
 }
 
+// compatMaxCount bounds count on one compat create (AB#865). The call is
+// synchronous and its answer is kept for Idempotency-Key replays.
+const compatMaxCount = 1000
+
+// compatCreateErr is the client error code and message of a failed create.
+func compatCreateErr(out createResult) (string, string) {
+	code, msg := "create_failed", "the hotel refused the room"
+	if e, ok := out.doc["error"].(map[string]string); ok {
+		code, msg = e["code"], e["message"]
+	} else if len(out.body) > 0 {
+		var d map[string]any
+		if json.Unmarshal(reEnvelope(out.status, out.header, out.body), &d) == nil {
+			if dd, ok := d["detail"].(map[string]any); ok {
+				code, _ = dd["error"].(string)
+				msg, _ = dd["message"].(string)
+			}
+		}
+	}
+	return code, msg
+}
+
+// compatCreateBatch answers a compat create with count > 1 (AB#865): 201
+// with the rooms that started, a short view each (GET /v1/sandboxes/{id}
+// has the rest), and the failures counted by "<status> <code>". When none
+// started, the first failure as a single create answers it.
+func (b *broker) compatCreateBatch(w http.ResponseWriter, results []createResult) {
+	rooms := []any{}
+	errs := map[string]int{}
+	for _, out := range results {
+		if out.status != 202 {
+			code, _ := compatCreateErr(out)
+			errs[strconv.Itoa(out.status)+" "+code]++
+			continue
+		}
+		bid, _ := out.doc["id"].(string)
+		b.mu.Lock()
+		u := ""
+		if rm := b.byBID(bid); rm != nil {
+			u = rm.uuid
+		}
+		b.mu.Unlock()
+		v := map[string]any{"id": u, "hotel": out.doc["hotel"], "state": "running"}
+		if st, ok := out.doc["state"]; ok {
+			v["state"] = st
+		}
+		for _, k := range []string{"image", "expires_at", "created_at", "placement_tier"} {
+			if x, ok := out.doc[k]; ok {
+				v[k] = x
+			}
+		}
+		if ttl, ok := out.doc["ttl_seconds"]; ok {
+			v["lifetime_seconds"] = ttl
+		}
+		rooms = append(rooms, v)
+	}
+	if len(rooms) == 0 {
+		out := results[0]
+		code, msg := compatCreateErr(out)
+		ra, _ := strconv.Atoi(out.header.Get("Retry-After"))
+		compatErr(w, out.status, code, msg, ra)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"sandboxes": rooms, "count": len(rooms), "errors": errs})
+}
+
 func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestState, raw []byte) {
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
@@ -478,24 +543,26 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 409, "image_not_ready", "the image is not built yet on a hotel this create may use (sealed hotels unless the create says \"sealed\": false); the broker is building it there, retry", 10)
 		return
 	}
-	if e, retry := b.admit(g, 1); e != nil {
+	count := 1
+	if v, ok := req["count"]; ok && v != nil {
+		f, isNum := v.(float64)
+		if !isNum || f != math.Trunc(f) || f < 1 || f > compatMaxCount {
+			compatErr(w, 400, "invalid_count", "count must be a whole number from 1 to "+strconv.Itoa(compatMaxCount), 0)
+			return
+		}
+		count = int(f)
+	}
+	if e, retry := b.admit(g, count); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
+	if count > 1 {
+		b.compatCreateBatch(w, b.createMany(r.Context(), g, native, count, time.Now(), pl))
 		return
 	}
 	out := b.createMany(r.Context(), g, native, 1, time.Now(), pl)[0]
 	if out.status != 202 {
-		code, msg := "create_failed", "the hotel refused the room"
-		if e, ok := out.doc["error"].(map[string]string); ok {
-			code, msg = e["code"], e["message"]
-		} else if len(out.body) > 0 {
-			var d map[string]any
-			if json.Unmarshal(reEnvelope(out.status, out.header, out.body), &d) == nil {
-				if dd, ok := d["detail"].(map[string]any); ok {
-					code, _ = dd["error"].(string)
-					msg, _ = dd["message"].(string)
-				}
-			}
-		}
+		code, msg := compatCreateErr(out)
 		ra, _ := strconv.Atoi(out.header.Get("Retry-After"))
 		compatErr(w, out.status, code, msg, ra)
 		return

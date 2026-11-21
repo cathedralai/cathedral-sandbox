@@ -8,7 +8,7 @@ The broker does four things:
 
 | Function | Routes | What it does |
 |---|---|---|
-| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
+| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000; the compat create takes `count` up to 1,000 and answers 201 `{sandboxes, count, errors}`) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
 | Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. `/v1/usage` gives hours per hotel, not prices (`"cost": "not_priced_here"`, AB#870). |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
 | Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. Private: open with the view token or a share link (`POST /v1/live/shares`). |
@@ -98,8 +98,8 @@ Each guest in the config can have limits (`guests.go`):
 
 | Field | Meaning |
 |---|---|
-| `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. |
-| `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. |
+| `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. A single `count` above the limit itself can never fit: 400 `count_over_room_limit`. |
+| `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. A single `count` above the limit itself: 400 `count_over_rate_limit` (send at most that many in one call). |
 | `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
