@@ -661,11 +661,18 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		t, dead := b.compat.tombs[id]
 		b.compat.mu.Unlock()
 		if dead && r.Method == "GET" && tail == "" {
-			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid)})
+			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid),
+				"end_reason": endDeleted, "gone_at": t.at.UTC().Format(time.RFC3339Nano)})
 			return
 		}
 		if dead && r.Method == "DELETE" && tail == "" {
 			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid)})
+			return
+		}
+		// A room that vanished reads as deleted, with why (AB#864).
+		if rec := b.endedByUUID(g.cfg.ID, id); rec != nil && r.Method == "GET" && tail == "" {
+			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "end_reason": rec.Reason,
+				"gone_at": rec.GoneAt.UTC().Format(time.RFC3339Nano)})
 			return
 		}
 		compatErr(w, 404, "sandbox_not_found", "no sandbox "+id, 0)
@@ -680,7 +687,16 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			return
 		}
 		if status == 404 {
-			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": "confirmed"})
+			doc := map[string]any{"id": id, "state": "deleted", "cleanup_state": "confirmed"}
+			b.mu.Lock()
+			if rm.deleteSent { // the client's delete, before the sync loop lets the room go
+				doc["end_reason"] = endDeleted
+				if !rm.vanished.IsZero() {
+					doc["gone_at"] = rm.vanished.UTC().Format(time.RFC3339Nano)
+				}
+			}
+			b.mu.Unlock()
+			writeJSON(w, 200, doc)
 			return
 		}
 		var doc map[string]any

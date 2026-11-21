@@ -46,6 +46,7 @@ type fakeHotel struct {
 	answerDelay   time.Duration    // wait between starting a room and answering its create (disk_test.go)
 	listFail      bool             // answer every room list 503 (disk_test.go)
 	rooms         []map[string]any // id + labels, for the room list
+	listExtra     map[string]any   // top-level fields added to the room list answer (ended_test.go)
 	networks      []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts      []byte           // body of GET /room/receipts
 	attestIn      [][]byte         // bodies of POST /room/attest
@@ -210,7 +211,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				out = append(out, rm)
 			}
 		}
-		writeJSON(w, 200, map[string]any{"sandboxes": out})
+		doc := map[string]any{"sandboxes": out}
+		for k, v := range f.listExtra {
+			doc[k] = v
+		}
+		writeJSON(w, 200, doc)
 	case p == "/v1/sandboxes" && r.Method == "DELETE":
 		f.bulkDeletes = append(f.bulkDeletes, r.URL.Query()["label"])
 		if f.bulkClaimBusy != 0 {

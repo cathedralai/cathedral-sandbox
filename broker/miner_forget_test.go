@@ -155,8 +155,9 @@ func TestOperatorForgetsTheRoomsOfADeadMinerHotel(t *testing.T) {
 	if status, doc := tc.call(t, "operator-key", "DELETE", forget, nil); status != 204 {
 		t.Fatalf("operator forget of a dead miner hotel: %d %v", status, doc)
 	}
-	if status, doc := tc.call(t, "key1", "GET", "/v1/sandboxes/"+roomID, nil); status != 404 {
-		t.Fatalf("forgotten room by broker id: %d %v", status, doc)
+	// AB#864: the guest learns the room is gone and why, not a plain 404.
+	if status, doc := tc.call(t, "key1", "GET", "/v1/sandboxes/"+roomID, nil); status != 410 || doc["sandbox"].(map[string]any)["reason"] != "hotel_removed" {
+		t.Fatalf("forgotten room by broker id: %d %v, want 410 hotel_removed", status, doc)
 	}
 	// compatRoom answers a tombstoned client id with state "deleted".
 	tc.b.compat.mu.Lock()
