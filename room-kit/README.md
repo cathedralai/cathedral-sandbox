@@ -222,6 +222,25 @@ looks at that room, with one GET.
 Limits: only rooms the front signed a create for; after a front restart the
 table is empty and no end is signed for earlier rooms.
 
+### TTL deletes through the front (AB#385)
+
+The room API removes a room past its limit by itself from `expires_at` plus
+its 300 s grace, and that removal never passes the front. With receipts on,
+the front deletes such a room first. Every `ROOM_REAP_SECONDS` (default 15, 0
+leaves TTL deletes to the API alone) it lists the rooms, and for each room
+whose `expires_at` lies at least `ROOM_REAP_AFTER_SECONDS` (default 30, at
+most 240) in the past it enters the room as a caller's delete does. A room
+with another request in flight is left for the next pass; otherwise, in the
+same locked step, the room is marked reaping: until the delete is signed,
+every new request but a read or a delete gets 409 `room_reaping`. Then it
+asks the API for that room again (a heartbeat since the list keeps the room)
+and sends one `DELETE`. The answer is signed as a `delete` receipt with
+`reason: "ttl"` and `ttl_expires_at`; a lost answer is signed as 502. A busy
+serial room and a failed list are left for the next pass. The API's own clean-up and `<ROOM_ID>-reaper.timer` stay as
+the backstop (front down or slow); a room they remove is ended by the look
+above with a `room_end`. Rooms the API removes for an idle window or a
+revoked key are not TTL deletes: they also end with a `room_end`.
+
 ### Pre-made rooms
 
 A create whose labels carry `cathedral_pool` = `"1"` makes a pre-made room. It
@@ -664,7 +683,7 @@ python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/
 | API (profile) on 127.0.0.1 | `<ROOM_ID>.service` |
 | Health endpoint on 127.0.0.1 | `<ROOM_ID>-health.service` |
 | Signed receipts (level 1 by default; listener `ROOM_RECEIPTS_LISTEN`) | `<ROOM_ID>-receipts.service` when `ROOM_RECEIPTS=1` |
-| TTL reaper (every 60 s) | `<ROOM_ID>-reaper.timer` |
+| TTL reaper (every 60 s; with receipts on, the front deletes due rooms first with a signed receipt, see "TTL deletes through the front") | `<ROOM_ID>-reaper.timer` |
 | Caddy (pinned, sha512) on 443. With receipts on, API calls go to the receipt listener; `/room/health` stays on the health port | `<ROOM_ID>-caddy.service`, `/etc/pool-room/Caddyfile` |
 | Service user | `poolroom` |
 

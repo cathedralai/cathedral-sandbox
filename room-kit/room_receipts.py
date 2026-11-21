@@ -2250,6 +2250,9 @@ class Ledger:
         # rooms that lost or never signed an action. Marks go when a 2xx delete is signed.
         self.in_flight: dict[str, int] = {}
         self.busy: set[str] = set()
+        # Rooms the TTL reaper is deleting (Server.reap_room): from its last look at expires_at to its signed
+        # delete, no request that could move the limit is let in (AB#385).
+        self.reaping: set[str] = set()
         self.serial: set[str] = set()
         self.broken: set[str] = set()
         # The flag of a serial or pool create needs that nothing ran in the room before the create was signed. The
@@ -2362,6 +2365,8 @@ class Ledger:
         """
         with self.lock:
             new_claim = kind == "claim" and room not in self.claimed
+            if room in self.reaping and kind not in ("read", "record_read", "delete"):
+                return None, (409, "room_reaping", "this room is past its limit and is being deleted")
             if new_claim and self.bulk_pending:
                 return None, (409, "pool_bulk_delete_busy", "a bulk delete is waiting or running; the room is not handed over")
             token = False
@@ -2799,6 +2804,13 @@ BULK_POLL_SECONDS = 0.2
 # The front forwards a bulk delete and waits for its answer for at most this long, in total (monotonic clock). After
 # that the caller gets 502 hotel_api_no_answer and the bulk delete counts as uncertain: the machine keeps running it.
 BULK_FORWARD_SECONDS = 300
+# TTL reaper (AB#385, Server.reap_due). The room API removes a room on its own from expires_at plus 300 s
+# (cathedral/sandbox_api.py GC_GRACE_SECONDS). The front deletes it, signed, this long after expires_at:
+# a heartbeat that comes just late still saves the room, and the front is well ahead of the API.
+REAP_SECONDS = 15
+REAP_AFTER_SECONDS = 30
+REAP_AFTER_MAX_SECONDS = 240
+REAP_NO_ANSWER = b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer; the delete may have run"}}'
 
 
 def bulk_outcome_is_certain(status: int) -> bool:
@@ -3118,6 +3130,19 @@ def api_request_path(raw_target: str) -> tuple[str, str]:
     path = parsed.path
     forward = path + (f"?{parsed.query}" if parsed.query else "")
     return path, forward
+
+
+def iso_epoch(value) -> float | None:
+    """The epoch of an ISO time with an offset (the API's expires_at), or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return None
+    return moment.timestamp()
 
 
 def parse_expires_at(value, now: float) -> float | None:
@@ -4226,9 +4251,12 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 1024
 
     def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30, *,
-                 attestation_only=False, look_seconds=None, pool_scan=True):
+                 attestation_only=False, look_seconds=None, pool_scan=True, reap_seconds=None,
+                 reap_after=REAP_AFTER_SECONDS):
         self._stop_look = threading.Event()
         self.look_thread = None
+        self.reap_thread = None
+        self.reap_after = reap_after
         super().__init__(addr, Handler)
         self.attest_per_minute = max(1, int(attest_per_minute))
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
@@ -4245,6 +4273,10 @@ class Server(ThreadingHTTPServer):
                 self.look_thread = threading.Thread(target=self.look_loop, args=(look_seconds,), daemon=True,
                                                     name="room-look")
                 self.look_thread.start()
+            if reap_seconds is not None:
+                self.reap_thread = threading.Thread(target=self.reap_loop, args=(reap_seconds,), daemon=True,
+                                                    name="room-reap")
+                self.reap_thread.start()
             if pool_scan and not self.collect_surviving_pool_rooms():
                 threading.Thread(target=self.pool_scan_loop, daemon=True, name="pool-restart-scan").start()
 
@@ -4344,6 +4376,115 @@ class Server(ThreadingHTTPServer):
         for room, incarnation in live.items():
             if room not in present:
                 self.look_at(room, incarnation)
+
+    # -- TTL reaper (AB#385). The room API deletes a room past its limit by itself, from expires_at plus its
+    # grace (GC_GRACE_SECONDS, 300 s), and that delete never passes this front. So the front deletes each room
+    # whose limit ran out REAP_AFTER_SECONDS after expires_at, well inside that grace, through the same signed
+    # delete a caller gets: one delete receipt with reason "ttl". The API's own clean-up stays as the backstop
+    # (the front down or slow), and a room it removes is still ended by the look above (room_end).
+    def reap_loop(self, seconds: float) -> None:
+        """Delete the rooms whose limit ran out, every *seconds*, until the server closes."""
+        while not self._stop_look.wait(seconds):
+            try:
+                self.reap_due()
+            except Exception:  # noqa: BLE001 one failed pass must not end the loop
+                traceback.print_exc()
+
+    def reap_due(self, now: float | None = None) -> list[dict]:
+        """One reaper pass: the receipts it signed. A failed list or an unexpected answer deletes nothing."""
+        if not self.pool_scan_ready:
+            return []  # the startup scan decides which rooms this front knows first
+        listed = self.api_get("/v1/sandboxes", 60)
+        if listed is None or listed[0] != 200:
+            return []
+        try:
+            rooms = json.loads(listed[1])["sandboxes"]
+            due = [(doc["id"], doc["expires_at"]) for doc in rooms if self.reap_is_due(doc, now)]
+        except (ValueError, RecursionError, KeyError, TypeError, AttributeError):
+            return []
+        signed = []
+        for room, expires_at in due:
+            receipt = self.reap_room(room, expires_at, now)
+            if receipt is not None:
+                signed.append(receipt)
+        return signed
+
+    def reap_is_due(self, doc, now: float | None = None) -> bool:
+        """Whether a room document from the API names a room whose limit ran out at least reap_after ago."""
+        room, expiry = doc.get("id"), iso_epoch(doc.get("expires_at"))
+        if not isinstance(room, str) or room_of(f"/v1/sandboxes/{room}") != room or unquote(room) != room:
+            return False
+        return expiry is not None and (time.time() if now is None else now) >= expiry + self.reap_after
+
+    def reap_room(self, room: str, expires_at: str, now: float | None = None) -> dict | None:
+        """Delete one due room with a signed receipt, or None when it was left for a later pass.
+
+        The room is entered as a caller's delete is (a busy serial room is left alone). A room with another
+        request in flight is left. Otherwise the room is marked reaping, which refuses every new request but a
+        read or a delete (409 room_reaping), and only then asked for again: a heartbeat since the list moved its
+        limit, and such a room is not deleted. No heartbeat can land between that look and the delete. The delete is sent once; a lost answer is signed
+        as 502, as for a caller.
+        """
+        ledger = self.ledger
+        turn, refusal = ledger.enter(room, "delete")
+        if refusal is not None:
+            return None
+        marked = False
+        try:
+            with ledger.lock:
+                # Alone, and from here no request that could move the limit is let in, so the expires_at read
+                # below is still the room's limit when the delete is sent. A caller's delete still passes.
+                if ledger.in_flight.get(room) != 1 or room in ledger.reaping:
+                    return None
+                ledger.reaping.add(room)
+                marked = True
+            got = self.api_get(f"/v1/sandboxes/{room}", 30)
+            if got is None or got[0] != 200:
+                return None  # gone already (the look ends it) or no answer: nothing is sent
+            try:
+                doc = json.loads(got[1])
+                if doc.get("id") != room or not self.reap_is_due(doc, now):
+                    return None
+                expires_at = doc["expires_at"]
+            except (ValueError, RecursionError, KeyError, TypeError, AttributeError):
+                return None
+            turn.called = True
+            status, out = self.api_send("DELETE", f"/v1/sandboxes/{room}", 120)
+            if status is None:
+                turn.lost = True
+                status, out = 502, REAP_NO_ANSWER
+            try:
+                receipt = ledger.sign({
+                    "action": "delete", "target": f"DELETE /v1/sandboxes/{room}", "sandbox_id": room,
+                    "customer_request_sha256": sha(b""), "command_sha256": None, "image": None,
+                    "image_digest": None, "status": status, "result_sha256": sha(out),
+                    "reason": "ttl", "ttl_expires_at": expires_at,
+                })
+            except Exception:  # noqa: BLE001 the delete was sent: say so, as a caller's delete would
+                traceback.print_exc()
+                return None
+            if 200 <= status < 300:
+                retire_room(ledger, room, self.exec_results)
+            print(f"room-receipts: reaper deleted {room} (expires_at {expires_at}): status {status}, "
+                  f"receipt {receipt['receipt_sha256']}", flush=True)
+            return receipt
+        finally:
+            if marked:
+                with ledger.lock:
+                    ledger.reaping.discard(room)
+            ledger.leave(turn)
+
+    def api_send(self, method: str, path: str, timeout: float) -> tuple[int | None, bytes]:
+        """One request to the room API with the front's own key, sent once: (None, b"") when it gave no answer."""
+        c = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=timeout)
+        try:
+            c.request(method, path, headers={"Authorization": "Bearer " + self.api_key.decode()})
+            r = c.getresponse()
+            return r.status, r.read()
+        except (http.client.HTTPException, OSError):
+            return None, b""
+        finally:
+            c.close()
 
     def look_one(self, room: str) -> None:
         """The same look for one room: one GET, no list. Run before a read of the room's receipts."""
@@ -4496,14 +4637,20 @@ def main() -> int:
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
     look = float(env.get("ROOM_LOOK_SECONDS", "15"))  # 0 turns the look off
+    reap = float(env.get("ROOM_REAP_SECONDS", str(REAP_SECONDS)))  # 0 leaves TTL deletes to the API alone
+    reap_after = float(env.get("ROOM_REAP_AFTER_SECONDS", str(REAP_AFTER_SECONDS)))
+    if reap < 0 or not 0 <= reap_after <= REAP_AFTER_MAX_SECONDS:
+        raise SystemExit(f"ROOM_REAP_SECONDS must be 0 or more and ROOM_REAP_AFTER_SECONDS 0 to {REAP_AFTER_MAX_SECONDS}")
+    reaper = {"reap_seconds": reap or None, "reap_after": reap_after}
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
             env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
     if miner is None:
-        srv = Server((host, int(port)), *args, look_seconds=look or None)
+        srv = Server((host, int(port)), *args, look_seconds=look or None, **reaper)
         srv.serve_forever()
         return 0
     tls_host, tls_port = env["ROOM_RECEIPTS_TLS_LISTEN"].rsplit(":", 1)
-    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None)
+    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None,
+                    **reaper)
     plain = Server((host, int(port)), *args, attestation_only=True)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
     print(f"room-receipts: miner hotel: HTTPS {tls_host}:{tls_port} tls_spki_sha256 {miner.tls_spki_sha256}; "

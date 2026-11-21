@@ -326,8 +326,12 @@ A dedicated machine's create receipts also carry `owner_request_sha256`,
 - A new boot makes a new key and a new chain. A restart of
   `room-sealed-receipts.service` inside the guest also makes a new key and a
   new binding.
-- Rooms that the TTL reaper removes get no delete receipt. Neither do rooms
-  that a bulk delete or an API restart removes one by one.
+- A room past its TTL is deleted by the receipts front with a signed
+  `delete` receipt (`reason: "ttl"`, room-kit/README.md "TTL deletes through
+  the front"). A room the API removes by itself (the front was down past the
+  API's 300 s grace, an idle window, a revoked key) gets a `room_end`, not a
+  delete receipt. Rooms that a bulk delete or an API restart removes one by
+  one get no receipt of their own.
 - After a restart of the receipts service, the broker serves the new
   binding only. Receipts signed under the old one verify only against an
   attestation saved at the time (`verify_receipts.py --save`).
