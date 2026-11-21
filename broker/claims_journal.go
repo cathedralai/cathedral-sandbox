@@ -116,18 +116,22 @@
 // goes into the new generation. No record is written while a compaction
 // runs.
 //
-// open removes, without reporting anything: a generation newer than CURRENT
-// (unfinished) or older (obsolete), an empty unlisted segment, leftover
-// temporary files (claims.id's among them), and an initialization that left
-// no valid claims.id and holds no record (it is redone; a claims.id that does
-// not parse counts as missing). open reports incomplete
-// (errClaimJournalIncomplete) for real loss only: claims.id present but
-// claims/ or CURRENT missing; CURRENT naming a missing generation; another
-// journal-id; a missing or unreadable manifest; a listed segment missing, or
-// a closed one shorter than its size or last seq, or with another sha256; the
-// chain ending before the valid head, or another chain hash there; a
-// non-empty unlisted segment; both head files unreadable; records in a
-// generation while claims.id is missing or does not parse. An incomplete
+// open first syncs state_dir and claims/, so that the names claims.id and
+// CURRENT it found are durable before it removes anything they make obsolete
+// or acknowledges a record under them (a crash can leave either rename
+// visible but not yet synced). It then removes, without reporting anything:
+// a generation newer than CURRENT (unfinished) or older (obsolete), an empty
+// unlisted segment, leftover temporary files (claims.id's among them), and
+// an initialization that left no valid claims.id and holds no record (it is
+// redone; a claims.id that does not parse counts as missing). open reports
+// incomplete (errClaimJournalIncomplete) for real loss only: claims.id
+// present but claims/ or CURRENT missing; CURRENT naming a missing
+// generation; another journal-id; a missing or unreadable manifest; a listed
+// segment missing, or a closed one shorter than its size or last seq, or
+// with another sha256; the chain ending before the valid head, or another
+// chain hash there; a non-empty unlisted segment; both head files
+// unreadable; records in a generation while claims.id is missing or does
+// not parse. An incomplete
 // journal is read only: replay yields what is readable, append and compact
 // refuse, and open changes no file, so the evidence stays for a person.
 //
@@ -895,6 +899,19 @@ func (j *claimJournal) load(id string, pre []string) (*claimJournal, error) {
 	if len(reasons) > 0 {
 		return j.readOnly(reasons, records)
 	}
+
+	// A crash can leave a rename visible but not yet durable: claims.id's at
+	// the end of an initialization whose state_dir sync failed, or CURRENT's
+	// after a compaction whose claims/ sync did not run. Both names are made
+	// durable before anything is removed as obsolete and before any record
+	// is acknowledged under them.
+	if err := j.disk.syncDir(j.stateDir); err != nil {
+		return nil, fmt.Errorf("claim journal: sync of state_dir before using claims.id: %w", err)
+	}
+	if err := j.disk.syncDir(j.dir); err != nil {
+		return nil, fmt.Errorf("claim journal: sync of claims/ before using CURRENT: %w", err)
+	}
+	j.disk.step("open-names-synced")
 
 	sort.Strings(debrisGen)
 	sort.Strings(debrisTop)

@@ -1983,3 +1983,98 @@ func TestClaimJournalInitRetrySyncsAncestors(t *testing.T) {
 		t.Fatalf("the second open synced %v before its first acknowledgement; want %s, %s, %s top down", before, base, a, state)
 	}
 }
+
+// Codex review finding 3 on #655: after a compaction's CURRENT rename whose
+// claims/ sync did not run, the next open must sync claims/ before it removes
+// the generation the visible CURRENT makes obsolete, and before it
+// acknowledges a record in the new one.
+func TestClaimJournalOpenSyncsCurrentBeforeRemovingOldGeneration(t *testing.T) {
+	state := t.TempDir()
+	claims := filepath.Join(state, claimJournalDirName)
+	crash := newClaimCrash("compact-current-renamed", 1)
+	j, _, err := openClaimJournalWith(state, claimJournalOptions{disk: claimJournalDisk{step: crash.step}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustClaimAppend(t, j, claimIDRange("o", 4)...)
+	crash.armed.Store(true)
+	done := j.compact([]claimRecord{testClaimRec("s0")})
+	crash.wait(t) // CURRENT names gen-2 in the page cache; claims/ never synced
+	select {
+	case err := <-done:
+		t.Fatalf("the compaction answered (%v) although its writer stopped", err)
+	default:
+	}
+	old := filepath.Join(claims, claimGenName(1))
+	var mu sync.Mutex
+	firstSync, oldThen := false, false
+	var o claimJournalOptions
+	o.disk.syncDir = func(d string) error {
+		mu.Lock()
+		if d == claims && !firstSync {
+			firstSync = true
+			_, err := os.Stat(old)
+			oldThen = err == nil
+		}
+		mu.Unlock()
+		return claimJournalSyncDir(d)
+	}
+	j2 := openTestClaimJournal(t, state, o)
+	mustClaimAppend(t, j2, "after")
+	_ = j2.close()
+	mu.Lock()
+	defer mu.Unlock()
+	if !firstSync || !oldThen {
+		t.Fatalf("open removed gen-1 before it synced claims/ (synced: %v, gen-1 still there at that sync: %v)", firstSync, oldThen)
+	}
+	if _, err := os.Stat(old); err == nil {
+		t.Fatal("gen-1 was not removed as obsolete")
+	}
+	if got := claimReplayIDs(t, state); !claimSame(got, []string{"s0", "after"}) {
+		t.Fatalf("replay %v", got)
+	}
+}
+
+// Codex review finding 4 on #655: an initialization whose claims.id rename
+// landed but whose state_dir sync failed leaves a valid claims.id; the next
+// open must sync state_dir before it acknowledges a record.
+func TestClaimJournalOpenSyncsClaimsIDBeforeAcknowledging(t *testing.T) {
+	state := t.TempDir()
+	o := claimJournalOptions{}
+	o.disk.syncDir = func(d string) error {
+		if d == state {
+			if _, err := os.Stat(filepath.Join(state, claimJournalIDName)); err == nil {
+				return errors.New("sync state_dir: input/output error")
+			}
+		}
+		return claimJournalSyncDir(d)
+	}
+	if _, _, err := openClaimJournalWith(state, o); err == nil {
+		t.Fatal("the first open succeeded although claims.id's name is not durable")
+	}
+	if id, err := readClaimText(filepath.Join(state, claimJournalIDName)); err != nil || !claimIDRE.MatchString(id) {
+		t.Fatalf("the first attempt should have left a valid claims.id: %q, %v", id, err)
+	}
+	var mu sync.Mutex
+	syncedState := false
+	o.disk.syncDir = func(d string) error {
+		mu.Lock()
+		if d == state {
+			syncedState = true
+		}
+		mu.Unlock()
+		return claimJournalSyncDir(d)
+	}
+	j, _, err := openClaimJournalWith(state, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	before := syncedState
+	mu.Unlock()
+	mustClaimAppend(t, j, "first")
+	_ = j.close()
+	if !before {
+		t.Fatal("the second open acknowledged records without syncing state_dir, claims.id's directory")
+	}
+}
