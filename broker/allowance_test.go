@@ -2194,3 +2194,34 @@ func TestMeteredFrozenRoomCountsTowardTheCap(t *testing.T) {
 		t.Fatalf("create at cap 1 with one frozen room: %d %v", status, doc)
 	}
 }
+
+// AB#894: the ComputeSDK provider is a compat client since #651. A metered
+// guest's create through it meets the same allowance as ctcli and Harbor
+// (compatCreate: meteredRefusal, then meteredCreate): at cap 0 every create
+// is refused 402 allowance_exhausted and no hotel gets a create; with room
+// in the allowance the same create goes through.
+func TestMeteredComputeSDKCreateMeetsTheAllowance(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 0))
+	sdk := map[string]string{"User-Agent": computeSDKAgent}
+	for _, body := range []map[string]any{
+		{"template": "node-22", "lifetime_seconds": 600, "network": "deny_all"},
+		{"template": "node-22", "count": 2},
+	} {
+		status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(body), sdk)
+		if status != 402 || anyCode(doc) != "allowance_exhausted" {
+			t.Fatalf("ComputeSDK create %v at cap 0: %d %v", body, status, doc)
+		}
+	}
+	if _, creates, _ := hotelCalls(tc, lives); creates != 0 {
+		t.Fatalf("cap 0: hotels got %d creates", creates)
+	}
+	tc.putAllowance(t, "g1", allowanceBody(2, 1))
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "node-22", "lifetime_seconds": 600, "network": "deny_all"}), sdk)
+	if _, creates, _ := hotelCalls(tc, lives); status != 201 || creates != 1 {
+		t.Fatalf("ComputeSDK create at cap 1: %d %v, %d creates", status, doc, creates)
+	}
+	if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "node-22"}), sdk); status != 402 || anyCode(doc) != "allowance_exhausted" {
+		t.Fatalf("a second ComputeSDK room at cap 1: %d %v", status, doc)
+	}
+}
