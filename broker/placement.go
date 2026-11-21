@@ -236,7 +236,8 @@ func (h *hotel) weight(free int) float64 {
 // waitSlot waits for a create slot at h. h.queued and g.queued count the
 // create while it waits. After the queue wait limit it moves the create to
 // another eligible hotel that pick chooses, if there is one. It returns the
-// hotel whose slot it holds, or nil when ctx ends (counts released).
+// hotel whose slot it holds, or nil when ctx ends or pl.deadline passes
+// (counts released).
 func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl placement, tried map[*hotel]bool) *hotel {
 	limit := b.maxQueueWait()
 	var timer <-chan time.Time
@@ -245,11 +246,33 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 		defer t.Stop()
 		timer = t.C
 	}
+	// The create's own deadline (create_timeout_seconds, AB#862). A free
+	// slot wins over a deadline that has passed: the create is sent.
+	var deadline <-chan time.Time
+	if !pl.deadline.IsZero() {
+		select {
+		case h.sem <- struct{}{}:
+			return h
+		default:
+		}
+		t := time.NewTimer(time.Until(pl.deadline))
+		defer t.Stop()
+		deadline = t.C
+	}
 	for {
 		select {
 		case h.sem <- struct{}{}:
 			return h
 		case <-ctx.Done():
+			b.mu.Lock()
+			h.queued--
+			g.queued--
+			h.holdDisk(pl, -1)
+			b.mu.Unlock()
+			return nil
+		case <-deadline:
+			// Same release as a guest that went away; createOne tells the
+			// two apart by the deadline (createDeadlinePassed).
 			b.mu.Lock()
 			h.queued--
 			g.queued--
