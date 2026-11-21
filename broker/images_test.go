@@ -45,6 +45,7 @@ type fakeHotel struct {
 	healthLive    map[string]any   // "live" in the /room/health answer; nil: omitted (disk_test.go)
 	answerDelay   time.Duration    // wait between starting a room and answering its create (disk_test.go)
 	listFail      bool             // answer every room list 503 (disk_test.go)
+	snapListFail  bool             // answer GET /v1/snapshots 500, like a hotel API that is down (AB#866)
 	rooms         []map[string]any // id + labels, for the room list
 	networks      []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts      []byte           // body of GET /room/receipts
@@ -378,6 +379,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.snaps[sid] = doc
 		writeJSON(w, 202, map[string]any{"operation_id": "op_1", "status": "done", "result": doc})
+	case p == "/v1/snapshots" && r.Method == "GET" && f.snapListFail:
+		writeErr(w, 500, "internal", "snapshot store unavailable")
 	case p == "/v1/snapshots" && r.Method == "GET":
 		want := r.URL.Query().Get("label")
 		k, v, _ := strings.Cut(want, "=")

@@ -574,6 +574,13 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 func snapshotName(g *guestState, name string) string { return g.cfg.ID + ":" + name }
 
 // guestSnapshot rewrites one hotel snapshot document for the guest.
+func hotelsWord(ids []string) string {
+	if len(ids) == 1 {
+		return "hotel"
+	}
+	return "hotels"
+}
+
 func guestSnapshot(g *guestState, h *hotel, doc map[string]any) {
 	if sid, ok := doc["snapshot_id"].(string); ok {
 		doc["snapshot_id"] = h.cfg.ID + "." + sid
@@ -646,6 +653,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	var mu sync.Mutex
 	var hits []hit
 	var busy []string
+	var unanswered []*hotel
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
 		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
@@ -662,6 +670,9 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 				return
 			}
 			if err != nil {
+				mu.Lock()
+				unanswered = append(unanswered, h)
+				mu.Unlock()
 				return
 			}
 			if sid := matchSnapshot(g, list, ref); sid != "" {
@@ -676,9 +687,33 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	case 1:
 		return hits[0].h, hits[0].sid, nil
 	case 0:
+		// A hotel that did not answer may hold the snapshot (AB#866): if it is
+		// up, the miss is a retry, not "not found". One already known down
+		// keeps 404 (named), so a long-down hotel does not make every unknown
+		// name a retry loop.
+		var up, down []string
+		b.mu.Lock()
+		for _, h := range unanswered {
+			if h.ok {
+				up = append(up, h.cfg.ID)
+			} else {
+				down = append(down, h.cfg.ID)
+			}
+		}
+		b.mu.Unlock()
+		sort.Strings(up)
+		sort.Strings(down)
+		if len(up) > 0 {
+			return nil, "", &apiErr{502, "hotel_unreachable", "no answer from " + hotelsWord(up) + " " + strings.Join(up, ", ") +
+				", which may hold snapshot " + ref + "; retry, or use the id <hotel>.<snapshot id>"}
+		}
 		// A busy hotel was never asked; it may hold the snapshot (AB#819).
 		if len(busy) > 0 {
 			return nil, "", busyHotelsErr(busy)
+		}
+		if len(down) > 0 {
+			return nil, "", &apiErr{404, "snapshot_not_found", "no snapshot " + ref + " on the hotels that answered; " +
+				hotelsWord(down) + " " + strings.Join(down, ", ") + " down, not checked"}
 		}
 		return nil, "", notFound
 	default:

@@ -470,6 +470,16 @@ labels each snapshot with the guest). An unknown or foreign snapshot gives
 503 `snapshot_hotel_unavailable`. A fork whose hotel is outside the hotel
 choice gives 409 `snapshot_hotel_excluded`.
 
+A bare name (or bare id) asks every hotel of the guest (AB#866). If none has
+it and a hotel that is up did not answer, the answer is 502
+`hotel_unreachable` naming that hotel: it may hold the snapshot, so retry, or
+use the `<hotel>.<snapshot id>` id. A busy hotel gives 503 `sold_out`
+(AB#819). A hotel already known down is not a reason to retry: the answer
+stays 404 `snapshot_not_found` and names it. The `<hotel>.<snapshot id>` id
+asks only that hotel: 502 `hotel_unreachable` if it does not answer, 404 if
+it answers without the snapshot. A snapshot lives only on its hotel: a hotel
+restart or roll drops it before its ttl.
+
 ## Workspaces
 
 A workspace is a named directory on one hotel that outlives rooms (#305).
