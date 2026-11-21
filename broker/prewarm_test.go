@@ -141,6 +141,74 @@ func TestPrewarmSkipsSealedOnlyImagesOnUnsealedHotels(t *testing.T) {
 	}
 }
 
+// AB#894: a sealed hotel pre-pulls the node-22 image once; an unsealed hotel
+// never pulls it.
+func TestPrewarmPullsNode22OnSealedHotelsOnly(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true)
+	node := pinnedImage("node", nodeDigest)
+	pulls := func(id string) int {
+		tc.b.prewarmHotel(tc.b.hotelByID(id))
+		n := 0
+		for _, req := range tc.hotels[id].prefetch {
+			for _, im := range req["images"].([]any) {
+				if im.(string) == node {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	if n := pulls("a"); n != 1 {
+		t.Fatalf("sealed hotel a pulled %s %d times, want once", node, n)
+	}
+	if n := pulls("b"); n != 0 {
+		t.Fatalf("unsealed hotel b pulled %s %d times, want never", node, n)
+	}
+}
+
+// AB#894 (Astra r2 finding 4): a hotel whose scratch is at or over the guest
+// prefetch line pulls no catalog image, logs the skip once per image, and
+// still takes creates; a hotel under the line pulls.
+func TestPrewarmSkipsCatalogPullOnAFullScratchAndStaysPlaceable(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true)
+	logs := captureLog(t)
+	node := pinnedImage("node", nodeDigest)
+	full, roomy := diskFullPct, diskFullPct-30
+	setHotel(tc, "a", func(h *hotel) { h.ok, h.roomDataPct = true, &full })
+	tc.b.prewarmHotel(tc.b.hotelByID("a"))
+	tc.b.prewarmHotel(tc.b.hotelByID("a")) // a second come-up does not log again
+	if n := len(tc.hotels["a"].prefetch); n != 0 {
+		t.Fatalf("hotel a at %.0f%% scratch got %d prefetch calls, want none", full, n)
+	}
+	if n := strings.Count(logs.String(), "catalog pre-pull of "+node+" skipped"); n != 1 {
+		t.Fatalf("skip of %s logged %d times, want once: %s", node, n, logs.String())
+	}
+	tc.b.mu.Lock()
+	ok, warm := tc.b.hotelByID("a").ok, tc.b.hotelByID("a").warm[node]
+	tc.b.mu.Unlock()
+	if !ok || warm {
+		t.Fatalf("hotel a after the skip: ok=%v warm=%v, want placeable and cold", ok, warm)
+	}
+	if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "node-22"}),
+		map[string]string{"User-Agent": computeSDKAgent}); status != 201 || creates(tc, "a") != 1 {
+		t.Fatalf("node-22 create on the full-scratch sealed hotel: %d %v, creates on a %d", status, doc, creates(tc, "a"))
+	}
+
+	setHotel(tc, "a", func(h *hotel) { h.roomDataPct = &roomy })
+	tc.b.prewarmHotel(tc.b.hotelByID("a"))
+	pulled := false
+	for _, req := range tc.hotels["a"].prefetch {
+		for _, im := range req["images"].([]any) {
+			pulled = pulled || im.(string) == node
+		}
+	}
+	if !pulled {
+		t.Fatalf("hotel a at %.0f%% scratch did not pull %s", roomy, node)
+	}
+}
+
 func compatWarmCreates(t *testing.T, tc *testChain, n int) map[string]int {
 	t.Helper()
 	got := map[string]int{}

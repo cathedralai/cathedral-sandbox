@@ -136,7 +136,20 @@ var catalogTemplates = []catalogTemplate{
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:b48013ae60249c18cc756d6b449e3320ec63e5861dd0e3cb87c38be11e775e08"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
+	// node-22 is the ComputeSDK benchmark's template (AB#894). The digest is
+	// the node:22-slim manifest list (holds linux/amd64) that the benchmark
+	// participant names. Sealed-only keeps the pre-pull off unsealed hotels
+	// (prewarmsTemplate) and forces every create onto the sealed pool.
+	{
+		Name: "node-22", DisplayName: "node-22",
+		Description: "1 vCPU, 4 GiB room with Node.js 22 (node:22-slim)",
+		CPU:         1, MemoryGiB: 4, DiskGiB: 10,
+		Image: pinnedImage("node", nodeDigest), Live: true, Sealed: sealedReady, SealedOnly: true,
+	},
 }
+
+// nodeDigest is node:22-slim (22-bookworm-slim).
+const nodeDigest = "sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee"
 
 // pinnedImage is repository@sha256:hex. The hotel image grammar is a tag or a
 // digest, not both. Live model templates use this for the published digest.
