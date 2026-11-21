@@ -834,16 +834,22 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 // ---------------------------------------------------------------- prefetch
 
 type prefetchHotel struct {
-	State      string           `json:"state"` // pulling, done, failed
-	Images     []map[string]any `json:"images,omitempty"`
-	Error      map[string]any   `json:"error,omitempty"`
-	StartedAt  time.Time        `json:"started_at"`
-	FinishedAt *time.Time       `json:"finished_at,omitempty"`
+	State  string           `json:"state"` // pulling, done, failed
+	Images []map[string]any `json:"images,omitempty"`
+	Error  map[string]any   `json:"error,omitempty"`
+	// Pin is "pinned" when the hotel kept the images from its GC, or
+	// "not_supported" when it pulled them but has no pins (an older room
+	// kit); empty for a prefetch without pin (AB#860).
+	Pin        string     `json:"pin,omitempty"`
+	Pinned     []any      `json:"pinned,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }
 
 type prefetchJob struct {
 	ID      string                    `json:"prefetch_id"`
 	guest   string                    // not shown
+	pin     int64                     // the pin cap sent with a pin prefetch; 0: no pin (AB#860)
 	Images  []string                  `json:"images"`
 	Created time.Time                 `json:"created_at"`
 	Hotels  map[string]*prefetchHotel `json:"hotels"`
@@ -862,7 +868,7 @@ func newID(prefix string) string {
 	return prefix + hex.EncodeToString(b[:])
 }
 
-// POST /v1/images/prefetch {images, registry_auth?, hotels?, hotel_labels?, exclude_hotel_labels?}
+// POST /v1/images/prefetch {images, registry_auth?, pin?, hotels?, hotel_labels?, exclude_hotel_labels?}
 func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guestState) {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var req map[string]any
@@ -892,9 +898,26 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 		writeErr(w, e.status, e.code, e.msg)
 		return
 	}
+	pin, _ := req["pin"].(bool)
+	if v, ok := req["pin"]; ok && v != nil {
+		if _, isBool := v.(bool); !isBool {
+			writeErr(w, 400, "invalid_prefetch", "pin must be true or false")
+			return
+		}
+	}
+	var pinMax int64
+	if pin {
+		b.mu.Lock()
+		pinMax = g.limits.pinMaxBytes()
+		b.mu.Unlock()
+		if pinMax == 0 {
+			writeErr(w, 403, "pins_not_enabled", "this key may not pin images; ask Cathedral for a pin limit")
+			return
+		}
+	}
 	auth := req["registry_auth"] // passed to the hotels, never stored
 
-	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
+	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, pin: pinMax, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
 	var targets []*hotel
 	b.mu.Lock()
 	for _, h := range b.hotelList() {
@@ -970,7 +993,7 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
 		go func(i int, ref string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			entry := b.prefetchRef(h, g, ref, auth, gen, true)
+			entry := b.prefetchRefPin(h, g, ref, auth, gen, true, job.pin)
 			b.prefetch.mu.Lock()
 			job.Hotels[h.cfg.ID].Images[i] = entry // a new map: views hold the old one
 			b.prefetch.mu.Unlock()
@@ -990,6 +1013,29 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
 			if st.Error == nil {
 				st.Error, _ = e["error"].(map[string]any)
 			}
+		}
+	}
+	if job.pin > 0 {
+		// A kit before AB#860 pulls and ignores "pin"; only its echo says the
+		// images are kept, so one hotel without it reads not_supported.
+		done := 0
+		for _, e := range st.Images {
+			if e["state"] == "done" {
+				done++
+			}
+			switch e["pin"] {
+			case "pinned":
+				st.Pinned = append(st.Pinned, e["ref"])
+			case imageListNotKitted:
+				st.Pin = imageListNotKitted
+			}
+		}
+		switch {
+		case st.Pin != "":
+		case len(st.Pinned) > 0 && len(st.Pinned) == done:
+			st.Pin = "pinned"
+		case len(st.Pinned) > 0:
+			st.Pin = "partial" // some pulled images are not pinned: see each entry's pin
 		}
 	}
 	if failed > 0 {

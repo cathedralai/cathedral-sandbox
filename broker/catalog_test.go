@@ -28,6 +28,47 @@ func TestCatalogListsRoomSizesThenLFM3(t *testing.T) {
 	}
 }
 
+// AB#894: node-22 is the ComputeSDK benchmark's template. It is listed live,
+// sealed ready and sealed only, pinned by digest, and every create of it lands
+// on the sealed hotel.
+func TestCatalogListsNode22(t *testing.T) {
+	tc := newChain(t)
+	// Old unsealed runtime entries must never receive a node-22 create.
+	for _, id := range []string{"b", "c"} {
+		setHotel(tc, id, func(h *hotel) { h.cfg.Sealed = false })
+	}
+	_, cat := tc.clientCall(t, "GET", "/v1/sandboxes/catalog", nil, nil)
+	node, ok := catalogByName(t, cat)["node-22"]
+	if !ok {
+		t.Fatalf("catalog has no node-22: %v", cat)
+	}
+	if node["live"] != true || node["sealed"] != "ready" || node["sealed_only"] != true {
+		t.Fatalf("node-22 catalog: %v", node)
+	}
+	want := pinnedImage("node", nodeDigest)
+	if node["image"] != want {
+		t.Fatalf("node-22 image %v want %s", node["image"], want)
+	}
+	if e := imageRefRefusal(want, false); e != nil {
+		t.Fatalf("node-22 image is not a valid hotel reference: %+v", e)
+	}
+	for _, body := range []map[string]any{{"template": "node-22"}, {"template": "node-22", "sealed": true}} {
+		if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", body); status >= 300 {
+			t.Fatalf("native %v: %d %v", body, status, doc)
+		}
+		if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(body), nil); status != 201 {
+			t.Fatalf("compat %v: %d %v", body, status, doc)
+		}
+	}
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": "node-22", "sealed": false})
+	if status != 409 || errCode(doc) != "template_sealed_only" {
+		t.Fatalf("node-22 sealed false: %d %v", status, doc)
+	}
+	if n := createsOn(tc); n["a"] != 4 || n["b"]+n["c"] != 0 {
+		t.Fatalf("node-22 creates must land on the sealed hotel only: %v", n)
+	}
+}
+
 func TestPinnedImageIsDigestOnly(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("ab", 32)
 	got := pinnedImage(lfm31_7bRepo, digest)

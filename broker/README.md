@@ -155,6 +155,7 @@ Each guest in the config can have limits (`guests.go`):
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels`. See "Guest policy and capacity catalog". |
 | `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
+| `pin_max_gib` | Image bytes the guest may pin on each hotel (prefetch `"pin": true`). Absent or 0: no pins; a pin gets 403 `pins_not_enabled`. Config only. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
@@ -169,6 +170,123 @@ limits without a restart:
 | `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels`, `policy` (`"policy": null` removes it) and `own_hosts_only`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
 
 A runtime change stays in memory. A restart goes back to the config file.
+
+### Meter routes (AB#890)
+
+`meter_key_sha256` is the SHA-256 of a narrow key for an external meter (the
+Polaris API meters const's broker-guest rooms against a Gamma hotkey
+account). It allows the two routes below and no other route. The operator
+key, the operator read key, the miner enrollment key and guest keys get 401
+on them. Without `meter_key_sha256` both answer 404. The digest must be a
+SHA-256 hex digest and must differ from the operator key, the operator read
+key, the miner enrollment key, and every guest key, next key and view token.
+An unknown guest id gets 404 `guest_not_found`.
+
+| Route (meter key) | What it does |
+|---|---|
+| `GET /v1/broker/guests/<id>/rooms` | The guest's rooms on the hotels it may use, asked like the guest's own `GET /v1/sandboxes` (label `broker_guest=<id>`): `{"rooms": [{"id": "<hotel>.<room>", "hotel", "state", "memory_gib", "vcpu", "created_at"}], "hotel_errors": {"<hotel>": "unavailable"}}`. `state` and `created_at` are the hotel's; `memory_gib` and `vcpu` are the hotel's `resources.memory_gib` and `resources.vcpu` (whole numbers, the ones the hotel's usage multiplies), null when the hotel did not send one. A hotel that does not answer is in `hotel_errors` and its rooms are left out; the call still answers 200. |
+| `POST /v1/broker/guests/<id>/freeze-all` | Calls the hotel's `POST /v1/sandboxes/<room>/freeze` for the guest on every room of the list above in state `running`: `{"frozen": [ids], "failed": {"<id>": "<hotel error code>"}, "hotel_errors": {...}}` (`unavailable` when a hotel call got no answer). Rooms in any other state are not touched. It never deletes and never thaws; a second call freezes nothing new. A frozen room still counts in the hotel's own usage and may still be removed by the hotel's TTL or idle sweep. |
+
+## Usage meter
+
+With `state_dir` set, the broker writes a numbered usage reading log for
+every room of every guest (`usage_meter.go`): one JSON line per reading in
+`state_dir/usage/<first seq>.jsonl`, schema `cathedral_usage_reading_v1`,
+fields `seq`, `run` (the broker room id), `guest`, `hotel`, `miner_hotkey`,
+`vcpu`, `memory_gib`, `started_at`, `seconds`, `state` (`running` or
+`ended`) and `at`. A run gets a reading at first sight (the broker's create
+answer, or the first room list that shows it), every
+`usage_meter_every_seconds` (default 60) while lists show it, and once
+`ended` when it leaves. `seconds` is observed time: a gap over 30 s between
+two sightings (a hotel that stops answering, a broker restart) adds nothing,
+and a delete adds its tail only when the hotel's last answered list still
+showed the room. A bulk delete ends its rooms at the list it takes just
+before the delete. A room the broker took back from a cancelled or failed
+create (its reap, the orphan cleanup, or a recorded leftover) is metered
+too, with `"billable": false` (absent means billable).
+Readings are cumulative, so a reader keeps the largest per run.
+`seconds` is truncated to whole seconds, so a room used and deleted within
+one observed second ends at 0. With `usage_meter_min_second` (default
+false) the ended reading of a billable run rounds up to the next whole
+second, at least 1; running readings and runs that are not billable are
+never rounded. Turning it on changes what customers pay: a pricing decision.
+
+| Route (operator key) | What it does |
+|---|---|
+| `GET /v1/broker/usage-meter?after=<seq>&limit=<n>` | Readings after `after` (default 0) in seq order, at most `limit` (default 500, at most 1,000): `{"readings", "next", "head", "observed_at", "write_errors", "unobserved_hotels", "pending_readings"}`. `pending_readings` counts readings observed but not durable yet (an append waiting for its retry); 0 when all is durable. `next` is the seq of the last reading returned (or `after`), so a reader never skips one. `head` is the highest seq written. `observed_at` is the oldest last answered room list among hotels with live rooms (now if none), leaving out a hotel whose latest list failed and that takes no new room (down, leaving or draining); `unobserved_hotels` counts those. Only durable (fsynced) readings are served; a file whose sync fails at start is served once a retry syncs it. The highest `after` is the acknowledged cursor, kept with the durable head and the highest issued seq in `state_dir/usage/acked.json`, so a seq is never issued twice: a file whose seqs are all at or below the cursor and that is older than 7 days is deleted, after the newest reading of each open run in it is written again under a new seq. Without `state_dir`: 404 `usage_meter_off`. |
+
+Operator note: a usage file that can never be synced (a failing disk)
+stalls the feed by design. The route serves nothing above it, so `head`
+stops, the ledger stops renewing leases and metered keys close. It shows as
+`pending_readings` staying above 0, `write_errors` growing, and the log line
+`usage meter: <file>: sync before replay failed`. Fix the disk first. Only
+if that fails, as a last resort, stop the broker, move that file out of
+`state_dir/usage/` and start the broker again. What that does:
+
+- No served seq is reused: `acked.json` holds the highest issued seq,
+  saved before any page served it.
+- Every reading in that file leaves the log, also ones already served (the
+  ledger has those).
+- A run whose newest state was in that file goes back to its last reading
+  in another file, or to zero seconds if it has none. The ledger already
+  holds a higher mark for it, so it charges nothing more for that run until
+  the run passes that mark (the customer's favour).
+- An ended run whose end was in that file may never show its final reading.
+
+Known limits (stage 1):
+
+- The readings are the front door's observation, not proof: nothing is
+  guest-signed (stage 2).
+- A front door crash loses the observed time since each run's last durable
+  reading (at most `usage_meter_every_seconds`, plus a delete's tail), in
+  the customer's favour. Nothing in a durable reading is lost.
+- A delete can count the time from the last sighting to the delete for a
+  room that vanished in between: at most one sync interval (2 s) while
+  lists answer, at most 30 s when its hotel's lists fail in between.
+- If the broker dies between learning that a create failed or was cancelled
+  and that reading reaching the disk (milliseconds: the writer is woken at
+  once and the path waits up to 3 s for it, outside the broker lock), the
+  restarted broker has no record of the failure. It adopts the surviving
+  room under the guest's label and meters it as billable until it leaves:
+  at most that one room's remaining lifetime, and the room is in the
+  guest's own list, so the guest can delete it. Persisting create outcomes
+  is a follow-up.
+- A room a sync adopted while its create was in flight has billable
+  readings until the orphan cleanup lists it, which is as soon as the
+  request's creates end (each bounded by the 12 minute create timeout);
+  from then on it is `billable: false`.
+- A hung disk stalls no broker work: no disk I/O happens under the broker
+  lock, a path that saw a turn to not billable waits at most 3 s, and a
+  route read waits at most 5 s for a write in progress, then answers what is
+  durable without acknowledging or pruning.
+- A file that can never be synced stalls the feed (operator note above).
+- The broker trusts each hotel's room list. The sync loop adopts any room
+  a hotel lists under a guest's label and meters it as that guest's
+  billable room, with no check against a create the broker made or against
+  the hotels the guest may use. Whoever can make a hotel list such a room
+  can bill that guest: anyone holding the hotel's key, or a host that can
+  alter the hotel's answers. Today an admitted miner hotel answers over its
+  attested guest TLS from the measured guest, and its key is installed in
+  the guest so the host never holds it; operator hotels are ours. The
+  broker sets no bound on the cost: the count, size and duration of such
+  rooms come from the hotel's list, and only the ledger's balance rules
+  limit the charge. A room limit does not bound it either: adopted rooms
+  count against the guest's `max_rooms`, so they can also refuse the
+  guest's own creates. The guest sees such a room in its own list when its
+  policy reaches that hotel, and can delete it by id there; a hotel that
+  goes on listing a deleted room is metered again after 24 h. This must be
+  closed before a hotel we do not operate, or one whose host holds its key,
+  carries a metered guest.
+- A room seen again after its ended reading is logged and not metered
+  again for 24 h.
+- While the disk refuses writes, readings queue in memory (about one per
+  live room per minute); `pending_readings` counts them.
+- If the whole `usage/` is lost, `acked.json` with it, seq restarts at 1: a
+  reader whose cursor is above `head` must treat that as an alarm.
+- A hotel left out of `observed_at` holds rooms whose seconds are not
+  growing; `unobserved_hotels` counts such hotels, not their rooms.
+- Replay reads and syncs every retained file at start; its time grows with
+  the readings kept (7 days plus whatever is unacknowledged).
 
 ## Guest policy and capacity catalog
 
@@ -313,7 +431,10 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 - Guest key: only the hotels the guest can reach, each with `tier`
   (`prefer`, `allow`, or `hotels` for a guest with no policy), preferred
   first, plus `guest` with `max_rooms` and `active_rooms`, and `classes`
-  over those hotels only.
+  over those hotels only. Each hotel also has `disk_used_pct` (how full its
+  data volume is; null: no reading yet) and `disk_admit_used_pct` (the fill
+  at which it takes no more rooms; null: not set). The disk budget fields
+  stay operator only.
 
 `free_rooms` comes from the function the placer uses (`admissibleFree`: 0
 when the hotel is down, draining, resting after a failure, at
@@ -603,6 +724,26 @@ pulled with `registry_auth` are not pulled again: the broker never keeps
 the login, so prefetch those again after a hotel restart. A broker restart
 forgets the list.
 
+`"pin": true` also asks each hotel to keep the images from its image
+cleanup. It needs the guest limit `pin_max_gib` (else 403
+`pins_not_enabled`); the broker sends it in bytes in `X-Pin-Max-Bytes`. A
+hotel answers 507 `pin_cap_exceeded` when the guest's pins there would pass
+the cap (or the hotel's own pin ceiling). Each image entry then has `pin`
+(`pinned`, `not_pinned`, or `not_supported` for a room kit without pins),
+and each hotel `pin` (`pinned`, or `not_supported` when any image there was
+pulled without a pin; `partial` when only some were pinned) with the `pinned`
+refs. The hotel-up replay pins a pinned ref again after a reboot; an unpin
+stops that.
+`DELETE /v1/images/pins?ref=<ref>&hotel=<id>` unpins one image there.
+
+`GET /v1/images?hotel=<id>` lists the images the guest pulled or was given
+on that hotel: `ref`, `digest`, `size_bytes`, `last_used_at`, `pinned`.
+Without `hotel`, the broker asks every hotel the guest reaches that is up
+(4 at a time, 10 s each) and answers `{"hotels": [...]}`, one entry per
+hotel, with `error` for a hotel that did not answer. A hotel outside the
+guest's reach is 404 `hotel_not_found`; a hotel whose room kit has no list
+says `"images_list": "not_supported"`.
+
 `GET /v1/broker/stats` gives per-hotel counts and latency percentiles
 (hotel call, wait in the broker queue, broker overhead). `POST` resets them.
 Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
@@ -654,7 +795,9 @@ view (every hotel and the admission policy) and `GET /v1/broker/miner-exits`,
 and no other route: it cannot
 read hotel documents, join, change or leave hotels, read or change guests, or
 open rooms. The digest must differ from the operator key, the miner
-enrollment key, and every guest key or view token.
+enrollment key, and every guest key or view token. `meter_key_sha256` is a
+separate key for the two meter routes (see "Meter routes" under Guest
+limits).
 The observed TLS key must match the AMD-verified binding before the broker
 sends the hotel key. Miner calls pin the guest key on both data and control
 connections. Plain HTTP, a client-supplied pin, and `verify=false` are refused.
@@ -673,7 +816,7 @@ receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `rooms_in_use` (rooms the broker holds there plus queued and in-flight creates; what a guest TLS re-seal waits to reach 0), `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested, and `hotel_key_install` on a hotel the broker installs the key into), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
 | `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). Every hotel must set `"sealed": true` (AB#776); a join without it gets 400 `invalid_hotel`. For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation; `"verify": false` is refused (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
 | `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
 
@@ -816,6 +959,21 @@ binding (`tls_spki_sha256`), with the hotel key installed inside the guest
 - The hotel key must be installed in the guest (`POST /room/hotel-key`)
   before the hotel answers keyed calls, and again after every reboot (the
   guest keeps it in memory). Until then the hotel is down (401).
+- `"hotel_key_install_signing_key_file"` (AB#817, needs `"guest_tls": true`)
+  makes the broker do that install. The file holds base64 of a 32-byte
+  Ed25519 seed, mode 600 or 640 (root:<broker group>, as the hotel key files), one per broker host; its public key (logged at
+  start, and `admission.hotel_key_install.signer_ed25519_b64` in the hotel
+  documents) must be in the guest build's `SEALED_HOTEL_KEY_INSTALL_SIGNERS`.
+  Right after the broker pins a new guest key it reads
+  `GET /room/hotel-key-install-key` over the pinned client (statement signed
+  by the binding's receipt key, for this binding, naming the binding's
+  install key), seals `key_file`'s key to it (the room-kit envelope, AAD
+  `hotel-key-install:<binding_sha256>`) and posts a signed
+  `cathedral_hotel_key_install_v1` request. `installed` or `unchanged` is
+  done. Anything else (a refusal code, a lost answer) is logged once by code
+  and tried again on the 5 s pin recheck. The hotel is not admitted until an
+  install on its current pin succeeded. No log line names the key or the seed.
+  Make a seed: `head -c 32 /dev/urandom | base64 > <file>; chmod 640 <file>; chgrp <broker group> <file>`.
 - `"require_sealed_guest_tls": true` (top level, default off) makes this
   every sealed hotel: a sealed config entry without `"guest_tls": true`
   stops the config from loading, and a sealed join must pass the same

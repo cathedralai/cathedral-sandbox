@@ -208,6 +208,9 @@ func (b *broker) admitted(h *hotel, now time.Time) bool {
 	if h.guestTLS() && (h.tlsPinErr != nil || h.guestPin.Load() == nil) {
 		return false // no verified guest TLS key: no hotel key goes there
 	}
+	if h.installNeeded() {
+		return false // the guest has no hotel key yet: every keyed call would answer 401
+	}
 	if !b.needsAttestation(h) {
 		return true
 	}
@@ -243,6 +246,9 @@ func (b *broker) admissionDoc(h *hotel, now time.Time) map[string]any {
 	}
 	if h.adm.reason != "" {
 		d["reason"] = h.adm.reason
+	}
+	if inst := h.installDoc(); inst != nil {
+		d["hotel_key_install"] = inst
 	}
 	if !h.adm.attestedAt.IsZero() {
 		d["attested_at"] = h.adm.attestedAt.UTC().Format(time.RFC3339)

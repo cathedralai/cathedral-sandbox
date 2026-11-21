@@ -354,6 +354,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 		b.addTotals(totals, e, now, sum)
 		d := b.capacityDoc(e, now, docs)
 		d["tier"] = t
+		guestDiskDoc(e.h, d)
 		out = append(out, d)
 	}
 	if g != nil {

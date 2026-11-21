@@ -99,6 +99,17 @@ type fakeHotel struct {
 	// with this status and keep the room (AB#338).
 	labelListFail  int
 	roomDeleteFail int
+	// absentDelete204: answer 204 to a delete of a room the hotel does not
+	// hold, as the real hotel does (usage_meter_test.go).
+	absentDelete204 bool
+	// bulkDeleteHold: when set, a bulk delete removes its rooms at once but
+	// answers only when the channel closes (usage_meter_test.go).
+	bulkDeleteHold chan struct{}
+	// Freeze (POST /v1/sandboxes/{id}/freeze, meter_test.go): the room ids and
+	// guest headers of every freeze, and a status to answer for a room id.
+	freezes     []string
+	freezeGuest []string
+	freezeFail  map[string]int
 	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
 	// runs without f.mu so it may hijack and hold the connection.
 	upgrade http.HandlerFunc
@@ -249,6 +260,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.rooms = kept
+		if hold := f.bulkDeleteHold; hold != nil {
+			f.mu.Unlock()
+			<-hold
+			f.mu.Lock()
+		}
 		w.WriteHeader(204)
 	case p == "/room/attest" && r.Method == "POST":
 		f.attestIn = append(f.attestIn, body)
@@ -351,6 +367,26 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		policy := map[string]any{"mode": req["mode"], "allow": req["allow"]}
 		writeJSON(w, 200, map[string]any{"sandbox_id": strings.Split(p, "/")[3],
 			"network": map[string]any{"mode": req["mode"], "allow": req["allow"], "policy": policy, "policy_sha256": "abc"}})
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.HasSuffix(p, "/freeze") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/sandboxes/"), "/freeze")
+		f.freezes = append(f.freezes, id)
+		f.freezeGuest = append(f.freezeGuest, r.Header.Get(guestHeader))
+		if st := f.freezeFail[id]; st != 0 {
+			writeErr(w, st, "freeze_failed", "the hotel could not freeze "+id)
+			return
+		}
+		for _, rm := range f.rooms {
+			if rm["id"] == id {
+				if rm["state"] != "running" && rm["state"] != "frozen" {
+					writeErr(w, 409, "sandbox_not_running", "cannot freeze sandbox in state "+fmt.Sprint(rm["state"]))
+					return
+				}
+				rm["state"] = "frozen"
+				writeJSON(w, 200, map[string]any{"id": id, "state": "frozen"})
+				return
+			}
+		}
+		writeErr(w, 404, "sandbox_not_found", id)
 	case strings.HasSuffix(p, "/sealed-exec") && r.Method == "POST":
 		f.sealedExecPaths = append(f.sealedExecPaths, p)
 		f.sealedExecBodies = append(f.sealedExecBodies, body)
@@ -485,6 +521,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(204)
 				return
 			}
+		}
+		if f.absentDelete204 {
+			w.WriteHeader(204)
+			return
 		}
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+id)
 	default:

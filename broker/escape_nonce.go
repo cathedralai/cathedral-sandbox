@@ -286,6 +286,13 @@ func plantAAD(hotel, windowID string) []byte {
 }
 
 func sealPlantNonce(plaintext, recipientPub []byte, hotel, windowID string) (map[string]string, error) {
+	return sealX25519Envelope(plaintext, recipientPub, plantHKDFInfo, plantAAD(hotel, windowID))
+}
+
+// sealX25519Envelope is room_receipts._seal_envelope: X25519 to the recipient,
+// HKDF-SHA256 (salt = AAD, info = info || ephemeral || recipient), AES-256-GCM
+// with the same AAD. The plant nonce and the hotel key install use it.
+func sealX25519Envelope(plaintext, recipientPub, info, aad []byte) (map[string]string, error) {
 	curve := ecdh.X25519()
 	recipient, err := curve.NewPublicKey(recipientPub)
 	if err != nil {
@@ -301,8 +308,7 @@ func sealPlantNonce(plaintext, recipientPub []byte, hotel, windowID string) (map
 	}
 	rawEph := eph.PublicKey().Bytes()
 	rawRec := recipient.Bytes()
-	aad := plantAAD(hotel, windowID)
-	key := hkdfSHA256(shared, aad, append(append(append([]byte{}, plantHKDFInfo...), rawEph...), rawRec...), 32)
+	key := hkdfSHA256(shared, aad, append(append(append([]byte{}, info...), rawEph...), rawRec...), 32)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
