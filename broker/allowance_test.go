@@ -2082,3 +2082,51 @@ func TestMeteredCompatCountOverCapRefusedBeforeBuilds(t *testing.T) {
 		t.Fatalf("compat count 5 at cap 3 of an unready image: %d %v, %d new builds", status, doc, builds()-before)
 	}
 }
+
+// ---------------------------------------------------------------- pair with the usage meter (S1)
+
+// A held lost attempt whose room appears late is counted against the cap,
+// metered as not billable (the guest got an error for that create), and its
+// run ends when the cleanup removes it.
+func TestMeteredHeldLateRoomIsMeteredNotBillable(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	hotelID, batch := lostCreateNoRoom(t, tc, lives)
+	lateRoom := func() {
+		f := tc.hotels[hotelID]
+		f.mu.Lock()
+		f.rooms = append(f.rooms, map[string]any{"id": "sbx_late", "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: batch}})
+		f.mu.Unlock()
+	}
+	lateRoom()
+	held := make(chan struct{})
+	lives[hotelID].mu.Lock()
+	lives[hotelID].holdDeletes = held // the cleanup waits, so the room is metered first
+	lives[hotelID].mu.Unlock()
+	tc.syncAll(hotelID)
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create while the late room is listed: %d %v", status, doc)
+	}
+	close(held)
+	waitRecord(t, tc, hotelID, batch, func(ub *unreapedBatch) bool { return ub == nil })
+	mustFlush(t, tc.b.meter)
+	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter?after=0&limit=5000", nil)
+	if status != 200 {
+		t.Fatalf("meter route: %d %v", status, doc)
+	}
+	run := hotelID + ".sbx_late"
+	var states []string
+	for _, r := range doc["readings"].([]any) {
+		reading := r.(map[string]any)
+		if reading["run"] != run {
+			continue
+		}
+		if reading["billable"] != false {
+			t.Fatalf("reading of the late room %v, want billable false", reading)
+		}
+		states = append(states, reading["state"].(string))
+	}
+	if len(states) == 0 || states[len(states)-1] != "ended" {
+		t.Fatalf("late room readings %v, want not billable and then ended", states)
+	}
+}
