@@ -200,6 +200,11 @@ before the delete. A room the broker took back from a cancelled or failed
 create (its reap, the orphan cleanup, or a recorded leftover) is metered
 too, with `"billable": false` (absent means billable).
 Readings are cumulative, so a reader keeps the largest per run.
+`seconds` is truncated to whole seconds, so a room used and deleted within
+one observed second ends at 0. With `usage_meter_min_second` (default
+false) the ended reading of a billable run rounds up to the next whole
+second, at least 1; running readings and runs that are not billable are
+never rounded. Turning it on changes what customers pay: a pricing decision.
 
 | Route (operator key) | What it does |
 |---|---|
