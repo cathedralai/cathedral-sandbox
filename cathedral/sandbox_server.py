@@ -89,8 +89,15 @@ class Response:
         return cls(status, data, {"Content-Type": JSON, **(headers or {})})
 
     @classmethod
-    def error(cls, status: int, code: str, message: str, headers: Mapping[str, str] | None = None) -> "Response":
-        return cls.json(status, {"error": {"code": code, "message": message}}, headers)
+    def error(
+        cls,
+        status: int,
+        code: str,
+        message: str,
+        headers: Mapping[str, str] | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> "Response":
+        return cls.json(status, {"error": {**(detail or {}), "code": code, "message": message}}, headers)
 
     @classmethod
     def no_content(cls) -> "Response":
@@ -365,7 +372,7 @@ class SandboxApplication:
             return Response.error(status, exc.code, str(exc))
         except SandboxOpError as exc:
             hdrs = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
-            return Response.error(exc.http_status, exc.code, str(exc), hdrs)
+            return Response.error(exc.http_status, exc.code, str(exc), hdrs, exc.detail)
         except AfflineRerunError as exc:
             return Response.error(exc.http_status, exc.category, str(exc))
         except json.JSONDecodeError as exc:
@@ -491,7 +498,16 @@ class SandboxApplication:
         # collected sandbox never lingers in the list or counts against quota.
         self._sweep_inline()
         docs = self.provider.list(labels=query.get("label", []), state=(query.get("state") or [None])[0])
-        return Response.json(200, {"sandboxes": docs})
+        payload: dict[str, Any] = {"sandboxes": docs}
+        # AB#864: rooms that left in the last 10 min and why, and when this API
+        # started, so the broker can tell an end from a hotel restart.
+        ended = getattr(self.provider, "ended", None)
+        if callable(ended):
+            payload["ended"] = ended()
+        started = getattr(self.provider, "api_started_at", None)
+        if callable(started):
+            payload["api_started_at"] = started()
+        return Response.json(200, payload)
 
     def bulk_delete(self, *, query, headers, body, api_key, **_):
         labels = query.get("label", [])

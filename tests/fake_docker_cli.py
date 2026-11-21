@@ -347,7 +347,11 @@ def main(argv):
         with Locked() as st:
             for cid, c in st["containers"].items():
                 if c["labels"].get(k) == v:
-                    print(f"{cid} {c['labels'].get('cathedral.sandbox.id', '')}")
+                    sid = c["labels"].get("cathedral.sandbox.id", "")
+                    if "{{.State}}" in argv[argv.index("--format") + 1]:
+                        print(f"{cid} {c.get('status', 'running')} {sid}")
+                    else:
+                        print(f"{cid} {sid}")
         return 0
 
     if cmd == "exec" and b.get("exec_model"):
@@ -536,6 +540,12 @@ class FakeDocker:
     def add_container(self, cid: str, *, name: str, labels: dict[str, str]) -> None:
         state = self._load()
         state["containers"][cid] = {"name": name, "labels": labels, "status": "running", "argv": []}
+        self._save(state)
+
+    def set_container(self, cid: str, **fields: Any) -> None:
+        """Change a container as the daemon would see it (status, exit_code, oom_killed)."""
+        state = self._load()
+        state["containers"][cid].update(fields)
         self._save(state)
 
     def add_log(self, cid: str, stream: str, text: str, ns: int) -> None:

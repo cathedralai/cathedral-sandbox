@@ -8,8 +8,8 @@ The broker does four things:
 
 | Function | Routes | What it does |
 |---|---|---|
-| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
-| Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. |
+| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000; the compat create takes `count` up to 1,000 and answers 201 `{sandboxes, count, errors}`) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
+| Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. `/v1/usage` gives hours per hotel, not prices (`"cost": "not_priced_here"`, AB#870). |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
 | Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. Private: open with the view token or a share link (`POST /v1/live/shares`). |
 
@@ -40,7 +40,12 @@ Creates in flight:
   10; -1 turns it off) for a create slot moves to another eligible hotel
   with a free room. If there is none, it keeps waiting.
 - A hotel whose host memory use is at or above `mem_full_pct` (config,
-  default 90; -1 turns it off) takes no new rooms. The value is the hotel
+  default 90; -1 turns it off) takes no new rooms. A hotel may carry its own
+  `mem_full_pct` (1 to 100; config, operator join, or PATCH
+  `{"mem_full_pct": n}`, `null` back to the broker-wide value; AB#855). It
+  replaces the broker-wide value for that hotel, even when that one is -1. A
+  PATCH of a config file hotel is not saved: the file keeps the durable
+  value. Hotel docs and `/v1/broker/stats` show the limit in force. The value is the hotel
   health value `host_mem_used_pct` (MemTotal minus MemAvailable, so page
   cache does not count). Hotel slots come from an install-time sizing with
   memory overcommit, so free slots alone cannot see rooms that use their
@@ -93,8 +98,8 @@ Each guest in the config can have limits (`guests.go`):
 
 | Field | Meaning |
 |---|---|
-| `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. |
-| `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. |
+| `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. A single `count` above the limit itself can never fit: 400 `count_over_room_limit`. |
+| `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. A single `count` above the limit itself: 400 `count_over_rate_limit` (send at most that many in one call). |
 | `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
 | `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
@@ -582,6 +587,16 @@ labels each snapshot with the guest). An unknown or foreign snapshot gives
 503 `snapshot_hotel_unavailable`. A fork whose hotel is outside the hotel
 choice gives 409 `snapshot_hotel_excluded`.
 
+A bare name (or bare id) asks every hotel of the guest (AB#866). If none has
+it and a hotel that is up did not answer, the answer is 502
+`hotel_unreachable` naming that hotel: it may hold the snapshot, so retry, or
+use the `<hotel>.<snapshot id>` id. A busy hotel gives 503 `sold_out`
+(AB#819). A hotel already known down is not a reason to retry: the answer
+stays 404 `snapshot_not_found` and names it. The `<hotel>.<snapshot id>` id
+asks only that hotel: 502 `hotel_unreachable` if it does not answer, 404 if
+it answers without the snapshot. A snapshot lives only on its hotel: a hotel
+restart or roll drops it before its ttl.
+
 ## Workspaces
 
 A workspace is a named directory on one hotel that outlives rooms (#305).
@@ -628,6 +643,31 @@ does not keep it and does not show it. The answer (202) gives a
 `prefetch_id`. `GET /v1/images/prefetch/<id>` gives the state on each
 hotel (`pulling`, `done` with image sizes, or `failed` with the error).
 The broker keeps a job for 24 hours, in memory.
+
+Each image is its own hotel call, up to 4 at once per hotel, so a long list
+does not run past one call's limit. Each entry of a hotel's `images` has
+its own `state` (`pulling`, `done`, `failed`) and `error`. A hotel is
+`failed` when any image failed; its `error` is the first failed image's
+error (with 2 or more: "n of m images failed; first: ...").
+
+A hotel whose scratch is at its admission line (`disk_admit_used_pct`, or
+80% used) pulls nothing: it reads `failed` with `image_store_full` (AB#861).
+
+Warm steering (AB#859): once an image is `done` on a hotel, that guest's
+creates of the same image reference prefer the hotels that hold it. Like
+the catalog prewarm, it only narrows the hotels that have a free room; when
+none of them does, a cold hotel serves. The reference must match exactly
+(`alpine` does not warm `alpine:latest`). Other guests are not steered.
+Config `"prefer_guest_warm": false` turns steering off. A compat
+`POST /v1/images/import` pulls as the guest and warms the same way.
+
+When a hotel comes back after being down, the broker asks it, as the guest,
+whether it still holds each image the guest prefetched there in the last
+7 days (up to 256 per guest and hotel). A held image is warm again with no
+pull; a missing one (a reboot wiped the scratch) is pulled again. Images
+pulled with `registry_auth` are not pulled again: the broker never keeps
+the login, so prefetch those again after a hotel restart. A broker restart
+forgets the list.
 
 `GET /v1/broker/stats` gives per-hotel counts and latency percentiles
 (hotel call, wait in the broker queue, broker overhead). `POST` resets them.
