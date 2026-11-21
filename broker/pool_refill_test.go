@@ -555,3 +555,43 @@ func TestPoolCreateLostAnswerRoomIsDecidedByItsReceipts(t *testing.T) {
 		t.Fatalf("%d receipts reads of %s, want 1 (after its create ended)", len(r), hid)
 	}
 }
+
+// The hotel reports its used memory and its share, each rounded to 0.1, so
+// the memory they give moves a little from one answer to the next. Where
+// the memory bound is the smaller one, that must not delete and make ready
+// rooms; a configured ram_gib comes first (coordinator's read of #663 at
+// 18c6b5c, finding 2).
+func TestPoolMemoryBoundHoldsWhenHealthNumbersMove(t *testing.T) {
+	t.Run("from health", func(t *testing.T) {
+		pc := newPoolChain(t, []string{"a"}, nil)
+		f := pc.hotels["a"]
+		f.set(func(f *fakePoolHotel) { f.slots, f.memGiB, f.memPct = 480, 0.7, 10.2 }) // 6.86 GiB: bound 10 by memory
+		pc.up("a")
+		pc.target(100)
+		pc.fill("a", 10)
+		for _, pct := range []float64{10.3, 10.2, 10.3} { // 10.3 alone: 6.80 GiB, bound 9
+			f.set(func(f *fakePoolHotel) { f.memPct = pct })
+			pc.sync("a")
+			pc.steps("a", 3)
+		}
+		if c := pc.counts("a"); c.ready != 10 || c.stale != 0 {
+			t.Fatalf("memory-bound hotel, its health moving by one rounding step: %+v, want 10 ready kept", c)
+		}
+		if d, n := len(f.roomDeletes()), len(f.creates()); d != 0 || n != 10 {
+			t.Fatalf("%d deletes and %d creates, want 0 and 10", d, n)
+		}
+		_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+		if v := doc["hotels"].(map[string]any)["a"].(map[string]any); v["bound_by_memory"] != float64(10) {
+			t.Fatalf("view: bound_by_memory %v, want 10 (the largest memory seen)", v["bound_by_memory"])
+		}
+	})
+	t.Run("ram_gib first", func(t *testing.T) {
+		pc := newPoolChain(t, []string{"a"}, func(c *config) { c.Hotels[0].RAMGiB = 6 }) // bound 8; health says 384 GiB
+		pc.up("a")
+		pc.target(100)
+		_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+		if v := doc["hotels"].(map[string]any)["a"].(map[string]any); v["bound_by_memory"] != float64(8) || v["bound"] != float64(8) {
+			t.Fatalf("ram_gib 6 with health of 38.4 of 384 GiB: bound_by_memory %v, bound %v; want 8 and 8", v["bound_by_memory"], v["bound"])
+		}
+	})
+}
