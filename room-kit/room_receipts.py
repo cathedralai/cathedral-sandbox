@@ -2807,6 +2807,8 @@ RAW_REQUEST = OPAQUE_BODY | {"file_put"} | {a for _m, _p, a in SIGNED_SLICE3}
 REQUEST_WITHHELD = {"secret_put"}
 # Answers the front never parses on success: an archive, or a file's bytes.
 RAW_ANSWER = OPAQUE_BODY | {"file_get"}
+# Answers the front never parses at all: a guest port's answer is whatever the room's own server sent.
+GUEST_ANSWER = {"port_http"}
 # Signed, but still refused on a serial room: a terminal runs commands no receipt orders, and a ticket
 # only opens a terminal or desktop socket.
 SERIAL_CLOSED = {"access_ticket", "terminal_create", "terminal_delete", "terminal_connect", "terminal_input",
@@ -4159,13 +4161,14 @@ class Handler(BaseHTTPRequestHandler):
         req = {}
         try:
             req = json.loads(body) if body and action not in RAW_REQUEST else {}
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
         res = {}
         try:
             # tar_get answers an archive on success and a JSON error otherwise.
-            res = json.loads(out) if out and not (action in RAW_ANSWER and 200 <= status < 300) else {}
-        except ValueError:
+            res = json.loads(out) if out and not (action in RAW_ANSWER and 200 <= status < 300) \
+                and action not in GUEST_ANSWER else {}
+        except (ValueError, RecursionError):
             pass
         m = re.match("^" + ROOM, path)
         sandbox = m["id"] if m else (res.get("id") if isinstance(res, dict) else None)
@@ -4220,7 +4223,8 @@ class Handler(BaseHTTPRequestHandler):
             **({"exec_token_sha256": sha(token.encode())} if isinstance(token, str) and token else {}),
             **({"start_command": start_command, "start_command_sha256": start_command_sha256}
                if action == "create" else {}),
-            **({"snapshot_id": snapshot_deleted["id"]} if snapshot_deleted else {}),
+            # Decoded, as the API decodes its route parameters; target keeps the spelling sent.
+            **({"snapshot_id": unquote(snapshot_deleted["id"])} if snapshot_deleted else {}),
         }
 
     @staticmethod

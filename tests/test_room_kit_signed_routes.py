@@ -122,6 +122,7 @@ def _sample_for(method: str, action: str) -> str:
 def front(tmp_path, monkeypatch):
     monkeypatch.setattr(rr, "tsm_provider", lambda: None)
     seen: list[tuple[str, str, bytes, dict]] = []
+    answers: dict[str, tuple[int, bytes]] = {}  # path -> (status, body) to answer instead
 
     class Api(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -134,6 +135,7 @@ def front(tmp_path, monkeypatch):
             seen.append((self.command, self.path, self.rfile.read(n) if n else b"", dict(self.headers)))
             status = 201 if self.command == "POST" and self.path.endswith("/terminals") else 200
             body = json.dumps({"ok": True, "path": self.path}).encode()
+            status, body = answers.get(self.path, (status, body))
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -147,9 +149,13 @@ def front(tmp_path, monkeypatch):
     ledger = rr.Ledger("room-a", str(tmp_path))
     server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, KEY, "/nonexistent.sock", pool_scan=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    front_answers[id(ledger)] = answers
     yield server.server_address[1], seen, ledger
     server.shutdown()
     api.shutdown()
+
+
+front_answers: dict[int, dict] = {}
 
 
 def _call(port: int, method: str, path: str, body: bytes | None = None, headers: dict | None = None):
@@ -283,3 +289,31 @@ def test_a_slice3_body_with_a_lone_surrogate_is_signed_not_refused(front) -> Non
 ])
 def test_route_kind_keeps_terminals_closed_on_serial_rooms(method, tail, kind) -> None:
     assert rr.route_kind(method, "/v1/sandboxes/sbx_9" + tail) == kind
+
+
+@pytest.mark.parametrize("status", [200, 500])
+def test_a_guest_port_answer_is_never_parsed(front, status) -> None:
+    # The room's own server chose these bytes: JSON nested past the parser's limit must not cost the receipt.
+    port, _seen, ledger = front
+    deep = b"[" * 100_000 + b"]" * 100_000
+    front_answers[id(ledger)]["/v1/sandboxes/sbx_9/ports/8080/http"] = (status, deep)
+    got, headers, out = _call(port, "POST", "/v1/sandboxes/sbx_9/ports/8080/http", b"")
+    assert got == status and out == deep and "X-Room-Receipt-Error" not in headers
+    st = _statement(headers)
+    assert st["action"] == "port_http" and st["result_sha256"] == rr.sha(deep) and st["sandbox_id"] == "sbx_9"
+
+
+def test_a_deeply_nested_api_answer_does_not_cost_the_receipt(front) -> None:
+    port, _seen, ledger = front
+    deep = b"[" * 100_000 + b"]" * 100_000
+    front_answers[id(ledger)]["/v1/workspaces"] = (400, deep)
+    got, headers, _out = _call(port, "POST", "/v1/workspaces", b"[" * 100_000 + b"]" * 100_000)
+    assert got == 400 and _statement(headers)["action"] == "workspace_create"
+
+
+def test_a_snapshot_delete_names_the_snapshot_the_api_deletes(front) -> None:
+    port, seen, _ledger = front
+    _got, headers, _out = _call(port, "DELETE", "/v1/snapshots/%73nap_1")
+    st = _statement(headers)
+    assert st["snapshot_id"] == "snap_1" and st["target"] == "DELETE /v1/snapshots/%73nap_1"
+    assert seen[0][1] == "/v1/snapshots/%73nap_1"
