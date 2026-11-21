@@ -378,7 +378,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	hc := req.hotelConfig
 	if enroller {
 		if hc.MinerHotkey == "" || !hc.Sealed || (req.Verify != nil && !*req.Verify) ||
-			hc.ReservedFor != "" || hc.Labels != nil || hc.DataConns != 0 || hc.DataConnWaitSeconds != 0 ||
+			hc.ReservedFor != "" || hc.Labels != nil || hc.DataConns != 0 || hc.DataConnWaitSeconds != 0 || hc.MemFullPct != nil ||
 			!strings.HasPrefix(hc.API, "https://") || (hc.Health != "" && !strings.HasPrefix(hc.Health, "https://")) {
 			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
 			return
@@ -424,6 +424,9 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	case checkDiskConfig(hc) != nil:
 		writeErr(w, 400, "invalid_hotel", checkDiskConfig(hc).Error())
+		return
+	case checkMemFullPct(hc.MemFullPct) != nil:
+		writeErr(w, 400, "invalid_hotel", checkMemFullPct(hc.MemFullPct).Error())
 		return
 	case !validAlertChat(hc.AlertChatID):
 		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
@@ -623,13 +626,14 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		Lend        *bool             `json:"lend"`          // true: lend the reserved hotel to the pool (lend.go)
 		DrainNotice json.RawMessage   `json:"drain_notice"`  // a signed planned-maintenance notice; needs drain=true (drain_notice.go)
 		AlertChatID *string           `json:"alert_chat_id"` // the miner operator's alert chat; "" clears (alerts.go)
+		MemFullPct  json.RawMessage   `json:"mem_full_pct"`  // this hotel's memory limit, 1 to 100; null: the broker-wide value (AB#855)
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil) {
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil || len(req.MemFullPct) != 0) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true, with or without a drain_notice")
 		return
 	}
@@ -660,6 +664,23 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if req.MaxSlots != nil && *req.MaxSlots < 0 {
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
+	}
+	var memFull **float64 // nil: not in the request; *memFull nil: clear
+	if len(req.MemFullPct) > 0 {
+		var p *float64
+		if string(req.MemFullPct) != "null" {
+			var v float64
+			if json.Unmarshal(req.MemFullPct, &v) != nil {
+				writeErr(w, 400, "invalid_json", "mem_full_pct must be a number or null")
+				return
+			}
+			p = &v
+		}
+		if err := checkMemFullPct(p); err != nil {
+			writeErr(w, 400, "invalid_hotel", err.Error())
+			return
+		}
+		memFull = &p
 	}
 	if req.AlertChatID != nil && !validAlertChat(*req.AlertChatID) {
 		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
@@ -751,6 +772,9 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if req.AlertChatID != nil {
 		h.cfg.AlertChatID = *req.AlertChatID
 	}
+	if memFull != nil {
+		h.cfg.MemFullPct = *memFull
+	}
 	h.cfgMu.Unlock()
 	var err error
 	if newNotice != nil {
@@ -777,6 +801,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.LentFrom = oldCfg.LentFrom
 		h.cfg.LentReportID = oldCfg.LentReportID
 		h.cfg.AlertChatID = oldCfg.AlertChatID
+		h.cfg.MemFullPct = oldCfg.MemFullPct
 		h.cfgMu.Unlock()
 		b.mu.Unlock()
 		writeErr(w, 500, "state_write_failed", "cannot keep the hotel update; nothing changed")
@@ -876,7 +901,8 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
-		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice()}
+		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice(),
+		"mem_pct": h.memPct, "mem_full_pct": b.memFullLimit(h), "mem_full": b.memFull(h)}
 	diskDoc(h, d)
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p

@@ -504,7 +504,7 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 	b.mu.Lock()
 	out := []map[string]any{}
 	for _, h := range b.hotelList() {
-		if !g.allowsHotel(h) {
+		if !g.guestReaches(h) {
 			continue
 		}
 		free := b.freeFor(h)

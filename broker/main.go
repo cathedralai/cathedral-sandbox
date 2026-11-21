@@ -115,6 +115,11 @@ type hotelConfig struct {
 	// value and none at or above it; disk_extra_gib is not counted. Nil: the
 	// disk_extra_gib rule above.
 	DiskAdmitUsedPct *float64 `json:"disk_admit_used_pct,omitempty"`
+	// MemFullPct: this hotel's memory limit for new rooms, in place of the
+	// broker-wide mem_full_pct (placement.go memFull, AB#855). A sealed hotel
+	// that holds many rooms needs a lower mark than a plain one. Nil: the
+	// broker-wide value. 1 to 100. PATCH sets or clears it live.
+	MemFullPct *float64 `json:"mem_full_pct,omitempty"`
 }
 
 type guestConfig struct {
@@ -553,6 +558,9 @@ func loadBroker(path string) (*broker, error) {
 			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
 		}
 		if err := checkDiskConfig(hc); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
+		}
+		if err := checkMemFullPct(hc.MemFullPct); err != nil {
 			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
 		}
 		k, err := os.ReadFile(hc.KeyFile)
@@ -2189,7 +2197,7 @@ func (b *broker) handleStats(w http.ResponseWriter, r *http.Request, g *guestSta
 			"id": h.cfg.ID, "ok": h.ok, "drain": h.drain(), "sealed": h.cfg.Sealed, "slots": h.slots, "broker_running": running, "queued": h.queued, "creating": h.creating,
 			"api_running": h.apiRunning, "api_deleting": h.apiDeleting, "containers": h.containers,
 			"runtime": h.hotelRuntime(), "kernel_isolation": h.kernelIsolation,
-			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1, "mem_full": b.memFull(h),
+			"cpu_pct": h.cpuPct, "mem_pct": h.memPct, "mem_gib": h.memGiB, "load1": h.load1, "mem_full": b.memFull(h), "mem_full_pct": b.memFullLimit(h),
 			"created": h.created, "failed": h.failed, "rejected_429": h.rejected,
 			"hotel_ms": pct(h.lat.hotel), "queue_ms": pct(h.lat.queue), "overhead_ms": pct(h.lat.overhead),
 			"conns": h.conns.stats(),
@@ -2792,15 +2800,20 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			}
 			b.handleProbe(w, r, g)
 		case p == "/v1/status":
+			// A guest counts its own hotels (AB#869); an ops key the fleet.
 			b.mu.Lock()
-			up := 0
+			n, up := 0, 0
 			for _, h := range b.hotelList() {
+				if !g.cfg.Ops && !g.guestReaches(h) {
+					continue
+				}
+				n++
 				if h.ok {
 					up++
 				}
 			}
 			b.mu.Unlock()
-			writeJSON(w, 200, map[string]any{"service": "central-booking", "hotels": len(b.hotelList()), "hotels_up": up, "uptime_s": int(time.Since(b.started).Seconds())})
+			writeJSON(w, 200, map[string]any{"service": "central-booking", "hotels": n, "hotels_up": up, "uptime_s": int(time.Since(b.started).Seconds())})
 		default:
 			writeErr(w, 404, "route_not_found", "central booking does not route "+r.Method+" "+p)
 		}
