@@ -88,8 +88,11 @@ settings in the table come from the same place.
 receipts off. The installer starts `<ROOM_ID>-receipts.service`
 (`room_receipts.py`).
 
-What it turns on: an Ed25519 receipt chain for create, exec, background
-process start, delete and network policy changes. The process listens on
+What it turns on: an Ed25519 receipt chain for every route that changes a
+room, the hotel or an account: create, exec, processes, delete, network
+policy, files, tar, directories, terminals, ports, snapshots, workspaces,
+secrets and images (the list and the routes left unsigned, each with its
+reason: `docs/AB385_GUEST_SIGNED_ROUTES.md`). The process listens on
 `ROOM_RECEIPTS_LISTEN` (default `127.0.0.1:18092`). That port is not
 `ROOM_API_PORT` and not `ROOM_HEALTH_PORT`. It proxies those calls to the
 room API on `127.0.0.1:ROOM_API_PORT`. When receipts are on, Caddy sends
@@ -179,7 +182,9 @@ signed request at a time, so the order of its receipts is the order things ran.
   `/terminals`, a process's `/logs`, `sealed-secrets`, `sealed-env`, `/entries`)
   pass without a token and leave no receipt. Every other route that is not a
   signed route or a delete, the front's own sealed secrets and sealed exec
-  included, is refused with 409 `room_serial_unsigned`.
+  included, is refused with 409 `room_serial_unsigned`. Terminal routes and
+  access tickets stay refused although they are signed: a terminal runs
+  commands that no receipt orders.
 - On a serial room each request is sent to the API once, a read or a signed
   GET included (an ordinary room retries a GET whose answer was lost). A read
   whose answer is lost answers 502, signs nothing and does not break the room

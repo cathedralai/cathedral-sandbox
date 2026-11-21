@@ -2788,9 +2788,52 @@ SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile("^" + ROOM + r"/thaw$"), "thaw"),
     ("POST", re.compile("^" + ROOM + r"/expose$"), "expose"),
 ]
+# AB#385 slice 3: every other route of the room API that changes a room, the hotel or an account.
+# tests/test_room_kit_signed_routes.py fails when the API gains a route that is neither signed nor on
+# its list of unsigned routes with a reason.
+SIGNED_SLICE3 = [
+    ("PUT", re.compile("^" + ROOM + r"/directories$"), "mkdir"),
+    ("DELETE", re.compile("^" + ROOM + r"/entries$"), "entry_delete"),
+    ("POST", re.compile("^" + ROOM + r"/ports/[0-9]+/http$"), "port_http"),
+    ("POST", re.compile("^" + ROOM + r"/access-tickets$"), "access_ticket"),
+    ("POST", re.compile("^" + ROOM + r"/terminals$"), "terminal_create"),
+    ("DELETE", re.compile("^" + ROOM + r"/terminals/[^/]+$"), "terminal_delete"),
+    ("POST", re.compile("^" + ROOM + r"/terminals/[^/]+/connect$"), "terminal_connect"),
+    ("POST", re.compile("^" + ROOM + r"/terminals/[^/]+/input$"), "terminal_input"),
+    ("POST", re.compile("^" + ROOM + r"/terminals/[^/]+/resize$"), "terminal_resize"),
+    ("POST", re.compile("^" + ROOM + r"/publish$"), "publish"),
+    ("DELETE", re.compile(r"^/v1/snapshots/[^/]+$"), "snapshot_delete"),
+    ("POST", re.compile(r"^/v1/snapshots/[^/]+/push$"), "snapshot_push"),
+    ("POST", re.compile(r"^/v1/workspaces$"), "workspace_create"),
+    ("DELETE", re.compile(r"^/v1/workspaces/[^/]+$"), "workspace_delete"),
+    ("POST", re.compile(r"^/v1/workspaces/[^/]+/versions$"), "workspace_version"),
+    ("POST", re.compile(r"^/v1/workspaces/[^/]+/rollback$"), "workspace_rollback"),
+    ("PUT", re.compile(r"^/v1/secrets/[^/]+$"), "secret_put"),
+    ("DELETE", re.compile(r"^/v1/secrets/[^/]+$"), "secret_delete"),
+    ("POST", re.compile(r"^/v1/images/prefetch$"), "image_prefetch"),
+    ("POST", re.compile(r"^/v1/images/build$"), "image_build"),
+    ("POST", re.compile(r"^/v1/affline/validate-rerun$"), "affline_rerun"),
+]
+SIGNED += SIGNED_SLICE3
+SNAPSHOT_DELETE_ID = re.compile(r"^/v1/snapshots/(?P<id>[^/]+)$")
 # Archive bodies are never JSON. Not parsing them keeps a large plain tar from
 # being decoded into a str on every pass.
 OPAQUE_BODY = {"tar_put", "tar_get"}
+# Request bodies the front neither pre-checks nor reads fields from: a file's bytes (a JSON file with a
+# lone surrogate escape or a "cmd" key is still just a file) and the slice 3 routes, whose receipts carry
+# only what every receipt carries. customer_request_sha256 still covers the bytes.
+RAW_REQUEST = OPAQUE_BODY | {"file_put"} | {a for _m, _p, a in SIGNED_SLICE3}
+# A plain secret's value is not hashed into a receipt anyone with the hotel key can read: a short value
+# would fall to a guess. The receipt names the secret (target) and says the request hash is withheld.
+REQUEST_WITHHELD = {"secret_put"}
+# Answers the front never parses on success: an archive, or a file's bytes.
+RAW_ANSWER = OPAQUE_BODY | {"file_get"}
+# Answers the front never parses at all: a guest port's answer is whatever the room's own server sent.
+GUEST_ANSWER = {"port_http"}
+# Signed, but still refused on a serial room: a terminal runs commands no receipt orders, and a ticket
+# only opens a terminal or desktop socket.
+SERIAL_CLOSED = {"access_ticket", "terminal_create", "terminal_delete", "terminal_connect", "terminal_input",
+                 "terminal_resize"}
 # Dedicated machine: the requests that start code need the owner signature.
 # A build runs Dockerfile steps in the guest, and the broker sends builds to
 # every hotel, so it is gated like a create.
@@ -3122,15 +3165,16 @@ def room_of(path: str) -> str | None:
 def route_kind(method: str, path: str) -> str:
     """How the gate sees a request that names a room.
 
-    delete, claim, signed (a row of SIGNED), record_read (the reads an unclaimed pool room allows), read, or
+    delete, claim, signed (a row of SIGNED not in SERIAL_CLOSED), record_read (the reads an unclaimed pool room allows), read, or
     other (anything on no list).
     """
     if method == "DELETE" and re.match("^" + ROOM + "$", path):
         return "delete"
     if method == "POST" and CLAIM_ROUTE.match(path):
         return "claim"
-    if any(meth == method and pat.match(path) for meth, pat, _action in SIGNED):
-        return "signed"
+    action = next((a for meth, pat, a in SIGNED if meth == method and pat.match(path)), None)
+    if action is not None:
+        return "other" if action in SERIAL_CLOSED else "signed"
     if any(meth == method and pat.match(path) for meth, pat in RECORD_READS):
         return "record_read"
     if any(meth == method and pat.match(path) for meth, pat in READS):
@@ -3522,7 +3566,7 @@ class Handler(BaseHTTPRequestHandler):
         # `path` is already the path the API routes on (api_request_path drops a ";params" suffix above),
         # so no spelling of a signed route reaches the API unsigned.
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
-        if action and body and action not in OPAQUE_BODY:
+        if action and body and action not in RAW_REQUEST:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
             # when the statement is signed. Refuse it before the API runs
             # the action: an action with no receipt is the one thing this
@@ -4235,14 +4279,15 @@ class Handler(BaseHTTPRequestHandler):
                *, target_path: str | None = None) -> dict:
         req = {}
         try:
-            req = json.loads(body) if body and action not in OPAQUE_BODY else {}
-        except ValueError:
+            req = json.loads(body) if body and action not in RAW_REQUEST else {}
+        except (ValueError, RecursionError):
             pass
         res = {}
         try:
             # tar_get answers an archive on success and a JSON error otherwise.
-            res = json.loads(out) if out and not (action in OPAQUE_BODY and 200 <= status < 300) else {}
-        except ValueError:
+            res = json.loads(out) if out and not (action in RAW_ANSWER and 200 <= status < 300) \
+                and action not in GUEST_ANSWER else {}
+        except (ValueError, RecursionError):
             pass
         m = re.match("^" + ROOM, path)
         sandbox = m["id"] if m else (res.get("id") if isinstance(res, dict) else None)
@@ -4267,12 +4312,15 @@ class Handler(BaseHTTPRequestHandler):
                 start_command = raw_start
                 start_command_sha256 = sha(canonical(start_command))
         receipt_path = target_path if target_path is not None else path
+        # The offline checker reads a snapshot_delete's snapshot_id (verify_receipts.py check 13).
+        snapshot_deleted = SNAPSHOT_DELETE_ID.match(path) if action == "snapshot_delete" else None
         return {
             "action": action,
             # *receipt_path* is path plus query (urlparse drops ``;params``); never the raw client target.
             "target": f"{self.command} {receipt_path}",
             "sandbox_id": sandbox if isinstance(sandbox, str) else None,
-            "customer_request_sha256": sha(body or b""),
+            "customer_request_sha256": None if action in REQUEST_WITHHELD else sha(body or b""),
+            **({"customer_request_withheld": "secret_value"} if action in REQUEST_WITHHELD else {}),
             "command_sha256": sha(canonical(command)) if command is not None else None,
             "image": image,
             "image_digest": self.server.image_digest(image) if image and status in (200, 201, 202) else None,
@@ -4294,6 +4342,8 @@ class Handler(BaseHTTPRequestHandler):
             **({"exec_token_sha256": sha(token.encode())} if isinstance(token, str) and token else {}),
             **({"start_command": start_command, "start_command_sha256": start_command_sha256}
                if action == "create" else {}),
+            # Decoded, as the API decodes its route parameters; target keeps the spelling sent.
+            **({"snapshot_id": unquote(snapshot_deleted["id"])} if snapshot_deleted else {}),
         }
 
     @staticmethod
