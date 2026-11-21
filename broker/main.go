@@ -2419,7 +2419,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			ub.busy = true
 			go func() {
 				ok := b.reapPass(h, ub.guest, batchID, ub.keep, 10*time.Second)
-				afterCleanupPass(h, batchID) // allowance.go
+				runAfterCleanupPass(h, batchID) // allowance.go
 				if ok {
 					b.reaped(h, batchID, ub) // ends the pass and decides the record in one step
 					return

@@ -1905,12 +1905,16 @@ func TestMeteredOverlappingCleanupPassesKeepTheOtherHolds(t *testing.T) {
 	}
 	paused, resume := make(chan struct{}), make(chan struct{})
 	var once, resumed, released sync.Once
-	saved := afterCleanupPass
-	afterCleanupPass = func(*hotel, string) { once.Do(func() { close(paused); <-resume }) }
+	hold := func(_ *hotel, id string) {
+		if id == batch { // only this test's passes; workers of earlier tests may still run
+			once.Do(func() { close(paused); <-resume })
+		}
+	}
+	afterCleanupPass.Store(&hold)
 	t.Cleanup(func() { // nothing stays parked when the test ends early
+		afterCleanupPass.Store(nil)
 		resumed.Do(func() { close(resume) })
 		released.Do(func() { close(lists) })
-		afterCleanupPass = saved
 	})
 	// A lands; the first pass lists and removes it, then waits before it
 	// finishes.

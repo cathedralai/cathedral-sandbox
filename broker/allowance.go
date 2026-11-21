@@ -86,6 +86,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -331,9 +332,16 @@ func (b *broker) meteredCreate(g *guestState, payload map[string]any, n int) (*a
 	return nil, 0
 }
 
-// afterCleanupPass runs when a sync loop cleanup pass has returned, before
-// its record is updated (busy is still set). Tests hold a pass there.
-var afterCleanupPass = func(h *hotel, batchID string) {}
+// afterCleanupPass, when set, runs when a sync loop cleanup pass has
+// returned, before its record is updated (busy is still set). Tests hold a
+// pass there. Atomic: cleanup workers of earlier tests may still read it.
+var afterCleanupPass atomic.Pointer[func(h *hotel, batchID string)]
+
+func runAfterCleanupPass(h *hotel, batchID string) {
+	if fn := afterCleanupPass.Load(); fn != nil {
+		(*fn)(h, batchID)
+	}
+}
 
 // afterMeteredCheck runs between a metered create's early check and its
 // reservation in admitCreate. Tests hold creates there to prove the
