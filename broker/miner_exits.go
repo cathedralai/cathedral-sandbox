@@ -31,8 +31,10 @@
 package main
 
 import (
+	"encoding/hex"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -56,6 +58,8 @@ type exitRoom struct {
 }
 
 type minerExit struct {
+	EventID       string     `json:"event_id"`        // stable once the state snapshot is saved
+	Sequence      uint64     `json:"sequence,string"` // meaningful only within a cursor epoch
 	Hotel         string     `json:"hotel"`
 	MinerHotkey   string     `json:"miner_hotkey"`
 	DownAt        time.Time  `json:"down_at"`
@@ -100,10 +104,12 @@ func (b *broker) noteMinerDown(h *hotel, now time.Time) {
 		return
 	}
 	sort.Slice(rooms, func(i, j int) bool { return rooms[i].ID < rooms[j].ID })
-	b.minerExits = append(b.minerExits, &minerExit{
+	e := &minerExit{
 		Hotel: h.cfg.ID, MinerHotkey: h.cfg.MinerHotkey, DownAt: now.UTC(),
 		DrainedAtDown: h.drain(), Rooms: rooms,
-	})
+	}
+	b.touchMinerExit(e)
+	b.minerExits = append(b.minerExits, e)
 	b.pruneMinerExits(now)
 	b.markDirty()
 }
@@ -136,6 +142,7 @@ func (b *broker) endMinerExits(id, how string, now time.Time, lost *bool) {
 			}
 			e.RoomsChecked = true
 		}
+		b.touchMinerExit(e)
 		changed = true
 	}
 	if changed {
@@ -159,6 +166,7 @@ func (b *broker) checkMinerExitRooms(h *hotel, listed map[string]bool) {
 			e.Rooms[i].Lost = &lost
 		}
 		e.RoomsChecked = true
+		b.touchMinerExit(e)
 		changed = true
 	}
 	if changed {
@@ -170,6 +178,7 @@ func (b *broker) checkMinerExitRooms(h *hotel, listed map[string]bool) {
 // records of a hotel over minerExitMaxPerHotel (so one flapping hotel cannot
 // push out the others), then the oldest over minerExitMax. Caller holds b.mu.
 func (b *broker) pruneMinerExits(now time.Time) {
+	before := len(b.minerExits)
 	perHotel := map[string]int{}
 	for _, e := range b.minerExits {
 		if now.Sub(e.DownAt) <= minerExitKeep {
@@ -179,15 +188,20 @@ func (b *broker) pruneMinerExits(now time.Time) {
 	kept := b.minerExits[:0]
 	for _, e := range b.minerExits {
 		if now.Sub(e.DownAt) > minerExitKeep {
+			b.dropMinerExitRevision(e)
 			continue
 		}
 		if perHotel[e.Hotel] > minerExitMaxPerHotel {
 			perHotel[e.Hotel]--
+			b.dropMinerExitRevision(e)
 			continue
 		}
 		kept = append(kept, e)
 	}
 	if over := len(kept) - minerExitMax; over > 0 {
+		for _, e := range kept[:over] {
+			b.dropMinerExitRevision(e)
+		}
 		// Shift down in place: re-slicing would leave the kept tail inside
 		// the range cleared below.
 		kept = append(kept[:0], kept[over:]...)
@@ -196,6 +210,9 @@ func (b *broker) pruneMinerExits(now time.Time) {
 		b.minerExits[i] = nil
 	}
 	b.minerExits = kept
+	if len(kept) != before {
+		b.markDirty()
+	}
 }
 
 // minerExitsSnapshot copies the records. Caller holds b.mu.
@@ -210,11 +227,21 @@ func (b *broker) minerExitsSnapshot() []minerExit {
 // restoreMinerExits takes the records read from the state file. Caller holds b.mu.
 func (b *broker) restoreMinerExits(list []minerExit, now time.Time) {
 	b.minerExits = nil
+	b.minerExitEpoch, b.minerExitSeq, b.minerExitFloor = newUUID(), 0, 0
+	seen := map[string]bool{}
 	for i := range list {
 		e := list[i].clone()
 		if e.Hotel == "" || e.DownAt.IsZero() {
 			continue
 		}
+		// Legacy records have no id. A duplicated saved id cannot be allowed
+		// to collapse two records in a downstream collector's upsert.
+		if e.EventID == "" || seen[e.EventID] {
+			e.EventID = newUUID()
+			b.markDirty()
+		}
+		seen[e.EventID] = true
+		b.touchMinerExit(&e)
 		b.minerExits = append(b.minerExits, &e)
 	}
 	sort.SliceStable(b.minerExits, func(i, j int) bool { return b.minerExits[i].DownAt.Before(b.minerExits[j].DownAt) })
@@ -223,6 +250,15 @@ func (b *broker) restoreMinerExits(list []minerExit, now time.Time) {
 
 // handleMinerExits: GET /v1/broker/miner-exits[?since=RFC3339].
 func (b *broker) handleMinerExits(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if after, ok := q["after"]; ok {
+		if len(after) != 1 || q.Has("since") {
+			writeErr(w, 400, "invalid_exit_cursor", "use one after cursor without since")
+			return
+		}
+		b.handleMinerExitUpdates(w, after[0])
+		return
+	}
 	var since time.Time
 	if s := r.URL.Query().Get("since"); s != "" {
 		t, err := time.Parse(time.RFC3339, s)
@@ -242,4 +278,96 @@ func (b *broker) handleMinerExits(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]any{"exits": out})
+}
+
+// touchMinerExit records a change to the latest state, not an append-only
+// transition journal. All cursor state and records share b.mu.
+func (b *broker) touchMinerExit(e *minerExit) {
+	if b.minerExitEpoch == "" || b.minerExitSeq == ^uint64(0) {
+		b.minerExitEpoch, b.minerExitSeq, b.minerExitFloor = newUUID(), 0, 0
+		for _, old := range b.minerExits {
+			b.minerExitSeq++
+			old.Sequence = b.minerExitSeq
+		}
+	}
+	if e.EventID == "" {
+		e.EventID = newUUID()
+	}
+	b.minerExitSeq++
+	e.Sequence = b.minerExitSeq
+}
+
+func (b *broker) dropMinerExitRevision(e *minerExit) {
+	// Even a caught-up collector needs to know when a pending outcome is
+	// discarded: its future resolution can no longer be observed here.
+	if !e.RoomsChecked {
+		b.touchMinerExit(e)
+	}
+	if e.Sequence > b.minerExitFloor {
+		b.minerExitFloor = e.Sequence
+	}
+}
+
+func parseMinerExitCursor(cursor string) (string, uint64, bool) {
+	epoch, raw, ok := strings.Cut(cursor, ":")
+	if !ok || len(epoch) != 36 || len(raw) == 0 || len(raw) > 20 ||
+		epoch[8] != '-' || epoch[13] != '-' || epoch[18] != '-' || epoch[23] != '-' {
+		return "", 0, false
+	}
+	h := strings.ReplaceAll(epoch, "-", "")
+	if len(h) != 32 || strings.ToLower(h) != h {
+		return "", 0, false
+	}
+	if _, err := hex.DecodeString(h); err != nil {
+		return "", 0, false
+	}
+	seq, err := strconv.ParseUint(raw, 10, 64)
+	return epoch, seq, err == nil && strconv.FormatUint(seq, 10) == raw
+}
+
+// ?after= opts into the cursor contract. An initial snapshot, restart,
+// retention gap or future cursor always requires a reset. A successful
+// incremental response means only that retained observed updates are complete;
+// it is never proof of every actual exit or of reward eligibility.
+func (b *broker) handleMinerExitUpdates(w http.ResponseWriter, cursor string) {
+	var epoch string
+	var after uint64
+	if cursor != "" {
+		var ok bool
+		epoch, after, ok = parseMinerExitCursor(cursor)
+		if !ok {
+			writeErr(w, 400, "invalid_exit_cursor", "after must be a previously returned cursor")
+			return
+		}
+	}
+	b.mu.Lock()
+	if b.minerExitEpoch == "" {
+		b.minerExitEpoch = newUUID()
+	}
+	b.pruneMinerExits(time.Now())
+	reason := ""
+	switch {
+	case cursor == "":
+		reason = "initial_snapshot"
+	case epoch != b.minerExitEpoch:
+		reason = "epoch_changed"
+	case after > b.minerExitSeq:
+		reason = "cursor_ahead"
+	case after < b.minerExitFloor:
+		reason = "retention_gap"
+	}
+	out := make([]minerExit, 0, len(b.minerExits))
+	for _, e := range b.minerExits {
+		if reason != "" || e.Sequence > after {
+			out = append(out, e.clone())
+		}
+	}
+	next := b.minerExitEpoch + ":" + strconv.FormatUint(b.minerExitSeq, 10)
+	b.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Sequence < out[j].Sequence })
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{
+		"schema": "cathedral_miner_exit_updates_v1", "exits": out,
+		"next_cursor": next, "reset_required": reason != "", "reset_reason": reason,
+	})
 }

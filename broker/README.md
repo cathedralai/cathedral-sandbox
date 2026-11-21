@@ -599,6 +599,14 @@ receive this policy document.
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
 | `GET /v1/broker/miner-exits` | Also for the read-only operator key. Miner hotels that went down holding customer rooms, oldest first: `hotel`, `miner_hotkey`, `down_at`, `drained_at_down`, `ended` (`up` when the same guest answered again, `forgotten` after a forget, absent while down), `ended_at`, `rooms_checked` and `rooms` (`id`, `uuid`, `guest`, `lost`: null until known, then whether the room was gone when the hotel came back; every room of a forgotten exit is lost). `?since=<RFC 3339>` keeps records that went down at or after that time. Kept in the client state file for 8 days, at most 50 per hotel and 1,000 in all. It is the input for forfeiting the miner's delivered hours for that window (AB#329); the broker itself forfeits and re-creates nothing. `drained_at_down` is not proof of notice: the miner's enroll key can set drain. |
 
+For incremental exit collection, `GET /v1/broker/miner-exits?after=` starts
+an explicit snapshot; subsequent calls pass its `next_cursor`. Records have
+an `event_id` and a decimal-string `sequence`. Always inspect `reset_required`:
+restart and retention gaps cannot be treated as clean history. See the
+[exit cursor contract](../docs/AB329_EXIT_CURSOR.md) for persistence limits,
+reset reasons and the future collector's obligations. This does not enable
+reward forfeiture.
+
 The broker keeps runtime hotels in `state_dir/hotels.json` and their keys in
 `state_dir/hotel-keys/<id>.key` (mode 0600). A hotel from the config file
 cannot be removed at runtime. Runtime join, PATCH and leave return

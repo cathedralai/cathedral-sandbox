@@ -408,6 +408,11 @@ type broker struct {
 	// minerExits: miner hotels that went down holding customer rooms
 	// (miner_exits.go). Guarded by b.mu.
 	minerExits []*minerExit
+	// Cursor epoch is deliberately process-local: a restart can lose the
+	// last unsaved observations and must never look like continuous history.
+	minerExitEpoch string
+	minerExitSeq   uint64
+	minerExitFloor uint64 // greatest revision removed by retention
 
 	// shares is sha256(share token) -> live view share link (live_share.go).
 	// In memory only. Guarded by b.mu.
