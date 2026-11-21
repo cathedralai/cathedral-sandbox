@@ -157,6 +157,7 @@ type poolHotel struct {
 	listed     bool                 // a room list answered since start
 	busy       bool                 // a step runs
 	creating   map[string]int       // creates in flight, by key
+	started    map[*room]time.Time  // creates in flight: when each started
 	lastCreate time.Time            // the last pool create's start
 	backoff    time.Time            // a create failed: none before this
 	claims     int                  // claims in flight (poolClaimBegin)
@@ -333,7 +334,7 @@ func (p *readyRooms) journalOK() bool { return p.journalState == "complete" }
 func (p *readyRooms) hotel(id string) *poolHotel {
 	ph := p.hotels[id]
 	if ph == nil {
-		ph = &poolHotel{rooms: map[string]*poolRoom{}, creating: map[string]int{}}
+		ph = &poolHotel{rooms: map[string]*poolRoom{}, creating: map[string]int{}, started: map[*room]time.Time{}}
 		p.hotels[id] = ph
 	}
 	return ph
@@ -366,6 +367,33 @@ func poolHotelMemMiB(h *hotel) float64 {
 		return float64(h.cfg.RAMGiB) * 1024
 	}
 	return 0
+}
+
+// oldestCreate is when ph's oldest pool create in flight started; zero when
+// none is in flight. Caller holds b.mu.
+func (ph *poolHotel) oldestCreate() time.Time {
+	var t time.Time
+	for _, at := range ph.started {
+		if t.IsZero() || at.Before(t) {
+			t = at
+		}
+	}
+	return t
+}
+
+// poolMaybeInFlight reports whether rm, a listed pool room the manager does
+// not hold, may be the room of a pool create still in flight on its hotel.
+// The hotel lists a room from the start of its create, before the create
+// answers (sandbox_guest.py records the room, then starts its guest), and
+// the sync loop takes in every listed room it does not know (syncHotel), so
+// such a room is in the room map before its create's answer names it. It
+// counts already, through ph.creating: taken in as unverified too, it would
+// count twice (at the bound the trim deletes a ready room for it) and have
+// its receipts read before its receipt 1 exists (quarantined). A room the
+// sync first saw before the oldest create in flight started is no such
+// room: rm.born is the time of that sync, taken after its list answered.
+func poolMaybeInFlight(rm *room, oldest time.Time) bool {
+	return !oldest.IsZero() && !rm.born.Before(oldest)
 }
 
 // poolFreeSlots is h's free slots, pool rooms counted as used. Caller holds
@@ -623,6 +651,8 @@ func (b *broker) poolStep(ctx context.Context, h *hotel) {
 		ph.inflight.Add(1)
 		b.mu.Unlock()
 		k, att := *w.create, w.att
+		// A create still in flight when its hotel leaves the config ends into
+		// a poolHotel nobody reads any more: harmless.
 		go func() {
 			defer ph.inflight.Done()
 			b.poolCreate(ctx, h, k, att)
@@ -659,14 +689,18 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 		ph.listed = true
 	}
 	// Rooms the hotel no longer holds are gone; pool-labelled rooms the
-	// manager does not hold are unverified.
+	// manager does not hold are unverified, once they cannot be the room of
+	// a create in flight (poolMaybeInFlight). A create whose answer was lost
+	// leaves its room to this: taken in when no create that could be its own
+	// is in flight, and decided by its receipts.
 	for hid := range ph.rooms {
 		if h.rooms[hid] == nil {
 			delete(ph.rooms, hid)
 		}
 	}
+	oldest := ph.oldestCreate()
 	for hid, rm := range h.rooms {
-		if rm.guest == poolGuestID && rm.state == stRunning && ph.rooms[hid] == nil {
+		if rm.guest == poolGuestID && rm.state == stRunning && ph.rooms[hid] == nil && !poolMaybeInFlight(rm, oldest) {
 			ph.rooms[hid] = &poolRoom{hid: hid, state: poolUnverified, why: "not made or proven by this process"}
 		}
 	}
@@ -1063,6 +1097,7 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	h.holdDisk(pl, 1)
 	h.place(rm)
 	ph.creating[k.name]++
+	ph.started[rm] = time.Now() // before the POST is sent: no listing of its room can come earlier
 	b.mu.Unlock()
 
 	status, hdr, out, err := h.doHeaders(context.WithoutCancel(ctx), h.cfg.API, "POST", "/v1/sandboxes", nil, body, poolCreateTimeout, nil)
@@ -1073,6 +1108,7 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	h.creating--
 	h.holdDisk(pl, -1)
 	ph.creating[k.name]--
+	delete(ph.started, rm)
 	var doc map[string]any
 	if err == nil {
 		_ = json.Unmarshal(out, &doc)
