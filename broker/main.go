@@ -1458,7 +1458,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	// The object form {"image", "registry_auth"} names its reference inside:
 	// the same refusal applies to it (AB#817).
 	if ref := createImageRef(payload); ref != "" {
-		if e := localImageRefusal(ref); e != nil {
+		if e := imageRefRefusal(ref, true); e != nil {
 			writeErr(w, e.status, e.code, e.msg)
 			return
 		}

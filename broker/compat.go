@@ -292,7 +292,7 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_image", "image is required", 0)
 		return
 	}
-	if e := localImageRefusal(req.Image); e != nil {
+	if e := imageRefRefusal(req.Image, true); e != nil {
 		compatErr(w, e.status, e.code, e.msg, 0)
 		return
 	}
@@ -378,7 +378,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	if ref, _ := req["image"].(string); ref != "" {
-		if e := localImageRefusal(ref); e != nil {
+		if e := imageRefRefusal(ref, true); e != nil {
 			compatErr(w, e.status, e.code, e.msg, 0)
 			return
 		}
