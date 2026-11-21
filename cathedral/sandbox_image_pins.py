@@ -49,8 +49,8 @@ def hotel_ceiling_bytes() -> int | None:
         pct = float(os.environ.get("ROOM_IMAGE_PIN_MAX_PCT", "") or DEFAULT_MAX_PCT)
     except ValueError:
         pct = DEFAULT_MAX_PCT
-    if not math.isfinite(pct) or not 0 < pct <= 100:
-        pct = DEFAULT_MAX_PCT
+    if not math.isfinite(pct) or not 0 <= pct <= 100:
+        pct = DEFAULT_MAX_PCT  # 0 is kept: it turns pins off on this hotel
     try:
         total = shutil.disk_usage(data_dir).total
     except OSError:

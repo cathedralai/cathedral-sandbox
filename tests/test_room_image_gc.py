@@ -166,11 +166,21 @@ def test_pinned_images_are_kept_like_the_keep_list(tmp_path: Path, capsys) -> No
     """AB#860: refs and image ids in the pins file stay; the GC logs once that pins hold the volume up."""
     d = FakeDocker([image("old", "swe/old:1", 30), image("mid", "swe/mid:1", 30), image("new", "swe/new:1", 30)])
     seen(tmp_path, old=9, mid=5, new=2)
-    keep_file = pins(tmp_path, {"ref": "swe/old:1", "image_id": "x", "owner": "o1"}, {"ref": "gone:1", "image_id": "mid", "owner": "o2"})
+    keep_file = pins(tmp_path, {"ref": "swe/old:1", "owner": "o1"}, {"ref": "gone:1", "image_id": "mid", "owner": "o2"})
     gc.run_once(args(tmp_path, keep_file=keep_file), d, fill=d.fill(other_gb=20), now=NOW)  # 110%, 80% after
     assert set(d.images) == {"old", "mid"}
     out = capsys.readouterr().out
     assert out.count("pinned images keep") == 1
+
+
+def test_a_pin_keeps_the_image_it_counted_not_what_a_moved_tag_names(tmp_path: Path) -> None:
+    """Review HOLD on #642: a pin with an image id keeps only that id. The tag
+    re-pulled as another, larger image is not pinned and can go."""
+    d = FakeDocker([image("small", "swe/app@sha256:aa", 10), image("big", "swe/app:latest", 90)])
+    seen(tmp_path, small=9, big=9)
+    keep_file = pins(tmp_path, {"ref": "swe/app:latest", "image_id": "small", "owner": "o1"})
+    gc.run_once(args(tmp_path, keep_file=keep_file), d, fill=d.fill(), now=NOW)
+    assert set(d.images) == {"small"}
 
 
 @pytest.mark.parametrize("bad", ["", "{not json", '{"pins": {}}', '{"pins": [1, "x"]}', None])

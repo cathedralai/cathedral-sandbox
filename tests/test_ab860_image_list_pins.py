@@ -143,6 +143,14 @@ def test_pin_over_the_hotel_ceiling_is_507_whatever_the_owner_cap(env, monkeypat
     assert status == 507 and doc["error"]["code"] == "pin_cap_exceeded" and "hotel" in doc["error"]["message"]
 
 
+def test_a_hotel_ceiling_of_zero_turns_pins_off(env, monkeypatch) -> None:
+    """Review observation on #642: ROOM_IMAGE_PIN_MAX_PCT=0 means no pins, not the default 50."""
+    _fake, _provider, app, _tmp = env
+    monkeypatch.setenv("ROOM_IMAGE_PIN_MAX_PCT", "0")
+    status, doc = prefetch(app, "ga", ["alpine:3.20"], pin=True, cap=1 << 40)
+    assert status == 507 and doc["error"]["code"] == "pin_cap_exceeded"
+
+
 def test_unpin_removes_only_the_callers_pin(env) -> None:
     _fake, _provider, app, tmp = env
     prefetch(app, "ga", ["ghcr.io/acme/big:1"], pin=True, cap=1 << 30)

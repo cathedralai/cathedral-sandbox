@@ -109,7 +109,14 @@ def load_pins(path: str | None) -> set[str]:
         return set()
     out = set()
     for p in pins:
-        out |= {v for v in (p.get("ref"), p.get("image_id")) if isinstance(v, str) and v}
+        # A pin protects the image it was counted for. Keeping the ref too would
+        # also keep whatever image a moved tag names now, which the pin cap never
+        # counted (review HOLD on #642). Only a record without an id keeps by ref.
+        iid, ref = p.get("image_id"), p.get("ref")
+        if isinstance(iid, str) and iid:
+            out.add(iid)
+        elif isinstance(ref, str) and ref:
+            out.add(ref)
     return out
 
 
