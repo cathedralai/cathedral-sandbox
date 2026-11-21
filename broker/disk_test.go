@@ -388,3 +388,72 @@ func TestSyncAdoptedRoomOfAnInFlightCreateCountsTwiceUntilItReturns(t *testing.T
 	// Now 10 extra fits the 50 budget again.
 	tc.room(t, "key1", diskBody(20, onB))
 }
+
+// AB#831 50 GiB default: a hotel with disk_admit_used_pct admits by the
+// scratch it really uses, so twenty 50 GiB rooms (1,000 GiB of limits) fit one
+// hotel whose scratch is mostly free, where disk_extra_gib 200 took four.
+func setAdmitByUse(tc *testChain, id string, limit float64, used *float64) {
+	setHotel(tc, id, func(h *hotel) {
+		h.cfg.DiskAdmitUsedPct, h.roomsUnchecked = &limit, false
+		h.cfg.DiskExtraGiB = intp(200) // ignored while disk_admit_used_pct is set
+		h.roomDataPct = used
+	})
+}
+
+func pctp(v float64) *float64 { return &v }
+
+func TestDiskAdmitByUseTakesTwentyDefaultRoomsOnOneHotel(t *testing.T) {
+	tc := newChain(t)
+	setAdmitByUse(tc, "b", 80, pctp(12.5))
+	onB := map[string]any{"hotels": []string{"b"}}
+	for i := 0; i < 20; i++ {
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", diskBody(50, onB))
+		if status != 202 {
+			t.Fatalf("room %d of 50 GiB on b: %d %v", i+1, status, doc)
+		}
+	}
+	// The extra is still reported for the operator, but it does not admit.
+	if used, _ := diskUsed(tc, "b"); used != 20*40 {
+		t.Fatalf("disk_extra_used_gib %d, want %d", used, 20*40)
+	}
+}
+
+func TestDiskAdmitByUseRefusesEveryRoomAtTheFloor(t *testing.T) {
+	tc := newChain(t)
+	for _, id := range []string{"a", "b", "c"} {
+		setAdmitByUse(tc, id, 80, pctp(80))
+	}
+	// At the floor every room is refused as sold out of disk, the base disk too.
+	wantDiskRefused(t, tc, diskBody(50, nil))
+	wantDiskRefused(t, tc, diskBody(10, nil))
+	wantDiskRefused(t, tc, map[string]any{"image": "alpine:3.20"})
+	// One hotel under the floor takes them all.
+	setHotel(tc, "c", func(h *hotel) { h.roomDataPct = pctp(79.9) })
+	for i := 0; i < 3; i++ {
+		if id := tc.room(t, "key1", diskBody(50, nil)); !strings.HasPrefix(id, "c.") {
+			t.Fatalf("room %q, want one on c (the only hotel under 80%%)", id)
+		}
+	}
+}
+
+func TestDiskAdmitByUseWithoutReadingTakesBaseRoomsOnly(t *testing.T) {
+	tc := newChain(t)
+	for _, id := range []string{"a", "b", "c"} {
+		setAdmitByUse(tc, id, 80, nil)
+	}
+	wantDiskRefused(t, tc, diskBody(50, nil))
+	tc.room(t, "key1", diskBody(10, nil))
+}
+
+func TestDiskAdmitByUseConfigChecked(t *testing.T) {
+	for _, bad := range []float64{0, 0.5, 99.5, 100, -1} {
+		if checkDiskConfig(hotelConfig{DiskAdmitUsedPct: &bad}) == nil {
+			t.Fatalf("disk_admit_used_pct %v accepted", bad)
+		}
+	}
+	for _, ok := range []float64{1, 80, 99} {
+		if err := checkDiskConfig(hotelConfig{DiskAdmitUsedPct: &ok}); err != nil {
+			t.Fatalf("disk_admit_used_pct %v: %v", ok, err)
+		}
+	}
+}

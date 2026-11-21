@@ -12,6 +12,13 @@
 // diskFullPct. Rooms of 10 GiB or less are never affected. A hotel without
 // disk_extra_gib has no disk admission at all (the behaviour before AB#831).
 //
+// A hotel with "disk_admit_used_pct" set admits by real use instead (AB#831,
+// 50 GiB default): every room's disk is its ceiling, not a reservation, so
+// the room count stays bound by memory. It takes any room while its last
+// room_data_used_pct is under the value and no room at all at or above it
+// (sold out, not an error); disk_extra_gib is not counted there. With no
+// reading yet it takes rooms of the base disk or less only.
+//
 // The check runs in pickIn, under b.mu, with the queue and slot counts, so
 // two big creates can never both take the last of one hotel's budget.
 // When no hotel fits only because of disk, the create answers 429
@@ -30,6 +37,9 @@ const (
 	diskFullPct           = 80.0 // room_data_used_pct at which a hotel takes no more big-disk rooms
 	diskSoldOutRetryAfter = 60   // seconds; disk frees only as rooms end
 )
+
+// noDiskCheck as a placement's diskGiB skips the disk check (withoutDisk).
+const noDiskCheck = -1
 
 // diskExtra is how much of a room's disk counts against a hotel budget.
 func diskExtra(diskGiB int) int { return max(diskGiB-baseRoomDiskGiB, 0) }
@@ -57,6 +67,9 @@ func checkDiskConfig(hc hotelConfig) error {
 	if hc.DiskExtraGiB != nil && *hc.DiskExtraGiB < 0 {
 		return fmt.Errorf("disk_extra_gib must be absent (no disk limit), 0 (rooms of %d GiB or less only) or more", baseRoomDiskGiB)
 	}
+	if p := hc.DiskAdmitUsedPct; p != nil && (math.IsNaN(*p) || *p < 1 || *p > 99) {
+		return fmt.Errorf("disk_admit_used_pct must be absent (disk_extra_gib rule) or 1 to 99")
+	}
 	return nil
 }
 
@@ -75,18 +88,30 @@ func (h *hotel) holdDisk(pl placement, sign int) {
 // flight counts twice until the create returns: on purpose, as the error is
 // a short false disk_sold_out, never a hotel filled over budget (skipping
 // such rooms undercounted a started room of a failed create until its batch
-// ended). Caller holds b.mu.
+// ended). A room the hotel killed after a delete is out of the room list
+// but holds its disk until docker rm ends: the hotel reports that extra disk
+// as removing_disk_gib (AB#863) and it counts here. Caller holds b.mu.
 func (h *hotel) diskExtraUsed() int {
-	n := h.diskPending
+	n := h.diskPending + h.removingDiskGiB
 	for _, rm := range h.rooms {
 		n += diskExtra(rm.diskGiB)
 	}
 	return n
 }
 
-// diskFits reports whether h may take a room with extra GiB above the base
-// disk now. Caller holds b.mu.
-func (b *broker) diskFits(h *hotel, extra int) bool {
+// diskFits reports whether h may take a room of diskGiB now (0: the hotel
+// default, noDiskCheck: always). Caller holds b.mu.
+func (b *broker) diskFits(h *hotel, diskGiB int) bool {
+	if diskGiB == noDiskCheck {
+		return true
+	}
+	extra := diskExtra(diskGiB)
+	if limit := h.cfg.DiskAdmitUsedPct; limit != nil {
+		if h.roomDataPct == nil {
+			return extra == 0
+		}
+		return *h.roomDataPct < *limit
+	}
 	budget := h.cfg.DiskExtraGiB
 	if extra <= 0 || budget == nil {
 		return true
@@ -109,6 +134,21 @@ func diskSoldOut(diskGiB int) createResult {
 		doc: errDoc("disk_sold_out", fmt.Sprintf("no hotel has %d GiB of disk free; try a smaller disk_gib or retry later", diskGiB))}
 }
 
+// guestDiskDoc is the guest's view of h's disk (AB#860): how full the data
+// volume is and the line at which it takes no more rooms, null when unknown
+// or unset. The budget and its use stay operator only. Caller holds b.mu.
+func guestDiskDoc(h *hotel, d map[string]any) {
+	var pct, admitPct any
+	if h.roomDataPct != nil {
+		pct = *h.roomDataPct
+	}
+	if h.cfg.DiskAdmitUsedPct != nil {
+		admitPct = *h.cfg.DiskAdmitUsedPct
+	}
+	d["disk_used_pct"] = pct
+	d["disk_admit_used_pct"] = admitPct
+}
+
 // diskDoc is the operator readback of h's disk budget. Caller holds b.mu.
 func diskDoc(h *hotel, d map[string]any) {
 	var budget, pct any
@@ -118,7 +158,12 @@ func diskDoc(h *hotel, d map[string]any) {
 	if h.roomDataPct != nil {
 		pct = *h.roomDataPct
 	}
-	d["disk_extra_gib"] = budget // null: no disk limit
+	var admitPct any
+	if h.cfg.DiskAdmitUsedPct != nil {
+		admitPct = *h.cfg.DiskAdmitUsedPct
+	}
+	d["disk_admit_used_pct"] = admitPct // null: the disk_extra_gib rule
+	d["disk_extra_gib"] = budget        // null: no disk limit
 	d["disk_extra_used_gib"] = h.diskExtraUsed()
 	d["room_data_used_pct"] = pct // null: no reading yet
 }

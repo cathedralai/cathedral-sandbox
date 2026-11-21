@@ -8,6 +8,7 @@
 //	"hotels": ["a", "b"]           the guest may use only these hotels (absent: all non-miner hotels)
 //	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" and "default_sealed" (capacity.go)
 //	"own_hosts_only": true         never a miner hotel, whatever the policy says (reserved customers)
+//	"pin_max_gib": 400             image bytes the guest may pin on each hotel (0 or absent: no pins, guest_images.go)
 //	"ops": true                    the guest may run the probe and reset the broker counters
 //
 // With "default_sealed", a create gets an unsealed room only when it says
@@ -50,6 +51,9 @@ type guestLimits struct {
 	// policy opts into miner hotels. For reserved customers (const). It is
 	// the guest-wide form of the create flag "own_hosts_only" (images.go).
 	OwnHostsOnly bool `json:"own_hosts_only,omitempty"`
+	// PinMaxGiB caps the image bytes the guest may pin on each hotel
+	// (prefetch "pin": true, guest_images.go). 0: pins are off.
+	PinMaxGiB int `json:"pin_max_gib,omitempty"`
 }
 
 func (l guestLimits) maxRooms() int {
@@ -110,6 +114,14 @@ func (b *broker) admit(g *guestState, n int) (*apiErr, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	lim := g.limits
+	// One call larger than a limit can never pass: say so (400), rather
+	// than a 429 whose Retry-After a client obeys forever (AB#865).
+	if n > lim.maxRooms() {
+		return &apiErr{400, "count_over_room_limit", fmt.Sprintf("this key may have %d rooms at one time; one create asked for %d. Send at most %d in one call", lim.maxRooms(), n, lim.maxRooms())}, 0
+	}
+	if lim.MaxCreatesPerMinute > 0 && n > lim.MaxCreatesPerMinute {
+		return &apiErr{400, "count_over_rate_limit", fmt.Sprintf("this key may ask for %d rooms per minute; one create asked for %d. Send at most %d in one call", lim.MaxCreatesPerMinute, n, lim.MaxCreatesPerMinute)}, 0
+	}
 	if used := b.activeRooms(g); used+n > lim.maxRooms() {
 		return &apiErr{429, "room_limit", fmt.Sprintf("this key may have %d rooms at one time; %d are running or starting. Delete rooms, or ask Cathedral for a higher limit", lim.maxRooms(), used)}, 10
 	}
@@ -197,6 +209,7 @@ func (b *broker) guestView(g *guestState) map[string]any {
 		"id": g.cfg.ID, "max_rooms": lim.maxRooms(), "max_creates_per_minute": lim.MaxCreatesPerMinute,
 		"default_sealed": lim.DefaultSealed, "hotels": hotels, "ops": g.cfg.Ops,
 		"active_rooms": b.activeRooms(g), "policy": lim.Policy, "own_hosts_only": lim.OwnHostsOnly,
+		"pin_max_gib": lim.PinMaxGiB,
 	}
 }
 
@@ -320,6 +333,14 @@ func (g *guestState) limitsAllow(b *broker, id string) bool {
 // list holds it).
 func (g *guestState) allowsHotel(h *hotel) bool {
 	return g.tierOf(h) != ""
+}
+
+// guestReaches reports whether h is one of g's hotels as placement sees them:
+// allowed, and not a miner hotel for an own-hosts-only guest. Every guest view
+// of hotels (capacity, /v1/broker/hotels, /v1/status) counts these and no
+// others (AB#869). Caller holds b.mu.
+func (g *guestState) guestReaches(h *hotel) bool {
+	return g.allowsHotel(h) && !(g.limits.OwnHostsOnly && isMinerHotel(h))
 }
 
 // tierOf is guestLimits.tierOf behind the hotel reservation: a hotel

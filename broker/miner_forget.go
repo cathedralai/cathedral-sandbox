@@ -129,6 +129,9 @@ func (b *broker) forgetAndLeave(w http.ResponseWriter, h *hotel, id string) {
 	b.mu.Lock()
 	n := 0
 	for _, rm := range h.rooms {
+		if rm.guest != "" && !rm.reaped { // whatever its state: the guest had it (AB#864)
+			b.addEnded(b.newEndRecord(h, rm, time.Now(), endHotelRemoved, ""))
+		}
 		rm.state, rm.since = stFailed, time.Now()
 		delete(b.savedUUIDs, rm.id)
 		b.release(h, rm)

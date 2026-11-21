@@ -220,7 +220,7 @@ def test_file_receipt_target_keeps_the_query_that_selects_the_file(front) -> Non
 
 
 @pytest.mark.parametrize("method,tail", [
-    ("POST", "/terminals"), ("PUT", "/directories"),
+    ("POST", "/terminals"), ("POST", "/access-tickets"),
     ("POST", "/terminals/t1/input"), ("GET", "/terminals/t1/output"), ("PATCH", ""),
 ])
 def test_unlisted_routes_are_refused_on_a_serial_room_and_pass_on_an_ordinary_one(front, method, tail) -> None:
