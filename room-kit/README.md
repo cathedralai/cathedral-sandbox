@@ -218,9 +218,11 @@ in `X-Room-Receipt` on the 101; on a refusal with its status and the hash of
 its body. Then it passes raw bytes both ways, frames unread. When either side
 ends (or the caller sends nothing for 900 s), it signs `terminal_session_close`
 with the same `session_id`, `session_open_receipt_sha256`, `close_reason`,
-`duration_ms`, and per direction the byte count and sha256 of the bytes on the
-wire after the handshake (`client_bytes`/`client_sha256` from the caller,
-`room_bytes`/`room_sha256` to it). The close receipt is in the room's receipt
+`duration_ms`, and per direction the byte count and sha256 of the bytes after
+the handshake, counted as the front wrote them to the other side's socket
+(`client_bytes`/`client_sha256` from the caller to the room,
+`room_bytes`/`room_sha256` from the room to the caller; a send cut short counts
+only what went out). The close receipt is in the room's receipt
 list. The session counts as a request in flight for the room, so the front's
 look leaves the room alone while it is open. Serial rooms and
 unclaimed pool rooms refuse the socket as before. Not over the miner hotel's TLS

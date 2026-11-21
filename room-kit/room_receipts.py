@@ -2929,7 +2929,8 @@ EXEC_RESULT_ROUTE = re.compile("^" + ROOM + r"/exec/result$")
 # Terminal WebSocket through the front (AB#385). The front strips Upgrade from what it forwards, so before this a
 # terminal socket never reached the room API through it. Now the front opens the same handshake to the API itself,
 # signs terminal_session_open on the API's answer (the 101 carries X-Room-Receipt), passes raw bytes both ways
-# and signs terminal_session_close at the end with the byte count and sha256 of each direction as on the wire.
+# and signs terminal_session_close at the end with the byte count and sha256 of each direction, counted as the
+# front wrote them to the other side's socket.
 TERMINAL_WS_ROUTE = re.compile("^" + ROOM + r"/terminals/(?P<tid>[^/]+)/ws$")
 WS_FORWARD_HEADERS = ("Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
                       "X-Cathedral-Access-Ticket")
@@ -3677,9 +3678,14 @@ class Handler(BaseHTTPRequestHandler):
         streams = {"client": [0, hashlib.sha256()], "room": [0, hashlib.sha256()]}
         ended: list[str] = []
 
-        def note(side: str, data: bytes) -> None:
-            streams[side][0] += len(data)
-            streams[side][1].update(data)
+        def send(sock: socket.socket, side: str, data: bytes) -> None:
+            # Counted as the socket takes them, so a send cut short counts only what went out.
+            view = memoryview(data)
+            while view:
+                n = sock.send(view)
+                streams[side][0] += n
+                streams[side][1].update(view[:n])
+                view = view[n:]
 
         def end(reason: str) -> None:
             if not ended:
@@ -3692,17 +3698,19 @@ class Handler(BaseHTTPRequestHandler):
 
         def from_client() -> None:
             # Through rfile, so bytes already read past the handshake are kept.
-            try:
-                while True:
+            while True:
+                try:
                     data = self.rfile.read1(65536)
-                    if not data:
-                        return end("client_closed")
-                    note("client", data)
-                    up.sendall(data)
-            except TimeoutError:
-                end("idle")
-            except (OSError, ValueError):
-                end("client_closed")
+                except TimeoutError:
+                    return end("idle")
+                except (OSError, ValueError):
+                    return end("client_closed")
+                if not data:
+                    return end("client_closed")
+                try:
+                    send(up, "client", data)
+                except OSError:
+                    return end("room_closed")
 
         reader = None
         try:
@@ -3711,16 +3719,18 @@ class Handler(BaseHTTPRequestHandler):
             up.settimeout(None)
             reader = threading.Thread(target=from_client, daemon=True, name="room-terminal-ws")
             reader.start()
-            if rest:
-                note("room", rest)
-                self.wfile.write(rest)
+            data = rest
             while True:
+                if data:
+                    try:
+                        send(self.connection, "room", data)
+                    except OSError:
+                        end("client_closed")
+                        break
                 data = up.recv(65536)
                 if not data:
                     end("room_closed")
                     break
-                note("room", data)
-                self.wfile.write(data)
         except OSError:
             end("room_closed")
         finally:
