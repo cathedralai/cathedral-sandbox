@@ -109,6 +109,12 @@ type hotelConfig struct {
 	// each, summed over its rooms (disk.go, AB#831). Nil: no disk limit.
 	// 0: rooms of 10 GiB or less only.
 	DiskExtraGiB *int `json:"disk_extra_gib,omitempty"`
+	// DiskAdmitUsedPct: admit by the scratch the hotel really uses, not by
+	// the rooms' disk limits (disk.go, AB#831 50 GiB default). Set, the hotel
+	// takes any room of any disk while its room_data_used_pct is under this
+	// value and none at or above it; disk_extra_gib is not counted. Nil: the
+	// disk_extra_gib rule above.
+	DiskAdmitUsedPct *float64 `json:"disk_admit_used_pct,omitempty"`
 }
 
 type guestConfig struct {
@@ -853,9 +859,8 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) 
 	hotels := b.hotelList()
 	total := 0.0
 	weight := make([]float64, len(hotels))
-	extra := diskExtra(pl.diskGiB)
 	for i, h := range hotels {
-		if exclude[h] || !pl.allows(h) || !b.diskFits(h, extra) {
+		if exclude[h] || !pl.allows(h) || !b.diskFits(h, pl.diskGiB) {
 			continue
 		}
 		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
@@ -947,7 +952,6 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	finish := func(r createResult) createResult { r.lost = lost; return r }
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
-	extra := diskExtra(pl.diskGiB) // held on the hotel (holdDisk) from pick until the room is known or the create ends (disk.go)
 	for attempt := 0; attempt < 3; attempt++ {
 		b.mu.Lock()
 		h := b.pick(tried, pl)
@@ -964,7 +968,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			}
 			// A hotel would take the room but for its disk: sold out of disk,
 			// not of rooms.
-			diskOnly := last.status == 0 && extra > 0 && b.pick(tried, pl.withoutDisk()) != nil
+			// The disk extra is held on the hotel (holdDisk) from pick until
+			// the room is known or the create ends (disk.go).
+			diskOnly := last.status == 0 && b.pick(tried, pl.withoutDisk()) != nil
 			b.mu.Unlock()
 			if last.status != 0 {
 				return finish(last)
