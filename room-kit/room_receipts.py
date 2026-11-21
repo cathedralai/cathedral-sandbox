@@ -104,9 +104,13 @@ Guest ingress key (ROOM_GUEST_INGRESS=1, sealed only; AB#422). The front
 makes, at start and in memory, a P-256 TLS key for customer Preview URLs and
 names its SPKI sha256 in the binding (guest_ingress.tls_spki_sha256), so the
 boot's REPORT_DATA commits to it. It is not the miner hotel's control-plane
-TLS key (tls_spki_sha256). Nothing serves on it yet: the certificate (AB#423),
-the host DNAT to the guest and the signed expose come next. Flag off: the
-binding is byte for byte what it was.
+TLS key (tls_spki_sha256). With ROOM_INGRESS_ZONE set the binding also names
+the zone, and room_ingress.py serves HTTPS on ROOM_INGRESS_TLS_LISTEN with that
+key: a Let's Encrypt certificate for <hotel>.<zone> and *.<hotel>.<zone>
+(DNS-01 through the broker, signed with the receipt key; room_acme.py), and a
+signed POST /v1/sandboxes/<id>/expose answers https://<room>-<port>.<hotel>.<zone>/
+with a receipt that names the port, the URL and the ingress key. Flag off: the
+binding is byte for byte what it was and expose goes to the API (501).
 
 Dedicated sealed machine (one owner). The host launches the guest with the
 owner's Ed25519 public key and the manifest digest in fw_cfg, and with
@@ -252,6 +256,7 @@ SECRET_VERSION_MAX = 2**53 - 1  # an integer a browser can hold exactly
 SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")  # a file name: no slash, no leading dot
 SECRETS_ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SECRETS_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-secrets$")
+EXPOSE_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/expose$")  # answered by the front with guest ingress (AB#422)
 # AB#389: the Cathedral API names the sandbox a create is for in this label
 # (the id its customer holds, a UUID) and refuses it from customers. The create
 # receipt signs it, so the customer can tie that id to this room without the
@@ -1457,19 +1462,30 @@ class GuestIngress:
     Made here, inside the guest, so the host never holds it. The binding names
     its SPKI sha256 (binding_fields), so the boot's SNP report commits to it,
     and a client that pins that value knows the TLS session ends in this guest.
-    The certificate is self-issued for now; a publicly trusted one for the same
-    key waits on AB#423. Kept apart from MinerHotel's key: that one is the
-    control plane's channel, this one faces customers.
+    The certificate is self-issued until room_ingress gets a Let's Encrypt one
+    for the same key (ROOM_INGRESS_ZONE set). Kept apart from MinerHotel's key:
+    that one is the control plane's channel, this one faces customers.
     """
 
-    def __init__(self, hotel: str):
+    def __init__(self, hotel: str, zone: str | None = None):
         self.cert_pem, self._key_pem, self.tls_spki_sha256 = make_tls_identity(hotel)
+        # ROOM_INGRESS_ZONE: named in the binding so a verifier can check an expose URL's host.
+        self.zone = zone or None
+        # room_ingress.IngressState once the front serves on this key (main), else None.
+        self.serving = None
 
     def __repr__(self) -> str:
         return f"GuestIngress(tls_spki_sha256={self.tls_spki_sha256})"
 
+    def key_pem(self) -> bytes:
+        """The private key, for the TLS context and the certificate request. Memory only."""
+        return self._key_pem
+
     def binding_fields(self) -> dict:
-        return {"guest_ingress": {"schema": INGRESS_SCHEMA, "tls_spki_sha256": self.tls_spki_sha256}}
+        fields = {"schema": INGRESS_SCHEMA, "tls_spki_sha256": self.tls_spki_sha256}
+        if self.zone:
+            fields["zone"] = self.zone
+        return {"guest_ingress": fields}
 
 
 class InstallRefused(Exception):
@@ -3076,6 +3092,8 @@ def retire_room(ledger: "Ledger", room: str, exec_results: "ExecResults | None" 
         ledger.sealed_env.retire(room, ledger.room_incarnation)
     if exec_results is not None:
         exec_results.forget_room(room, ledger.room_life)
+    if ledger.ingress is not None and ledger.ingress.serving is not None:
+        ledger.ingress.serving.forget_room(room)  # its Preview URLs answer 404 from here on
 
 
 def room_of(path: str) -> str | None:
@@ -3472,6 +3490,10 @@ class Handler(BaseHTTPRequestHandler):
             # them (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
             # other path, flag on or off, passes as before.
             return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
+        if (self.command == "POST" and EXPOSE_ROUTE.match(path) and ledger.ingress is not None
+                and ledger.ingress.serving is not None):
+            # Guest ingress (AB#422): answered and signed here; the API's expose (501) is not called.
+            return self.handle_expose(ledger, room, path, forward_path, body)
         # `path` is already the path the API routes on (api_request_path drops a ";params" suffix above),
         # so no spelling of a signed route reaches the API unsigned.
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
@@ -4030,6 +4052,72 @@ class Handler(BaseHTTPRequestHandler):
             extra["X-Room-Receipt-Error"] = type(exc).__name__
         return self.reply(200, reply, extra)
 
+    def handle_expose(self, ledger: "Ledger", room: str, path: str, forward_path: str, body: bytes | None):
+        """POST /v1/sandboxes/<id>/expose with the guest ingress serving (AB#422).
+
+        The room must be one the API answers as running for this caller. The URL is
+        https://<room label>-<port>.<hotel>.<zone>/, served by room_ingress with the key the
+        binding names. Every answer to a caller with the key is signed; a success names the
+        port, the URL, its host and the ingress key's SPKI sha256.
+        """
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        serving = ledger.ingress.serving
+        port = None
+        try:
+            doc = json.loads(body) if body else None
+            canonical(doc)
+            port = doc.get("port") if isinstance(doc, dict) else None
+        except UnicodeEncodeError:
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"the body holds a lone surrogate escape"}}')
+        except ValueError:
+            pass
+        extra: dict = {}
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            status, out = 400, {"error": {"code": "invalid_port", "message": "port must be between 1 and 65535"}}
+        else:
+            try:
+                got = self.upstream(self.server.api_port, None, method="GET", path=f"/v1/sandboxes/{room}",
+                                    timeout=30)
+            except (http.client.HTTPException, OSError):
+                got = (502, [], b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer"}}')
+            state = None
+            try:
+                state = json.loads(got[2]).get("state") if got[0] == 200 else None
+            except (ValueError, AttributeError):
+                pass
+            if got[0] != 200:
+                status, out = got[0], None
+                try:
+                    out = json.loads(got[2])
+                except ValueError:
+                    out = {"error": {"code": "sandbox_unavailable", "message": "the room could not be read"}}
+            elif state != "running":
+                status, out = 409, {"error": {"code": "sandbox_not_running", "message": "only a running room can be exposed"}}
+            elif not serving.ready:
+                status, out = 503, {"error": {"code": "ingress_not_ready",
+                                              "message": "this hotel has no Preview URL certificate yet; retry shortly"}}
+            else:
+                try:
+                    host, url = serving.expose(room, port)
+                except ValueError as exc:
+                    status, out = 409, {"error": {"code": "expose_refused", "message": str(exc)}}
+                else:
+                    spki = ledger.ingress.tls_spki_sha256
+                    status, out = 200, {"port": port, "url": url, "host": host, "status": "exposed",
+                                        "tls_spki_sha256": spki}
+                    extra = {"expose_port": port, "expose_url": url, "expose_host": host,
+                             "ingress_tls_spki_sha256": spki}
+        raw = canonical(out)
+        headers = {}
+        try:
+            headers["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
+                {**self.fields("expose", path, body, status, raw, target_path=forward_path), **extra}))).decode()
+        except Exception as exc:  # noqa: BLE001 answer, and say the receipt is missing
+            traceback.print_exc()
+            headers["X-Room-Receipt-Error"] = type(exc).__name__
+        return self.reply(status, raw, headers)
+
     def handle_escape_plant_key(self, ledger: "Ledger"):
         """GET /room/escape-plant-key: the guest X25519 public key (Escape hotels only)."""
         if self.command != "GET":
@@ -4462,7 +4550,8 @@ def main() -> int:
     store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
     secrets = SealedSecrets(env.get("ROOM_SEALED_SECRETS_DIR") or DEFAULT_SECRETS_DIR) if sealed_secrets_wanted() else None
     sealed_exec = SealedExec() if sealed_exec_wanted() else None
-    ingress = GuestIngress(env["ROOM_HOTEL_NAME"]) if guest_ingress_wanted() else None
+    ingress = (GuestIngress(env["ROOM_HOTEL_NAME"], zone=(env.get("ROOM_INGRESS_ZONE") or "").strip() or None)
+               if guest_ingress_wanted() else None)
     try:
         ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets, sealed_exec=sealed_exec,
                         ingress=ingress)
@@ -4487,7 +4576,8 @@ def main() -> int:
             print(f"room-receipts: sealed commands on: key {ledger.sealed_exec.public_b64} in the binding", flush=True)
         if ledger.ingress is not None:
             print(f"room-receipts: guest ingress key on: tls_spki_sha256 {ledger.ingress.tls_spki_sha256} "
-                  "in the binding (nothing serves on it yet)", flush=True)
+                  f"in the binding{'' if ledger.ingress.zone else ' (no ROOM_INGRESS_ZONE: nothing serves on it)'}",
+                  flush=True)
     elif secrets is not None or sealed_exec is not None or ingress is not None:
         flags = [name for name, box in (("ROOM_SEALED_SECRETS", secrets), ("ROOM_SEALED_EXEC", sealed_exec),
                                         ("ROOM_GUEST_INGRESS", ingress)) if box is not None]
@@ -4498,6 +4588,9 @@ def main() -> int:
     look = float(env.get("ROOM_LOOK_SECONDS", "15"))  # 0 turns the look off
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
             env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
+    if ledger.sealed and ledger.ingress is not None and ledger.ingress.zone:
+        import room_ingress  # installed beside this file; only a sealed guest with a zone loads it
+        room_ingress.start(ledger, env, args[1], api_key, store)
     if miner is None:
         srv = Server((host, int(port)), *args, look_seconds=look or None)
         srv.serve_forever()

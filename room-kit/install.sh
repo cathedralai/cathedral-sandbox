@@ -207,6 +207,8 @@ install -m 0755 "$KIT/room_api.py" "$ROOM_OPT/bin/room_api.py"
 install -m 0755 "$KIT/assess.py" "$ROOM_OPT/bin/assess.py"
 install -m 0755 "$KIT/size.py" "$ROOM_OPT/bin/size.py"
 install -m 0755 "$KIT/room_receipts.py" "$ROOM_OPT/bin/room_receipts.py"
+install -m 0644 "$KIT/room_ingress.py" "$ROOM_OPT/bin/room_ingress.py"
+install -m 0644 "$KIT/room_acme.py" "$ROOM_OPT/bin/room_acme.py"
 install -m 0755 "$KIT/room_egress.py" "$ROOM_OPT/bin/room_egress.py"
 install -m 0755 "$KIT/room_image_gc.py" "$ROOM_OPT/bin/room_image_gc.py"
 
@@ -563,6 +565,15 @@ if [ "${ROOM_GUEST_INGRESS:-0}" = 1 ]; then
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 Environment=ROOM_GUEST_INGRESS=1
 EOF
+if [ -n "${ROOM_INGRESS_ZONE:-}" ]; then
+# Preview URL ingress served by the front (room_ingress.py): HTTPS on the guest
+# ingress port with that key, a Let's Encrypt certificate over DNS-01 through
+# the broker. No zone: the key only, as before.
+cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
+Environment=ROOM_INGRESS_ZONE=$ROOM_INGRESS_ZONE ROOM_INGRESS_BROKER_URL=$ROOM_INGRESS_BROKER_URL ROOM_INGRESS_TLS_LISTEN=$ROOM_INGRESS_TLS_LISTEN ROOM_INGRESS_PUBLIC_PORT=${ROOM_INGRESS_PUBLIC_PORT:-443}
+Environment=ROOM_ACME_DIRECTORY=${ROOM_ACME_DIRECTORY:-https://acme-v02.api.letsencrypt.org/directory} ROOM_ACME_DNS_WAIT=${ROOM_ACME_DNS_WAIT:-20}${ROOM_ACME_EMAIL:+ ROOM_ACME_EMAIL=$ROOM_ACME_EMAIL}
+EOF
+fi
 fi
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_receipts.py
