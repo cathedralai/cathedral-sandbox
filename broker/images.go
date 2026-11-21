@@ -910,8 +910,24 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
 	sem := make(chan struct{}, prefetchPerHotel)
 	var wg sync.WaitGroup
 	for i, ref := range job.Images {
-		wg.Add(1)
 		sem <- struct{}{}
+		// Earlier pulls of this job may have taken the hotel to its disk line
+		// since the job was accepted: check again before each ref (AB#861).
+		b.mu.Lock()
+		full := b.prefetchDiskFull(h)
+		var refused map[string]any
+		if full {
+			refused = imageStoreFull(h)
+		}
+		b.mu.Unlock()
+		if full {
+			<-sem
+			b.prefetch.mu.Lock()
+			job.Hotels[h.cfg.ID].Images[i] = map[string]any{"ref": ref, "state": "failed", "error": refused}
+			b.prefetch.mu.Unlock()
+			continue
+		}
+		wg.Add(1)
 		go func(i int, ref string) {
 			defer wg.Done()
 			defer func() { <-sem }()

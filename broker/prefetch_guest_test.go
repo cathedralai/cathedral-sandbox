@@ -226,3 +226,28 @@ func TestPrefetchSkipsHotelAtItsDiskLine(t *testing.T) {
 		t.Fatalf("hotel c: %v", st)
 	}
 }
+
+// A hotel that reaches its disk line during a job pulls none of the refs still queued.
+func TestPrefetchStopsQueuedRefsAtTheDiskLine(t *testing.T) {
+	tc := guestFixture(t)
+	tc.hotels["b"].pullDelay = 200 * time.Millisecond
+	refs := []string{"r/a:1", "r/b:1", "r/c:1", "r/d:1", "r/e:1", "r/f:1"}
+	status, doc := tc.call(t, "key1", "POST", "/v1/images/prefetch", map[string]any{"images": refs, "hotels": []string{"b"}})
+	if status != 202 {
+		t.Fatalf("prefetch: %d %v", status, doc)
+	}
+	time.Sleep(50 * time.Millisecond) // the first 4 are in flight
+	full := 85.0
+	setHotel(tc, "b", func(h *hotel) { h.roomDataPct = &full })
+	v := waitPrefetch(t, tc, "key1", doc["prefetch_id"].(string))
+	if n := len(tc.hotels["b"].prefetch); n != 4 {
+		t.Fatalf("want the 4 in-flight pulls only, got %d", n)
+	}
+	imgs := v["hotels"].(map[string]any)["b"].(map[string]any)["images"].([]any)
+	for _, i := range []int{4, 5} {
+		m := imgs[i].(map[string]any)
+		if m["state"] != "failed" || m["error"].(map[string]any)["code"] != "image_store_full" {
+			t.Fatalf("queued ref %d: %v", i, m)
+		}
+	}
+}
