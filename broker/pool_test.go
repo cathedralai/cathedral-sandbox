@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -791,5 +793,166 @@ func TestPoolCreateRechecksTheTargetBeforeItIsSent(t *testing.T) {
 	pc.b.poolCreate(context.Background(), h, *w.create, w.att)
 	if n := len(f.creates()); n != 0 {
 		t.Fatalf("%d pool creates after targets 0, want 0", n)
+	}
+}
+
+// failJournalOpens makes the next n journal opens fail with err, then opens
+// for real; it returns the number of opens tried so far and the time the
+// first good open started.
+func failJournalOpens(t *testing.T, n int, err error) func() (int, time.Time) {
+	t.Helper()
+	var mu sync.Mutex
+	tries := 0
+	var good time.Time
+	old := poolOpenJournal
+	poolOpenJournal = func(stateDir string) (*claimJournal, claimJournalHeads, error) {
+		mu.Lock()
+		tries++
+		fail := tries <= n
+		if !fail && good.IsZero() {
+			good = time.Now()
+		}
+		mu.Unlock()
+		if fail {
+			return nil, claimJournalHeads{}, err
+		}
+		return old(stateDir)
+	}
+	oldEvery := poolJournalRetry
+	poolJournalRetry = 50 * time.Millisecond
+	t.Cleanup(func() { poolOpenJournal, poolJournalRetry = old, oldEvery })
+	return func() (int, time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		return tries, good
+	}
+}
+
+// A journal open that fails for a reason other than loss (a head file that
+// cannot be read; the lock a broker still running on the same state_dir
+// holds) is tried again on a timer: after two failures the third open brings
+// the pool to "complete" with no broker restart. Nothing is created or
+// deleted while it fails, and the receipts reads of the rooms found come
+// before the first create.
+func TestPoolJournalOpenIsRetriedUntilItOpens(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	f.addRoom("r-pool", "pool")
+	f.addRoom("r-stale", "pool")
+	tries := failJournalOpens(t, 2, errors.New("claim journal: a head file cannot be read"))
+	pc.start() // the first open, at load, fails
+	if pc.b.pool.journalState != "unavailable" {
+		t.Fatalf("journal %s after a failed open, want unavailable", pc.b.pool.journalState)
+	}
+	pc.up("a")
+	pc.target(3)
+	_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+	j := doc["journal"].(map[string]any)
+	if j["state"] != "unavailable" || !strings.Contains(j["why"].(string), "head file cannot be read") || j["next_try"] == nil {
+		t.Fatalf("GET journal while unavailable: %v", j)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pc.b.runPool(ctx)
+	waitFor(t, "the journal to open on a retry", func() bool {
+		pc.b.mu.Lock()
+		defer pc.b.mu.Unlock()
+		return pc.b.pool.journalState == "complete"
+	})
+	waitFor(t, "the pool to fill", func() bool { return pc.counts("a").ready == 3 })
+	cancel()
+	n, good := tries()
+	if n != 3 {
+		t.Fatalf("%d journal opens, want 3 (two failed, one good)", n)
+	}
+	creates := f.creates()
+	if len(creates) != 1 || len(f.roomDeletes()) != 0 {
+		t.Fatalf("%d creates, %d deletes; want 1 create (2 rooms were proven by receipts) and no delete", len(creates), len(f.roomDeletes()))
+	}
+	if !creates[0].at.After(good) {
+		t.Fatalf("a create at %s, before the journal opened at %s", creates[0].at, good)
+	}
+	var lastRead time.Time
+	for _, c := range f.callsOf("GET", "/v1/sandboxes/") {
+		if strings.HasSuffix(c.path, "/receipts") && c.at.After(lastRead) {
+			lastRead = c.at
+		}
+	}
+	if lastRead.IsZero() || !creates[0].at.After(lastRead) {
+		t.Fatalf("first create at %s, last receipts read at %s: the reads must come first", creates[0].at, lastRead)
+	}
+}
+
+// An incomplete journal is never opened again: a person looks.
+func TestPoolIncompleteJournalIsNeverRetried(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	pc.breakJournal()
+	tries := failJournalOpens(t, 0, nil)
+	pc.start()
+	if pc.b.pool.journalState != "incomplete" {
+		t.Fatalf("journal %s, want incomplete", pc.b.pool.journalState)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go pc.b.runPool(ctx)
+	time.Sleep(10 * poolJournalRetry)
+	cancel()
+	if n, _ := tries(); n != 1 {
+		t.Fatalf("%d opens of an incomplete journal, want 1 (at load)", n)
+	}
+}
+
+// Stopping the broker while the open waits for its next try leaves no
+// retry running and no journal open.
+func TestPoolJournalRetryStopsWithTheBroker(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	tries := failJournalOpens(t, 1<<30, errors.New("claim journal: claims/ is locked by another broker"))
+	pc.start()
+	ctx, cancel := context.WithCancel(context.Background())
+	go pc.b.runPool(ctx)
+	waitFor(t, "a retry", func() bool { n, _ := tries(); return n >= 2 })
+	cancel()
+	pc.b.pool.close() // returns only once the retry has stopped
+	n, _ := tries()
+	time.Sleep(5 * poolJournalRetry)
+	if m, _ := tries(); m != n {
+		t.Fatalf("opens went on after the stop: %d then %d", n, m)
+	}
+	pc.b.mu.Lock()
+	j, state := pc.b.pool.journal, pc.b.pool.journalState
+	pc.b.mu.Unlock()
+	if j != nil || state != "unavailable" {
+		t.Fatalf("after the stop: journal %v, state %s", j, state)
+	}
+}
+
+// After a restart (or a late journal open) no pool create comes before the
+// first receipts read of every room found, even when the reads take more
+// than one step (at most 20 a step).
+func TestPoolCreatesWaitForEveryFirstReceiptsRead(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	for i := 0; i < 25; i++ {
+		f.addRoom(fmt.Sprintf("r-%02d", i), "pool")
+	}
+	pc.start()
+	pc.up("a")
+	pc.target(30)
+	pc.steps("a", 4)
+	var lastRead time.Time
+	reads := 0
+	for _, c := range f.callsOf("GET", "/v1/sandboxes/") {
+		if strings.HasSuffix(c.path, "/receipts") {
+			reads++
+			if c.at.After(lastRead) {
+				lastRead = c.at
+			}
+		}
+	}
+	creates := f.creates()
+	if reads != 25 || len(creates) == 0 {
+		t.Fatalf("%d reads, %d creates after 4 steps; want 25 reads and then creates", reads, len(creates))
+	}
+	if !creates[0].at.After(lastRead) {
+		t.Fatalf("first create at %s before the last first read at %s", creates[0].at, lastRead)
 	}
 }

@@ -463,9 +463,12 @@ func (b *broker) readyRoomsViewLocked(now time.Time) map[string]any {
 		totals["creating"] += c.creating
 	}
 	totals["claiming"], totals["mapped"] = 0, 0
-	journal := map[string]any{"state": p.journalState}
+	journal := map[string]any{"state": p.journalState, "opens_tried": p.journalTries}
 	if p.journalWhy != "" {
 		journal["why"] = p.journalWhy
+	}
+	if p.journalState == "unavailable" && !p.journalNextTry.IsZero() {
+		journal["next_try"] = p.journalNextTry.UTC().Format(time.RFC3339)
 	}
 	return map[string]any{
 		"guest": poolGuestID, "keys": keys,

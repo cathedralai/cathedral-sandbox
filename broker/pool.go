@@ -140,22 +140,44 @@ type poolHotel struct {
 }
 
 type readyRooms struct {
-	keys    []poolKey
-	guest   *guestState
-	saveMu  sync.Mutex // one settings write at a time
-	journal *claimJournal
+	keys     []poolKey
+	guest    *guestState
+	saveMu   sync.Mutex // one settings write at a time
+	stateDir string
+	// Guarded by b.mu once the broker serves (the retry writes them).
 	// journalState is "complete", "incomplete" or "unavailable".
+	journal                  *claimJournal
 	journalState, journalWhy string
-	// Guarded by b.mu.
-	settings readyRoomsSettings
-	hotels   map[string]*poolHotel
+	journalTries             int       // opens tried
+	journalNextTry           time.Time // unavailable: when the open is tried again
+	journalLoggedAt          time.Time // last log line of a failed retry
+	settings                 readyRoomsSettings
+	hotels                   map[string]*poolHotel
+	// The open retry's lifetime (retryJournal). Guarded by retryMu.
+	retryMu   sync.Mutex
+	retryStop chan struct{} // closed by close(): the retry ends
+	retryDone chan struct{} // closed when the retry has ended
+	closed    bool
 }
 
-// openJournal opens the claim journal. The manager creates and deletes
-// rooms only while it is open and complete.
+// poolOpenJournal opens the claim journal; a variable so a test can make an
+// open fail. poolJournalRetry: how often an open that failed is tried again.
+var (
+	poolOpenJournal  = openClaimJournal
+	poolJournalRetry = 5 * time.Second
+)
+
+// openJournal opens the claim journal at load. The manager creates and
+// deletes rooms only while it is open and complete. An incomplete journal
+// stays so: a person looks. Any other failed open (a head file that cannot
+// be read, a lock another broker on the same state_dir still holds) leaves
+// the pool "unavailable" and is tried again every poolJournalRetry by
+// retryJournal, which runPool starts.
 func (p *readyRooms) openJournal(stateDir string) {
-	j, _, err := openClaimJournal(stateDir)
+	p.stateDir = stateDir
+	j, _, err := poolOpenJournal(stateDir)
 	p.journal = j
+	p.journalTries = 1
 	switch {
 	case err == nil:
 		p.journalState = "complete"
@@ -164,13 +186,109 @@ func (p *readyRooms) openJournal(stateDir string) {
 		log.Printf("ready rooms: %v; the pool manager creates and deletes nothing until a person looks", err)
 	default:
 		p.journalState, p.journalWhy = "unavailable", err.Error()
-		log.Printf("ready rooms: claim journal not opened: %v; the pool manager creates and deletes nothing", err)
+		p.journalNextTry, p.journalLoggedAt = time.Now().Add(poolJournalRetry), time.Now()
+		log.Printf("ready rooms: claim journal not opened: %v; the pool manager creates and deletes nothing; tried again every %s", err, poolJournalRetry)
 	}
 }
 
-// close stops the journal's writer. Safe on nil.
+// startJournalRetry starts retryJournal once, when the journal is
+// unavailable and the pool is not closed.
+func (b *broker) startJournalRetry(ctx context.Context) {
+	p := b.pool
+	b.mu.Lock()
+	unavailable := p.journalState == "unavailable"
+	b.mu.Unlock()
+	p.retryMu.Lock()
+	defer p.retryMu.Unlock()
+	if !unavailable || p.closed || p.retryDone != nil {
+		return
+	}
+	p.retryStop, p.retryDone = make(chan struct{}), make(chan struct{})
+	go b.retryJournal(ctx, p.retryStop, p.retryDone)
+}
+
+// retryJournal tries the journal open again every poolJournalRetry until it
+// opens, turns out incomplete, or the broker stops. A journal it opened
+// after the stop is closed again, so nothing stays open. Once the journal is
+// complete the manager starts as after a load: each hotel's pool rooms are
+// unverified until their receipts are read, and no pool create comes before
+// those reads (poolPlan).
+func (b *broker) retryJournal(ctx context.Context, stop, done chan struct{}) {
+	p := b.pool
+	defer close(done)
+	t := time.NewTimer(poolJournalRetry)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		j, _, err := poolOpenJournal(p.stateDir)
+		select {
+		case <-ctx.Done():
+		case <-stop:
+		default:
+			if b.noteJournalOpen(j, err) {
+				return
+			}
+			t.Reset(poolJournalRetry)
+			continue
+		}
+		if j != nil {
+			_ = j.close() // stopped while it opened: leave no journal open
+		}
+		return
+	}
+}
+
+// noteJournalOpen records a retried open and reports whether the retry
+// ends.
+func (b *broker) noteJournalOpen(j *claimJournal, err error) bool {
+	p := b.pool
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p.journalTries++
+	switch {
+	case err == nil:
+		p.journal, p.journalState, p.journalWhy, p.journalNextTry = j, "complete", "", time.Time{}
+		log.Printf("ready rooms: claim journal opened on try %d; the pool starts on each hotel after its receipts reads", p.journalTries)
+		return true
+	case errors.Is(err, errClaimJournalIncomplete):
+		p.journal, p.journalState, p.journalWhy, p.journalNextTry = j, "incomplete", err.Error(), time.Time{}
+		log.Printf("ready rooms: %v; the pool manager creates and deletes nothing until a person looks", err)
+		return true
+	}
+	changed := err.Error() != p.journalWhy
+	p.journalWhy, p.journalNextTry = err.Error(), now.Add(poolJournalRetry)
+	if changed || now.Sub(p.journalLoggedAt) >= time.Minute {
+		p.journalLoggedAt = now
+		log.Printf("ready rooms: claim journal still not opened after %d tries: %v; tried again every %s", p.journalTries, err, poolJournalRetry)
+	}
+	return false
+}
+
+// close stops the open retry, waits for it, then stops the journal's writer.
+// Safe on nil and more than once.
 func (p *readyRooms) close() {
-	if p != nil && p.journal != nil {
+	if p == nil {
+		return
+	}
+	p.retryMu.Lock()
+	first := !p.closed
+	p.closed = true
+	stop, done := p.retryStop, p.retryDone
+	p.retryMu.Unlock()
+	if done != nil {
+		if first {
+			close(stop)
+		}
+		<-done
+	}
+	if p.journal != nil {
 		_ = p.journal.close()
 	}
 }
@@ -228,6 +346,7 @@ func (b *broker) runPool(ctx context.Context) {
 	if p == nil {
 		return
 	}
+	b.startJournalRetry(ctx)
 	t := time.NewTicker(poolTick)
 	defer t.Stop()
 	for {
@@ -435,6 +554,11 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	}
 	if b.poolCreateRefusalLocked(h, ph, now) != "" || now.Before(ph.nextCreate) || ph.full {
 		return w
+	}
+	for _, pr := range ph.rooms {
+		if pr.state == poolUnverified && pr.tries == 0 {
+			return w // the receipts reads come first, after a restart or a late journal open
+		}
 	}
 	for i := range p.keys {
 		k := &p.keys[i]
