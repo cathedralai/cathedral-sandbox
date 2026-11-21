@@ -209,3 +209,15 @@ func TestCreateTimeoutEndsTheWaitForAHotelConnection(t *testing.T) {
 		t.Fatalf("hotel counts after a client deadline: creating %d failed %d", creating, failed)
 	}
 }
+
+func TestCompatBatchCreateTimeoutAnswersTheFirstFailure(t *testing.T) {
+	tc := newChain(t)
+	oneBusyHotel(t, tc)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "sealed": false, "count": 3, "create_timeout_seconds": 1}), nil)
+	if d, _ := doc["detail"].(map[string]any); status != 503 || d["error"] != "create_timeout" {
+		t.Fatalf("compat count 3, no slot, deadline 1 s: %d %v", status, doc)
+	}
+	if n := createsOn(tc)["b"]; n != 0 {
+		t.Fatalf("%d creates reached the hotel", n)
+	}
+}
