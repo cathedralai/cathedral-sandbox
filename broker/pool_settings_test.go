@@ -22,7 +22,9 @@ type settingsChain struct {
 	stateDir string
 }
 
-func newSettingsChain(t *testing.T) *settingsChain {
+func newSettingsChain(t *testing.T) *settingsChain { return newSettingsChainWith(t, nil) }
+
+func newSettingsChainWith(t *testing.T, mutate func(c *config)) *settingsChain {
 	t.Helper()
 	dir := t.TempDir()
 	key := filepath.Join(dir, "hotel.key")
@@ -34,6 +36,9 @@ func newSettingsChain(t *testing.T) *settingsChain {
 		Guests:     []guestConfig{{ID: "g1", KeySHA256: sha("key1")}},
 		Hotels:     []hotelConfig{{ID: "a", API: "http://127.0.0.1:1", Health: "http://127.0.0.1:1", KeyFile: key, Sealed: true}},
 		ReadyRooms: &readyRoomsConfig{Guest: poolGuestID, Keys: []readyRoomKeyEntry{{Template: "node-22"}}}}
+	if mutate != nil {
+		mutate(&cfg)
+	}
 	raw, _ := json.Marshal(cfg)
 	if err := os.WriteFile(sc.cfgPath, raw, 0o600); err != nil {
 		t.Fatal(err)
@@ -199,5 +204,33 @@ func TestReadyRoomsOffChangesNothing(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(state, name)); err == nil {
 			t.Fatalf("%s exists without ready_rooms", name)
 		}
+	}
+}
+
+// The meter-key routes answer for the reserved pool guest as for an unknown
+// guest: an external meter never lists or freezes pool rooms.
+func TestMeterRoutesRefuseThePoolGuest(t *testing.T) {
+	sc := newSettingsChainWith(t, func(c *config) { c.MeterKeySHA256 = sha("meter-key") })
+	call := func(method, path string) (int, string) {
+		r, _ := http.NewRequest(method, sc.srv.URL+path, nil)
+		r.Header.Set("Authorization", "Bearer meter-key")
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var doc map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&doc)
+		return resp.StatusCode, errCode(doc)
+	}
+	for _, action := range []struct{ method, path string }{{"GET", "rooms"}, {"POST", "freeze-all"}} {
+		pst, pcode := call(action.method, "/v1/broker/guests/"+poolGuestID+"/"+action.path)
+		ust, ucode := call(action.method, "/v1/broker/guests/no-such-guest/"+action.path)
+		if pst != 404 || pst != ust || pcode != ucode {
+			t.Fatalf("%s %s for the pool guest: %d %q; for an unknown guest: %d %q", action.method, action.path, pst, pcode, ust, ucode)
+		}
+	}
+	if st, _ := call("GET", "/v1/broker/guests/g1/rooms"); st != 200 {
+		t.Fatalf("meter rooms of a configured guest: %d, want 200", st)
 	}
 }
