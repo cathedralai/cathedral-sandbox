@@ -29,8 +29,8 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +88,10 @@ type placement struct {
 	// encrypted to the room runtime matches (encryptedCreateLeg), on every
 	// retry, fallback and queue move too.
 	registryAuth bool
+	// deadline: the create's create_timeout_seconds as a time (zero: none,
+	// AB#862). A create still waiting for a hotel create slot at this time
+	// ends with 503 create_timeout; one already sent to a hotel is not cut.
+	deadline time.Time
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -615,6 +619,13 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 func snapshotName(g *guestState, name string) string { return g.cfg.ID + ":" + name }
 
 // guestSnapshot rewrites one hotel snapshot document for the guest.
+func hotelsWord(ids []string) string {
+	if len(ids) == 1 {
+		return "hotel"
+	}
+	return "hotels"
+}
+
 func guestSnapshot(g *guestState, h *hotel, doc map[string]any) {
 	if sid, ok := doc["snapshot_id"].(string); ok {
 		doc["snapshot_id"] = h.cfg.ID + "." + sid
@@ -687,6 +698,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	var mu sync.Mutex
 	var hits []hit
 	var busy []string
+	var unanswered []*hotel
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
 		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
@@ -703,6 +715,9 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 				return
 			}
 			if err != nil {
+				mu.Lock()
+				unanswered = append(unanswered, h)
+				mu.Unlock()
 				return
 			}
 			if sid := matchSnapshot(g, list, ref); sid != "" {
@@ -717,9 +732,33 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	case 1:
 		return hits[0].h, hits[0].sid, nil
 	case 0:
+		// A hotel that did not answer may hold the snapshot (AB#866): if it is
+		// up, the miss is a retry, not "not found". One already known down
+		// keeps 404 (named), so a long-down hotel does not make every unknown
+		// name a retry loop.
+		var up, down []string
+		b.mu.Lock()
+		for _, h := range unanswered {
+			if h.ok {
+				up = append(up, h.cfg.ID)
+			} else {
+				down = append(down, h.cfg.ID)
+			}
+		}
+		b.mu.Unlock()
+		sort.Strings(up)
+		sort.Strings(down)
+		if len(up) > 0 {
+			return nil, "", &apiErr{502, "hotel_unreachable", "no answer from " + hotelsWord(up) + " " + strings.Join(up, ", ") +
+				", which may hold snapshot " + ref + "; retry, or use the id <hotel>.<snapshot id>"}
+		}
 		// A busy hotel was never asked; it may hold the snapshot (AB#819).
 		if len(busy) > 0 {
 			return nil, "", busyHotelsErr(busy)
+		}
+		if len(down) > 0 {
+			return nil, "", &apiErr{404, "snapshot_not_found", "no snapshot " + ref + " on the hotels that answered; " +
+				hotelsWord(down) + " " + strings.Join(down, ", ") + " down, not checked"}
 		}
 		return nil, "", notFound
 	default:
@@ -856,7 +895,7 @@ type prefetchHotel struct {
 type prefetchJob struct {
 	ID      string                    `json:"prefetch_id"`
 	guest   string                    // not shown
-	pin     int64                     // the pin cap sent with a pin prefetch; 0: no pin
+	pin     int64                     // the pin cap sent with a pin prefetch; 0: no pin (AB#860)
 	Images  []string                  `json:"images"`
 	Created time.Time                 `json:"created_at"`
 	Hotels  map[string]*prefetchHotel `json:"hotels"`
@@ -900,6 +939,11 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 			return
 		}
 	}
+	pl, e := b.parseSelection(g, req)
+	if e != nil {
+		writeErr(w, e.status, e.code, e.msg)
+		return
+	}
 	pin, _ := req["pin"].(bool)
 	if v, ok := req["pin"]; ok && v != nil {
 		if _, isBool := v.(bool); !isBool {
@@ -917,30 +961,35 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 			return
 		}
 	}
-	pl, e := b.parseSelection(g, req)
-	if e != nil {
-		writeErr(w, e.status, e.code, e.msg)
-		return
-	}
-	hotelBody := map[string]any{"images": images}
-	if pin {
-		// Set explicitly: the body is rebuilt, so a field the broker does not
-		// name never reaches the hotel.
-		hotelBody["pin"] = true
-	}
-	if auth, ok := req["registry_auth"]; ok && auth != nil {
-		hotelBody["registry_auth"] = auth // passed to the hotels, never stored
-	}
-	body, _ := json.Marshal(hotelBody)
+	auth := req["registry_auth"] // passed to the hotels, never stored
 
 	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, pin: pinMax, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
 	var targets []*hotel
+	b.mu.Lock()
 	for _, h := range b.hotelList() {
-		if pl.selects(h) {
-			targets = append(targets, h)
-			job.Hotels[h.cfg.ID] = &prefetchHotel{State: "pulling", StartedAt: job.Created}
+		if !pl.selects(h) {
+			continue
 		}
+		st := &prefetchHotel{State: "pulling", StartedAt: job.Created}
+		job.Hotels[h.cfg.ID] = st
+		if b.prefetchDiskFull(h) { // AB#861: a pull would fill the scratch the rooms write to
+			err := imageStoreFull(h)
+			st.State, st.Error, st.FinishedAt = "failed", err, &job.Created
+			for _, ref := range images {
+				st.Images = append(st.Images, map[string]any{"ref": ref, "state": "failed", "error": err})
+			}
+			continue
+		}
+		for _, ref := range images {
+			st.Images = append(st.Images, map[string]any{"ref": ref, "state": "pulling"})
+		}
+		targets = append(targets, h)
 	}
+	gens := make([]int, len(targets))
+	for i, h := range targets {
+		gens[i] = h.warmGen
+	}
+	b.mu.Unlock()
 	b.prefetch.mu.Lock()
 	if b.prefetch.jobs == nil {
 		b.prefetch.jobs = map[string]*prefetchJob{}
@@ -954,64 +1003,83 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 	view := b.prefetchView(job)
 	b.prefetch.mu.Unlock()
 
-	for _, h := range targets {
-		go b.prefetchOn(h, job, body)
+	for i, h := range targets {
+		go b.prefetchOn(h, job, auth, gens[i])
 	}
 	writeJSON(w, 202, view)
 }
 
-// prefetchOn pulls the images on one hotel. A pull can take minutes, so it
-// does not use the guest request context. The guest id is forwarded so the
-// hotel grants ownership of the pulled image ids to this guest (AB#650).
-func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
+// prefetchOn pulls the job's images on one hotel, one ref per hotel call and
+// up to prefetchPerHotel at once, each with its own cap (AB#859): one call
+// for the whole list ran past its cap on a long list while the hotel kept
+// pulling. gen is h.warmGen when the job started.
+func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
 	g := b.guests[job.guest]
-	var status int
-	var out []byte
-	var err error
-	if g != nil {
-		hdr := http.Header{guestHeader: {g.cfg.ID}}
-		if job.pin > 0 {
-			hdr.Set(pinMaxHeader, strconv.FormatInt(job.pin, 10))
+	sem := make(chan struct{}, prefetchPerHotel)
+	var wg sync.WaitGroup
+	for i, ref := range job.Images {
+		sem <- struct{}{}
+		// Earlier pulls of this job may have taken the hotel to its disk line
+		// since the job was accepted: check again before each ref (AB#861).
+		b.mu.Lock()
+		full := b.prefetchDiskFull(h)
+		var refused map[string]any
+		if full {
+			refused = imageStoreFull(h)
 		}
-		status, _, out, err = h.doHeaders(context.Background(), h.cfg.API, "POST", "/v1/images/prefetch", nil, body, 30*time.Minute, hdr)
-	} else {
-		status, _, out, err = h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+		b.mu.Unlock()
+		if full {
+			<-sem
+			b.prefetch.mu.Lock()
+			job.Hotels[h.cfg.ID].Images[i] = map[string]any{"ref": ref, "state": "failed", "error": refused}
+			b.prefetch.mu.Unlock()
+			continue
+		}
+		wg.Add(1)
+		go func(i int, ref string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			entry := b.prefetchRefPin(h, g, ref, auth, gen, true, job.pin)
+			b.prefetch.mu.Lock()
+			job.Hotels[h.cfg.ID].Images[i] = entry // a new map: views hold the old one
+			b.prefetch.mu.Unlock()
+		}(i, ref)
 	}
-	var doc map[string]any
-	_ = json.Unmarshal(out, &doc)
+	wg.Wait()
 	now := time.Now().UTC()
 	b.prefetch.mu.Lock()
 	defer b.prefetch.mu.Unlock()
 	st := job.Hotels[h.cfg.ID]
 	st.FinishedAt = &now
-	switch {
-	case err != nil:
-		e := hotelAPIErr(h, err)
-		st.State, st.Error = "failed", map[string]any{"code": e.code, "message": e.msg}
-	case status == 200 || status == 202:
-		st.State = "done"
-		res, _ := doc["result"].(map[string]any)
-		if imgs, ok := res["images"].([]any); ok {
-			for _, x := range imgs {
-				if m, ok := x.(map[string]any); ok {
-					st.Images = append(st.Images, m)
-				}
+	st.State = "done"
+	failed := 0
+	for _, e := range st.Images {
+		if e["state"] == "failed" {
+			failed++
+			if st.Error == nil {
+				st.Error, _ = e["error"].(map[string]any)
 			}
 		}
-		if job.pin > 0 {
-			// A kit before AB#860 pulls and ignores "pin"; only the echo
-			// says the images are kept.
-			if pinned, ok := res["pinned"].([]any); ok {
-				st.Pin, st.Pinned = "pinned", pinned
-			} else {
+	}
+	if job.pin > 0 {
+		// A kit before AB#860 pulls and ignores "pin"; only its echo says the
+		// images are kept, so one hotel without it reads not_supported.
+		for _, e := range st.Images {
+			switch e["pin"] {
+			case "pinned":
+				st.Pinned = append(st.Pinned, e["ref"])
+			case imageListNotKitted:
 				st.Pin = imageListNotKitted
 			}
 		}
-	default:
+		if st.Pin == "" && len(st.Pinned) > 0 {
+			st.Pin = "pinned"
+		}
+	}
+	if failed > 0 {
 		st.State = "failed"
-		st.Error = map[string]any{"code": "prefetch_failed", "message": fmt.Sprintf("hotel answered %d", status)}
-		if e, ok := doc["error"].(map[string]any); ok {
-			st.Error = map[string]any{"code": e["code"], "message": e["message"], "status": status}
+		if failed > 1 && st.Error != nil {
+			st.Error = map[string]any{"code": st.Error["code"], "message": fmt.Sprintf("%d of %d images failed; first: %v", failed, len(st.Images), st.Error["message"])}
 		}
 	}
 }
@@ -1022,6 +1090,9 @@ func (b *broker) prefetchView(job *prefetchJob) map[string]any {
 	summary := map[string]int{"pulling": 0, "done": 0, "failed": 0}
 	for id, st := range job.Hotels {
 		cp := *st
+		// Entries are replaced, never changed in place, so a copy of the
+		// slice is enough for the caller to encode after the lock.
+		cp.Images = slices.Clone(st.Images)
 		hotels[id] = cp
 		summary[st.State]++
 	}

@@ -88,9 +88,11 @@ func (h *hotel) holdDisk(pl placement, sign int) {
 // flight counts twice until the create returns: on purpose, as the error is
 // a short false disk_sold_out, never a hotel filled over budget (skipping
 // such rooms undercounted a started room of a failed create until its batch
-// ended). Caller holds b.mu.
+// ended). A room the hotel killed after a delete is out of the room list
+// but holds its disk until docker rm ends: the hotel reports that extra disk
+// as removing_disk_gib (AB#863) and it counts here. Caller holds b.mu.
 func (h *hotel) diskExtraUsed() int {
-	n := h.diskPending
+	n := h.diskPending + h.removingDiskGiB
 	for _, rm := range h.rooms {
 		n += diskExtra(rm.diskGiB)
 	}

@@ -172,6 +172,7 @@ receipts of one room, use `--sandbox <id>`.
 | `invalid_network_mode` | 400 | A network change has no `mode` |
 | `room_limit` | 429 | Guest has reached its `max_rooms` limit |
 | `create_rate_limit` | 429 | Guest has exceeded `max_creates_per_minute` |
+| `count_over_rate_limit`, `count_over_room_limit` | 400 | One create's `count` is above `max_creates_per_minute` or `max_rooms`; send at most that many per call |
 | `create_rate_exceeded`, `quota_exhausted`, `key_subquota_exhausted` | 429 | The hotel itself is at a limit; retry after `Retry-After` |
 | `invalid_request` | 400 | A field has the wrong shape (an unknown key in `image`, a number for `entrypoint`, nesting past the parser) |
 | `invalid_entrypoint`, `invalid_user`, `invalid_workdir`, `entrypoint_exited` | 400 | The image cannot start as asked |

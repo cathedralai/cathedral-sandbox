@@ -111,6 +111,14 @@ func (g *connGate) acquire(ctx context.Context, hotelID string) (release func(),
 		defer t.Stop()
 		bound = t.C
 	}
+	// A create's own deadline (create_timeout_seconds, AB#862) also ends
+	// the wait; the create was not sent.
+	var deadline <-chan time.Time
+	if d, ok := ctx.Value(createDeadlineKey{}).(time.Time); ok && !d.IsZero() {
+		t := time.NewTimer(time.Until(d))
+		defer t.Stop()
+		deadline = t.C
+	}
 	select {
 	case g.slots <- struct{}{}:
 		return release, nil
@@ -120,6 +128,8 @@ func (g *connGate) acquire(ctx context.Context, hotelID string) (release func(),
 		g.refused.Add(1)
 		g.logWait(hotelID, true)
 		return nil, errHotelBusy
+	case <-deadline:
+		return nil, errCreateDeadline
 	}
 }
 
