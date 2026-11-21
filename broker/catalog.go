@@ -236,7 +236,7 @@ func applyCatalogTemplate(req map[string]any) *apiErr {
 	if id, _ := req["image_id"].(string); id != "" {
 		return nil
 	}
-	if ref, _ := req["image"].(string); ref != "" {
+	if createImageRef(req) != "" {
 		return nil
 	}
 	name, _ := req["template"].(string)

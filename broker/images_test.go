@@ -27,6 +27,7 @@ type fakeHotel struct {
 	receiptTag    string                    // appended to the X-Room-Receipt of a create, to tell hotels apart
 	authFail      bool                      // answer creates 401, like a hotel whose API key changed
 	pullOutage    bool                      // answer creates 502 image_pull_failed for a registry outage
+	pullLimited   bool                      // answer creates 502 image_pull_failed for the registry's rate limit (registry_auth_test.go)
 	calls         []string                  // "METHOD /path?query" of every request
 	snaps         map[string]map[string]any // hotel snapshot id -> document
 	prefetch      []map[string]any
@@ -138,6 +139,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if req["image"] == "nosuch/x:1" {
 			writeErr(w, 502, "image_pull_failed", "docker pull failed for nosuch/x:1: Error response from daemon: pull access denied for nosuch/x, repository does not exist")
+			return
+		}
+		if f.pullLimited {
+			writeErr(w, 502, "image_pull_failed", "docker pull failed for acme/private:1: Error response from daemon: toomanyrequests: You have reached your pull rate limit.")
 			return
 		}
 		if f.pullOutage {
