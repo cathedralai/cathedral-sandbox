@@ -13,6 +13,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -214,6 +215,9 @@ def _dial_in_room(
     return _run_dial(argv, port, body=body, timeout_seconds=timeout_seconds, in_room=True)
 
 
+_BAD_HEADER = re.compile(r"[\r\n\x00]")
+
+
 def _run_dial(argv: list[str], port: int, *, body: bytes, timeout_seconds: float,
               in_room: bool = False) -> GuestHttpResult:
     try:
@@ -248,12 +252,19 @@ def _run_dial(argv: list[str], port: int, *, body: bytes, timeout_seconds: float
         meta = json.loads(head.decode("utf-8"))
         body_len = int(meta["body_len"])
         payload = rest[:body_len]
+        status = int(meta["status"])
+        if not 100 <= status <= 599:
+            raise ValueError("status out of range")
         headers_out = tuple(
             (str(name), str(value))
             for name, value in meta.get("headers") or []
             if str(name).lower() not in _DROP_RESPONSE
         )
-        return GuestHttpResult(status=int(meta["status"]), headers=headers_out, body=payload)
+        # In a gVisor room the guest writes this JSON line itself: never let a CR, LF
+        # or NUL reach send_header, where it would split the hotel's own response.
+        if any(_BAD_HEADER.search(n) or _BAD_HEADER.search(v) for n, v in headers_out):
+            raise ValueError("control character in a guest header")
+        return GuestHttpResult(status=status, headers=headers_out, body=payload)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise SandboxOpError("port_unreachable", 502, "hotel dial returned a broken answer") from exc
 

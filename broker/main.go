@@ -1986,7 +1986,10 @@ func setBrokerTiming(dst http.Header, hotelID string, queue, call time.Duration)
 // Credentials, cookies and Host never go on.
 var guestPortForward = []string{
 	"X-Guest-Method", "X-Guest-Target",
-	"Accept", "Accept-Encoding", "Content-Type", "Content-Encoding", "User-Agent", "Range",
+	// Not Accept-Encoding: forwarding it turns off Go's transparent gunzip, and the
+	// answer's Content-Encoding is not copied back, so a gzipping guest app would
+	// reach the browser as compressed bytes labelled plain.
+	"Accept", "Content-Type", "Content-Encoding", "User-Agent", "Range",
 }
 
 // guestPortHeaders is the extra hotel request header set for a guest port

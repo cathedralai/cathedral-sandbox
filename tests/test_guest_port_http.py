@@ -206,3 +206,25 @@ def test_in_room_script_round_trips_a_real_server(loopback_http):
     result = gph._run_dial(argv, port, body=b"payload", timeout_seconds=5.0, in_room=True)  # noqa: SLF001
     assert result.status == 201 and result.body == b"posted"
     assert seen[-1] == ("POST", "/ingest?a=b", b"payload")
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"status": 200, "headers": [["X-Evil", "a\r\nSet-Cookie: s=1"]], "body_len": 0},
+        {"status": 200, "headers": [["X-Evil\n", "a"]], "body_len": 0},
+        {"status": 200, "headers": [["X-Nul", "a\x00b"]], "body_len": 0},
+        {"status": 99, "headers": [], "body_len": 0},
+        {"status": 600, "headers": [], "body_len": 0},
+    ],
+)
+def test_gvisor_guest_cannot_split_the_hotel_response(monkeypatch, meta):
+    """In a gVisor room the guest writes the answer line itself: control characters and odd statuses refuse."""
+    from cathedral import guest_port_http as gph
+
+    calls: list = []
+    answer = _Completed(0, json.dumps(meta).encode() + b"\n")
+    monkeypatch.setattr(gph.subprocess, "run", _fake_run("runsc", answer, calls))
+    with pytest.raises(SandboxOpError) as refused:
+        gph.dial_container_loopback("cid1", 8080, method="GET", path="/")
+    assert refused.value.code == "port_unreachable"

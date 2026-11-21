@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -88,5 +89,47 @@ func TestGuestPortHeadersOnlyOnThePortRoute(t *testing.T) {
 		if got := guestPortHeaders(r, c.tail) != nil; got != c.want {
 			t.Errorf("%s %s: headers %v, want %v", c.method, c.tail, got, c.want)
 		}
+	}
+}
+
+// A gzipping guest app must reach the caller decoded: the broker drops the
+// answer's Content-Encoding, so it must not forward the caller's
+// Accept-Encoding (which would turn off Go's transparent gunzip).
+func TestGuestPortDialDecodesAGzippedAnswer(t *testing.T) {
+	tc := newChain(t)
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	h := tc.b.hotelByID("b")
+	hotel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept-Encoding") != "gzip" {
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("plain"))
+			return
+		}
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		_, _ = zw.Write([]byte("<html>hello</html>"))
+		_ = zw.Close()
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(200)
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(hotel.Close)
+	h.cfg.API = hotel.URL
+
+	req, _ := http.NewRequest("POST", tc.srv.URL+"/v1/sandboxes/"+id+"/ports/8080/http", nil)
+	req.Header.Set("Authorization", "Bearer key1")
+	req.Header.Set("X-Guest-Method", "GET")
+	req.Header.Set("X-Guest-Target", "/")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	tr := &http.Transport{DisableCompression: true}
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(out) != "<html>hello</html>" {
+		t.Fatalf("broker answered %d %q, want the decoded page", resp.StatusCode, out)
 	}
 }
