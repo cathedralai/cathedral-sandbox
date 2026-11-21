@@ -77,6 +77,14 @@ rebuild; a hotel without them gives `deleted`, `ttl_expired`,
 - A create that waits longer than `max_queue_wait_seconds` (config, default
   10; -1 turns it off) for a create slot moves to another eligible hotel
   with a free room. If there is none, it keeps waiting.
+- A create may send `create_timeout_seconds` (1 to 720, native and compat).
+  If no create slot (or data connection) at a hotel comes free in that time,
+  the create answers 503 `create_timeout` with `Retry-After: 5` and no room
+  is started. A create already sent to a hotel is not cut: it runs to the
+  hotel's answer. In a batch, rooms not sent by then count as
+  `503 create_timeout` in `errors`. Without the field a create waits as before.
+- A compat exec (`/exec`, `/execs`) without `timeout_seconds` runs under 600 s
+  (`default_exec_seconds` in the catalog), not `max_exec_seconds`.
 - A hotel whose host memory use is at or above `mem_full_pct` (config,
   default 90; -1 turns it off) takes no new rooms. A hotel may carry its own
   `mem_full_pct` (1 to 100; config, operator join, or PATCH
