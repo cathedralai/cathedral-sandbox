@@ -133,10 +133,10 @@ func TestConfigHotelMemFullPctIsLoadedAndValidated(t *testing.T) {
 
 func TestRuntimeHotelMemFullPctAtJoinAndPatchSurvivesRestart(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "bad", "api": "https://x.invalid", "key": joinKey, "mem_full_pct": 0}); status != 400 {
+	if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "bad", "api": "https://x.invalid", "key": joinKey, "sealed": true, "mem_full_pct": 0}); status != 400 {
 		t.Fatalf("join with mem_full_pct 0: %d", status)
 	}
-	joinMiner(t, tc, "m1", true, 4, nil)
+	joinMiner(t, tc, "m1", 4, nil)
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/m1", map[string]any{"mem_full_pct": 75}); status != 200 || doc["mem_full_pct"] != 75.0 {
 		t.Fatalf("PATCH runtime hotel: %d %v", status, doc)
 	}
