@@ -1325,6 +1325,11 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 // reaped clears a recorded request once its rooms on h are confirmed gone.
 func (b *broker) reaped(h *hotel, batchID string) {
 	b.mu.Lock()
+	if ub := h.unreaped[batchID]; ub != nil && b.holdsLocked(h, batchID, ub, time.Now()) {
+		ub.busy = false // a metered guest's lost create may still start its room (allowance.go)
+		b.mu.Unlock()
+		return
+	}
 	delete(h.unreaped, batchID)
 	b.mu.Unlock()
 	log.Printf("orphan rooms on hotel %s (batch %s) confirmed removed", h.cfg.ID, batchID)
@@ -2379,7 +2384,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	for batchID, ub := range h.unreaped {
 		switch {
 		case ub.busy:
-		case !leftover[batchID] && now.Before(ub.holdUntil): // a lost create may still start its room (allowance.go)
+		case !leftover[batchID] && b.holdsLocked(h, batchID, ub, now): // a lost create may still start its room (allowance.go)
 		case !leftover[batchID]:
 			delete(h.unreaped, batchID) // the hotel lists none of its rooms
 			log.Printf("orphan rooms on hotel %s (batch %s) no longer listed", h.cfg.ID, batchID)
@@ -2425,6 +2430,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	}
 	forced = b.checkReservedRooms(h)
 	h.roomsUnchecked = false
+	b.listedLocked(h) // the metered recount of a joined hotel (allowance.go)
 }
 
 func (b *broker) syncLoop(ctx context.Context, h *hotel) {

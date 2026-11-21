@@ -39,6 +39,8 @@ type lifeHotel struct {
 	holdCreates   chan struct{}
 	enteredCreate chan string
 	name          string
+	// holdDeletes, when set, holds each room DELETE until it is closed.
+	holdDeletes chan struct{}
 }
 
 type lifeCall struct {
@@ -49,8 +51,11 @@ type lifeCall struct {
 func (l *lifeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	l.mu.Lock()
 	l.seen = append(l.seen, r.Method+" "+r.URL.Path)
-	hide, holdCreates, entered := l.hideDeletes, l.holdCreates, l.enteredCreate
+	hide, holdCreates, entered, holdDeletes := l.hideDeletes, l.holdCreates, l.enteredCreate, l.holdDeletes
 	l.mu.Unlock()
+	if holdDeletes != nil && r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/v1/sandboxes/") {
+		<-holdDeletes
+	}
 	if holdCreates != nil && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" {
 		entered <- l.name
 		<-holdCreates
@@ -1265,10 +1270,15 @@ func TestMeteredLateRoomInTheHoldIsReapedAsAnOrphan(t *testing.T) {
 	f.mu.Lock()
 	f.rooms = append(f.rooms, map[string]any{"id": "sbx_late", "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: batch}})
 	f.mu.Unlock()
+	release := make(chan struct{})
+	lives[hotelID].mu.Lock()
+	lives[hotelID].holdDeletes = release // the reap's DELETE waits until the refusal is checked
+	lives[hotelID].mu.Unlock()
 	tc.syncAll(hotelID)
 	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
 		t.Fatalf("create while the late room is reaped: %d %v", status, doc)
 	}
+	close(release)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		tc.b.mu.Lock()
@@ -1464,5 +1474,208 @@ func TestMeteredJoinedHotelKeepsNonMeteredAdmission(t *testing.T) {
 	f.listFail = false
 	f.mu.Unlock()
 	tc.syncAll("d1")
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+}
+
+// ---------------------------------------------------------------- review round 3
+
+// waitRecord waits until cond holds for h's unreaped record of batch (nil:
+// none), checked under the broker lock.
+func waitRecord(t *testing.T, tc *testChain, hotelID, batch string, cond func(ub *unreapedBatch) bool) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		tc.b.mu.Lock()
+		ub := tc.b.hotelByID(hotelID).unreaped[batch]
+		ok := cond(ub)
+		tc.b.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("record of batch %s on hotel %s: condition never held", batch, hotelID)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestMeteredHoldSurvivesAFailedThenEmptyCleanup(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	for _, id := range []string{"b", "c"} {
+		f := tc.hotels[id]
+		f.mu.Lock()
+		f.createFail, f.labelListFail = 504, 503 // no room yet, and the first cleanup list fails
+		f.mu.Unlock()
+	}
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}})
+	if status != 504 {
+		t.Fatalf("lost create: %d %v", status, doc)
+	}
+	hotelID, batch := "", ""
+	for _, id := range []string{"b", "c"} {
+		f := tc.hotels[id]
+		f.mu.Lock()
+		f.createFail, f.labelListFail = 0, 0 // the background cleanup list now succeeds, empty
+		if len(f.creates) == 1 {
+			labels, _ := f.creates[0]["labels"].(map[string]any)
+			hotelID, batch = id, labels[batchLabel].(string)
+		}
+		f.mu.Unlock()
+	}
+	// The background pass (after 1 s) lists nothing: the record stays, held.
+	waitRecord(t, tc, hotelID, batch, func(ub *unreapedBatch) bool { return ub != nil && !ub.busy })
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create after a failed then empty cleanup, during the hold: %d %v", status, doc)
+	}
+	tc.syncAll()
+	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 {
+		t.Fatalf("create after a sync during the hold: %d", status)
+	}
+	if _, _, deletes := hotelCalls(tc, lives); deletes != 0 {
+		t.Fatalf("%d deletes", deletes)
+	}
+}
+
+func TestMeteredBatchHoldKeepsUnfinishedAttempts(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 2))
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.createFail = 504
+	f.mu.Unlock()
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "count": 2})
+	if _, creates, _ := hotelCalls(tc, lives); status != 504 || creates != 2 {
+		t.Fatalf("batch of 2, both answers lost: %d %v, %d creates", status, doc, creates)
+	}
+	f.mu.Lock()
+	f.createFail = 0
+	labels, _ := f.creates[0]["labels"].(map[string]any)
+	batch := labels[batchLabel].(string)
+	// One attempt's room appears late; the other never does.
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_late", "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: batch}})
+	f.mu.Unlock()
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 2.0 {
+		t.Fatalf("both lost attempts held: %v", v)
+	}
+	tc.syncAll("b")
+	waitRecord(t, tc, "b", batch, func(ub *unreapedBatch) bool {
+		f.mu.Lock()
+		deleted := len(f.roomDeletes)
+		f.mu.Unlock()
+		return ub != nil && !ub.busy && deleted == 1
+	})
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 1.0 {
+		t.Fatalf("after the late room is reaped, the other attempt must still count: %v", v)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "count": 2}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("a batch of 2 beside the unfinished attempt: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	tc.b.hotelByID("b").unreaped[batch].holdUntil = time.Now().Add(-time.Second) // the hold passes
+	tc.b.mu.Unlock()
+	tc.syncAll("b")
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 0.0 {
+		t.Fatalf("after the hold: %v", v)
+	}
+}
+
+// Known limit: a restart forgets a hold. Only an attempt whose room the
+// hotel had not listed yet escapes; a listed room counts after the restart.
+func TestMeteredRestartDuringTheHold(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	lostCreateNoRoom(t, tc, lives)
+	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 {
+		t.Fatalf("create during the hold: %d", status)
+	}
+	tc.restart(t) // the hold was in memory only; the hotel lists no room yet
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 202 {
+		t.Fatalf("create after a restart with no room listed (the documented limit): %d %v", status, doc)
+	}
+
+	tc2, lives2 := meteredChain(t, nil)
+	tc2.putAllowance(t, "g1", allowanceBody(1, 1))
+	for _, id := range []string{"b", "c"} { // the room starts, its answer is lost, the cleanup list fails
+		f := tc2.hotels[id]
+		f.mu.Lock()
+		f.createFail, f.createFailAfterStart, f.labelListFail = 503, true, 503
+		f.mu.Unlock()
+	}
+	if status, _ := tc2.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 503 {
+		t.Fatalf("lost create with its room: %d", status)
+	}
+	for _, id := range []string{"b", "c"} {
+		f := tc2.hotels[id]
+		f.mu.Lock()
+		f.createFail, f.createFailAfterStart = 0, false
+		f.mu.Unlock()
+	}
+	tc2.restart(t) // the hotel lists the room: it counts as the guest's
+	if status, doc := tc2.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b", "c"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create after a restart with the room listed: %d %v", status, doc)
+	}
+	if _, creates, _ := hotelCalls(tc2, lives2); creates != 1 {
+		t.Fatalf("%d creates", creates)
+	}
+}
+
+// Known limit: a room the hotel hides while its removal fails is not
+// counted, with or without a restart. It is not listed, so not metered.
+func TestMeteredHiddenRoomsAreNotCountedWithoutARestart(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	lives["b"].mu.Lock()
+	lives["b"].hideDeletes = true
+	lives["b"].mu.Unlock()
+	// An orphan: the room starts, its answer is lost, the cleanup DELETE
+	// answers 204 and the hotel hides the room.
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.createFail, f.createFailAfterStart = 503, true
+	f.mu.Unlock()
+	if status, _ := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); status != 503 {
+		t.Fatalf("lost create: %d", status)
+	}
+	f.mu.Lock()
+	f.createFail, f.createFailAfterStart = 0, false
+	hidden := len(f.rooms)
+	f.mu.Unlock()
+	tc.syncAll()
+	if hidden != 1 {
+		t.Fatalf("the orphan container should still exist at the hotel: %d rooms", hidden)
+	}
+	r1 := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}) // one extra room per hidden room
+	// A room of the guest: deleted, hidden, released by the sync loop.
+	tc.putAllowance(t, "g1", allowanceBody(2, 1))
+	lives["c"].mu.Lock()
+	lives["c"].hideDeletes = true
+	lives["c"].mu.Unlock()
+	if status, _ := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+r1, nil); status != 204 {
+		t.Fatalf("delete: %d", status)
+	}
+	tc.b.mu.Lock()
+	tc.b.byBID(r1).vanished = time.Now().Add(-3 * time.Second)
+	tc.b.mu.Unlock()
+	tc.syncAll()
+	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}})
+}
+
+func TestMeteredJoinRecountEndsAtTheFirstSuccessfulList(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 5))
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
+	hs := httptest.NewServer(f)
+	t.Cleanup(hs.Close)
+	tc.hotels["d"] = f
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+		t.Fatalf("join d: %d %v", status, doc)
+	}
+	stopSyncLoop(t, tc, "d")
+	tc.syncAll("d") // the first list succeeds
+	f.mu.Lock()
+	f.listFail = true // later lists fail, before any metered request
+	f.mu.Unlock()
+	tc.syncAll("d")
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 }

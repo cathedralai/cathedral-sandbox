@@ -338,11 +338,14 @@ A metered create, and each lifetime extension of a metered room, is refused:
 Live rooms are the guest's creates in flight, every room the broker still
 holds for it (rooms being removed included, until the sync loop lets them
 go), and every create attempt whose answer was lost. A lost attempt counts
-until its orphan reap is confirmed; when the reap finds no room (a proxy
-timed out while the hotel may go on), it counts for a hold of
-`uncertain_create_hold_seconds` (config; default and minimum 720, the
-broker's create timeout to a hotel, `hotelCreateTimeout`), and a room the
-hotel lists for it in that time is reaped as an orphan. Every retry of a
+until the hotel has listed its room and the broker has removed it, or until
+a hold of `uncertain_create_hold_seconds` has passed (config; default and
+minimum 720, the broker's create timeout to a hotel, `hotelCreateTimeout`):
+a proxy may time out while the hotel goes on, so a cleanup that finds no
+room, at once or after failed tries, does not end the count early. A room
+the hotel lists in that time is reaped as an orphan. In a batch each lost
+attempt counts on its own: removing one late room does not release the
+others. Every retry of a
 create on another hotel is a new admission: the lease must be fresh, the cap
 must hold the live rooms with the room the failed attempt may hold, and the
 create's `ttl_seconds` and memory must fit the allowance of that moment (409
@@ -385,13 +388,22 @@ them; if it cannot, it does not start. The ledger sends
 
 Known limits:
 
-- A room whose removal keeps failing is hidden from its hotel's list. A
-  broker restart forgets it: one extra room per hidden room, until the hotel
-  removes it. The limit is per hidden room, so repeated failed removals
-  across restarts can add up. A hidden room is not listed, so it is not
-  metered.
+- A hotel answers DELETE 204 even when the container removal fails, and
+  then hides the room from its list (`cathedral/sandbox_guest.py`). A room
+  the hotel hides while its removal is failing is not counted against the
+  cap, with or without a broker restart: an orphan stops counting at its
+  DELETE, one of the guest's rooms when the sync loop releases it (which
+  keeps at most as many gone rooms as the hotel reports deleting). The
+  bound is one extra room per such hidden room, until the hotel removes it,
+  so repeated failed removals can add up. A hidden room is not listed, so it
+  is not metered or billed. Confirming each removal would need a probe per
+  delete; that is left for a follow-up.
 - A lost create that the hotel completes after the hold escapes the count
   until its room is listed (then it counts as one of the guest's rooms).
+- Holds and unreaped records of lost create attempts live in memory. A
+  broker restart forgets them: one extra room per lost attempt in flight at
+  the restart, and only when the hotel had not yet listed that room. A room
+  the hotel lists counts as one of the guest's rooms after the restart.
 - After a failed save (500) the guest is closed in memory only. A restart
   loads whatever the file holds: the allowance the ledger just sent (the
   rename was done, the directory sync failed) or the previous one (the write
@@ -404,8 +416,6 @@ Known limits:
 - Between the check and the hotel call an extension can wait for a hotel
   data connection: `data_conn_wait_seconds` (default 10 s), or the call's
   own deadline (30 s to 2 min) when that is negative.
-- Unreaped records of lost create attempts live in memory. After a restart
-  their rooms are listed with the guest's label and counted as its rooms.
 
 ## Per-room tunables
 
