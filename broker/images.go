@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -331,6 +332,45 @@ func localImageRefusal(ref string) *apiErr {
 		return &apiErr{422, "snapshot_image_by_name", "start from a snapshot with snapshot_id; a snapshot image cannot be named in image"}
 	}
 	return nil
+}
+
+// imageRefPattern is the hotel's image reference grammar, byte for byte
+// (_IMAGE_REF_RE in cathedral/sandbox_api.py): optional registry, repository,
+// then a :tag or an @sha256 digest. A name with neither is refused, not read
+// as :latest: every hotel refuses it, and a mutable implicit tag would also
+// split warm-cache keys (AB#868). image_ref_test.go pins the parity.
+const imageRefPattern = `^(?:(?P<registry>[a-z0-9][a-z0-9._-]*(?::[0-9]+)?)/)?(?P<repository>[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*?)` +
+	`(?::(?P<tag>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})|@(?P<digest>sha256:[0-9a-f]{64}))$`
+
+var (
+	imageRefRE = regexp.MustCompile(imageRefPattern)
+	// The same grammar without the tag or digest: such a ref only lacks one.
+	untaggedRefRE = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9._-]*(?::[0-9]+)?/)?[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*$`)
+	// An Agent IDE template uid, which the hotel resolves to an image (sandbox_api.py _TEMPLATE_UID_RE).
+	templateUIDRE = regexp.MustCompile(`^sbt-[a-z0-9][a-z0-9-]{0,48}$`)
+)
+
+// imageRefRefusal refuses a guest's image reference before anything is
+// placed, started or pulled: a hotel-local artifact (localImageRefusal), or a
+// reference no hotel accepts. A create may also name a template uid; a
+// prefetch may not (the hotel's prefetch takes registry references only).
+func imageRefRefusal(ref string, templateOK bool) *apiErr {
+	if e := localImageRefusal(ref); e != nil {
+		return e
+	}
+	if imageRefRE.MatchString(ref) || (templateOK && templateUIDRE.MatchString(ref)) {
+		return nil
+	}
+	shown := ref
+	if len(shown) > 200 {
+		shown = shown[:200] + "..."
+	}
+	if untaggedRefRE.MatchString(ref) {
+		return &apiErr{400, "invalid_image_reference", fmt.Sprintf(
+			"image %q has no tag or digest: add :tag or @sha256:<digest>, for example %s:<tag>; an untagged name is not read as :latest", shown, shown)}
+	}
+	return &apiErr{400, "invalid_image_reference", fmt.Sprintf(
+		"image %q is not a valid reference: use [registry/]name:tag or [registry/]name@sha256:<64 hex>", shown)}
 }
 
 // imageRepoName is the last path part of an image reference without its
@@ -846,6 +886,12 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 	if len(images) == 0 || len(images) != len(list) {
 		writeErr(w, 400, "invalid_prefetch", "images must be a non-empty list of image references")
 		return
+	}
+	for _, ref := range images { // refused here, at once, not as a failed pull on every hotel
+		if e := imageRefRefusal(ref, false); e != nil {
+			writeErr(w, e.status, e.code, e.msg)
+			return
+		}
 	}
 	pl, e := b.parseSelection(g, req)
 	if e != nil {
