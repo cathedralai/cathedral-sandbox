@@ -506,9 +506,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	h := newHotel(hc, req.Key)
 	h.runtime = true
 	h.pinChip = joinChip
-	// Not listed yet: metered admission (allowance.go) and a reserved hotel
-	// (lend.go) wait for its first room list, which the sync loop runs at once.
-	h.roomsUnchecked = true
+	b.markUnlisted(h) // metered admission waits for its first room list (allowance.go)
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {

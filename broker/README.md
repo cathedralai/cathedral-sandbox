@@ -337,11 +337,19 @@ A metered create, and each lifetime extension of a metered room, is refused:
 
 Live rooms are the guest's creates in flight, every room the broker still
 holds for it (rooms being removed included, until the sync loop lets them
-go), and every create attempt whose answer was lost, until its orphan reap
-is confirmed or the hotel stops listing the room. A create whose attempt was
-lost tries another hotel only while the cap has room for both. Lease, cap,
-size and lifetime are checked against one allowance, under the lock that
-reserves the rooms. `max_rooms` still applies on top (429 `room_limit`).
+go), and every create attempt whose answer was lost. A lost attempt counts
+until its orphan reap is confirmed; when the reap finds no room (a proxy
+timed out while the hotel may go on), it counts for a hold of
+`uncertain_create_hold_seconds` (config; default and minimum 720, the
+broker's create timeout to a hotel, `hotelCreateTimeout`), and a room the
+hotel lists for it in that time is reaped as an orphan. Every retry of a
+create on another hotel is a new admission: the lease must be fresh, the cap
+must hold the live rooms with the room the failed attempt may hold, and the
+create's `ttl_seconds` and memory must fit the allowance of that moment (409
+`allowance_changed` when they no longer do); a retry that does not fit is
+not sent, and the guest gets the last attempt's error. Lease, cap, size and
+lifetime are checked against one allowance, under the lock that reserves the
+rooms. `max_rooms` still applies on top (429 `room_limit`).
 
 Size and lifetime of a metered room:
 
@@ -370,13 +378,27 @@ every metered guest closed. A file that does not parse is moved aside
 issues are lost, so only an issue above the broker clock at start, in unix
 milliseconds, opens a guest again. An entry that cannot open admission
 closes that guest and keeps its issue (or that clock value when the issue
-itself is not usable). The ledger sends `issue = max(last + 1, unix ms)`.
+itself is not usable). In both cases the broker writes the closed entries
+and their watermarks to a fresh file at once, so every later start keeps
+them; if it cannot, it does not start. The ledger sends
+`issue = max(last + 1, unix ms)`.
 
 Known limits:
 
 - A room whose removal keeps failing is hidden from its hotel's list. A
-  broker restart forgets it: at most one extra room per such room, until the
-  hotel removes it. It is not listed, so it is not metered.
+  broker restart forgets it: one extra room per hidden room, until the hotel
+  removes it. The limit is per hidden room, so repeated failed removals
+  across restarts can add up. A hidden room is not listed, so it is not
+  metered.
+- A lost create that the hotel completes after the hold escapes the count
+  until its room is listed (then it counts as one of the guest's rooms).
+- After a failed save (500) the guest is closed in memory only. A restart
+  loads whatever the file holds: the allowance the ledger just sent (the
+  rename was done, the directory sync failed) or the previous one (the write
+  failed before the rename), which keeps its original `ledger_seen_at`.
+  Either is an allowance the ledger sent, so admission after the restart
+  lasts at most one `lease_seconds` from that allowance's own stamp, and the
+  next push replaces it.
 - A hotel that never answers a list after a restart or a join keeps its
   metered guests at 503 until it lists or is removed.
 - Between the check and the hotel call an extension can wait for a hotel

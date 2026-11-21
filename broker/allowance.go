@@ -22,11 +22,15 @@
 // After a restart the file is read again: a cap of 0 stays 0, the issue is
 // kept, and a lease keeps its ledger_seen_at, so it can expire across the
 // restart. A missing file leaves every metered guest closed. A file that does
-// not parse is moved aside and closes every metered guest; its issues are
+// not parse is kept aside and closes every metered guest; its issues are
 // lost, so the next issue must be above the broker's clock in unix
 // milliseconds at start. A stored entry that cannot open admission closes
 // that guest and keeps its issue (or that clock value when the issue itself
-// is not usable).
+// is not usable). Either way the closed state is written to a fresh file at
+// once, so a later start keeps it; a broker that cannot write it does not
+// start. After a failed save the file holds the allowance just sent or the
+// previous one, each with its own ledger_seen_at, so a restart admits for at
+// most one lease of an allowance the ledger sent.
 //
 // A metered create, and each lifetime extension of a metered room, is refused:
 //   - 503 allowance_recount with Retry-After until every hotel the guest may
@@ -39,11 +43,16 @@
 //
 // Live rooms of a metered guest are its creates in flight, every room the
 // broker still holds for it (rooms being removed included, until the sync
-// loop lets them go), and every create attempt whose answer was lost, until
-// its orphan reap is confirmed or the hotel no longer lists the room. A lost
-// attempt is retried on another hotel only while the cap has room for both.
-// Size, lifetime, lease and cap are checked against one allowance, under the
-// lock that reserves the rooms.
+// loop lets them go), and every create attempt whose answer was lost: until
+// its orphan reap is confirmed, and when the reap found no room, for a hold
+// of uncertain_create_hold_seconds (default and minimum: the create timeout,
+// hotelCreateTimeout) in case the hotel still starts it; a room it lists in
+// that time is reaped as an orphan. Every retry of a metered create on
+// another hotel is a new admission: lease and cap with the room the failed
+// attempt may hold, and the create's ttl and memory against the allowance of
+// that moment; a retry that does not fit is not sent. Size, lifetime, lease
+// and cap are checked against one allowance, under the lock that reserves the
+// rooms.
 //
 // A metered create always sends ttl_seconds of at most max_ttl_seconds (the
 // maximum when absent) and resources.memory_gib (4, the hotel default, when
@@ -70,6 +79,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -141,6 +151,18 @@ type allowances struct {
 	// request on one hotel that its reap pass could not confirm gone, while
 	// the hotel's unreaped record of the request lasts. Guarded by broker.mu.
 	orphans map[string]int
+	// removed is orphanKey(hotel, batch) -> orphan rooms of the request a
+	// reap pass deleted on that hotel, read and cleared by settleUncertain
+	// (a later background pass leaves a small entry behind). Guarded by
+	// broker.mu.
+	removed map[string]int
+	// unlisted holds hotels joined at runtime that have not answered a room
+	// list yet (metered recount only; roomsUnchecked covers hotels loaded at
+	// start). Guarded by broker.mu.
+	unlisted map[*hotel]bool
+	// hold is how long a lost create attempt whose reap found no room still
+	// counts (uncertain_create_hold_seconds).
+	hold time.Duration
 }
 
 func orphanKey(hotelID, batchID string) string { return hotelID + "\x00" + batchID }
@@ -174,15 +196,35 @@ func (b *broker) meteredLiveLocked(g *guestState) int {
 }
 
 // recountPendingLocked reports whether a hotel that g may use, or has had
-// rooms on, has not answered a room list since the broker started: the
-// guest's rooms there are not counted yet. Caller holds b.mu.
+// rooms on, has not answered a room list since the broker started or since
+// it joined: the guest's rooms there are not counted yet. Caller holds b.mu.
 func (b *broker) recountPendingLocked(g *guestState) bool {
+	pending := false
 	for _, h := range b.hotelList() {
-		if h.roomsUnchecked && (g.allowsHotel(h) || len(b.guestRooms[g.cfg.ID][h.cfg.ID]) > 0) {
-			return true
+		unchecked := h.roomsUnchecked
+		if b.allow.unlisted[h] {
+			if h.listOK { // its first room list answered
+				delete(b.allow.unlisted, h)
+			} else {
+				unchecked = true
+			}
+		}
+		if unchecked && (g.allowsHotel(h) || len(b.guestRooms[g.cfg.ID][h.cfg.ID]) > 0) {
+			pending = true
 		}
 	}
-	return false
+	return pending
+}
+
+// markUnlisted records a hotel that joins at runtime as not yet listed, for
+// the metered recount only. Called before the hotel is in the set.
+func (b *broker) markUnlisted(h *hotel) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.allow.unlisted == nil {
+		b.allow.unlisted = map[*hotel]bool{}
+	}
+	b.allow.unlisted[h] = true
 }
 
 // allowanceRefusalLocked says why metered guest g may not add n rooms now
@@ -278,19 +320,74 @@ func (b *broker) noteUncertainLocked(g *guestState) {
 	b.allow.uncertain[g.cfg.ID]++
 }
 
-// retryRefusedLocked reports whether a create of metered guest g whose
-// attempt was just lost may not try another hotel: the lost attempt counts
-// as a room, so a retry needs room under the cap for both (and a fresh
-// lease). Caller holds b.mu.
-func (b *broker) retryRefusedLocked(g *guestState) bool {
-	e, _ := b.allowanceRefusalLocked(g, 0, time.Now())
-	return e != nil
+// createSize is the ttl_seconds and resources.memory_gib of a create body
+// as the hotel receives it (0: absent).
+type createSize struct{ ttl, memGiB float64 }
+
+func createSizeOf(body []byte) createSize {
+	var doc struct {
+		TTL       any `json:"ttl_seconds"`
+		Resources struct {
+			MemoryGiB any `json:"memory_gib"`
+		} `json:"resources"`
+	}
+	_ = json.Unmarshal(body, &doc)
+	ttl, _ := numberOf(doc.TTL)
+	mem, _ := numberOf(doc.Resources.MemoryGiB)
+	return createSize{ttl, mem}
+}
+
+// retryRefusalLocked says why a create of metered guest g may not try
+// another hotel now: a retry is a new admission. The lease must be fresh,
+// the cap must hold the live rooms (the reservation of this create and any
+// room a failed attempt may hold are in them), and the body, sent unchanged,
+// must fit the allowance of this moment. nil: g is not metered, or the retry
+// fits. Caller holds b.mu.
+func (b *broker) retryRefusalLocked(g *guestState, size createSize) (*apiErr, int) {
+	metered, a := b.meteredLocked(g)
+	if !metered {
+		return nil, 0
+	}
+	if e, retry := b.allowanceRefusalLocked(g, 0, time.Now()); e != nil {
+		return e, retry
+	}
+	if size.memGiB > float64(a.MaxMemoryGiB) || size.ttl > float64(a.MaxTTLSeconds) || size.ttl == 0 {
+		return &apiErr{409, "allowance_changed", "this key's allowance changed while the create was placed; the room it asked for no longer fits, so it was not tried on another hotel"}, 0
+	}
+	return nil, 0
+}
+
+// refusedRetry is the answer of a create whose retry was refused: the
+// failure of its last attempt, or the refusal when no attempt answered.
+func refusedRetry(last createResult, e *apiErr, retry int) createResult {
+	if last.status != 0 {
+		return last
+	}
+	r := createResult{status: e.status, doc: errDoc(e.code, e.msg)}
+	if retry > 0 {
+		r.header = http.Header{"Retry-After": {strconv.Itoa(retry)}}
+	}
+	return r
+}
+
+// noteOrphanRemovedLocked counts one orphan room of a create request that a
+// reap pass deleted on h. Caller holds b.mu.
+func (b *broker) noteOrphanRemovedLocked(h *hotel, batchID string) {
+	if b.allow.removed == nil {
+		b.allow.removed = map[string]int{}
+	}
+	b.allow.removed[orphanKey(h.cfg.ID, batchID)]++
 }
 
 // settleUncertain ends the lost attempts of one create request once its reap
-// pass ran: those whose rooms a hotel could not confirm gone go on counting
-// through that hotel's unreaped record of the request.
-func (b *broker) settleUncertain(g *guestState, batchID string, results []createResult) {
+// pass ran. Those whose rooms a hotel could not confirm gone go on counting
+// through that hotel's unreaped record of the request. For a metered guest,
+// those whose reap found no room are held: the hotel may still start the
+// room after its answer was lost (a proxy timed out, the hotel went on). A
+// held record counts until the hold passes, or, when the hotel lists a room
+// of the request, until the sync loop reaps it as an orphan. keep holds the
+// rooms the request did receive, by hotel.
+func (b *broker) settleUncertain(g *guestState, batchID string, results []createResult, keep map[*hotel]map[string]bool) {
 	lostOn := map[*hotel]int{}
 	total := 0
 	for _, res := range results {
@@ -313,9 +410,20 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 			delete(b.allow.orphans, k)
 		}
 	}
+	metered, _ := b.meteredLocked(g)
 	for h, n := range lostOn {
-		if h.unreaped[batchID] != nil {
-			b.allow.orphans[orphanKey(h.cfg.ID, batchID)] = n
+		key := orphanKey(h.cfg.ID, batchID)
+		gone := b.allow.removed[key]
+		delete(b.allow.removed, key)
+		switch {
+		case h.unreaped[batchID] != nil:
+			b.allow.orphans[key] = n
+		case metered && n > gone && b.allow.hold > 0:
+			if h.unreaped == nil {
+				h.unreaped = map[string]*unreapedBatch{}
+			}
+			h.unreaped[batchID] = &unreapedBatch{guest: g.cfg.ID, keep: keep[h], holdUntil: time.Now().Add(b.allow.hold)}
+			b.allow.orphans[key] = n - gone
 		}
 	}
 	if b.allow.uncertain[g.cfg.ID] -= total; b.allow.uncertain[g.cfg.ID] <= 0 {
@@ -705,6 +813,16 @@ func (b *broker) loadAllowances() error {
 	b.allow.byGuest = map[string]*guestAllowance{}
 	b.allow.uncertain = map[string]int{}
 	b.allow.orphans = map[string]int{}
+	b.allow.removed = map[string]int{}
+	b.allow.unlisted = map[*hotel]bool{}
+	switch hold := b.cfg.UncertainCreateHoldSeconds; {
+	case hold == 0:
+		b.allow.hold = hotelCreateTimeout
+	case time.Duration(hold)*time.Second < hotelCreateTimeout:
+		return fmt.Errorf("config: uncertain_create_hold_seconds must be at least the create timeout to a hotel (%d s): a create the broker gave up on can still start a room until then", int(hotelCreateTimeout.Seconds()))
+	default:
+		b.allow.hold = time.Duration(hold) * time.Second
+	}
 	startMs := time.Now().UnixMilli()
 	for id, g := range b.guests {
 		if g.limits.Metered && b.cfg.StateDir == "" {
@@ -722,6 +840,21 @@ func (b *broker) loadAllowances() error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
+	// A file that does not parse, or holds an entry that is not usable, is
+	// kept aside and replaced at once by a file holding the closed entries
+	// and their issue watermarks, so a later start keeps them too.
+	quarantine := func(why string) error {
+		aside := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405Z")
+		if werr := os.WriteFile(aside, raw, 0o600); werr != nil {
+			log.Printf("%s: %s; the old file was not kept aside: %v", path, why, werr)
+		} else {
+			log.Printf("%s: %s; the old file is kept at %s", path, why, aside)
+		}
+		if err := b.saveAllowances(b.allow.byGuest); err != nil {
+			return fmt.Errorf("%s: %s, and the closed state could not be written: %w", path, why, err)
+		}
+		return nil
+	}
 	var f allowanceFile
 	if err := json.Unmarshal(raw, &f); err != nil || f.Version != 1 || f.Guests == nil {
 		for id, g := range b.guests {
@@ -729,24 +862,22 @@ func (b *broker) loadAllowances() error {
 				b.allow.byGuest[id] = &guestAllowance{Issue: startMs}
 			}
 		}
-		aside := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405Z")
-		if rerr := os.Rename(path, aside); rerr != nil {
-			log.Printf("%s does not parse (%v) and was not moved aside: %v; metered guests stay closed until the ledger sends an issue above %d", path, err, rerr, startMs)
-			return nil
-		}
-		log.Printf("%s does not parse (%v); moved to %s; metered guests stay closed until the ledger sends an issue above %d", path, err, aside, startMs)
-		return nil
+		return quarantine(fmt.Sprintf("does not parse (%v); metered guests stay closed until the ledger sends an issue above %d", err, startMs))
 	}
+	closed := false
 	for id, a := range f.Guests {
 		switch {
 		case a.Issue < 1:
 			log.Printf("%s: guest %s: the stored issue is not usable; the guest stays closed until the ledger sends an issue above %d", path, id, startMs)
-			a = guestAllowance{Issue: startMs}
+			a, closed = guestAllowance{Issue: startMs}, true
 		case !a.usable():
 			log.Printf("%s: guest %s: the stored allowance is not usable; the guest stays closed until the ledger sends an issue above %d", path, id, a.Issue)
-			a = guestAllowance{Issue: a.Issue}
+			a, closed = guestAllowance{Issue: a.Issue}, true
 		}
 		b.allow.byGuest[id] = &a
+	}
+	if closed {
+		return quarantine("an entry is not usable")
 	}
 	return nil
 }

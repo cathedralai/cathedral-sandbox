@@ -52,8 +52,8 @@ type guestLimits struct {
 	// the guest-wide form of the create flag "own_hosts_only" (images.go).
 	OwnHostsOnly bool `json:"own_hosts_only,omitempty"`
 	// Metered: the guest is admitted only on the ledger's allowance
-	// (allowance.go). It starts closed: cap 0 and no lease. A PUT of an
-	// allowance also makes a guest metered.
+	// (allowance.go). It starts closed: cap 0 and no lease. Only the config
+	// makes a guest metered.
 	Metered bool `json:"metered,omitempty"`
 }
 

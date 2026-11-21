@@ -139,6 +139,11 @@ type config struct {
 	// MaxQueueWaitSeconds: a create that waits longer than this for a create
 	// slot at its hotel moves to another eligible hotel (default 10; -1: never).
 	MaxQueueWaitSeconds float64 `json:"max_queue_wait_seconds"`
+	// UncertainCreateHoldSeconds: how long a metered guest's create attempt
+	// whose answer was lost, and whose reap found no room, still counts
+	// against its cap (allowance.go). 0 or absent: the create timeout to a
+	// hotel (hotelCreateTimeout, 720); less is refused.
+	UncertainCreateHoldSeconds int `json:"uncertain_create_hold_seconds,omitempty"`
 	// MemFullPct: a hotel whose host memory use is at or above this percent
 	// takes no new rooms (default 90; -1: no memory limit). Slots come from an
 	// install-time sizing with memory overcommit, so they cannot see rooms
@@ -341,6 +346,9 @@ type unreapedBatch struct {
 	guest string
 	keep  map[string]bool // room ids the request did receive: never reaped
 	busy  bool            // a removal pass is running
+	// holdUntil: a metered guest's lost create whose reap found no room; the
+	// record stays, unlisted, until then (allowance.go settleUncertain).
+	holdUntil time.Time
 }
 
 type guestState struct {
@@ -952,8 +960,21 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
 	extra := diskExtra(pl.diskGiB) // held on the hotel (holdDisk) from pick until the room is known or the create ends (disk.go)
+	// size: read from body at the first retry of a metered create (allowance.go).
+	var size *createSize
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 && size == nil && g.limits.Metered { // Metered is set once, at load
+			s := createSizeOf(body)
+			size = &s
+		}
 		b.mu.Lock()
+		if size != nil {
+			// A retry is a new admission for a metered guest (allowance.go).
+			if e, retry := b.retryRefusalLocked(g, *size); e != nil {
+				b.mu.Unlock()
+				return finish(refusedRetry(last, e, retry))
+			}
+		}
 		h := b.pick(tried, pl)
 		if h == nil && !fellBack {
 			// "placement": "prefer": the named hotels are down or full.
@@ -1172,10 +1193,6 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 				b.mu.Unlock()
 				return finish(last)
 			}
-			if b.retryRefusedLocked(g) { // a metered guest: no room under the cap for a retry (allowance.go)
-				b.mu.Unlock()
-				return finish(last)
-			}
 			b.mu.Unlock()
 			continue
 		}
@@ -1262,7 +1279,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 			}
 		}
 	}
-	b.settleUncertain(g, batchID, results) // allowance.go
+	b.settleUncertain(g, batchID, results, keep) // allowance.go
 	return results
 }
 
@@ -1347,6 +1364,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
 			b.release(h, rm)
 		}
+		b.noteOrphanRemovedLocked(h, batchID) // allowance.go
 		b.mu.Unlock()
 		log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, guestID)
 	}
@@ -2355,6 +2373,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	for batchID, ub := range h.unreaped {
 		switch {
 		case ub.busy:
+		case !leftover[batchID] && now.Before(ub.holdUntil): // a lost create may still start its room (allowance.go)
 		case !leftover[batchID]:
 			delete(h.unreaped, batchID) // the hotel lists none of its rooms
 			log.Printf("orphan rooms on hotel %s (batch %s) no longer listed", h.cfg.ID, batchID)
