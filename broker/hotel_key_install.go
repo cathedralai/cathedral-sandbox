@@ -166,6 +166,16 @@ func (b *broker) installHotelKey(ctx context.Context, h *hotel, raw []byte, peer
 	// health and admission at once instead of at the next attest retry.
 	h.adm.checkedAt = time.Time{}
 	log.Printf("hotel %s: hotel key %s... installed in the guest on TLS key %s...", h.cfg.ID, keySHA[:12], peerSPKI[:16])
+	// The hotel came up before this install, and syncHotel held its pulls
+	// (AB#896). Each takes b.mu itself, so it runs in its own goroutine.
+	if h.pullsOwed && h.ok {
+		h.pullsOwed = false
+		log.Printf("hotel %s: starting the image pulls held for the key install", h.cfg.ID)
+		if b.prewarms(h) {
+			go b.prewarmHotel(h)
+		}
+		go b.replayGuestPrefetch(h)
+	}
 }
 
 func (b *broker) sendHotelKeyInstall(ctx context.Context, h *hotel, raw []byte, peerSPKI string) (string, error) {

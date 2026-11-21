@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +57,9 @@ type installGuest struct {
 	dropAnswer bool   // install, then drop the connection before answering
 	posts      int
 	bearerSeen int // keyed calls before an install
+
+	prefetch401 int            // POST /v1/images/prefetch answered 401 (no key installed)
+	pulled      map[string]int // keyed prefetch pulls by "<guest header> <image>"
 }
 
 func newInstallGuest(t *testing.T, hotel string, signers ...string) *installGuest {
@@ -139,7 +143,11 @@ func (g *installGuest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if g.key == "" || got != g.key {
+	keyed := g.key != "" && got == g.key
+	if r.URL.Path == "/v1/images/prefetch" {
+		g.notePrefetch(r, keyed)
+	}
+	if !keyed {
 		if g.key == "" && got != "" {
 			g.bearerSeen++
 		}
@@ -156,6 +164,31 @@ func (g *installGuest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, 200, map[string]any{"ok": true})
 	}
+}
+
+// notePrefetch counts a POST /v1/images/prefetch. Caller holds g.mu.
+func (g *installGuest) notePrefetch(r *http.Request, keyed bool) {
+	if !keyed {
+		g.prefetch401++
+		return
+	}
+	var body struct {
+		Images []string `json:"images"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if g.pulled == nil {
+		g.pulled = map[string]int{}
+	}
+	for _, im := range body.Images {
+		g.pulled[r.Header.Get(guestHeader)+" "+im]++
+	}
+}
+
+// prefetches returns the 401 prefetch count and a copy of the keyed pulls.
+func (g *installGuest) prefetches() (int, map[string]int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.prefetch401, maps.Clone(g.pulled)
 }
 
 // serveInstall is room_receipts.Ledger.install_hotel_key. Caller holds g.mu.
@@ -460,6 +493,166 @@ func TestConfigHotelKeyInstallRefusalsKeepTheHotelOut(t *testing.T) {
 	if installErr(tc, h) != "install_key_signature_invalid" || g.posts != 0 {
 		t.Fatalf("forged install key: err %q posts %d", installErr(tc, h), g.posts)
 	}
+}
+
+// AB#896: the come-up pulls (catalog prewarm, guest prefetch replay) wait for
+// the hotel key install. A guest without the key answers health 401, but a
+// room call it answers counts as an answer (any status under 500, a 401 too),
+// so syncHotel can see an installer hotel come up while the guest holds no
+// key. Every pull would answer 401 then, and nothing would start them again.
+
+// prewarmInstallHotel is installHotel with prewarm_catalog set to on.
+func prewarmInstallHotel(t *testing.T, tc *testChain, signerFile string, g *installGuest, on bool) *hotel {
+	t.Helper()
+	if err := writePrewarm(tc, on, nil); err != nil {
+		t.Fatal(err)
+	}
+	return installHotel(t, tc, signerFile, g)
+}
+
+// upWithoutKey brings h up while the guest refuses the key install: the first
+// sync pins, is refused and finds health 401 (down); then a guest call to a
+// room there answers 401, and the next sync counts the hotel up on it.
+func upWithoutKey(t *testing.T, tc *testChain, g *installGuest, h *hotel) {
+	t.Helper()
+	ctx := context.Background()
+	g.mu.Lock()
+	g.refuse = "install_not_fresh"
+	g.mu.Unlock()
+	tc.b.syncHotel(ctx, h)
+	setHotel(tc, h.cfg.ID, func(h *hotel) { h.lastOK = time.Now().Add(-time.Minute) }) // health answered before this boot
+	if status, _, _, err := h.do(ctx, "GET", "/v1/sandboxes/r1", nil, nil, 5*time.Second); err != nil || status != 401 {
+		t.Fatalf("room call to the keyless guest: %d %v", status, err)
+	}
+	tc.b.syncHotel(ctx, h)
+	tc.b.mu.Lock()
+	up, needed := h.ok, h.installNeeded()
+	tc.b.mu.Unlock()
+	if !up || !needed {
+		t.Fatalf("fixture: up %t, install needed %t; want the hotel up before its install", up, needed)
+	}
+}
+
+// installNow lets the guest take the key and runs the sync pass whose pin
+// recheck installs it.
+func installNow(t *testing.T, tc *testChain, g *installGuest, h *hotel) {
+	t.Helper()
+	g.mu.Lock()
+	g.refuse = ""
+	g.mu.Unlock()
+	setHotel(tc, h.cfg.ID, func(h *hotel) { h.pinCheckedAt = time.Time{} })
+	tc.b.syncHotel(context.Background(), h)
+	if g.installed() != installHotelKeyValue || installErr(tc, h) != "" {
+		t.Fatalf("late install: key installed %t, err %q", g.installed() == installHotelKeyValue, installErr(tc, h))
+	}
+}
+
+// catalogPulls is the set of prewarm pulls h gets, keyed as installGuest.pulled.
+func catalogPulls(t *testing.T, h *hotel) map[string]bool {
+	t.Helper()
+	want := map[string]bool{}
+	for _, tp := range catalogTemplates {
+		if tp.Live && tp.Image != "" && prewarmsTemplate(h, tp) {
+			want[" "+tp.Image] = true
+		}
+	}
+	if !want[" "+warmImage] {
+		t.Fatalf("fixture: %s is not a prewarm image of hotel %s", warmImage, h.cfg.ID)
+	}
+	return want
+}
+
+// pulledOnce waits until the guest pulled every key of want, gives later sync
+// passes the chance to start a second pull, and checks each was pulled once.
+func pulledOnce(t *testing.T, tc *testChain, g *installGuest, h *hotel, want map[string]bool) {
+	t.Helper()
+	waitFor(t, "the pulls", func() bool {
+		_, pulled := g.prefetches()
+		return len(pulled) >= len(want)
+	})
+	tc.b.syncHotel(context.Background(), h)
+	tc.b.syncHotel(context.Background(), h)
+	time.Sleep(200 * time.Millisecond) // a second pull would run in the background
+	refused, pulled := g.prefetches()
+	if refused != 0 || len(pulled) != len(want) {
+		t.Fatalf("%d prefetches answered 401, pulls %v; want each of %v once", refused, pulled, want)
+	}
+	for k := range want {
+		if pulled[k] != 1 {
+			t.Fatalf("pulls %v; want each of %v once", pulled, want)
+		}
+	}
+}
+
+func TestCatalogPrewarmWaitsForALateKeyInstall(t *testing.T) {
+	signerFile, signer, _ := installSeedFile(t, 0o600)
+	tc := newChainState(t, t.TempDir())
+	g := newInstallGuest(t, "ct", signer)
+	h := prewarmInstallHotel(t, tc, signerFile, g, true)
+	upWithoutKey(t, tc, g, h)
+	time.Sleep(200 * time.Millisecond) // a pull started at the come-up would run in the background
+	if refused, pulled := g.prefetches(); refused != 0 || len(pulled) != 0 {
+		t.Fatalf("come-up before the install: %d prefetches answered 401, pulls %v; want none", refused, pulled)
+	}
+	tc.b.mu.Lock()
+	gen := h.warmGen
+	tc.b.mu.Unlock()
+
+	installNow(t, tc, g, h)
+	pulledOnce(t, tc, g, h, catalogPulls(t, h))
+	waitFor(t, warmImage+" warm", func() bool {
+		tc.b.mu.Lock()
+		defer tc.b.mu.Unlock()
+		return h.warm[warmImage]
+	})
+	tc.b.mu.Lock()
+	sameUp := h.ok && h.warmGen == gen
+	tc.b.mu.Unlock()
+	if !sameUp {
+		t.Fatal("the hotel went down and came up again; want the pulls on the same come-up")
+	}
+}
+
+func TestGuestReplayWaitsForALateKeyInstall(t *testing.T) {
+	signerFile, signer, _ := installSeedFile(t, 0o600)
+	tc := newChainState(t, t.TempDir())
+	g := newInstallGuest(t, "ct", signer)
+	h := prewarmInstallHotel(t, tc, signerFile, g, false)
+	// g1 prefetched guestImage on ct before the guest rebooted.
+	setHotel(tc, "ct", func(h *hotel) { h.guestWant = map[string]map[string]time.Time{"g1": {guestImage: time.Now()}} })
+	upWithoutKey(t, tc, g, h)
+	time.Sleep(200 * time.Millisecond)
+	if refused, pulled := g.prefetches(); refused != 0 || len(pulled) != 0 {
+		t.Fatalf("come-up before the install: %d prefetches answered 401, pulls %v; want none", refused, pulled)
+	}
+
+	installNow(t, tc, g, h)
+	pulledOnce(t, tc, g, h, map[string]bool{"g1 " + guestImage: true})
+	waitFor(t, "the guest ref warm", func() bool {
+		tc.b.mu.Lock()
+		defer tc.b.mu.Unlock()
+		return h.guestWarm["g1"][guestImage]
+	})
+}
+
+// The usual order: the install lands in the sync pass before health first
+// answers. The come-up starts the pulls, once.
+func TestKeyInstalledBeforeTheComeUpPullsOnce(t *testing.T) {
+	signerFile, signer, _ := installSeedFile(t, 0o600)
+	tc := newChainState(t, t.TempDir())
+	g := newInstallGuest(t, "ct", signer)
+	h := prewarmInstallHotel(t, tc, signerFile, g, true)
+	setHotel(tc, "ct", func(h *hotel) {
+		h.ok = false // as at broker start
+		h.guestWant = map[string]map[string]time.Time{"g1": {guestImage: time.Now()}}
+	})
+	tc.b.syncHotel(context.Background(), h) // pins, installs, then health answers: the come-up
+	if g.installed() != installHotelKeyValue {
+		t.Fatal("fixture: no install in the first sync")
+	}
+	want := catalogPulls(t, h)
+	want["g1 "+guestImage] = true
+	pulledOnce(t, tc, g, h, want)
 }
 
 func TestConfigHotelKeyInstallLoadRules(t *testing.T) {

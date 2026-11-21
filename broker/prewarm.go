@@ -27,6 +27,7 @@ func (b *broker) hotelWentDown(h *hotel) {
 	h.warm = nil
 	h.guestWarm = nil
 	h.warmGen++
+	h.pullsOwed = false // the next come-up decides again
 }
 
 // prewarms reports whether h pulls the catalog images when it comes up:
