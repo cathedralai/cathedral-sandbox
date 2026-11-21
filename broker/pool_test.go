@@ -713,3 +713,38 @@ func TestPoolRestartDeletesAProvenRoomOfNoKey(t *testing.T) {
 		t.Fatalf("deletes %v, want r-other\n%s", dels, pc.debug("a"))
 	}
 }
+
+// With two keys, a cold image of one key stops only that key's pool creates:
+// the other key's warm image still fills (codex review of #658).
+func TestPoolColdKeyDoesNotStopAWarmKey(t *testing.T) {
+	lfm, _ := templateByName("lfm3-1.7b")
+	pc := newPoolChain(t, []string{"a"}, func(c *config) {
+		c.ReadyRooms.Keys = append(c.ReadyRooms.Keys, readyRoomKeyEntry{Template: "lfm3-1.7b"})
+	})
+	f := pc.hotels["a"]
+	f.set(func(f *fakePoolHotel) { f.coldImages = map[string]bool{lfm.Image: true} })
+	pc.up("a")
+	st, doc := pc.operator("PUT", "/v1/broker/ready-rooms", map[string]any{"per_hotel": map[string]int{"node-22": 2, "lfm3-1.7b": 1},
+		"refill_per_second": 4, "refill_during_claims": 1, "reserve_share": 0.25})
+	if st != 200 {
+		t.Fatalf("PUT: %d %v", st, doc)
+	}
+	pc.steps("a", 4)
+	var node, other int
+	for _, c := range f.creates() {
+		switch {
+		case strings.Contains(string(c.body), nodeImage()):
+			node++
+		default:
+			other++
+		}
+	}
+	if node != 2 || other != 0 {
+		t.Fatalf("creates: %d node-22, %d of the cold key; want 2 and 0\n%s", node, other, pc.debug("a"))
+	}
+	_, doc = pc.operator("GET", "/v1/broker/ready-rooms", nil)
+	ha := doc["hotels"].(map[string]any)["a"].(map[string]any)
+	if why, _ := ha["cold_keys"].([]any); len(why) != 1 || why[0] != "lfm3-1.7b" {
+		t.Fatalf("GET hotel a: %v", ha)
+	}
+}

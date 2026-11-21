@@ -62,7 +62,8 @@ type fakePoolHotel struct {
 	listFail      bool
 	attestFail    bool
 	deleteFail    bool
-	createFail    bool // answer creates 503 and start no room
+	createFail    bool            // answer creates 503 and start no room
+	coldImages    map[string]bool // a prefetch of one of these answers 502: the image stays cold
 	readFail      bool
 	prefetchGate  chan struct{} // non-nil: a prefetch waits for it
 }
@@ -216,6 +217,16 @@ func (f *fakePoolHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "/v1/quota":
 		reply(200, map[string]any{"usage": map[string]any{}})
 	case p == "/v1/images/prefetch" && r.Method == "POST":
+		var doc struct {
+			Images []string `json:"images"`
+		}
+		_ = json.Unmarshal(body, &doc)
+		for _, img := range doc.Images {
+			if f.coldImages[img] {
+				reply(502, map[string]any{"error": map[string]any{"code": "image_pull_failed"}})
+				return
+			}
+		}
 		reply(200, map[string]any{"state": "done"})
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		if f.listFail || f.healthFail {

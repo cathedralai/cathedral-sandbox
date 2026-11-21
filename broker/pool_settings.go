@@ -109,6 +109,17 @@ func (p *readyRooms) key(name string) *poolKey {
 	return nil
 }
 
+// keysWithTarget is the keys whose target is above 0. Caller holds b.mu.
+func (p *readyRooms) keysWithTarget() []string {
+	var out []string
+	for _, k := range p.keys {
+		if p.settings.target(k.name) > 0 {
+			out = append(out, k.name)
+		}
+	}
+	return out
+}
+
 func (p *readyRooms) keyByImage(image string) *poolKey {
 	for i := range p.keys {
 		if p.keys[i].image == image {
@@ -429,6 +440,13 @@ func (b *broker) readyRoomsViewLocked(now time.Time) map[string]any {
 		d := map[string]any{"ready": c.ready, "claiming": 0, "stale": c.stale, "quarantined": c.quarantined,
 			"unverified": c.unverified, "creating": c.creating, "mapped": 0, "bound": p.boundLocked(),
 			"pool_creates": why == "", "listed_since_start": p.hotel(id).listed}
+		if cold := b.poolColdKeysLocked(h); len(cold) > 0 {
+			d["cold_keys"] = cold // these keys get no pool create here until their image is warm
+			if why == "" && len(cold) == len(p.keysWithTarget()) {
+				why = "image of " + strings.Join(cold, ", ") + " not warm"
+				d["pool_creates"] = false
+			}
+		}
 		if why != "" {
 			d["why_no_creates"] = why
 		}

@@ -10,9 +10,9 @@
 // Where pool rooms are made. A hotel takes pool creates only when it is an
 // operator hotel (no miner hotkey), shared (not reserved for a guest),
 // sealed, admitted with a verified SEV-SNP attestation whose AMD chain passed
-// and whose binding names a receipt key, the key's image is warm there (the
-// catalog pre-pull, prewarm.go), and it would place a room now
-// (admissibleFree, diskFits). At most 1 pool create a second per hotel: a
+// and whose binding names a receipt key, and it would place a room now
+// (admissibleFree, diskFits); and a key's rooms go only where that key's
+// image is warm (the catalog pre-pull, prewarm.go). At most 1 pool create a second per hotel: a
 // create starts no sooner than poolCreateEvery after the previous one's
 // answer, and a create slot is taken without waiting, so a customer create
 // never waits for a pool create.
@@ -307,12 +307,19 @@ func (b *broker) poolCreateRefusalLocked(h *hotel, ph *poolHotel, now time.Time)
 	if b.admissibleFree(h, now) <= 0 {
 		return "takes no room now"
 	}
-	for _, k := range p.keys {
-		if p.settings.target(k.name) > 0 && !h.warm[k.image] {
-			return "image of " + k.name + " not warm"
+	return ""
+}
+
+// poolColdKeysLocked is the keys with a target whose image is not warm on h:
+// they get no pool create there; the other keys do. Caller holds b.mu.
+func (b *broker) poolColdKeysLocked(h *hotel) []string {
+	var cold []string
+	for _, k := range b.pool.keys {
+		if b.pool.settings.target(k.name) > 0 && !h.warm[k.image] {
+			cold = append(cold, k.name)
 		}
 	}
-	return ""
+	return cold
 }
 
 // poolWork is what one step does outside b.mu.
@@ -437,7 +444,7 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	}
 	for i := range p.keys {
 		k := &p.keys[i]
-		if ph.creating[k.name]+len(ready[k.name]) < p.settings.target(k.name) && b.diskFits(h, k.diskGiB) {
+		if ph.creating[k.name]+len(ready[k.name]) < p.settings.target(k.name) && h.warm[k.image] && b.diskFits(h, k.diskGiB) {
 			w.create = k
 			break
 		}
@@ -677,7 +684,7 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	pl := placement{diskGiB: k.diskGiB}
 	b.mu.Lock()
 	ph := p.hotel(h.cfg.ID)
-	if why := b.poolCreateRefusalLocked(h, ph, time.Now()); why != "" {
+	if why := b.poolCreateRefusalLocked(h, ph, time.Now()); why != "" || !h.warm[k.image] {
 		b.mu.Unlock()
 		<-h.sem
 		return
