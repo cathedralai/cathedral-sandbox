@@ -237,3 +237,65 @@ def test_the_real_api_room_is_reaped_signed_and_the_chain_verifies(tmp_path, mon
         server.shutdown()
         httpd.shutdown()
         provider.close()
+
+
+def test_a_heartbeat_during_the_reap_is_refused_so_the_limit_read_is_the_one_deleted_on(tmp_path, monkeypatch) -> None:
+    # Review of #645: on an ordinary room a delete holds no token, so a heartbeat could land between the
+    # reaper's last look at expires_at and its DELETE. The reaping mark closes that window.
+    from cathedral.sandbox_provider import InMemorySandboxProvider
+    from cathedral.sandbox_server import SandboxApplication, run
+
+    monkeypatch.setattr(rr, "tsm_provider", lambda: None)
+    provider = InMemorySandboxProvider()
+    httpd, (_, api_port) = run(SandboxApplication(provider, require_auth=False))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    ledger = rr.Ledger("room-a", str(tmp_path))
+    server = rr.Server(("127.0.0.1", 0), ledger, api_port, 1, KEY, "/x.sock", pool_scan=False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+
+    def call(method: str, path: str, doc=None):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request(method, path, body=json.dumps(doc) if doc is not None else None, headers=AUTH)
+        r = c.getresponse()
+        return r.status, r.read()
+
+    try:
+        status, out = call("POST", "/v1/sandboxes", {"image": "alpine:3.20", "ttl_seconds": 1})
+        room = json.loads(out)["id"]
+        seen: list[tuple[int, bytes]] = []
+        real_get = server.api_get
+
+        def racing_get(path: str, timeout: float, total: float | None = None):
+            if path == f"/v1/sandboxes/{room}":
+                seen.append(call("PATCH", f"/v1/sandboxes/{room}", {"ttl_seconds": 600}))  # a heartbeat
+                seen.append(call("GET", f"/v1/sandboxes/{room}"))  # a read still passes
+            return real_get(path, timeout, total)
+
+        monkeypatch.setattr(server, "api_get", racing_get)
+        signed = server.reap_due(time.time() + 1 + rr.REAP_AFTER_SECONDS + 1)
+        assert seen[0][0] == 409 and json.loads(seen[0][1])["error"]["code"] == "room_reaping"
+        assert seen[1][0] == 200
+        assert [s["statement"]["reason"] for s in signed] == ["ttl"]
+        assert ledger.reaping == set()
+        assert call("GET", f"/v1/sandboxes/{room}")[0] == 404
+    finally:
+        server.shutdown()
+        httpd.shutdown()
+        provider.close()
+
+
+def test_the_reaping_mark_refuses_writes_but_not_reads_or_a_delete(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rr, "tsm_provider", lambda: None)
+    ledger = rr.Ledger("room-a", str(tmp_path))
+    ledger.reaping.add("sbx_1")
+    for kind in ("other", "signed", "claim"):
+        turn, refusal = ledger.enter("sbx_1", kind)
+        assert turn is None and refusal[1] == "room_reaping"
+    for kind in ("read", "record_read", "delete"):
+        turn, refusal = ledger.enter("sbx_1", kind)
+        assert refusal is None
+        ledger.leave(turn)
+    turn, refusal = ledger.enter("sbx_2", "other")
+    assert refusal is None
+    ledger.leave(turn)

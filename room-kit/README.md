@@ -229,12 +229,14 @@ its 300 s grace, and that removal never passes the front. With receipts on,
 the front deletes such a room first. Every `ROOM_REAP_SECONDS` (default 15, 0
 leaves TTL deletes to the API alone) it lists the rooms, and for each room
 whose `expires_at` lies at least `ROOM_REAP_AFTER_SECONDS` (default 30, at
-most 240) in the past it enters the room as a caller's delete does, asks the
-API for that room again (a heartbeat since the list keeps the room), and
-sends one `DELETE`. The answer is signed as a `delete` receipt with
+most 240) in the past it enters the room as a caller's delete does. A room
+with another request in flight is left for the next pass; otherwise, in the
+same locked step, the room is marked reaping: until the delete is signed,
+every new request but a read or a delete gets 409 `room_reaping`. Then it
+asks the API for that room again (a heartbeat since the list keeps the room)
+and sends one `DELETE`. The answer is signed as a `delete` receipt with
 `reason: "ttl"` and `ttl_expires_at`; a lost answer is signed as 502. A busy
-serial room, a room with another request in flight and a failed list are left
-for the next pass. The API's own clean-up and `<ROOM_ID>-reaper.timer` stay as
+serial room and a failed list are left for the next pass. The API's own clean-up and `<ROOM_ID>-reaper.timer` stay as
 the backstop (front down or slow); a room they remove is ended by the look
 above with a `room_end`. Rooms the API removes for an idle window or a
 revoked key are not TTL deletes: they also end with a `room_end`.

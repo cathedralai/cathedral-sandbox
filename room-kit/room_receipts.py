@@ -2250,6 +2250,9 @@ class Ledger:
         # rooms that lost or never signed an action. Marks go when a 2xx delete is signed.
         self.in_flight: dict[str, int] = {}
         self.busy: set[str] = set()
+        # Rooms the TTL reaper is deleting (Server.reap_room): from its last look at expires_at to its signed
+        # delete, no request that could move the limit is let in (AB#385).
+        self.reaping: set[str] = set()
         self.serial: set[str] = set()
         self.broken: set[str] = set()
         # The flag of a serial or pool create needs that nothing ran in the room before the create was signed. The
@@ -2362,6 +2365,8 @@ class Ledger:
         """
         with self.lock:
             new_claim = kind == "claim" and room not in self.claimed
+            if room in self.reaping and kind not in ("read", "record_read", "delete"):
+                return None, (409, "room_reaping", "this room is past its limit and is being deleted")
             if new_claim and self.bulk_pending:
                 return None, (409, "pool_bulk_delete_busy", "a bulk delete is waiting or running; the room is not handed over")
             token = False
@@ -4414,20 +4419,25 @@ class Server(ThreadingHTTPServer):
     def reap_room(self, room: str, expires_at: str, now: float | None = None) -> dict | None:
         """Delete one due room with a signed receipt, or None when it was left for a later pass.
 
-        The room is entered as a caller's delete is (a busy serial room is left alone), and it is asked for
-        again inside that turn: a heartbeat since the list moved its limit, and such a room is not deleted.
-        A room with another request in flight is left too. The delete is sent once; a lost answer is signed
+        The room is entered as a caller's delete is (a busy serial room is left alone). A room with another
+        request in flight is left. Otherwise the room is marked reaping, which refuses every new request but a
+        read or a delete (409 room_reaping), and only then asked for again: a heartbeat since the list moved its
+        limit, and such a room is not deleted. No heartbeat can land between that look and the delete. The delete is sent once; a lost answer is signed
         as 502, as for a caller.
         """
         ledger = self.ledger
         turn, refusal = ledger.enter(room, "delete")
         if refusal is not None:
             return None
+        marked = False
         try:
             with ledger.lock:
-                alone = ledger.in_flight.get(room) == 1
-            if not alone:
-                return None
+                # Alone, and from here no request that could move the limit is let in, so the expires_at read
+                # below is still the room's limit when the delete is sent. A caller's delete still passes.
+                if ledger.in_flight.get(room) != 1 or room in ledger.reaping:
+                    return None
+                ledger.reaping.add(room)
+                marked = True
             got = self.api_get(f"/v1/sandboxes/{room}", 30)
             if got is None or got[0] != 200:
                 return None  # gone already (the look ends it) or no answer: nothing is sent
@@ -4459,6 +4469,9 @@ class Server(ThreadingHTTPServer):
                   f"receipt {receipt['receipt_sha256']}", flush=True)
             return receipt
         finally:
+            if marked:
+                with ledger.lock:
+                    ledger.reaping.discard(room)
             ledger.leave(turn)
 
     def api_send(self, method: str, path: str, timeout: float) -> tuple[int | None, bytes]:
