@@ -412,6 +412,55 @@ func TestQuarantineFillingTheBoundStopsRefill(t *testing.T) {
 	}
 }
 
+// On an incomplete journal, or one that could not be opened, the manager
+// creates and deletes nothing.
+func TestPoolManagerOffWhenJournalIncomplete(t *testing.T) {
+	for _, how := range []string{"incomplete", "unavailable"} {
+		t.Run(how, func(t *testing.T) {
+			pc := newPoolChain(t, []string{"a"}, nil)
+			f := pc.hotels["a"]
+			f.addRoom("r-pool", "pool") // provably unclaimed and over target 0: deleted on a complete journal
+			switch how {
+			case "incomplete":
+				pc.breakJournal()
+			case "unavailable":
+				pc.b.pool.close()
+				_ = os.RemoveAll(filepath.Join(pc.stateDir, claimJournalDirName))
+				_ = os.Remove(filepath.Join(pc.stateDir, claimJournalIDName))
+				if err := os.WriteFile(filepath.Join(pc.stateDir, claimJournalDirName), []byte("not a directory"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pc.start()
+			if pc.b.pool.journalState != how {
+				t.Fatalf("journal %s, want %s", pc.b.pool.journalState, how)
+			}
+			pc.up("a")
+			pc.target(3)
+			for i := 0; i < 5; i++ {
+				pc.sync("a")
+				pc.step("a")
+			}
+			pc.target(0)
+			pc.steps("a", 3)
+			if n := len(f.creates()); n != 0 {
+				t.Fatalf("%d creates on a journal %s, want 0", n, how)
+			}
+			if n := len(f.roomDeletes()); n != 0 {
+				t.Fatalf("%d deletes on a journal %s, want 0", n, how)
+			}
+			_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
+			ha := doc["hotels"].(map[string]any)["a"].(map[string]any)
+			if ha["pool_creates"] != false || !strings.Contains(ha["why_no_creates"].(string), "claim journal "+how) {
+				t.Fatalf("GET hotel a %v", ha)
+			}
+			if j := doc["journal"].(map[string]any); j["state"] != how {
+				t.Fatalf("GET journal %v", j)
+			}
+		})
+	}
+}
+
 // Pool creates go only to operator, shared, sealed hotels with a verified
 // attestation where the image is warm.
 func TestPoolOnlyOnOperatorSealedAttestedWarmHotels(t *testing.T) {

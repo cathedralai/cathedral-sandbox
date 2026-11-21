@@ -290,6 +290,10 @@ func (b *broker) poolAttestLocked(h *hotel, ph *poolHotel, now time.Time) (poolA
 func (b *broker) poolCreateRefusalLocked(h *hotel, ph *poolHotel, now time.Time) string {
 	p := b.pool
 	switch {
+	case !p.journalOK():
+		return "claim journal " + p.journalState
+	case !ph.listed:
+		return "no room list since start"
 	case h.cfg.MinerHotkey != "":
 		return "miner hotel"
 	case h.reservedFor() != "":
@@ -362,6 +366,12 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	ph := p.hotel(h.cfg.ID)
+	if !ph.listed {
+		if !h.listOK {
+			return nil // the room map is empty because nobody looked
+		}
+		ph.listed = true
+	}
 	// Rooms the hotel no longer holds are gone; pool-labelled rooms the
 	// manager does not hold are unverified.
 	for hid := range ph.rooms {
@@ -390,6 +400,9 @@ func (b *broker) poolPlan(h *hotel) *poolWork {
 				w.reads = append(w.reads, pr.hid)
 			}
 		}
+	}
+	if !p.journalOK() {
+		return w // reads only: no create, no delete
 	}
 	ready := map[string][]*poolRoom{}
 	for _, pr := range sortedPoolRooms(ph) {
@@ -608,7 +621,7 @@ func (b *broker) poolDelete(ctx context.Context, h *hotel, hid string) {
 	b.mu.Lock()
 	ph := b.pool.hotel(h.cfg.ID)
 	pr := ph.rooms[hid]
-	ok := pr != nil && pr.state == poolStale && pr.proven
+	ok := pr != nil && pr.state == poolStale && pr.proven && b.pool.journalOK()
 	b.mu.Unlock()
 	if !ok {
 		return
