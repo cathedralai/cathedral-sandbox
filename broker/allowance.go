@@ -297,6 +297,17 @@ func (b *broker) allowanceRefusalLocked(g *guestState, n int, now time.Time) (*a
 	return nil, 0
 }
 
+// compatCountOf is the count a compat create asks for, for its early metered
+// checks: 1 unless a whole number from 1 to compatMaxCount (the create
+// validates count again and refuses a bad one).
+func compatCountOf(req map[string]any) int {
+	f, ok := req["count"].(float64)
+	if !ok || f != math.Trunc(f) || f < 1 || f > compatMaxCount {
+		return 1
+	}
+	return int(f)
+}
+
 // meteredRefusal is allowanceRefusalLocked under b.mu: an early refusal,
 // before any hotel or build call. admitCreate decides.
 func (b *broker) meteredRefusal(g *guestState, n int) (*apiErr, int) {

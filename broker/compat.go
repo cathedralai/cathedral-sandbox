@@ -445,7 +445,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	// A metered guest out of its allowance: refused before any hotel or build call (allowance.go).
-	if e, retry := b.meteredRefusal(g, 1); e != nil {
+	if e, retry := b.meteredRefusal(g, compatCountOf(req)); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
@@ -530,7 +530,7 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 	}
 	native["ttl_seconds"] = ttl
 	// A metered guest: allowance, size and lifetime before any hotel call (allowance.go).
-	if e, retry := b.meteredCreate(g, native, 1); e != nil {
+	if e, retry := b.meteredCreate(g, native, compatCountOf(req)); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}

@@ -1995,3 +1995,90 @@ func TestMeteredRejectedJoinsLeaveNothingBehind(t *testing.T) {
 		t.Fatalf("%d rejected joins kept in the metered recount", n)
 	}
 }
+
+// ---------------------------------------------------------------- compat count (AB#865)
+
+func TestMeteredCompatCountIsOneAdmission(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "count": 5}), nil)
+	if _, creates, _ := hotelCalls(tc, lives); status != 402 || anyCode(doc) != "allowance_exhausted" || creates != 0 {
+		t.Fatalf("compat count 5 at cap 3: %d %v, %d creates", status, doc, creates)
+	}
+	status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "count": 3, "lifetime_seconds": 172800}), nil)
+	if _, creates, _ := hotelCalls(tc, lives); status != 201 || creates != 3 {
+		t.Fatalf("compat count 3 at cap 3: %d %v, %d creates", status, doc, creates)
+	}
+	for _, f := range tc.hotels {
+		f.mu.Lock()
+		for _, c := range f.creates {
+			if c["ttl_seconds"] != 3600.0 {
+				f.mu.Unlock()
+				t.Fatalf("a room of the batch got ttl %v, want 3600", c["ttl_seconds"])
+			}
+		}
+		f.mu.Unlock()
+	}
+	if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil); status != 402 || anyCode(doc) != "allowance_exhausted" {
+		t.Fatalf("a fourth room at cap 3: %d %v", status, doc)
+	}
+}
+
+func TestMeteredCompatCountLostAnswersAreHeld(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	tc.putAllowance(t, "g1", allowanceBody(1, 2))
+	for _, id := range []string{"a", "b", "c"} {
+		f := tc.hotels[id]
+		f.mu.Lock()
+		f.createFail = 504 // each answer is lost, no room yet
+		f.mu.Unlock()
+	}
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4", "count": 2}), nil)
+	if _, creates, _ := hotelCalls(tc, lives); status != 504 || creates != 2 {
+		t.Fatalf("compat batch of 2 with lost answers: %d %v, %d creates (no retry may join them)", status, doc, creates)
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		f := tc.hotels[id]
+		f.mu.Lock()
+		f.createFail = 0
+		f.mu.Unlock()
+	}
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 2.0 {
+		t.Fatalf("both lost attempts held: %v", v)
+	}
+	if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "room-1x4"}), nil); status != 402 || anyCode(doc) != "allowance_exhausted" {
+		t.Fatalf("a create during the hold: %d %v", status, doc)
+	}
+	if _, creates, _ := hotelCalls(tc, lives); creates != 2 {
+		t.Fatalf("%d creates", creates)
+	}
+}
+
+func TestMeteredCompatCountOverCapRefusedBeforeBuilds(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	for _, f := range tc.hotels {
+		f.mu.Lock()
+		f.failBuild = true
+		f.mu.Unlock()
+	}
+	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
+	_, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
+	imgID, _ := doc["image_id"].(string)
+	waitImage(t, tc, imgID)
+	tc.putAllowance(t, "g1", allowanceBody(1, 3))
+	builds := func() int {
+		n := 0
+		for _, f := range tc.hotels {
+			f.mu.Lock()
+			n += len(f.builds)
+			f.mu.Unlock()
+		}
+		return n
+	}
+	before := builds()
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": imgID, "count": 5}), nil)
+	time.Sleep(100 * time.Millisecond) // a build the create started would have reached a hotel
+	if status != 402 || anyCode(doc) != "allowance_exhausted" || builds() != before {
+		t.Fatalf("compat count 5 at cap 3 of an unready image: %d %v, %d new builds", status, doc, builds()-before)
+	}
+}
