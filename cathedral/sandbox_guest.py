@@ -691,12 +691,16 @@ class DockerClient:
         finally:
             shutil.rmtree(config_dir, ignore_errors=True)
 
-    def pull(self, image: str, *, registry_auth: Mapping[str, str] | None = None) -> None:
+    def pull(self, image: str, *, registry_auth: Mapping[str, str] | None = None, local_as: str | None = None) -> None:
+        """docker pull *image*. *local_as*: the name the image is used under
+        locally, when the pull goes by another name (a Hub-login pull goes to
+        registry-1.docker.io); a local copy under either name is a refresh."""
         # A refresh of an image already here is counted but never refused:
         # refusing it would turn a cross-guest grant pull into a 403
         # image_not_owned. A moved tag downloads only its changed layers; the
         # reservation keeps new pulls from stacking on top of it (AB#861).
-        gate = self.pull_gate.admit(image, refuse=not self.image_exists(image))
+        local = self.image_exists(image) or (local_as is not None and local_as != image and self.image_exists(local_as))
+        gate = self.pull_gate.admit(image, refuse=not local)
         with gate, self._registry_env(image, registry_auth) as env:
             result = self.run(["docker", "pull", image], timeout=600.0, env=env)
         if result.returncode != 0:
@@ -762,7 +766,7 @@ class DockerClient:
             # to docker.io only, so the registry-1.docker.io name skips them.
             # Digest refs use the same rewrite: a plain Hub digest would still
             # hit the mirror and hand the customer credential to Google.
-            self.pull(direct, registry_auth=registry_auth)
+            self.pull(direct, registry_auth=registry_auth, local_as=image)
             if "@" in image:
                 # docker tag cannot target a digest reference; the pull already
                 # made the content local under the registry-1.docker.io name.
