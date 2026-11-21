@@ -1765,12 +1765,31 @@ func TestMeteredHoldOutlivesItsHotelLeaving(t *testing.T) {
 	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); status != 402 || errCode(doc) != "allowance_exhausted" {
 		t.Fatalf("create after the hotel left during the hold: %d %v", status, doc)
 	}
+	// Known limit: the room lands on the removed hotel before the deadline
+	// and stays; no list of that hotel can count it, so after the deadline it
+	// is one extra room.
+	f.mu.Lock()
+	labels, _ := f.creates[0]["labels"].(map[string]any)
+	f.rooms = append(f.rooms, map[string]any{"id": "sbx_late", "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: labels[batchLabel]}})
+	f.mu.Unlock()
 	tc.b.mu.Lock()
 	for _, ha := range tc.b.allow.held {
 		ha.until = time.Now().Add(-time.Second) // the hold passes
 	}
 	tc.b.mu.Unlock()
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	tc.b.mu.Lock()
+	kept := len(tc.b.allow.held) + len(tc.b.allow.attempts)
+	tc.b.mu.Unlock()
+	if kept != 0 {
+		t.Fatalf("an expired hold of a hotel that left is still kept after the admission compared it: %d entries", kept)
+	}
+	f.mu.Lock()
+	still := len(f.rooms)
+	f.mu.Unlock()
+	if still != 1 {
+		t.Fatalf("the late room on the removed hotel: %d rooms, want it still there", still)
+	}
 }
 
 func TestMeteredCleanupListAskedBeforeTheDeadlineKeepsTheHold(t *testing.T) {
@@ -1828,5 +1847,147 @@ func TestMeteredCleanupListAskedBeforeTheDeadlineKeepsTheHold(t *testing.T) {
 	}
 	if _, creates, _ := hotelCalls(tc, lives); creates != 1 {
 		t.Fatalf("%d creates dispatched at cap 1", creates)
+	}
+}
+
+// ---------------------------------------------------------------- review round 5
+
+// lostBatch makes hotel b answer a batch of n creates 504 without starting
+// rooms, at cap n, and returns the batch label.
+func lostBatch(t *testing.T, tc *testChain, lives map[string]*lifeHotel, n int) string {
+	t.Helper()
+	tc.putAllowance(t, "g1", allowanceBody(1, n))
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.createFail = 504
+	f.mu.Unlock()
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "count": n})
+	if _, creates, _ := hotelCalls(tc, lives); status != 504 || creates != n {
+		t.Fatalf("batch of %d, all answers lost: %d %v, %d creates", n, status, doc, creates)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createFail = 0
+	labels, _ := f.creates[0]["labels"].(map[string]any)
+	return labels[batchLabel].(string)
+}
+
+func lateRoom(tc *testChain, id, batch string) {
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": map[string]any{guestLabel: "g1", batchLabel: batch}})
+	f.mu.Unlock()
+}
+
+func TestMeteredOverlappingCleanupPassesKeepTheOtherHolds(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	batch := lostBatch(t, tc, lives, 3) // attempts A, B and C held
+	l, f := lives["b"], tc.hotels["b"]
+	// Every cleanup list is parked at the hotel until released, and says so.
+	lists, taken := make(chan struct{}), make(chan struct{}, 8)
+	l.mu.Lock()
+	l.holdList, l.listTaken, l.holdLabelLists = lists, taken, true
+	l.mu.Unlock()
+	passes := 0
+	waitTaken := func(want bool) {
+		t.Helper()
+		select {
+		case <-taken:
+			passes++
+			if !want {
+				t.Fatal("a second cleanup pass started while the first one still held the record")
+			}
+		case <-time.After(500 * time.Millisecond):
+			if want {
+				t.Fatal("no cleanup pass started")
+			}
+		}
+	}
+	paused, resume := make(chan struct{}), make(chan struct{})
+	var once, resumed, released sync.Once
+	saved := afterCleanupPass
+	afterCleanupPass = func(*hotel, string) { once.Do(func() { close(paused); <-resume }) }
+	t.Cleanup(func() { // nothing stays parked when the test ends early
+		resumed.Do(func() { close(resume) })
+		released.Do(func() { close(lists) })
+		afterCleanupPass = saved
+	})
+	// A lands; the first pass lists and removes it, then waits before it
+	// finishes.
+	lateRoom(tc, "sbx_A", batch)
+	tc.syncAll("b")
+	waitTaken(true)
+	lists <- struct{}{}
+	<-paused
+	// B lands. A sync now must not start a second pass.
+	lateRoom(tc, "sbx_B", batch)
+	tc.syncAll("b")
+	waitTaken(false)
+	resumed.Do(func() { close(resume) })
+	waitRecord(t, tc, "b", batch, func(ub *unreapedBatch) bool { return ub != nil && !ub.busy }) // the first pass has finished
+	tc.syncAll("b")                                                                              // B is listed: one pass for it
+	waitTaken(true)
+	released.Do(func() { close(lists) }) // every parked list answers with B in it
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f.mu.Lock()
+		deletesB := 0
+		for _, id := range f.roomDeletes {
+			if id == "sbx_B" {
+				deletesB++
+			}
+		}
+		f.mu.Unlock()
+		tc.b.mu.Lock()
+		ub := tc.b.hotelByID("b").unreaped[batch]
+		idle := ub == nil || !ub.busy
+		tc.b.mu.Unlock()
+		if deletesB == passes-1 && idle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cleanup never settled: %d passes, %d deletes of B", passes, deletesB)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// C has not landed: it must still count.
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 1.0 {
+		t.Fatalf("after A and B were removed: %v, want C still counted", v)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "count": 3}); status != 402 {
+		t.Fatalf("a batch of 3 beside the unfinished attempt: %d %v", status, doc)
+	}
+}
+
+func TestMeteredRemovedRoomCountsOnce(t *testing.T) {
+	tc, lives := meteredChain(t, nil)
+	batch := lostBatch(t, tc, lives, 3)
+	tc.b.mu.Lock()
+	h := tc.b.hotelByID("b")
+	for _, id := range []string{"sbx_A", "sbx_B", "sbx_B"} { // two passes both deleted B
+		tc.b.noteOrphanRemovedLocked(h, batch, id)
+	}
+	left := tc.b.unresolvedLocked(h, batch)
+	tc.b.mu.Unlock()
+	if left != 1 {
+		t.Fatalf("A once and B twice leave %d unresolved, want 1 (C)", left)
+	}
+}
+
+func TestMeteredRejectedJoinsLeaveNothingBehind(t *testing.T) {
+	tc, _ := meteredChain(t, nil)
+	for i := 0; i < 5; i++ {
+		if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": fmt.Sprintf("x%d", i), "api": "http://127.0.0.1:1", "key": joinKey}); status != 502 {
+			t.Fatalf("join of an unreachable hotel: %d", status)
+		}
+		if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "b", "api": "http://127.0.0.1:1", "key": joinKey}); status != 409 {
+			t.Fatalf("join under an existing id: %d", status)
+		}
+	}
+	tc.b.mu.Lock()
+	n := len(tc.b.allow.unlisted)
+	tc.b.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d rejected joins kept in the metered recount", n)
 	}
 }

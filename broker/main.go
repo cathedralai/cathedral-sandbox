@@ -1313,7 +1313,7 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 		for _, wait := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second} {
 			time.Sleep(wait)
 			if b.reapPass(h, g.cfg.ID, batchID, keep, 10*time.Second) {
-				b.reaped(h, batchID)
+				b.reaped(h, batchID, ub)
 				return
 			}
 		}
@@ -1326,11 +1326,18 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 }
 
 // reaped clears a recorded request once its rooms on h are confirmed gone.
-func (b *broker) reaped(h *hotel, batchID string) {
+// ub is the record the finished pass worked on: the pass ends (busy) and the
+// record's fate is decided in one b.mu step, so no second pass starts in
+// between.
+func (b *broker) reaped(h *hotel, batchID string, ub *unreapedBatch) {
 	b.mu.Lock()
-	if ub := h.unreaped[batchID]; ub != nil && b.holdsLocked(h, batchID, ub, b.cleanupListedAtLocked(h, batchID)) {
-		ub.busy = false // a metered guest's lost create may still start its room (allowance.go)
+	ub.busy = false
+	if h.unreaped[batchID] != ub { // removed meanwhile
 		b.mu.Unlock()
+		return
+	}
+	if b.holdsLocked(h, batchID, ub, b.cleanupListedAtLocked(h, batchID)) {
+		b.mu.Unlock() // a metered guest's lost create may still start its room (allowance.go)
 		return
 	}
 	delete(h.unreaped, batchID)
@@ -1382,7 +1389,7 @@ func (b *broker) reapPass(h *hotel, guestID, batchID string, keep map[string]boo
 		if rm := h.rooms[s.ID]; rm != nil { // the sync loop adopted it meanwhile
 			b.release(h, rm)
 		}
-		b.noteOrphanRemovedLocked(h, batchID) // allowance.go
+		b.noteOrphanRemovedLocked(h, batchID, s.ID) // allowance.go
 		b.mu.Unlock()
 		log.Printf("orphan room %s.%s of guest %s removed (create answer lost)", h.cfg.ID, s.ID, guestID)
 	}
@@ -2412,12 +2419,14 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 			ub.busy = true
 			go func() {
 				ok := b.reapPass(h, ub.guest, batchID, ub.keep, 10*time.Second)
+				afterCleanupPass(h, batchID) // allowance.go
+				if ok {
+					b.reaped(h, batchID, ub) // ends the pass and decides the record in one step
+					return
+				}
 				b.mu.Lock()
 				ub.busy = false
 				b.mu.Unlock()
-				if ok {
-					b.reaped(h, batchID)
-				}
 			}()
 		}
 	}

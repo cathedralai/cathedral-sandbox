@@ -402,6 +402,12 @@ Known limits:
   delete; that is left for a follow-up.
 - A lost create that the hotel completes after the hold escapes the count
   until its room is listed (then it counts as one of the guest's rooms).
+- A hold on a hotel that is removed or replaced during the hold ends at its
+  deadline with no further list of that hotel. A room that started there
+  before the deadline and keeps running is then not counted: one extra room
+  per unresolved attempt on a removed or replaced hotel, until the room ends
+  or the hotel rejoins and lists it (then it counts as one of the guest's
+  rooms). Repeated removals can add up.
 - Holds and unreaped records of lost create attempts live in memory. A
   broker restart forgets them: one extra room per lost attempt in flight at
   the restart, and only when the hotel had not yet listed that room. A room

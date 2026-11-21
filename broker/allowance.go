@@ -155,10 +155,11 @@ type allowances struct {
 	// create request on one hotel, while the hotel's unreaped record of the
 	// request lasts. Guarded by broker.mu.
 	attempts map[string]int
-	// removed is orphanKey(hotel, batch) -> orphan rooms of the request that
-	// a reap pass deleted on that hotel. attempts - removed is what the
-	// record still counts. Guarded by broker.mu.
-	removed map[string]int
+	// removed is orphanKey(hotel, batch) -> the ids of orphan rooms of the
+	// request that a reap pass deleted on that hotel; a room deleted twice
+	// counts once. attempts - len(removed) is what the record still counts.
+	// Guarded by broker.mu.
+	removed map[string]map[string]bool
 	// listedAt is orphanKey(hotel, batch) -> when the last successful
 	// cleanup list of the request was asked for: a hold ends only on a
 	// list asked for after its deadline. Guarded by broker.mu.
@@ -214,13 +215,31 @@ func (b *broker) meteredLiveLocked(g *guestState) int {
 	}
 	now := time.Now()
 	for key, ha := range b.allow.held {
+		if b.hotelByID(ha.h.cfg.ID) == ha.h { // counted through the hotel's record
+			if _, bid, _ := strings.Cut(key, "\x00"); ha.h.unreaped[bid] == nil {
+				b.dropHoldLocked(key) // released
+			}
+			continue
+		}
 		// A hold on a hotel that left (or was replaced under its id) counts
 		// until its deadline: no list of that hotel can resolve it now.
-		if ha.guest == g.cfg.ID && b.hotelByID(ha.h.cfg.ID) != ha.h && now.Before(ha.until) {
-			n += max(0, ha.n-b.allow.removed[key])
+		if !now.Before(ha.until) {
+			b.dropHoldLocked(key)
+			continue
+		}
+		if ha.guest == g.cfg.ID {
+			n += max(0, ha.n-len(b.allow.removed[key]))
 		}
 	}
 	return n
+}
+
+// dropHoldLocked forgets a hold and its counts. Caller holds b.mu.
+func (b *broker) dropHoldLocked(key string) {
+	delete(b.allow.held, key)
+	delete(b.allow.attempts, key)
+	delete(b.allow.removed, key)
+	delete(b.allow.listedAt, key)
 }
 
 // recountPendingLocked reports whether a hotel that g may use, or has had
@@ -235,8 +254,16 @@ func (b *broker) recountPendingLocked(g *guestState) bool {
 	return false
 }
 
+// unmarkUnlisted forgets a hotel whose join failed.
+func (b *broker) unmarkUnlisted(h *hotel) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.allow.unlisted, h)
+}
+
 // markUnlisted records a hotel that joins at runtime as not yet listed, for
-// the metered recount only. Called before the hotel is in the set.
+// the metered recount only. Called before the hotel is in the set; a join
+// that fails calls unmarkUnlisted.
 func (b *broker) markUnlisted(h *hotel) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -303,6 +330,10 @@ func (b *broker) meteredCreate(g *guestState, payload map[string]any, n int) (*a
 	afterMeteredCheck()
 	return nil, 0
 }
+
+// afterCleanupPass runs when a sync loop cleanup pass has returned, before
+// its record is updated (busy is still set). Tests hold a pass there.
+var afterCleanupPass = func(h *hotel, batchID string) {}
 
 // afterMeteredCheck runs between a metered create's early check and its
 // reservation in admitCreate. Tests hold creates there to prove the
@@ -389,13 +420,18 @@ func refusedRetry(last createResult, e *apiErr, retry int) createResult {
 	return r
 }
 
-// noteOrphanRemovedLocked counts one orphan room of a create request that a
-// reap pass deleted on h. Caller holds b.mu.
-func (b *broker) noteOrphanRemovedLocked(h *hotel, batchID string) {
+// noteOrphanRemovedLocked records orphan room roomID of a create request as
+// deleted on h by a reap pass. Two passes that delete one room count it
+// once. Caller holds b.mu.
+func (b *broker) noteOrphanRemovedLocked(h *hotel, batchID, roomID string) {
 	if b.allow.removed == nil {
-		b.allow.removed = map[string]int{}
+		b.allow.removed = map[string]map[string]bool{}
 	}
-	b.allow.removed[orphanKey(h.cfg.ID, batchID)]++
+	key := orphanKey(h.cfg.ID, batchID)
+	if b.allow.removed[key] == nil {
+		b.allow.removed[key] = map[string]bool{}
+	}
+	b.allow.removed[key][roomID] = true
 }
 
 // unresolvedLocked is what h's unreaped record of a create request counts
@@ -408,7 +444,7 @@ func (b *broker) unresolvedLocked(h *hotel, batchID string) int {
 	if !known {
 		return 1
 	}
-	return max(0, n-b.allow.removed[key])
+	return max(0, n-len(b.allow.removed[key]))
 }
 
 // holdsLocked reports whether h's unreaped record of a create request must
@@ -477,7 +513,7 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 		b.allow.attempts = map[string]int{}
 	}
 	if b.allow.removed == nil {
-		b.allow.removed = map[string]int{}
+		b.allow.removed = map[string]map[string]bool{}
 	}
 	if b.allow.held == nil {
 		b.allow.held = map[string]*heldAttempts{}
@@ -503,7 +539,7 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 	for h, n := range lostOn {
 		key := orphanKey(h.cfg.ID, batchID)
 		ub := h.unreaped[batchID]
-		if !metered || b.allow.removed[key] >= n {
+		if !metered || len(b.allow.removed[key]) >= n {
 			// Not metered: as before. Metered and every attempt's room listed
 			// and removed: nothing is left to count.
 			if ub == nil {
@@ -910,7 +946,7 @@ func (b *broker) loadAllowances() error {
 	b.allow.byGuest = map[string]*guestAllowance{}
 	b.allow.uncertain = map[string]int{}
 	b.allow.attempts = map[string]int{}
-	b.allow.removed = map[string]int{}
+	b.allow.removed = map[string]map[string]bool{}
 	b.allow.listedAt = map[string]time.Time{}
 	b.allow.held = map[string]*heldAttempts{}
 	b.allow.unlisted = map[*hotel]bool{}
