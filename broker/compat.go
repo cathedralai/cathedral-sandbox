@@ -275,7 +275,8 @@ func (b *broker) compatCatalog(w http.ResponseWriter, g *guestState) {
 			"ipv4_cidrs": true, "ipv6": false, "hostname_ports": []int{80, 443}},
 		"available": free > 0, "free_rooms": free, "max_lifetime_seconds": 23 * 3600, "cleanup_margin_seconds": 0,
 		"exec_output_limit_bytes": 16 << 20, "max_exec_seconds": b.maxExec(),
-		"templates": catalogTemplateViews(),
+		"default_exec_seconds": min(compatExecDefaultSeconds, b.maxExec()),
+		"templates":            catalogTemplateViews(),
 	})
 }
 
@@ -439,6 +440,7 @@ func (b *broker) compatCreateBatch(w http.ResponseWriter, results []createResult
 }
 
 func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestState, raw []byte) {
+	tRecv := time.Now()
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
@@ -545,6 +547,14 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		}
 	}
 	b.scope(g, &pl, false, sealedField)
+	// create_timeout_seconds (AB#862): the native rule; compat builds the
+	// hotel body field by field, so the value never reaches a hotel.
+	deadline, derr := createDeadline(req, tRecv)
+	if derr != nil {
+		compatErr(w, derr.status, derr.code, derr.msg, 0)
+		return
+	}
+	pl.deadline = deadline
 	// The warm preference (prewarm.go) reads pl.image; the native path sets it
 	// in handleCreate. Only catalog images are ever marked warm, so any other
 	// ref leaves placement unchanged.
@@ -572,10 +582,10 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	if count > 1 {
-		b.compatCreateBatch(w, b.createMany(r.Context(), g, native, count, time.Now(), pl))
+		b.compatCreateBatch(w, b.createMany(r.Context(), g, native, count, tRecv, pl))
 		return
 	}
-	out := b.createMany(r.Context(), g, native, 1, time.Now(), pl)[0]
+	out := b.createMany(r.Context(), g, native, 1, tRecv, pl)[0]
 	if out.status != 202 {
 		code, msg := compatCreateErr(out)
 		ra, _ := strconv.Atoi(out.header.Get("Retry-After"))
@@ -740,11 +750,24 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		t, dead := b.compat.tombs[id]
 		b.compat.mu.Unlock()
 		if dead && r.Method == "GET" && tail == "" {
-			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid)})
+			// An operator forget also writes a tombstone; its end record says
+			// hotel_removed, which the client must see (review F1 on #637).
+			reason, goneAt := endDeleted, t.at
+			if rec := b.endedByUUID(g.cfg.ID, id); rec != nil {
+				reason, goneAt = rec.Reason, rec.GoneAt
+			}
+			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid),
+				"end_reason": reason, "gone_at": goneAt.UTC().Format(time.RFC3339Nano)})
 			return
 		}
 		if dead && r.Method == "DELETE" && tail == "" {
 			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid)})
+			return
+		}
+		// A room that vanished reads as deleted, with why (AB#864).
+		if rec := b.endedByUUID(g.cfg.ID, id); rec != nil && r.Method == "GET" && tail == "" {
+			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "end_reason": rec.Reason,
+				"gone_at": rec.GoneAt.UTC().Format(time.RFC3339Nano)})
 			return
 		}
 		compatErr(w, 404, "sandbox_not_found", "no sandbox "+id, 0)
@@ -759,7 +782,16 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			return
 		}
 		if status == 404 {
-			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": "confirmed"})
+			doc := map[string]any{"id": id, "state": "deleted", "cleanup_state": "confirmed"}
+			b.mu.Lock()
+			if rm.deleteSent { // the client's delete, before the sync loop lets the room go
+				doc["end_reason"] = endDeleted
+				if !rm.vanished.IsZero() {
+					doc["gone_at"] = rm.vanished.UTC().Format(time.RFC3339Nano)
+				}
+			}
+			b.mu.Unlock()
+			writeJSON(w, 200, doc)
 			return
 		}
 		var doc map[string]any
@@ -945,6 +977,10 @@ func spillToken(v any) (string, bool) {
 	return s, true
 }
 
+// compatExecDefaultSeconds is the time limit of a compat exec that sends no
+// timeout_seconds (AB#862).
+const compatExecDefaultSeconds = 600
+
 func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
@@ -982,7 +1018,9 @@ func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 		}
 		body["spill_token"] = token
 	}
-	timeout := maxExec
+	// No timeout_seconds: 600 s, not the 14,400 s ceiling. An exec holds a
+	// hotel data connection for its whole run (AB#862).
+	timeout := min(compatExecDefaultSeconds, maxExec)
 	if v, ok := req["timeout_seconds"].(float64); ok && v > 0 {
 		timeout = int(v)
 	}

@@ -188,7 +188,7 @@ func TestExchangeMeterPageMatchesTheCapturedCase(t *testing.T) {
 	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); status == 202 {
 		t.Fatalf("failed create: %d %v", status, doc)
 	}
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 
 	status, raw, err := rawCall(tc, "operator-key", "", c.Method, "/v1/broker/usage-meter?after=0&limit=500", nil)
 	if err != nil || status != c.Status {

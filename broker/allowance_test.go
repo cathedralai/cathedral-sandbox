@@ -2114,7 +2114,7 @@ func TestMeteredHeldLateRoomIsMeteredNotBillable(t *testing.T) {
 	}
 	close(held)
 	waitRecord(t, tc, hotelID, batch, func(ub *unreapedBatch) bool { return ub == nil })
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter?after=0&limit=5000", nil)
 	if status != 200 {
 		t.Fatalf("meter route: %d %v", status, doc)
@@ -2133,5 +2133,64 @@ func TestMeteredHeldLateRoomIsMeteredNotBillable(t *testing.T) {
 	}
 	if len(states) == 0 || states[len(states)-1] != "ended" {
 		t.Fatalf("late room readings %v, want not billable and then ended", states)
+	}
+}
+
+// Main's meter key (#648) and the allowance route both sit under
+// /v1/broker/guests/<id>/. After the merge the meter key gets nothing on the
+// allowance route or the usage meter, and the operator key keeps both and
+// gets no meter key route.
+func TestMeteredAllowanceRouteIsTheOperatorsNotTheMeterKeys(t *testing.T) {
+	tc, _ := meteredChain(t, func(c *config) { c.MeterKeySHA256 = sha("meter-key") })
+	for _, c := range []struct {
+		method, path string
+		body         any
+	}{
+		{"GET", "/v1/broker/guests/g1/allowance", nil},
+		{"PUT", "/v1/broker/guests/g1/allowance", allowanceBody(1, 5)},
+		{"GET", "/v1/broker/usage-meter", nil},
+	} {
+		if status, doc := tc.call(t, "meter-key", c.method, c.path, c.body); status != 401 {
+			t.Fatalf("meter key %s %s: %d %v, want 401", c.method, c.path, status, doc)
+		}
+	}
+	if v := tc.getAllowance(t, "g1"); v["cap"] != 0.0 || v["ledger_seen_at"] != nil {
+		t.Fatalf("a meter key PUT changed the allowance: %v", v)
+	}
+	tc.putAllowance(t, "g1", allowanceBody(1, 2))
+	if status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter", nil); status != 200 {
+		t.Fatalf("operator key usage meter: %d %v", status, doc)
+	}
+	for _, rt := range meterPaths("g1") {
+		if status, doc := tc.call(t, "operator-key", rt[0], rt[1], nil); status != 401 {
+			t.Fatalf("operator key %s %s: %d %v, want 401", rt[0], rt[1], status, doc)
+		}
+	}
+	if status, doc := tc.call(t, "meter-key", "GET", "/v1/broker/guests/g1/rooms", nil); status != 200 {
+		t.Fatalf("meter key on its own route: %d %v", status, doc)
+	}
+}
+
+// Pins today's behaviour for #648's freeze, which another team must rule
+// on: a frozen room stays in the hotel's list and in the broker's room map,
+// so it counts toward a metered guest's live rooms and its cap.
+func TestMeteredFrozenRoomCountsTowardTheCap(t *testing.T) {
+	tc, _ := meteredChain(t, func(c *config) { c.MeterKeySHA256 = sha("meter-key") })
+	tc.putAllowance(t, "g1", allowanceBody(1, 1))
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	tc.syncAll()
+	status, doc := tc.call(t, "meter-key", "POST", "/v1/broker/guests/g1/freeze-all", nil)
+	if frozen, _ := doc["frozen"].([]any); status != 200 || len(frozen) != 1 || frozen[0] != bid {
+		t.Fatalf("freeze-all: %d %v", status, doc)
+	}
+	tc.syncAll()
+	if s := hotelRoomState(tc.hotels["b"], strings.SplitN(bid, ".", 2)[1]); s != "frozen" {
+		t.Fatalf("hotel room state %v, want frozen", s)
+	}
+	if v := tc.getAllowance(t, "g1"); v["live_rooms"] != 1.0 {
+		t.Fatalf("live_rooms with one frozen room: %v", v)
+	}
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 || errCode(doc) != "allowance_exhausted" {
+		t.Fatalf("create at cap 1 with one frozen room: %d %v", status, doc)
 	}
 }

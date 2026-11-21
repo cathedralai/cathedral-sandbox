@@ -1334,6 +1334,20 @@ def test_install_guest_ingress_wires_the_front_only(host: FakeHost) -> None:
     assert "INGRESS" not in (host.etc / "api.env").read_text()
     assert "ROOM_SEALED_EXEC=1" not in unit and "ROOM_SEALED_SECRETS=1" not in unit
     assert 'ROOM_GUEST_INGRESS="1"' in (host.etc / "room.env").read_text()
+    assert "ROOM_INGRESS_ZONE" not in unit  # the key only: nothing serves without a zone
+
+
+def test_install_guest_ingress_with_a_zone_passes_the_serving_settings(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(ROOM_GUEST_INGRESS="1", ROOM_INGRESS_ZONE="hotels.example.com",
+                                          ROOM_INGRESS_BROKER_URL="https://broker.example",
+                                          ROOM_INGRESS_TLS_LISTEN="10.215.0.2:8443")))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    unit = host.unit("room-a-receipts.service")
+    assert ("Environment=ROOM_INGRESS_ZONE=hotels.example.com ROOM_INGRESS_BROKER_URL=https://broker.example "
+            "ROOM_INGRESS_TLS_LISTEN=10.215.0.2:8443 ROOM_INGRESS_PUBLIC_PORT=443\n") in unit
+    assert "ROOM_ACME_DIRECTORY=https://acme-v02.api.letsencrypt.org/directory ROOM_ACME_DNS_WAIT=20" in unit
+    assert unit.index("ROOM_INGRESS_ZONE=") < unit.index("ExecStart=")
+    assert "INGRESS" not in (host.etc / "api.env").read_text()
 
 
 @pytest.mark.parametrize("overrides,message", [

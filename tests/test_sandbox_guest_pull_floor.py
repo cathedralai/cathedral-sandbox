@@ -136,3 +136,16 @@ def test_refresh_of_a_local_image_is_not_refused(fake, monkeypatch) -> None:
         p.prefetch(PrefetchRequest(images=("alpine:3.20",)))
     finally:
         p.close()
+
+
+def test_hub_login_refresh_of_an_anonymously_cached_image_is_not_refused(fake, monkeypatch) -> None:
+    # The login pull goes to registry-1.docker.io/library/alpine:3.20, a name not
+    # local yet; alpine:3.20 is. It is a refresh: never refused (a refusal there
+    # becomes 403 image_not_owned with no failover).
+    monkeypatch.setattr(os, "statvfs", vfs(2))
+    p = DockerGuestProvider()
+    try:
+        p.prefetch(PrefetchRequest(images=("alpine:3.20",), registry_auth={"username": "u", "password": "p"}))
+        assert any("registry-1.docker.io" in c[-1] for c in fake.calls_of("pull"))
+    finally:
+        p.close()

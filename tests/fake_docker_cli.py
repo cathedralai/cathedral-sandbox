@@ -304,6 +304,29 @@ def main(argv):
         print(cid)
         return 0
 
+    if cmd == "kill":
+        # AB#863: delete kills the room before docker rm. kill_hang / kill_fail
+        # count per container like rm_hang / rm_fail.
+        ref = argv[-1]
+        with Locked() as st:
+            cid = find(st, ref)
+            key = cid or ref
+            seen = st.setdefault("kill_seen", {}).get(key, 0)
+            st["kill_seen"][key] = seen + 1
+            hang = seen < b.get("kill_hang", {}).get(key, 0)
+            fail = seen < b.get("kill_fail", {}).get(key, 0)
+            if cid is not None and not hang and not fail:
+                st["containers"][cid]["status"] = "exited"
+                st["containers"][cid].setdefault("exit_code", 137)
+        if hang:
+            time.sleep(30)
+            return 1
+        if fail or cid is None:
+            print(f"Error response from daemon: cannot kill container: {ref}", file=sys.stderr)
+            return 1
+        print(ref)
+        return 0
+
     if cmd == "rm":
         ref = argv[-1]
         with Locked() as st:

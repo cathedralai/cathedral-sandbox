@@ -88,9 +88,11 @@ func (h *hotel) holdDisk(pl placement, sign int) {
 // flight counts twice until the create returns: on purpose, as the error is
 // a short false disk_sold_out, never a hotel filled over budget (skipping
 // such rooms undercounted a started room of a failed create until its batch
-// ended). Caller holds b.mu.
+// ended). A room the hotel killed after a delete is out of the room list
+// but holds its disk until docker rm ends: the hotel reports that extra disk
+// as removing_disk_gib (AB#863) and it counts here. Caller holds b.mu.
 func (h *hotel) diskExtraUsed() int {
-	n := h.diskPending
+	n := h.diskPending + h.removingDiskGiB
 	for _, rm := range h.rooms {
 		n += diskExtra(rm.diskGiB)
 	}
@@ -130,6 +132,21 @@ func (b *broker) diskFits(h *hotel, diskGiB int) bool {
 func diskSoldOut(diskGiB int) createResult {
 	return createResult{status: 429, header: http.Header{"Retry-After": {strconv.Itoa(diskSoldOutRetryAfter)}},
 		doc: errDoc("disk_sold_out", fmt.Sprintf("no hotel has %d GiB of disk free; try a smaller disk_gib or retry later", diskGiB))}
+}
+
+// guestDiskDoc is the guest's view of h's disk (AB#860): how full the data
+// volume is and the line at which it takes no more rooms, null when unknown
+// or unset. The budget and its use stay operator only. Caller holds b.mu.
+func guestDiskDoc(h *hotel, d map[string]any) {
+	var pct, admitPct any
+	if h.roomDataPct != nil {
+		pct = *h.roomDataPct
+	}
+	if h.cfg.DiskAdmitUsedPct != nil {
+		admitPct = *h.cfg.DiskAdmitUsedPct
+	}
+	d["disk_used_pct"] = pct
+	d["disk_admit_used_pct"] = admitPct
 }
 
 // diskDoc is the operator readback of h's disk budget. Caller holds b.mu.

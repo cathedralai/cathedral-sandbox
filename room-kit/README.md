@@ -88,8 +88,11 @@ settings in the table come from the same place.
 receipts off. The installer starts `<ROOM_ID>-receipts.service`
 (`room_receipts.py`).
 
-What it turns on: an Ed25519 receipt chain for create, exec, background
-process start, delete and network policy changes. The process listens on
+What it turns on: an Ed25519 receipt chain for every route that changes a
+room, the hotel or an account: create, exec, processes, delete, network
+policy, files, tar, directories, terminals, ports, snapshots, workspaces,
+secrets and images (the list and the routes left unsigned, each with its
+reason: `docs/AB385_GUEST_SIGNED_ROUTES.md`). The process listens on
 `ROOM_RECEIPTS_LISTEN` (default `127.0.0.1:18092`). That port is not
 `ROOM_API_PORT` and not `ROOM_HEALTH_PORT`. It proxies those calls to the
 room API on `127.0.0.1:ROOM_API_PORT`. When receipts are on, Caddy sends
@@ -179,7 +182,9 @@ signed request at a time, so the order of its receipts is the order things ran.
   `/terminals`, a process's `/logs`, `sealed-secrets`, `sealed-env`, `/entries`)
   pass without a token and leave no receipt. Every other route that is not a
   signed route or a delete, the front's own sealed secrets and sealed exec
-  included, is refused with 409 `room_serial_unsigned`.
+  included, is refused with 409 `room_serial_unsigned`. Terminal routes and
+  access tickets stay refused although they are signed: a terminal runs
+  commands that no receipt orders.
 - On a serial room each request is sent to the API once, a read or a signed
   GET included (an ordinary room retries a GET whose answer was lost). A read
   whose answer is lost answers 502, signs nothing and does not break the room
@@ -206,6 +211,28 @@ signed request at a time, so the order of its receipts is the order things ran.
 
 An ordinary room runs requests side by side, as before.
 
+### Terminal sockets (AB#385)
+
+`GET /v1/sandboxes/<id>/terminals/<tid>/ws` with a WebSocket handshake passes
+through the front (before, the front dropped `Upgrade` and the API answered a
+plain GET with 404). The front needs the hotel key, sends the same handshake to
+the room API with its own key and the caller's `Sec-WebSocket-*` and
+`X-Cathedral-Access-Ticket` headers (the API checks and spends the ticket), and
+signs `terminal_session_open` on the API's answer: on a 101 with a `session_id`,
+in `X-Room-Receipt` on the 101; on a refusal with its status and the hash of
+its body. Then it passes raw bytes both ways, frames unread. When either side
+ends (or the caller sends nothing for 900 s), it signs `terminal_session_close`
+with the same `session_id`, `session_open_receipt_sha256`, `close_reason`,
+`duration_ms`, and per direction the byte count and sha256 of the bytes after
+the handshake, counted as the front wrote them to the other side's socket
+(`client_bytes`/`client_sha256` from the caller to the room,
+`room_bytes`/`room_sha256` from the room to the caller; a send cut short counts
+only what went out). The close receipt is in the room's receipt
+list. The session counts as a request in flight for the room, so the front's
+look leaves the room alone while it is open. Serial rooms and
+unclaimed pool rooms refuse the socket as before. Not over the miner hotel's TLS
+port (501): terminals never reach a miner hotel.
+
 ### Receipts when a room ends without a request
 
 The front keeps a table of live rooms (a room enters with its 2xx create and
@@ -221,6 +248,25 @@ looks at that room, with one GET.
 
 Limits: only rooms the front signed a create for; after a front restart the
 table is empty and no end is signed for earlier rooms.
+
+### TTL deletes through the front (AB#385)
+
+The room API removes a room past its limit by itself from `expires_at` plus
+its 300 s grace, and that removal never passes the front. With receipts on,
+the front deletes such a room first. Every `ROOM_REAP_SECONDS` (default 15, 0
+leaves TTL deletes to the API alone) it lists the rooms, and for each room
+whose `expires_at` lies at least `ROOM_REAP_AFTER_SECONDS` (default 30, at
+most 240) in the past it enters the room as a caller's delete does. A room
+with another request in flight is left for the next pass; otherwise, in the
+same locked step, the room is marked reaping: until the delete is signed,
+every new request but a read or a delete gets 409 `room_reaping`. Then it
+asks the API for that room again (a heartbeat since the list keeps the room)
+and sends one `DELETE`. The answer is signed as a `delete` receipt with
+`reason: "ttl"` and `ttl_expires_at`; a lost answer is signed as 502. A busy
+serial room and a failed list are left for the next pass. The API's own clean-up and `<ROOM_ID>-reaper.timer` stay as
+the backstop (front down or slow); a room they remove is ended by the look
+above with a `room_end`. Rooms the API removes for an idle window or a
+revoked key are not TTL deletes: they also end with a `room_end`.
 
 ### Pre-made rooms
 
@@ -664,7 +710,7 @@ python3 hotel_offer.py --origin ... --hotkey-file <hotkey> --post https://<api>/
 | API (profile) on 127.0.0.1 | `<ROOM_ID>.service` |
 | Health endpoint on 127.0.0.1 | `<ROOM_ID>-health.service` |
 | Signed receipts (level 1 by default; listener `ROOM_RECEIPTS_LISTEN`) | `<ROOM_ID>-receipts.service` when `ROOM_RECEIPTS=1` |
-| TTL reaper (every 60 s) | `<ROOM_ID>-reaper.timer` |
+| TTL reaper (every 60 s; with receipts on, the front deletes due rooms first with a signed receipt, see "TTL deletes through the front") | `<ROOM_ID>-reaper.timer` |
 | Caddy (pinned, sha512) on 443. With receipts on, API calls go to the receipt listener; `/room/health` stays on the health port | `<ROOM_ID>-caddy.service`, `/etc/pool-room/Caddyfile` |
 | Service user | `poolroom` |
 

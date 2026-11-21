@@ -8,6 +8,7 @@
 //	"hotels": ["a", "b"]           the guest may use only these hotels (absent: all non-miner hotels)
 //	"policy": {prefer, allow, deny} hotels by selector; replaces "hotels" and "default_sealed" (capacity.go)
 //	"own_hosts_only": true         never a miner hotel, whatever the policy says (reserved customers)
+//	"pin_max_gib": 400             image bytes the guest may pin on each hotel (0 or absent: no pins, guest_images.go)
 //	"ops": true                    the guest may run the probe and reset the broker counters
 //	"metered": true                admitted only on the ledger's allowance; closed until one comes (allowance.go)
 //
@@ -55,6 +56,9 @@ type guestLimits struct {
 	// (allowance.go). It starts closed: cap 0 and no lease. Only the config
 	// makes a guest metered.
 	Metered bool `json:"metered,omitempty"`
+	// PinMaxGiB caps the image bytes the guest may pin on each hotel
+	// (prefetch "pin": true, guest_images.go). 0: pins are off.
+	PinMaxGiB int `json:"pin_max_gib,omitempty"`
 }
 
 func (l guestLimits) maxRooms() int {
@@ -219,6 +223,7 @@ func (b *broker) guestView(g *guestState) map[string]any {
 		"id": g.cfg.ID, "max_rooms": lim.maxRooms(), "max_creates_per_minute": lim.MaxCreatesPerMinute,
 		"default_sealed": lim.DefaultSealed, "hotels": hotels, "ops": g.cfg.Ops,
 		"active_rooms": b.activeRooms(g), "policy": lim.Policy, "own_hosts_only": lim.OwnHostsOnly,
+		"pin_max_gib": lim.PinMaxGiB,
 	}
 }
 

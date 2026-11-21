@@ -256,8 +256,11 @@ def test_receipt_records_names_and_policy_hash_not_values() -> None:
     assert rr.sha(rr.canonical(got)) == network_policy_sha256(policy)
     old = rr.Handler.network_policy("create", 202, {"network": {"policy": {"mode": "deny_all", "allow": []}}})
     assert old == {"mode": "deny_all", "allow": []}
-    # Secret routes are not signed: their bodies never reach a receipt.
-    assert not any(pat.match("/v1/secrets/PIP_TOKEN") for _, pat, _ in rr.SIGNED)
+    # Secret routes are signed (AB#385), but a secret's value never reaches a receipt: the PUT's request hash
+    # is withheld and the DELETE has no body.
+    rows = [(m, a) for m, pat, a in rr.SIGNED if pat.match("/v1/secrets/PIP_TOKEN")]
+    assert rows == [("PUT", "secret_put"), ("DELETE", "secret_delete")]
+    assert "secret_put" in rr.REQUEST_WITHHELD
 
 
 def test_hotel_access_log_has_no_value(fake, daemon, monkeypatch, capfd) -> None:

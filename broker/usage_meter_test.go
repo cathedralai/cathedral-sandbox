@@ -18,13 +18,13 @@ import (
 // clock through the calls syncHotel and the create and delete hooks make;
 // the chain tests check that wiring against fake hotels.
 
-var meterT0 = time.Unix(1_800_000_000, 0)
+var usageMeterT0 = time.Unix(1_800_000_000, 0)
 
-func at(sec float64) time.Time { return meterT0.Add(time.Duration(sec * float64(time.Second))) }
+func at(sec float64) time.Time { return usageMeterT0.Add(time.Duration(sec * float64(time.Second))) }
 
-func testMeter(t *testing.T, dir string, every int64) *usageMeter {
+func testUsageMeter(t *testing.T, dir string, every int64) *usageMeter {
 	t.Helper()
-	m, err := openUsageMeter(dir, every, meterT0)
+	m, err := openUsageMeter(dir, every, usageMeterT0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func wantSeqs(t *testing.T, rs []usageReading, n int) {
 // them 4 s later (only listed time counts).
 func TestUsageMeterChurnMetersEveryRoom(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	type room struct {
 		run           string
 		created, died float64
@@ -200,7 +200,7 @@ func TestUsageMeterChurnMetersEveryRoom(t *testing.T) {
 // time; a confirmed one adds the time since the create.
 func TestUsageMeterSubSyncRoomViaHooks(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(10.2))
 	m.end("h.a", at(11.7), true)
 	m.seen(sighting("h.b"), at(10.2))
@@ -221,7 +221,7 @@ func TestUsageMeterSubSyncRoomViaHooks(t *testing.T) {
 // skipped, and a new broker writes a new file after it.
 func TestUsageMeterSeqSurvivesRestartAndSkipsTornLine(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	m.seen(sighting("h.b"), at(0))
 	for p := 2.0; p <= 60; p += 2 {
@@ -236,11 +236,11 @@ func TestUsageMeterSeqSurvivesRestartAndSkipsTornLine(t *testing.T) {
 	_, _ = f.WriteString(`{"schema":"cathedral_usage_reading_v1","seq":5,"run":"h.`)
 	f.Close()
 
-	m2 := testMeter(t, dir, 60)
+	m2 := testUsageMeter(t, dir, 60)
 	if m2.head != 4 || m2.nextSeq != 5 || len(m2.runs) != 2 {
 		t.Fatalf("after restart: head %d next %d runs %d, want 4, 5, 2", m2.head, m2.nextSeq, len(m2.runs))
 	}
-	if r := m2.runs["h.a"]; r.observed != 60*time.Second || r.last.StartedAt != meterT0.Unix() {
+	if r := m2.runs["h.a"]; r.observed != 60*time.Second || r.last.StartedAt != usageMeterT0.Unix() {
 		t.Fatalf("h.a replayed as %+v", r)
 	}
 	m2.seen(sighting("h.c"), at(100))
@@ -248,7 +248,7 @@ func TestUsageMeterSeqSurvivesRestartAndSkipsTornLine(t *testing.T) {
 	if m2.fname == torn {
 		t.Fatal("the new broker appended to the file with the torn line")
 	}
-	m3 := testMeter(t, dir, 60)
+	m3 := testUsageMeter(t, dir, 60)
 	if m3.head != 5 || m3.nextSeq != 6 {
 		t.Fatalf("second restart: head %d next %d", m3.head, m3.nextSeq)
 	}
@@ -271,7 +271,7 @@ func TestUsageMeterTornOnlyFileIsSetAside(t *testing.T) {
 	if err := os.WriteFile(name, []byte(`{"schema":"cathedral_usage_rea`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	mustFlush(t, m)
 	all := logReadings(t, dir)
@@ -286,7 +286,7 @@ func TestUsageMeterTornOnlyFileIsSetAside(t *testing.T) {
 // downtime adds nothing, and time counts again from the first sighting.
 func TestUsageMeterRestartContinuesFromLoggedSeconds(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 10)
+	m := testUsageMeter(t, dir, 10)
 	m.seen(sighting("h.a"), at(0))
 	for p := 2.0; p <= 40; p += 2 {
 		listPass(m, at(p), []string{"h.a"})
@@ -295,7 +295,7 @@ func TestUsageMeterRestartContinuesFromLoggedSeconds(t *testing.T) {
 	listPass(m, at(42), []string{"h.a"}) // observed, never written: the crash loses it
 	// crash: m is dropped without a flush
 
-	m2 := testMeter(t, dir, 10)
+	m2 := testUsageMeter(t, dir, 10)
 	listPass(m2, at(300), []string{"h.a"}) // first sighting after the restart
 	listPass(m2, at(302), []string{"h.a"})
 	m2.end("h.a", at(305), true)
@@ -307,8 +307,8 @@ func TestUsageMeterRestartContinuesFromLoggedSeconds(t *testing.T) {
 		t.Fatalf("readings %+v", got)
 	}
 	for i, r := range got {
-		if r.Seconds != want[i] || r.StartedAt != meterT0.Unix() {
-			t.Fatalf("reading %d: seconds %d started_at %d, want %d and %d", i, r.Seconds, r.StartedAt, want[i], meterT0.Unix())
+		if r.Seconds != want[i] || r.StartedAt != usageMeterT0.Unix() {
+			t.Fatalf("reading %d: seconds %d started_at %d, want %d and %d", i, r.Seconds, r.StartedAt, want[i], usageMeterT0.Unix())
 		}
 	}
 	if got[5].At != at(300).Unix() || got[6].State != "ended" {
@@ -320,7 +320,7 @@ func TestUsageMeterRestartContinuesFromLoggedSeconds(t *testing.T) {
 // and the time the broker did not see adds nothing.
 func TestUsageMeterOutageSpanningRoomEnd(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 10)
+	m := testUsageMeter(t, dir, 10)
 	m.seen(sighting("h.a"), at(0))
 	for p := 2.0; p <= 20; p += 2 {
 		listPass(m, at(p), []string{"h.a"})
@@ -328,7 +328,7 @@ func TestUsageMeterOutageSpanningRoomEnd(t *testing.T) {
 	mustFlush(t, m)
 	// The broker dies at 21; the room ends on the hotel at 50; the broker
 	// is back at 80.
-	m2 := testMeter(t, dir, 10)
+	m2 := testUsageMeter(t, dir, 10)
 	m2.hotelPass("h", nil, nil, at(80), false, false, false) // the list does not answer yet: nothing ends
 	if len(m2.runs) != 1 {
 		t.Fatal("a failed first list ended the run")
@@ -346,7 +346,7 @@ func TestUsageMeterOutageSpanningRoomEnd(t *testing.T) {
 // seconds of the last list that showed the room.
 func TestUsageMeterHotelDownStopsTheMeter(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	for p := 2.0; p <= 20; p += 2 {
 		listPass(m, at(p), []string{"h.a"})
@@ -377,7 +377,7 @@ func TestUsageMeterHotelDownStopsTheMeter(t *testing.T) {
 // after 60 s, the gap counts nothing.
 func TestUsageMeterGapRule(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 600)
+	m := testUsageMeter(t, dir, 600)
 	m.seen(sighting("h.a"), at(0))
 	listPass(m, at(10), []string{"h.a"})
 	listPass(m, at(12), nil, "h.a") // missing from this list, still in the room map
@@ -398,7 +398,7 @@ func TestUsageMeterGapRule(t *testing.T) {
 // the seqs instead of reusing them.
 func TestUsageMeterAppendFailureRetriesWithoutLossOrDuplicate(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	mustFlush(t, m)
 	fails := 2
@@ -464,7 +464,7 @@ func TestUsageMeterAppendFailureRetriesWithoutLossOrDuplicate(t *testing.T) {
 	if fmt.Sprint(served) != "[1 2 3 5]" || p.Next != 5 || p.Head != 5 {
 		t.Fatalf("served %v next %d head %d", served, p.Next, p.Head)
 	}
-	m2 := testMeter(t, dir, 60)
+	m2 := testUsageMeter(t, dir, 60)
 	if m2.head != 5 || m2.ended["h.a"] == nil || m2.runs["h.a"] != nil {
 		t.Fatalf("replay: head %d", m2.head)
 	}
@@ -473,7 +473,7 @@ func TestUsageMeterAppendFailureRetriesWithoutLossOrDuplicate(t *testing.T) {
 // writeTestReadings writes n readings, maxLines per file.
 func writeTestReadings(t *testing.T, dir string, n, maxLines int) *usageMeter {
 	t.Helper()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.maxLines = maxLines
 	for i := 0; i < n; i++ {
 		m.seen(sighting(fmt.Sprintf("h.r%d", i)), at(float64(i)))
@@ -537,7 +537,7 @@ func TestUsageMeterCursorNeverSkips(t *testing.T) {
 // whose first reading was pruned keeps its state from a later reading.
 func TestUsageMeterPruneRespectsCursorAndAge(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 10)
+	m := testUsageMeter(t, dir, 10)
 	m.maxLines = 5
 	m.seen(sighting("h.live"), at(0)) // seq 1, in the first file
 	mustFlush(t, m)
@@ -585,12 +585,12 @@ func TestUsageMeterPruneRespectsCursorAndAge(t *testing.T) {
 		t.Fatalf("newest file gone or acked %d", m.acked)
 	}
 
-	m2 := testMeter(t, dir, 10)
+	m2 := testUsageMeter(t, dir, 10)
 	if m2.acked != 15 {
 		t.Fatalf("acked after restart %d", m2.acked)
 	}
 	r := m2.runs["h.live"]
-	if r == nil || r.observed != 10*time.Second || r.last.StartedAt != meterT0.Unix() {
+	if r == nil || r.observed != 10*time.Second || r.last.StartedAt != usageMeterT0.Unix() {
 		t.Fatalf("open run after pruning its first file: %+v", r)
 	}
 }
@@ -606,7 +606,7 @@ func TestUsageMeterBrokerHooksAndRoute(t *testing.T) {
 	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+id, nil); status != 204 {
 		t.Fatalf("delete: %d %v", status, doc)
 	}
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 
 	for _, key := range []string{"key1", "reader-key", "enroller-key", ""} {
 		if status, doc := tc.call(t, key, "GET", "/v1/broker/usage-meter", nil); status != 401 {
@@ -647,9 +647,9 @@ func TestUsageMeterBrokerHooksAndRoute(t *testing.T) {
 		}
 	})
 	tc.b.syncHotel(context.Background(), tc.b.hotelByID("b"))
-	mustFlush(t, tc.b.meter)
-	if tc.b.meter.head != 2 {
-		t.Fatalf("head %d after the release, want 2", tc.b.meter.head)
+	mustFlush(t, tc.b.usageMeter)
+	if tc.b.usageMeter.head != 2 {
+		t.Fatalf("head %d after the release, want 2", tc.b.usageMeter.head)
 	}
 }
 
@@ -662,8 +662,8 @@ func TestUsageMeterCrashBeforeFirstAppendStartsAtFirstSight(t *testing.T) {
 	restart := time.Now().Unix()
 	tc.start(t) // no flush: the queued first reading is lost
 	tc.b.syncHotel(context.Background(), tc.b.hotelByID("b"))
-	mustFlush(t, tc.b.meter)
-	p, err := tc.b.meter.page(0, 10, time.Now())
+	mustFlush(t, tc.b.usageMeter)
+	p, err := tc.b.usageMeter.page(0, 10, time.Now())
 	if err != nil || len(p.Readings) != 1 {
 		t.Fatalf("page %+v err %v", p, err)
 	}
@@ -694,8 +694,8 @@ func TestUsageMeterSyncAdoptionKeepsLoggedStart(t *testing.T) {
 	tc.hotels["b"].mu.Unlock()
 	tc.b.syncHotel(context.Background(), tc.b.hotelByID("b"))
 	tc.b.syncHotel(context.Background(), tc.b.hotelByID("b"))
-	mustFlush(t, tc.b.meter)
-	p, _ := tc.b.meter.page(1, 10, time.Now())
+	mustFlush(t, tc.b.usageMeter)
+	p, _ := tc.b.usageMeter.page(1, 10, time.Now())
 	if len(p.Readings) != 1 {
 		t.Fatalf("page %+v", p)
 	}
@@ -704,7 +704,7 @@ func TestUsageMeterSyncAdoptionKeepsLoggedStart(t *testing.T) {
 	if r.Seq != 2 || r.Run != "b.sbx_1" || r.StartedAt != start || r.Seconds != 1200 || r.State != "running" {
 		t.Fatalf("adopted reading %+v", r)
 	}
-	if run := tc.b.meter.runs["b.sbx_1"]; run == nil || run.observed < 1200*time.Second || run.observed > 1203*time.Second {
+	if run := tc.b.usageMeter.runs["b.sbx_1"]; run == nil || run.observed < 1200*time.Second || run.observed > 1203*time.Second {
 		t.Fatalf("run %+v", run)
 	}
 }
@@ -713,7 +713,7 @@ func TestUsageMeterSyncAdoptionKeepsLoggedStart(t *testing.T) {
 // and the route answers 404 usage_meter_off to the operator, 401 to others.
 func TestUsageMeterOffWithoutStateDir(t *testing.T) {
 	tc := newChain(t)
-	if tc.b.meter != nil {
+	if tc.b.usageMeter != nil {
 		t.Fatal("a meter without state_dir")
 	}
 	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
@@ -721,10 +721,10 @@ func TestUsageMeterOffWithoutStateDir(t *testing.T) {
 	if status, _ := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+id, nil); status != 204 {
 		t.Fatalf("delete: %d", status)
 	}
-	if err := tc.b.meter.flush(); err != nil {
+	if err := tc.b.usageMeter.flush(); err != nil {
 		t.Fatal(err)
 	}
-	tc.b.meter.checkpoint(time.Now())
+	tc.b.usageMeter.checkpoint(time.Now())
 	if status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter", nil); status != 404 || errCode(doc) != "usage_meter_off" {
 		t.Fatalf("operator: %d %v", status, doc)
 	}
@@ -737,7 +737,7 @@ func TestUsageMeterOffWithoutStateDir(t *testing.T) {
 // restart loses no observed time.
 func TestUsageMeterCheckpointAtStop(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	m.seen(sighting("h.b"), at(0))
 	for p := 2.0; p <= 30; p += 2 {
@@ -753,7 +753,7 @@ func TestUsageMeterCheckpointAtStop(t *testing.T) {
 
 func TestUsageMeterConfigRejectsNegativeEvery(t *testing.T) {
 	b := &broker{cfg: config{UsageMeterEverySeconds: -1}}
-	if err := b.openMeter(); err == nil {
+	if err := b.loadUsageMeter(); err == nil {
 		t.Fatal("a negative usage_meter_every_seconds was accepted")
 	}
 }
@@ -762,9 +762,9 @@ func TestUsageMeterConfigRejectsNegativeEvery(t *testing.T) {
 func TestUsageMeterRouteCapsTheLimit(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	for i := 0; i < 1003; i++ {
-		tc.b.meter.seen(sighting(fmt.Sprintf("b.r%d", i)), time.Now())
+		tc.b.usageMeter.seen(sighting(fmt.Sprintf("b.r%d", i)), time.Now())
 	}
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter?limit=5000", nil)
 	if status != 200 || len(doc["readings"].([]any)) != usagePageMax || doc["next"].(float64) != usagePageMax || doc["head"].(float64) != 1003 {
 		t.Fatalf("page: %d next %v head %v", status, doc["next"], doc["head"])
@@ -779,7 +779,7 @@ func TestUsageMeterRouteCapsTheLimit(t *testing.T) {
 // ends at its last seconds; it has no sync pass of its own.
 func TestUsageMeterRunOnGoneHotelEnds(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.known = func(id string) bool { return id != "gone" }
 	m.seen(usageSighting{run: "gone.a", guest: "g1", hotel: "gone"}, at(0))
 	m.seen(sighting("h.b"), at(0))
@@ -796,7 +796,7 @@ func TestUsageMeterRunOnGoneHotelEnds(t *testing.T) {
 // lost.
 func TestUsageMeterDeleteTailNeedsTheLastList(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 600)
+	m := testUsageMeter(t, dir, 600)
 	m.seen(sighting("h.live"), at(0))
 	m.seen(sighting("h.lost"), at(0))
 	listPass(m, at(2), []string{"h.live", "h.lost"})
@@ -828,7 +828,7 @@ func TestUsageMeterDeleteOfAbsentRoomAnswered204AddsNothing(t *testing.T) {
 	if status, _ := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+id, nil); status != 204 {
 		t.Fatalf("delete: %d", status)
 	}
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 	got := readingsOf(logReadings(t, filepath.Join(tc.b.cfg.StateDir, usageDirName)), id)
 	if len(got) != 2 || got[1].State != "ended" || got[1].Seconds != 0 {
 		t.Fatalf("readings %+v, want ended at 0 s", got)
@@ -852,17 +852,17 @@ func TestUsageMeterBulkDeleteEndsTheRunWithItsSeconds(t *testing.T) {
 	})
 	syncNow(tc, "b")
 	syncNow(tc, "b")
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 	got := readingsOf(logReadings(t, filepath.Join(tc.b.cfg.StateDir, usageDirName)), id)
 	if len(got) != 2 || got[0].Seconds != 0 || got[1].State != "ended" || got[1].Seconds < 1 || got[1].Seconds > 10 {
 		t.Fatalf("readings %+v, want one ended reading with 1 to 10 s", got)
 	}
 }
 
-// meterRunsOf is the readings of run in tc's log.
-func meterRunsOf(t *testing.T, tc *testChain, run string) []usageReading {
+// usageMeterRunsOf is the readings of run in tc's log.
+func usageMeterRunsOf(t *testing.T, tc *testChain, run string) []usageReading {
 	t.Helper()
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 	return readingsOf(logReadings(t, filepath.Join(tc.b.cfg.StateDir, usageDirName)), run)
 }
 
@@ -910,7 +910,7 @@ func TestUsageMeterReapedRoomIsMeteredNotBillable(t *testing.T) {
 		syncNow(tc, "b")
 		time.Sleep(20 * time.Millisecond)
 	}
-	got := meterRunsOf(t, tc, "b.sbx_cancelled")
+	got := usageMeterRunsOf(t, tc, "b.sbx_cancelled")
 	if len(got) != 1 || got[0].Billable == nil || *got[0].Billable || got[0].State != "running" || got[0].Guest != "g1" {
 		t.Fatalf("readings while cleanup fails %+v", got)
 	}
@@ -919,12 +919,12 @@ func TestUsageMeterReapedRoomIsMeteredNotBillable(t *testing.T) {
 	f.mu.Unlock()
 	<-done
 	letGo(tc, "b")
-	got = meterRunsOf(t, tc, "b.sbx_cancelled")
+	got = usageMeterRunsOf(t, tc, "b.sbx_cancelled")
 	if len(got) != 2 || got[1].State != "ended" || got[1].Billable == nil || *got[1].Billable {
 		t.Fatalf("readings after cleanup %+v", got)
 	}
 	var line map[string]any
-	p, _ := tc.b.meter.page(0, 10, time.Now())
+	p, _ := tc.b.usageMeter.page(0, 10, time.Now())
 	_ = json.Unmarshal(p.Readings[len(p.Readings)-1], &line)
 	if line["billable"] != false {
 		t.Fatalf("route line %v, want billable false", line)
@@ -956,13 +956,13 @@ func TestUsageMeterRecordedLeftoverIsMeteredNotBillable(t *testing.T) {
 	f.rooms = nil // finally removed
 	f.mu.Unlock()
 	syncNow(tc, "b")
-	got := meterRunsOf(t, tc, "b.sbx_orphan")
+	got := usageMeterRunsOf(t, tc, "b.sbx_orphan")
 	if len(got) != 2 || got[0].Billable == nil || *got[0].Billable || got[1].State != "ended" || got[1].Seconds != 1 || got[1].Billable == nil || *got[1].Billable {
 		t.Fatalf("readings %+v, want first and ended (1 s), both billable false", got)
 	}
 	// A registered room's readings carry no billable field.
 	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
-	if got := meterRunsOf(t, tc, id); len(got) != 1 || got[0].Billable != nil {
+	if got := usageMeterRunsOf(t, tc, id); len(got) != 1 || got[0].Billable != nil {
 		t.Fatalf("guest room readings %+v", got)
 	}
 }
@@ -971,7 +971,7 @@ func TestUsageMeterRecordedLeftoverIsMeteredNotBillable(t *testing.T) {
 // reading again first: after a restart the run keeps started_at and seconds.
 func TestUsageMeterPruneCarriesAnOpenRunsOnlyReading(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 10)
+	m := testUsageMeter(t, dir, 10)
 	m.maxLines = 3
 	m.seen(sighting("h.quiet"), at(0))
 	for p := 2.0; p <= 20; p += 2 {
@@ -1002,12 +1002,12 @@ func TestUsageMeterPruneCarriesAnOpenRunsOnlyReading(t *testing.T) {
 	}
 	all := logReadings(t, dir)
 	last := all[len(all)-1]
-	if last.Seq != 8 || last.Run != "h.quiet" || last.Seconds != 20 || last.StartedAt != meterT0.Unix() || last.State != "running" {
+	if last.Seq != 8 || last.Run != "h.quiet" || last.Seconds != 20 || last.StartedAt != usageMeterT0.Unix() || last.State != "running" {
 		t.Fatalf("carried reading %+v", last)
 	}
-	m2 := testMeter(t, dir, 10)
+	m2 := testUsageMeter(t, dir, 10)
 	r := m2.runs["h.quiet"]
-	if r == nil || r.observed != 20*time.Second || r.last.StartedAt != meterT0.Unix() || r.lastSeq != 8 {
+	if r == nil || r.observed != 20*time.Second || r.last.StartedAt != usageMeterT0.Unix() || r.lastSeq != 8 {
 		t.Fatalf("after restart: %+v", r)
 	}
 }
@@ -1020,7 +1020,7 @@ func TestUsageMeterCrashBeforeFsyncReissuesNoServedSeq(t *testing.T) {
 	for _, kept := range []bool{false, true} {
 		t.Run(fmt.Sprintf("line kept %v", kept), func(t *testing.T) {
 			dir := t.TempDir()
-			m := testMeter(t, dir, 60)
+			m := testUsageMeter(t, dir, 60)
 			m.seen(sighting("h.a"), at(0))
 			mustFlush(t, m)
 			served := map[int64]string{}
@@ -1054,7 +1054,7 @@ func TestUsageMeterCrashBeforeFsyncReissuesNoServedSeq(t *testing.T) {
 				lines := strings.SplitAfter(string(raw), "\n")
 				_ = os.WriteFile(name, []byte(lines[0]), 0o600)
 			}
-			m2 := testMeter(t, dir, 60)
+			m2 := testUsageMeter(t, dir, 60)
 			m2.seen(sighting("h.c"), at(2))
 			mustFlush(t, m2)
 			p2, _ := m2.page(0, 10, time.Now())
@@ -1100,8 +1100,8 @@ func TestUsageMeterSizeIsWholeNumbers(t *testing.T) {
 		"labels": map[string]any{guestLabel: "g1"}, "resources": map[string]any{"vcpu": 1.5, "memory_gib": 3.2}})
 	f.mu.Unlock()
 	syncNow(tc, "b")
-	mustFlush(t, tc.b.meter)
-	p, _ := tc.b.meter.page(0, 10, time.Now())
+	mustFlush(t, tc.b.usageMeter)
+	p, _ := tc.b.usageMeter.page(0, 10, time.Now())
 	if len(p.Readings) != 1 || !strings.Contains(string(p.Readings[0]), `"vcpu":2,"memory_gib":4,`) {
 		t.Fatalf("line %s", p.Readings)
 	}
@@ -1112,7 +1112,7 @@ func TestUsageMeterSizeIsWholeNumbers(t *testing.T) {
 // takes rooms counts, a recovered one counts again, and a sync that never
 // completes a list attempt still goes stale.
 func TestUsageMeterObservedAtLeavesOutAnUnplaceableSilentHotel(t *testing.T) {
-	m := testMeter(t, t.TempDir(), 600)
+	m := testUsageMeter(t, t.TempDir(), 600)
 	pass := func(hotel string, when float64, listOK, unplaceable bool) {
 		run := hotel + ".r"
 		var listed []usageSighting
@@ -1237,7 +1237,7 @@ func TestUsageMeterSlowBulkDeleteKeepsItsSighting(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	letGo(tc, "b") // two syncs release the room while the delete answer is held
-	if got := meterRunsOf(t, tc, id); len(got) != 2 || got[1].State != "ended" || got[1].Seconds < 1 {
+	if got := usageMeterRunsOf(t, tc, id); len(got) != 2 || got[1].State != "ended" || got[1].Seconds < 1 {
 		close(hold)
 		t.Fatalf("readings before the delete answers %+v, want ended with at least 1 s", got)
 	}
@@ -1245,7 +1245,7 @@ func TestUsageMeterSlowBulkDeleteKeepsItsSighting(t *testing.T) {
 	if status := <-done; status != 200 {
 		t.Fatalf("bulk delete: %d", status)
 	}
-	got := meterRunsOf(t, tc, id)
+	got := usageMeterRunsOf(t, tc, id)
 	if len(got) != 2 || got[1].State != "ended" || got[1].Seconds < 1 || got[1].Seconds > 10 {
 		t.Fatalf("readings %+v, want one ended reading with 1 to 10 s", got)
 	}
@@ -1268,7 +1268,7 @@ func TestUsageMeterOrphanCleanupMetersTheRoom(t *testing.T) {
 	if len(deleted) != 1 || left != 0 {
 		t.Fatalf("cleanup deleted %v, %d rooms left", deleted, left)
 	}
-	got := meterRunsOf(t, tc, "b."+deleted[0])
+	got := usageMeterRunsOf(t, tc, "b."+deleted[0])
 	if len(got) != 2 || got[1].State != "ended" {
 		t.Fatalf("readings %+v, want a first and an ended reading", got)
 	}
@@ -1312,7 +1312,7 @@ func TestUsageMeterAdoptedRoomOfAFailedCreateEndsNotBillable(t *testing.T) {
 		t.Fatal("the create succeeded")
 	}
 	letGo(tc, "b")
-	got := meterRunsOf(t, tc, "b."+hid)
+	got := usageMeterRunsOf(t, tc, "b."+hid)
 	if len(got) < 2 || got[0].Billable != nil || got[len(got)-1].State != "ended" {
 		t.Fatalf("readings %+v, want a billable first reading and an ended one", got)
 	}
@@ -1328,7 +1328,7 @@ func TestUsageMeterAdoptedRoomOfAFailedCreateEndsNotBillable(t *testing.T) {
 // seq is 3, never one a reader has seen.
 func TestUsageMeterSeqNeverRestartsAfterPruningEveryReading(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.x"), at(0))
 	m.end("h.x", at(1), false)
 	mustFlush(t, m)
@@ -1343,7 +1343,7 @@ func TestUsageMeterSeqNeverRestartsAfterPruningEveryReading(t *testing.T) {
 		t.Fatalf("served %v", served)
 	}
 
-	m2 := testMeter(t, dir, 60)
+	m2 := testUsageMeter(t, dir, 60)
 	m2.write = func(f *os.File, b []byte) error { _, _ = f.Write(b[:3]); return errors.New("no space left on device") }
 	m2.seen(sighting("h.y"), at(10))
 	if err := m2.flush(); err == nil {
@@ -1364,7 +1364,7 @@ func TestUsageMeterSeqNeverRestartsAfterPruningEveryReading(t *testing.T) {
 	}
 	// The broker dies with h.y still queued. The next one prunes (nothing is
 	// queued), then dies too; the one after finds only the empty file.
-	m3 := testMeter(t, dir, 60)
+	m3 := testUsageMeter(t, dir, 60)
 	if _, err := m3.page(2, 10, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -1372,7 +1372,7 @@ func TestUsageMeterSeqNeverRestartsAfterPruningEveryReading(t *testing.T) {
 		t.Fatal("the acknowledged old file was not pruned")
 	}
 
-	m4 := testMeter(t, dir, 60)
+	m4 := testUsageMeter(t, dir, 60)
 	if m4.nextSeq != 3 || m4.head != 2 {
 		t.Fatalf("after restart: next %d head %d, want 3 and 2", m4.nextSeq, m4.head)
 	}
@@ -1394,7 +1394,7 @@ func TestUsageMeterSeqNeverRestartsAfterPruningEveryReading(t *testing.T) {
 // sync is retried; once it succeeds the readings are served.
 func TestUsageMeterReplaySyncFailureServesNothingUntilSynced(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	m.seen(sighting("h.b"), at(0))
 	mustFlush(t, m)
@@ -1408,7 +1408,7 @@ func TestUsageMeterReplaySyncFailureServesNothingUntilSynced(t *testing.T) {
 	}
 	t.Cleanup(func() { usageSyncFile = orig })
 
-	m2 := testMeter(t, dir, 60)
+	m2 := testUsageMeter(t, dir, 60)
 	if m2.head != 0 || m2.nextSeq != 3 || len(m2.runs) != 2 || m2.writeErrors != 1 {
 		t.Fatalf("replay: head %d next %d runs %d errors %d", m2.head, m2.nextSeq, len(m2.runs), m2.writeErrors)
 	}
@@ -1443,7 +1443,7 @@ func TestUsageMeterReplaySyncFailureServesNothingUntilSynced(t *testing.T) {
 // durable and write_errors grows; after recovery pending_readings is 0.
 func TestUsageMeterRouteReportsPendingReadings(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	m := tc.b.meter
+	m := tc.b.usageMeter
 	m.write = func(f *os.File, p []byte) error { return errors.New("no space left on device") }
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
@@ -1498,7 +1498,7 @@ func TestUsageMeterNotBillableSurvivesARestart(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	syncNow(tc, "b") // adopted: a billable first reading
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 	if status := <-done; status == 202 {
 		t.Fatal("the create succeeded")
 	}
@@ -1509,7 +1509,7 @@ func TestUsageMeterNotBillableSurvivesARestart(t *testing.T) {
 		t.Fatalf("readings on disk at the crash %+v, want billable then not billable at the same seconds", before)
 	}
 	tc.start(t) // crash and restart: the new broker has no record of the failed create
-	r := tc.b.meter.runs[run]
+	r := tc.b.usageMeter.runs[run]
 	if r == nil || r.last.Billable == nil || *r.last.Billable {
 		t.Fatalf("replayed run %+v, want not billable", r)
 	}
@@ -1518,7 +1518,7 @@ func TestUsageMeterNotBillableSurvivesARestart(t *testing.T) {
 	f.rooms, f.roomDeleteFail = nil, 0
 	f.mu.Unlock()
 	letGo(tc, "b")
-	got := meterRunsOf(t, tc, run)
+	got := usageMeterRunsOf(t, tc, run)
 	if len(got) < 3 || got[len(got)-1].State != "ended" {
 		t.Fatalf("readings %+v, want an ended reading after the restart", got)
 	}
@@ -1534,7 +1534,7 @@ func TestUsageMeterNotBillableSurvivesARestart(t *testing.T) {
 // queue first, so after a crash the ended reading is there.
 func TestUsageMeterPruneWritesAQueuedEndFirst(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.maxLines = 2
 	m.seen(sighting("h.quiet"), at(0)) // seq 1: file 1
 	m.seen(sighting("h.x"), at(1))     // seq 2: file 1
@@ -1551,12 +1551,12 @@ func TestUsageMeterPruneWritesAQueuedEndFirst(t *testing.T) {
 		t.Fatal("file 1 was not pruned")
 	}
 	// crash: m is dropped
-	m2 := testMeter(t, dir, 60)
+	m2 := testUsageMeter(t, dir, 60)
 	if m2.ended["h.quiet"] == nil || m2.runs["h.quiet"] != nil {
 		t.Fatal("after the crash h.quiet is neither ended nor known")
 	}
 	got := readingsOf(logReadings(t, dir), "h.quiet")
-	if len(got) == 0 || got[len(got)-1].State != "ended" || got[len(got)-1].StartedAt != meterT0.Unix() {
+	if len(got) == 0 || got[len(got)-1].State != "ended" || got[len(got)-1].StartedAt != usageMeterT0.Unix() {
 		t.Fatalf("h.quiet readings %+v", got)
 	}
 }
@@ -1582,7 +1582,7 @@ func TestUsageMeterDirectorySyncFailureServesAndPrunesNothing(t *testing.T) {
 			}
 			t.Cleanup(func() { usageSyncDir = orig })
 
-			m := testMeter(t, dir, 60)
+			m := testUsageMeter(t, dir, 60)
 			m.seen(sighting("h.a"), at(0))
 			if err := m.flush(); err == nil {
 				t.Fatal("flush succeeded with the directory not synced")
@@ -1641,7 +1641,7 @@ func TestUsageMeterNoPruneWhileAReplayedRangeIsUnsynced(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			m := testMeter(t, dir, 10)
+			m := testUsageMeter(t, dir, 10)
 			m.maxLines = 2
 			m.seen(sighting("h.L"), at(0))
 			m.seen(sighting("h.x"), at(0))
@@ -1664,7 +1664,7 @@ func TestUsageMeterNoPruneWhileAReplayedRangeIsUnsynced(t *testing.T) {
 				return orig(f)
 			}
 			t.Cleanup(func() { usageSyncFile = orig })
-			m2 := testMeter(t, dir, 10) // crash and restart: file 3 does not sync
+			m2 := testUsageMeter(t, dir, 10) // crash and restart: file 3 does not sync
 			if _, err := m2.page(2, 10, time.Now()); err != nil {
 				t.Fatal(err)
 			}
@@ -1674,8 +1674,8 @@ func TestUsageMeterNoPruneWhileAReplayedRangeIsUnsynced(t *testing.T) {
 			// Another crash loses the unsynced file.
 			_ = os.Remove(file3)
 			usageSyncFile = orig
-			m3 := testMeter(t, dir, 10)
-			if r := m3.runs["h.L"]; r == nil || r.last.StartedAt != meterT0.Unix() {
+			m3 := testUsageMeter(t, dir, 10)
+			if r := m3.runs["h.L"]; r == nil || r.last.StartedAt != usageMeterT0.Unix() {
 				t.Fatalf("h.L after the second crash: %+v", r)
 			}
 		})
@@ -1697,7 +1697,7 @@ func TestUsageMeterNewUsageDirNeedsItsParentSynced(t *testing.T) {
 		return orig(d)
 	}
 	t.Cleanup(func() { usageSyncDir = orig })
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	if err := m.flush(); err == nil {
 		t.Fatal("flush succeeded with usage/ not durable")
@@ -1716,7 +1716,7 @@ func TestUsageMeterNewUsageDirNeedsItsParentSynced(t *testing.T) {
 	}
 	// A usage/ that existed at start needs no parent sync.
 	failing = true
-	m2 := testMeter(t, dir, 60)
+	m2 := testUsageMeter(t, dir, 60)
 	m2.seen(sighting("h.b"), at(1))
 	mustFlush(t, m2)
 }
@@ -1731,10 +1731,10 @@ func TestUsageMeterHungDiskStallsNothing(t *testing.T) {
 	t.Cleanup(func() { usageTurnWait, usageReadWait = oldTurn, oldRead })
 	tc := newChainState(t, t.TempDir())
 	syncNow(tc, "b")
-	mustFlush(t, tc.b.meter)
+	mustFlush(t, tc.b.usageMeter)
 	hung := make(chan struct{})
 	t.Cleanup(func() { close(hung) })
-	tc.b.meter.write = func(f *os.File, p []byte) error { <-hung; return errors.New("disk hung") }
+	tc.b.usageMeter.write = func(f *os.File, p []byte) error { <-hung; return errors.New("disk hung") }
 
 	f := tc.hotels["b"]
 	f.mu.Lock()
@@ -1781,14 +1781,14 @@ func TestUsageMeterHungDiskStallsNothing(t *testing.T) {
 // the room in its own list and can delete it).
 func TestUsageMeterKnownLimitCrashBeforeTheTurnIsDurable(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 10)
+	m := testUsageMeter(t, dir, 10)
 	m.seen(sighting("h.orphan"), at(0)) // adopted by a sync: billable
 	mustFlush(t, m)
 	if !m.seen(usageSighting{run: "h.orphan", guest: "g1", hotel: "h"}, at(1)) {
 		t.Fatal("no turn to not billable")
 	}
 	// crash: the turn is queued, never written
-	m2 := testMeter(t, dir, 10)
+	m2 := testUsageMeter(t, dir, 10)
 	if r := m2.runs["h.orphan"]; r == nil || r.last.Billable != nil {
 		t.Fatalf("replayed run %+v: the documented limit no longer holds, update the README", r)
 	}
@@ -1808,7 +1808,7 @@ func TestUsageMeterKnownLimitCrashBeforeTheTurnIsDurable(t *testing.T) {
 // fault, or the operator's last resort) cannot bring a served seq back.
 func TestUsageMeterServedSeqSurvivesALostLogFile(t *testing.T) {
 	dir := t.TempDir()
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	m.end("h.a", at(1), false)
 	mustFlush(t, m)
@@ -1820,7 +1820,7 @@ func TestUsageMeterServedSeqSurvivesALostLogFile(t *testing.T) {
 	for _, f := range files {
 		_ = os.Remove(f.path)
 	}
-	m2 := testMeter(t, dir, 60)
+	m2 := testUsageMeter(t, dir, 60)
 	if m2.nextSeq != 3 {
 		t.Fatalf("next seq after losing the log %d, want 3 (above the served 2)", m2.nextSeq)
 	}
@@ -1849,7 +1849,7 @@ func TestUsageMeterNewStateDirSyncsEveryNewAncestor(t *testing.T) {
 		return orig(d)
 	}
 	t.Cleanup(func() { usageSyncDir = orig })
-	m := testMeter(t, dir, 60)
+	m := testUsageMeter(t, dir, 60)
 	m.seen(sighting("h.a"), at(0))
 	if err := m.flush(); err == nil {
 		t.Fatal("flush succeeded with a new ancestor not durable")
@@ -1868,5 +1868,227 @@ func TestUsageMeterNewStateDirSyncsEveryNewAncestor(t *testing.T) {
 	want := []string{base, filepath.Join(base, "a"), state}
 	if len(synced) < 3 || fmt.Sprint(synced[:3]) != fmt.Sprint(want) {
 		t.Fatalf("synced %v, want %v first", synced, want)
+	}
+}
+
+// Main's meter key routes (#648, meter.go) and the usage meter route share
+// the word meter and nothing else. After the merge the meter key gets no
+// usage readings, and the operator key keeps the usage meter and gets no
+// meter key route.
+func TestUsageMeterRouteAndMeterKeyRoutesStayApart(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MeterKeySHA256 = sha("meter-key")
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	syncNow(tc, "b")
+	mustFlush(t, tc.b.usageMeter)
+	for _, c := range [][2]string{{"GET", "/v1/broker/usage-meter"}, {"GET", "/v1/broker/usage-meter?after=0&limit=10"}, {"POST", "/v1/broker/usage-meter"}} {
+		if status, doc := tc.call(t, "meter-key", c[0], c[1], nil); status != 401 {
+			t.Fatalf("meter key %s %s: %d %v, want 401", c[0], c[1], status, doc)
+		}
+	}
+	status, doc := tc.call(t, "operator-key", "GET", "/v1/broker/usage-meter?after=0", nil)
+	rs, _ := doc["readings"].([]any)
+	if status != 200 || len(rs) != 1 || rs[0].(map[string]any)["run"] != id {
+		t.Fatalf("operator key usage meter: %d %v, want the room's first reading", status, doc)
+	}
+	for _, rt := range meterPaths("g1") {
+		if status, doc := tc.call(t, "operator-key", rt[0], rt[1], nil); status != 401 {
+			t.Fatalf("operator key %s %s: %d %v, want 401", rt[0], rt[1], status, doc)
+		}
+	}
+	if n := len(tc.hotels["b"].freezes); n != 0 {
+		t.Fatalf("hotel got %d freezes", n)
+	}
+	if status, doc := tc.call(t, "meter-key", "GET", "/v1/broker/guests/g1/rooms", nil); status != 200 {
+		t.Fatalf("meter key on its own route: %d %v", status, doc)
+	}
+}
+
+// endedReadings is how many ended readings run has in tc's log.
+func endedReadings(t *testing.T, tc *testChain, run string) (n int, all []usageReading) {
+	t.Helper()
+	all = usageMeterRunsOf(t, tc, run)
+	for _, r := range all {
+		if r.State == "ended" {
+			n++
+		}
+	}
+	return n, all
+}
+
+// Every way a room leaves the broker on main (#637 records why) gives its
+// run exactly one ended reading, and a later sync adds none. #637 adds no
+// end path of its own: its records are written at the sync loop's release
+// of a vanished room and at the miner forget, both of which end the run.
+func TestUsageMeterEndsOnceOnEveryEndPathOfMain(t *testing.T) {
+	for _, c := range []struct {
+		name, reason string
+		end          func(t *testing.T, tc *testChain, bid string)
+	}{
+		{"delete by id", "deleted", func(t *testing.T, tc *testChain, bid string) {
+			if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes/"+bid, nil); status != 204 {
+				t.Fatalf("delete: %d %v", status, doc)
+			}
+			releaseGone(t, tc, "b")
+		}},
+		{"delete by label", "deleted", func(t *testing.T, tc *testChain, bid string) {
+			if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+				t.Fatalf("bulk delete: %d %v", status, doc)
+			}
+			releaseGone(t, tc, "b")
+		}},
+		{"listed expiry", "ttl_expired", func(t *testing.T, tc *testChain, bid string) {
+			setOnHotel(tc, bid, "expires_at", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339))
+			syncNow(tc, "b")
+			vanish(t, tc, bid)
+		}},
+		{"hotel ended list", "idle_timeout", func(t *testing.T, tc *testChain, bid string) {
+			f := tc.hotels["b"]
+			f.mu.Lock()
+			f.listExtra = map[string]any{"ended": []map[string]any{{"id": strings.SplitN(bid, ".", 2)[1], "end_reason": "idle_timeout"}}}
+			f.mu.Unlock()
+			vanish(t, tc, bid)
+		}},
+		{"hotel api restart", "hotel_restarted", func(t *testing.T, tc *testChain, bid string) {
+			f := tc.hotels["b"]
+			f.mu.Lock()
+			f.listExtra = map[string]any{"api_started_at": "2026-11-21T07:00:00+00:00"}
+			f.mu.Unlock()
+			syncNow(tc, "b")
+			f.mu.Lock()
+			f.listExtra = map[string]any{"api_started_at": "2026-11-21T08:00:00+00:00"}
+			f.mu.Unlock()
+			vanish(t, tc, bid)
+		}},
+		{"vanished", "unknown", func(t *testing.T, tc *testChain, bid string) {
+			vanish(t, tc, bid)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tc := newChainState(t, t.TempDir())
+			bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "labels": map[string]string{"job": "x"}})
+			syncNow(tc, "b")
+			c.end(t, tc, bid)
+			if r := goneReason(t, tc, "key1", bid); r != c.reason {
+				t.Fatalf("end record reason %q, want %q", r, c.reason)
+			}
+			syncNow(tc, "b")
+			if n, all := endedReadings(t, tc, bid); n != 1 || all[len(all)-1].State != "ended" {
+				t.Fatalf("readings %+v, want exactly one ended reading, last", all)
+			}
+		})
+	}
+
+	t.Run("miner forget", func(t *testing.T) {
+		tc := newChainState(t, t.TempDir())
+		g := newRebootingGuest(t, "m1")
+		_, bid, _ := readyToForget(t, tc, g)
+		if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/m1?forget_rooms=true", nil); status != 204 {
+			t.Fatalf("forget: %d %v", status, doc)
+		}
+		if r := goneReason(t, tc, "key1", bid); r != "hotel_removed" {
+			t.Fatalf("end record reason %q, want hotel_removed", r)
+		}
+		syncNow(tc, "b") // any pass sweeps the runs of a hotel the broker no longer has
+		syncNow(tc, "b")
+		if n, all := endedReadings(t, tc, bid); n != 1 || all[len(all)-1].State != "ended" {
+			t.Fatalf("readings %+v, want exactly one ended reading, last", all)
+		}
+	})
+
+	t.Run("refused create", func(t *testing.T) {
+		tc := newChainState(t, t.TempDir()) // no hotel applies tunables: the broker reaps the room
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{
+			"image": "alpine:3.20", "hotels": []string{"b"}, "tunables": coldTunables()})
+		if status != 409 || errCode(doc) != "tunables_unavailable" {
+			t.Fatalf("create: %d %v", status, doc)
+		}
+		releaseGone(t, tc, "b")
+		syncNow(tc, "b")
+		if status, list := endedOf(t, tc, "key1", ""); status != 200 || len(list) != 0 {
+			t.Fatalf("end records after a refused create: %d %v, want none", status, list)
+		}
+		mustFlush(t, tc.b.usageMeter)
+		var runs []string
+		for _, r := range logReadings(t, filepath.Join(tc.b.cfg.StateDir, usageDirName)) {
+			if r.State == "ended" {
+				runs = append(runs, r.Run)
+			}
+			if r.Billable == nil || *r.Billable {
+				t.Fatalf("a refused create's reading is billable: %+v", r)
+			}
+		}
+		if len(runs) != 1 {
+			t.Fatalf("ended readings for %v, want one run", runs)
+		}
+	})
+
+	// #637 drops the end record when a late list shows the room again; the
+	// run stays ended (README: not metered again for 24 h).
+	t.Run("late list after the end", func(t *testing.T) {
+		tc := newChainState(t, t.TempDir())
+		bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+		syncNow(tc, "b")
+		f := tc.hotels["b"]
+		f.mu.Lock()
+		saved := append([]map[string]any(nil), f.rooms...)
+		f.mu.Unlock()
+		vanish(t, tc, bid)
+		_, before := endedReadings(t, tc, bid)
+		f.mu.Lock()
+		f.rooms = saved
+		f.mu.Unlock()
+		syncNow(tc, "b")
+		if status, _ := tc.call(t, "key1", "GET", "/v1/sandboxes/"+bid, nil); status != 200 {
+			t.Fatalf("re-adopted room: %d, want 200", status)
+		}
+		n, after := endedReadings(t, tc, bid)
+		if n != 1 || len(after) != len(before) {
+			t.Fatalf("readings before %+v after %+v, want one ended reading and nothing new", before, after)
+		}
+	})
+}
+
+// Pins today's behaviour for #648's freeze, which another team must rule on
+// (is a frozen room billable?). The hotel still lists a frozen room, with
+// state "frozen"; the broker keeps it as a running room, and the usage meter
+// counts its seconds like any listed room: readings say "running" and carry
+// no billable field.
+func TestUsageMeterFrozenRoomIsStillMeteredAsBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	tc.b.cfg.MeterKeySHA256 = sha("meter-key")
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
+	syncNow(tc, "b")
+	status, doc := tc.call(t, "meter-key", "POST", "/v1/broker/guests/g1/freeze-all", nil)
+	if frozen, _ := doc["frozen"].([]any); status != 200 || len(frozen) != 1 || frozen[0] != bid {
+		t.Fatalf("freeze-all: %d %v", status, doc)
+	}
+	if s := hotelRoomState(tc.hotels["b"], strings.SplitN(bid, ".", 2)[1]); s != "frozen" {
+		t.Fatalf("hotel room state %v, want frozen", s)
+	}
+	m := tc.b.usageMeter
+	for i := 0; i < 2; i++ {
+		// 20 s between sightings and a reading due, without sleeping.
+		m.mu.Lock()
+		r := m.runs[bid]
+		r.lastSeen, r.lastAt = r.lastSeen.Add(-20*time.Second), r.lastAt-61
+		m.mu.Unlock()
+		syncNow(tc, "b")
+	}
+	tc.b.mu.Lock()
+	rm := tc.b.byBID(bid)
+	running := rm != nil && rm.state == stRunning
+	tc.b.mu.Unlock()
+	if !running {
+		t.Fatal("the broker no longer holds the frozen room as running")
+	}
+	all := usageMeterRunsOf(t, tc, bid)
+	if len(all) != 3 {
+		t.Fatalf("readings %+v, want the first and two more", all)
+	}
+	for i, r := range all {
+		if r.State != "running" || r.Billable != nil || r.Seconds < int64(20*i) {
+			t.Fatalf("reading %d of a frozen room: %+v", i, r)
+		}
 	}
 }
