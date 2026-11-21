@@ -188,11 +188,14 @@ func (r *usageRun) observe(at time.Time) {
 	}
 }
 
-// usageSighting is what the broker saw of one room.
+// usageSighting is what the broker saw of one room. pool: a ready-room pool
+// room (pool.go), not billable from its first reading, so it never turns and
+// nothing waits for a turn to be durable.
 type usageSighting struct {
 	run, guest, hotel, miner string
 	vcpu, memGiB             int64
 	billable                 bool
+	pool                     bool
 }
 
 var usageNotBillable = false
@@ -216,9 +219,11 @@ func (r *usageRun) update(s usageSighting) (turnedNotBillable bool) {
 
 // usageSightingOf is a sighting of a room in h's room map. A registered room
 // is a guest's; one without a client id is being reaped and is not billable.
+// A room of the ready-room pool guest is never billable (design 8.2).
 func usageSightingOf(h *hotel, rm *room, resources any) usageSighting {
 	vcpu, mem := usageSizeOf(resources)
-	return usageSighting{run: rm.id, guest: rm.guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem, billable: rm.uuid != ""}
+	pool := rm.guest == poolGuestID
+	return usageSighting{run: rm.id, guest: rm.guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem, billable: rm.uuid != "" && !pool, pool: pool}
 }
 
 // usageSizeOf reads resources.vcpu and resources.memory_gib as whole
@@ -542,7 +547,7 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) (turnedNotBillabl
 		r.update(s)
 		m.runs[s.run] = r
 		m.queueLocked(r, "running", at)
-		return !s.billable
+		return !s.billable && !s.pool
 	}
 	turned := r.update(s)
 	r.observe(at)
@@ -552,7 +557,7 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) (turnedNotBillabl
 	if turned || at.Unix()-r.lastAt >= m.every {
 		m.queueLocked(r, "running", at)
 	}
-	return turned
+	return turned && !s.pool
 }
 
 // end writes the ended reading of a run. confirmed: the broker's own delete
