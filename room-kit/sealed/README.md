@@ -540,9 +540,68 @@ forwards, and refuses to add one when it cannot list the rules. The check and
 the add hold a host-wide lock (`/run/lock/sealed-hotel-dnat.lock`), so two
 hotels starting together cannot both take one port.
 
-Still open: the guest side (an nft accept for the ingress port, the server on
-it, the ACME client that signs its challenge with the receipt key). It is in
-the measured image and needs a re-seal.
+## Preview URL ingress in the guest (AB#422)
+
+`SEALED_ROOM_GUEST_INGRESS=1` makes the front create the ingress TLS key in
+the guest and name its SPKI sha256 in the binding (`guest_ingress`). Add
+`SEALED_INGRESS_ZONE` (the broker's `acme_dns` zone, for example
+`hotels.cathedral.computer`) and `SEALED_INGRESS_BROKER_URL` (the broker's
+https origin) and the guest also serves on that key:
+
+- `build-guest.sh` writes `ROOM_INGRESS_ZONE`, `ROOM_INGRESS_BROKER_URL`,
+  `ROOM_INGRESS_TLS_LISTEN` (`<guest ip>:SEALED_INGRESS_TLS_PORT`),
+  `ROOM_INGRESS_PUBLIC_PORT` and `ROOM_ACME_DIRECTORY` (default Let's Encrypt)
+  into the measured room.env, and adds a guest nft accept for
+  `SEALED_INGRESS_TLS_PORT` on the uplink from any source, like the miner
+  port. Without a zone neither is written: room.env and the firewall are byte
+  for byte what they were. `SEALED_INGRESS_TLS_PORT` is now in the
+  measurement too: keep it equal to the host's value.
+- The binding's `guest_ingress` also names the `zone`, so a verifier can check
+  an expose URL's host.
+- `room_ingress.py` (in the front's process) serves HTTPS on that port with
+  the ingress key. The key stays in the front's memory; `load_cert_chain`
+  reads it from a root-only file in `/run/room-receipts` (tmpfs, guest memory)
+  that is removed at once. Until a certificate arrives, the same key serves
+  its self-issued certificate.
+- `room_acme.py` gets a certificate for `<hotel id>.<zone>` and
+  `*.<hotel id>.<zone>` (RFC 8555, ES256 account key made per process and
+  never written). DNS-01 goes through `PUT /v1/broker/acme-challenge`, signed
+  with the receipt key (broker README, "Preview URL certificates"); the
+  record is removed after each order. The broker answers 403 until it has
+  admitted this boot's binding, so the first tries back off (30 s doubling to
+  1 h). Renewal is two thirds into the certificate's life.
+- `POST /v1/sandboxes/<id>/expose {"port": n}` is answered by the front, not
+  the API (which still answers 501): for a running room it returns
+  `https://<room id with _ as ->-<port>.<hotel id>.<zone>/` (`:<public port>`
+  when not 443) and an `X-Room-Receipt` that names `expose_port`,
+  `expose_url`, `expose_host` and `ingress_tls_spki_sha256`. Before the
+  certificate it answers `503 ingress_not_ready`; a serial room answers `409
+  room_serial_unsigned` (its traffic would be unsigned). Every answer to a caller
+  with the key is signed. `verify_receipts.py --receipt-header <value>
+  --ingress-spki-sha256 <peer>` checks the receipt against the binding and the
+  served key against `guest_ingress.tls_spki_sha256`.
+- A request to an exposed host goes, as one request and answer, to the room
+  API's guest port dial (`ports/<port>/http`, AB#605) for `127.0.0.1:<port>`
+  inside the room. A host nothing exposed answers 404; a deleted room's URLs
+  end with it. No WebSocket or streamed answer yet (the dial buffers, 16 MiB
+  request cap), and the dial drops cookies.
+
+Before turning it on: the broker needs `acme_dns` for the zone, `<hotel
+id>.<zone>` and `*.<hotel id>.<zone>` must point at the host (A records), and
+the host needs `SEALED_GUEST_INGRESS=1` (above). Every boot (and every restart of
+the front) makes a new key, so each orders a new certificate: Let's Encrypt allows 5 for the same
+names per week, so a hotel that restarts more often than that waits for the
+limit (the old URLs serve the self-issued certificate meanwhile). Every
+hotel in the zone also shares Let's Encrypt's 50 certificates per week for the
+registered domain (cathedral.computer for hotels.cathedral.computer). A
+certificate that expires without a renewal turns expose off again (503) until
+the next one arrives. Point
+`SEALED_ACME_DIRECTORY` at Let's Encrypt staging for trials.
+
+Still open: a live run after the re-seal (https to a room port answered with
+the key the binding names, the expose receipt verified); WebSocket and
+streamed answers on Preview URLs; the broker's `acme_dns` config and the DNS
+records on the live zone.
 
 ## Remove
 

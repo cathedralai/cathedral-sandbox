@@ -75,8 +75,13 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      unknown, not retired. The output's pool_rooms gives each state.
  12. guest ingress (AB#422): a sealed binding that names guest_ingress must
      name a cathedral_guest_ingress_v1 object with a well-formed
-     tls_spki_sha256: the key Preview URLs will be served with, made in the
-     guest. The output reports it; nothing serves on it yet.
+     tls_spki_sha256: the key Preview URLs are served with, made in the
+     guest, and the zone when it names one. --ingress-spki-sha256 (the SPKI
+     sha256 of the TLS peer that served a Preview URL) must equal it. Each
+     successful expose receipt that names an expose URL must name the
+     binding's ingress key, a port 1 to 65535, and a host
+     <room>-<port>.<hotel>.<zone> of this binding's hotel and zone, with the
+     URL https://<host>[:port]/. The output's exposes lists them.
  13. snapshots and forks, inside one binding. A successful snapshot receipt
      names snapshot_id, snapshot_image_id (sha256: and 64 hex),
      snapshot_work_archive_sha256, snapshot_size_bytes and
@@ -565,6 +570,49 @@ def verify_guest_ingress(att: dict, peer_spki_sha256: str | None = None, require
     if peer_spki_sha256 is not None:
         need(peer_spki_sha256.lower() == tls, "the Preview URL peer is not the key the binding names (the host answered?)")
     return {"schema": INGRESS_SCHEMA, "tls_spki_sha256": tls, "peer_checked": peer_spki_sha256 is not None}
+
+
+EXPOSE_FIELDS = ("expose_port", "expose_url", "expose_host", "ingress_tls_spki_sha256")
+
+
+def check_exposes(att: dict, receipts: list[dict]) -> list[dict]:
+    """Expose receipts signed by a guest that serves Preview URLs (AB#422), checked against the binding.
+
+    The receipt is signed by the binding's receipt key (verify_receipts checks that); here its
+    expose fields must name the ingress key the binding names and a host under this binding's
+    hotel and zone. A receipt with none of the fields (the API's own 501, or a failed expose)
+    is not listed.
+    """
+    binding = att["binding"]
+    ingress = binding.get("guest_ingress") if isinstance(binding.get("guest_ingress"), dict) else None
+    out = []
+    for rc in receipts:
+        st = rc["statement"]
+        if st.get("action") != "expose":
+            continue
+        present = [k for k in EXPOSE_FIELDS if k in st]
+        if not present:
+            continue
+        where = f"expose receipt {st['sequence']}"
+        need(len(present) == len(EXPOSE_FIELDS), f"{where} names only some of the expose fields")
+        need(_is_int(st.get("status")) and 200 <= st["status"] < 300, f"{where} names a URL but did not succeed")
+        need(ingress is not None and isinstance(ingress.get("zone"), str),
+             f"{where}: the binding names no guest ingress zone, so no URL is attested")
+        need(st["ingress_tls_spki_sha256"] == ingress.get("tls_spki_sha256"),
+             f"{where} names another ingress key than the binding")
+        port = st["expose_port"]
+        need(_is_int(port) and 1 <= port <= 65535, f"{where}: expose_port is not a TCP port")
+        room = st.get("sandbox_id")
+        need(isinstance(room, str), f"{where} names no room")
+        base = f"{binding.get('hotel')}.{ingress['zone']}"
+        want_host = f"{room.replace('_', '-')}-{port}.{base}"
+        need(st["expose_host"] == want_host, f"{where}: host is not {want_host}")
+        url = st["expose_url"]
+        need(isinstance(url, str) and re.fullmatch(r"https://" + re.escape(want_host) + r"(:[1-9][0-9]{0,4})?/", url)
+             is not None, f"{where}: URL is not https://{want_host}/")
+        out.append({"sequence": st["sequence"], "sandbox_id": room, "port": port, "url": url,
+                    "tls_spki_sha256": st["ingress_tls_spki_sha256"]})
+    return out
 
 
 def verify_install_key(doc: dict, att: dict) -> str:
@@ -2377,6 +2425,8 @@ def main() -> int:
     ap.add_argument("--tls-spki-sha256", help="SPKI sha256 of the TLS peer that served the attestation; "
                                               "fails unless the binding names this key")
     ap.add_argument("--require-tls", action="store_true", help="fail unless the binding names a guest TLS key")
+    ap.add_argument("--ingress-spki-sha256", help="SPKI sha256 of the TLS peer that served a Preview URL; "
+                    "must equal the binding's guest_ingress key (AB#422)")
     ap.add_argument("--origin", help="a miner hotel's https://<ip>:<port>: fetch the attestation from the guest "
                                      "and check the TLS peer and the install key")
     ap.add_argument("--cathedral-sandbox", help="a Cathedral sandbox id (UUID): fail unless a successful create "
@@ -2395,7 +2445,8 @@ def main() -> int:
             ("--require-tls", a.require_tls), ("--kds-cache", a.kds_cache), ("--sandbox", a.sandbox),
             ("--hotel", a.hotel), ("--operator-key-file", a.operator_key_file), ("--save", a.save),
             ("--receipt-header", a.receipt_header), ("--cathedral-sandbox", a.cathedral_sandbox),
-            ("--key-file", a.key_file)) if value is not None and value is not False and value != []]
+            ("--key-file", a.key_file), ("--ingress-spki-sha256", a.ingress_spki_sha256))
+            if value is not None and value is not False and value != []]
         if clash:
             ap.error(f"--oneshot checks one file; it takes no {', '.join(clash)}")
         return run_mode(a)
@@ -2486,6 +2537,7 @@ def main() -> int:
         unproven_archives: list[str] = []
         if is_hotel_level(att):
             need(not (a.require_tls or a.origin or peer_spki), "a level 1 binding has no attested guest TLS")
+            need(not a.ingress_spki_sha256, "a level 1 binding has no attested guest ingress key")
             attestation_out = verify_hotel_attestation(att)
             chain_out = verify_receipts(att, live_receipts, chain_head)
         else:
@@ -2498,8 +2550,10 @@ def main() -> int:
                     need(install_doc is not None, "the hotel did not answer GET /room/hotel-key-install-key")
                     guest_tls["install_key_checked"] = verify_install_key(install_doc, att) is not None
                 attestation_out["guest_tls"] = guest_tls
-            guest_ingress = verify_guest_ingress(att)
+            guest_ingress = verify_guest_ingress(att, a.ingress_spki_sha256)
             if guest_ingress is not None:
+                if isinstance(att["binding"]["guest_ingress"].get("zone"), str):
+                    guest_ingress["zone"] = att["binding"]["guest_ingress"]["zone"]
                 attestation_out["guest_ingress"] = guest_ingress
             if owner is not None:
                 attestation_out["owner"] = verify_owner(att, owner)
@@ -2524,6 +2578,9 @@ def main() -> int:
         edges = check_snapshot_edges(receipts)
         if edges is not None:
             chain_out["forks"] = edges["forks"]
+        exposes = check_exposes(att, live_receipts) if not is_hotel_level(att) else []
+        if exposes:
+            chain_out["exposes"] = exposes
         checked = ("whole chain to the head the server named" if chain_head is not None
                    else "each receipt; not that none are missing")
         if edges is not None:
