@@ -98,6 +98,8 @@ func clientGone() createResult {
 func (b *broker) reapRoom(h *hotel, rm *room) {
 	b.mu.Lock()
 	rm.state, rm.since, rm.vanished = stDeleting, time.Now(), time.Now()
+	// The guest never had this room: it gets no end record (ended.go).
+	rm.reaped = true
 	if old := h.rooms[rm.hid]; old != nil && old != rm { // the sync loop saw it first
 		b.release(h, old)
 	}
