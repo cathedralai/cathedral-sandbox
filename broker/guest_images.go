@@ -139,5 +139,8 @@ func (b *broker) handleUnpin(w http.ResponseWriter, r *http.Request, g *guestSta
 		writeHotelErr(w, h, err)
 		return
 	}
+	if status == 200 || status == 404 {
+		b.forgetPinned(h, g.cfg.ID, ref) // a replay after a reboot must not pin it again
+	}
 	writeRaw(w, status, out)
 }

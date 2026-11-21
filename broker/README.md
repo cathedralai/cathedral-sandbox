@@ -576,7 +576,9 @@ hotel answers 507 `pin_cap_exceeded` when the guest's pins there would pass
 the cap (or the hotel's own pin ceiling). Each image entry then has `pin`
 (`pinned`, `not_pinned`, or `not_supported` for a room kit without pins),
 and each hotel `pin` (`pinned`, or `not_supported` when any image there was
-pulled without a pin) with the `pinned` refs.
+pulled without a pin; `partial` when only some were pinned) with the `pinned`
+refs. The hotel-up replay pins a pinned ref again after a reboot; an unpin
+stops that.
 `DELETE /v1/images/pins?ref=<ref>&hotel=<id>` unpins one image there.
 
 `GET /v1/images?hotel=<id>` lists the images the guest pulled or was given

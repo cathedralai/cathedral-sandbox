@@ -357,6 +357,9 @@ type hotel struct {
 	// login, prewarm.go). AB#859.
 	guestWarm map[string]map[string]bool
 	guestWant map[string]map[string]time.Time
+	// guestPinned: per guest, the refs this hotel pinned for it, so the replay
+	// after a reboot pins them again (AB#860). Guarded by broker.mu.
+	guestPinned map[string]map[string]bool
 }
 
 // unreapedBatch is one create request's leftover rooms on a hotel.

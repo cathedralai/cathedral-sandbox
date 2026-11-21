@@ -1064,7 +1064,11 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
 	if job.pin > 0 {
 		// A kit before AB#860 pulls and ignores "pin"; only its echo says the
 		// images are kept, so one hotel without it reads not_supported.
+		done := 0
 		for _, e := range st.Images {
+			if e["state"] == "done" {
+				done++
+			}
 			switch e["pin"] {
 			case "pinned":
 				st.Pinned = append(st.Pinned, e["ref"])
@@ -1072,8 +1076,12 @@ func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
 				st.Pin = imageListNotKitted
 			}
 		}
-		if st.Pin == "" && len(st.Pinned) > 0 {
+		switch {
+		case st.Pin != "":
+		case len(st.Pinned) > 0 && len(st.Pinned) == done:
 			st.Pin = "pinned"
+		case len(st.Pinned) > 0:
+			st.Pin = "partial" // some pulled images are not pinned: see each entry's pin
 		}
 	}
 	if failed > 0 {

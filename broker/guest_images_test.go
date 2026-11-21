@@ -272,3 +272,35 @@ func TestPinMaxGiBIsReadFromTheConfig(t *testing.T) {
 		t.Fatalf("pin_max_gib: %v %d", err, gc.PinMaxGiB)
 	}
 }
+
+// Review HOLD on #640: a ref pinned on a hotel is pinned again when the
+// hotel-up replay pulls it after a reboot; after an unpin it is pulled
+// without a pin.
+func TestReplayAfterARebootPinsAgain(t *testing.T) {
+	tc := newChain(t)
+	ka := newKitHotel(t, tc, "a")
+	tc.b.mu.Lock()
+	tc.b.guests["g1"].limits.PinMaxGiB = 3
+	tc.b.mu.Unlock()
+	status, doc := tc.call(t, "key1", "POST", "/v1/images/prefetch", map[string]any{"images": []string{"alpine:3.20"}, "hotels": []string{"a"}, "pin": true})
+	if status != 202 {
+		t.Fatalf("pin: %d %v", status, doc)
+	}
+	waitPrefetch(t, tc, "key1", doc["prefetch_id"].(string))
+	h := tc.b.hotelByID("a")
+	setHotel(tc, "a", func(h *hotel) { tc.b.hotelWentDown(h) }) // a reboot wipes the scratch
+	tc.b.replayGuestPrefetch(h)
+	n := len(ka.bodies)
+	if n != 2 || ka.bodies[1]["pin"] != true || ka.pinMax[1] != "3221225472" {
+		t.Fatalf("replay after reboot: %d prefetches, last %v cap %v; want a pinned replay", n, ka.bodies[n-1], ka.pinMax[n-1])
+	}
+	if status, _ := tc.call(t, "key1", "DELETE", "/v1/images/pins?ref=alpine:3.20&hotel=a", nil); status != 200 {
+		t.Fatalf("unpin: %d", status)
+	}
+	setHotel(tc, "a", func(h *hotel) { tc.b.hotelWentDown(h) })
+	tc.b.replayGuestPrefetch(h)
+	n = len(ka.bodies)
+	if _, pinned := ka.bodies[n-1]["pin"]; n != 3 || pinned || ka.pinMax[n-1] != "" {
+		t.Fatalf("replay after unpin: %d prefetches, last %v cap %q; want a plain pull", n, ka.bodies[n-1], ka.pinMax[n-1])
+	}
+}
