@@ -98,6 +98,12 @@ type fakeHotel struct {
 	// with this status and keep the room (AB#338).
 	labelListFail  int
 	roomDeleteFail int
+	// absentDelete204: answer 204 to a delete of a room the hotel does not
+	// hold, as the real hotel does (usage_meter_test.go).
+	absentDelete204 bool
+	// bulkDeleteHold: when set, a bulk delete removes its rooms at once but
+	// answers only when the channel closes (usage_meter_test.go).
+	bulkDeleteHold chan struct{}
 	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
 	// runs without f.mu so it may hijack and hold the connection.
 	upgrade http.HandlerFunc
@@ -244,6 +250,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.rooms = kept
+		if hold := f.bulkDeleteHold; hold != nil {
+			f.mu.Unlock()
+			<-hold
+			f.mu.Lock()
+		}
 		w.WriteHeader(204)
 	case p == "/room/attest" && r.Method == "POST":
 		f.attestIn = append(f.attestIn, body)
@@ -480,6 +491,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(204)
 				return
 			}
+		}
+		if f.absentDelete204 {
+			w.WriteHeader(204)
+			return
 		}
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+id)
 	default:

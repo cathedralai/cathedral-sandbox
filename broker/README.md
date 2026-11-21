@@ -120,6 +120,102 @@ limits without a restart:
 
 A runtime change stays in memory. A restart goes back to the config file.
 
+## Usage meter
+
+With `state_dir` set, the broker writes a numbered usage reading log for
+every room of every guest (`usage_meter.go`): one JSON line per reading in
+`state_dir/usage/<first seq>.jsonl`, schema `cathedral_usage_reading_v1`,
+fields `seq`, `run` (the broker room id), `guest`, `hotel`, `miner_hotkey`,
+`vcpu`, `memory_gib`, `started_at`, `seconds`, `state` (`running` or
+`ended`) and `at`. A run gets a reading at first sight (the broker's create
+answer, or the first room list that shows it), every
+`usage_meter_every_seconds` (default 60) while lists show it, and once
+`ended` when it leaves. `seconds` is observed time: a gap over 30 s between
+two sightings (a hotel that stops answering, a broker restart) adds nothing,
+and a delete adds its tail only when the hotel's last answered list still
+showed the room. A bulk delete ends its rooms at the list it takes just
+before the delete. A room the broker took back from a cancelled or failed
+create (its reap, the orphan cleanup, or a recorded leftover) is metered
+too, with `"billable": false` (absent means billable).
+Readings are cumulative, so a reader keeps the largest per run.
+
+| Route (operator key) | What it does |
+|---|---|
+| `GET /v1/broker/usage-meter?after=<seq>&limit=<n>` | Readings after `after` (default 0) in seq order, at most `limit` (default 500, at most 1,000): `{"readings", "next", "head", "observed_at", "write_errors", "unobserved_hotels", "pending_readings"}`. `pending_readings` counts readings observed but not durable yet (an append waiting for its retry); 0 when all is durable. `next` is the seq of the last reading returned (or `after`), so a reader never skips one. `head` is the highest seq written. `observed_at` is the oldest last answered room list among hotels with live rooms (now if none), leaving out a hotel whose latest list failed and that takes no new room (down, leaving or draining); `unobserved_hotels` counts those. Only durable (fsynced) readings are served; a file whose sync fails at start is served once a retry syncs it. The highest `after` is the acknowledged cursor, kept with the durable head and the highest issued seq in `state_dir/usage/acked.json`, so a seq is never issued twice: a file whose seqs are all at or below the cursor and that is older than 7 days is deleted, after the newest reading of each open run in it is written again under a new seq. Without `state_dir`: 404 `usage_meter_off`. |
+
+Operator note: a usage file that can never be synced (a failing disk)
+stalls the feed by design. The route serves nothing above it, so `head`
+stops, the ledger stops renewing leases and metered keys close. It shows as
+`pending_readings` staying above 0, `write_errors` growing, and the log line
+`usage meter: <file>: sync before replay failed`. Fix the disk first. Only
+if that fails, as a last resort, stop the broker, move that file out of
+`state_dir/usage/` and start the broker again. What that does:
+
+- No served seq is reused: `acked.json` holds the highest issued seq,
+  saved before any page served it.
+- Every reading in that file leaves the log, also ones already served (the
+  ledger has those).
+- A run whose newest state was in that file goes back to its last reading
+  in another file, or to zero seconds if it has none. The ledger already
+  holds a higher mark for it, so it charges nothing more for that run until
+  the run passes that mark (the customer's favour).
+- An ended run whose end was in that file may never show its final reading.
+
+Known limits (stage 1):
+
+- The readings are the front door's observation, not proof: nothing is
+  guest-signed (stage 2).
+- A front door crash loses the observed time since each run's last durable
+  reading (at most `usage_meter_every_seconds`, plus a delete's tail), in
+  the customer's favour. Nothing in a durable reading is lost.
+- A delete can count the time from the last sighting to the delete for a
+  room that vanished in between: at most one sync interval (2 s) while
+  lists answer, at most 30 s when its hotel's lists fail in between.
+- If the broker dies between learning that a create failed or was cancelled
+  and that reading reaching the disk (milliseconds: the writer is woken at
+  once and the path waits up to 3 s for it, outside the broker lock), the
+  restarted broker has no record of the failure. It adopts the surviving
+  room under the guest's label and meters it as billable until it leaves:
+  at most that one room's remaining lifetime, and the room is in the
+  guest's own list, so the guest can delete it. Persisting create outcomes
+  is a follow-up.
+- A room a sync adopted while its create was in flight has billable
+  readings until the orphan cleanup lists it, which is as soon as the
+  request's creates end (each bounded by the 12 minute create timeout);
+  from then on it is `billable: false`.
+- A hung disk stalls no broker work: no disk I/O happens under the broker
+  lock, a path that saw a turn to not billable waits at most 3 s, and a
+  route read waits at most 5 s for a write in progress, then answers what is
+  durable without acknowledging or pruning.
+- A file that can never be synced stalls the feed (operator note above).
+- The broker trusts each hotel's room list. The sync loop adopts any room
+  a hotel lists under a guest's label and meters it as that guest's
+  billable room, with no check against a create the broker made or against
+  the hotels the guest may use. Whoever can make a hotel list such a room
+  can bill that guest: anyone holding the hotel's key, or a host that can
+  alter the hotel's answers. Today an admitted miner hotel answers over its
+  attested guest TLS from the measured guest, and its key is installed in
+  the guest so the host never holds it; operator hotels are ours. The
+  broker sets no bound on the cost: the count, size and duration of such
+  rooms come from the hotel's list, and only the ledger's balance rules
+  limit the charge. A room limit does not bound it either: adopted rooms
+  count against the guest's `max_rooms`, so they can also refuse the
+  guest's own creates. The guest sees such a room in its own list when its
+  policy reaches that hotel, and can delete it by id there; a hotel that
+  goes on listing a deleted room is metered again after 24 h. This must be
+  closed before a hotel we do not operate, or one whose host holds its key,
+  carries a metered guest.
+- A room seen again after its ended reading is logged and not metered
+  again for 24 h.
+- While the disk refuses writes, readings queue in memory (about one per
+  live room per minute); `pending_readings` counts them.
+- If the whole `usage/` is lost, `acked.json` with it, seq restarts at 1: a
+  reader whose cursor is above `head` must treat that as an alarm.
+- A hotel left out of `observed_at` holds rooms whose seconds are not
+  growing; `unobserved_hotels` counts such hotels, not their rooms.
+- Replay reads and syncs every retained file at start; its time grows with
+  the readings kept (7 days plus whatever is unacknowledged).
+
 ## Guest policy and capacity catalog
 
 A guest `policy` chooses hotels by selector, not by a fixed id list
