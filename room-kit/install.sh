@@ -442,7 +442,9 @@ EOF
 mark "unit:$ROOM_ID-health.service"
 
 # The API collects past-TTL sandboxes only when it handles a list/get.
-# This timer makes collection happen even when no client is calling.
+# This timer makes collection happen even when no client is calling. With
+# ROOM_RECEIPTS=1 the receipts front deletes due rooms first, with a signed
+# receipt (ROOM_REAP_SECONDS, AB#385); this stays as the backstop.
 cat > "$UNIT_DIR/$ROOM_ID-reaper.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TTL reaper tick
