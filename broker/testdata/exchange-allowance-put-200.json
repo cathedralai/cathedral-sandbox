@@ -1,0 +1,35 @@
+{
+ "captured_at_unix": 1795259990.391,
+ "method": "PUT",
+ "path": "/v1/broker/guests/g-small/allowance",
+ "request_headers": {
+  "User-Agent": "python-httpx/0.28.1",
+  "Content-Type": "application/json"
+ },
+ "authorization": "Bearer <operator key removed>",
+ "request_body": {
+  "issue": 20,
+  "cap": 3,
+  "lease_seconds": 600,
+  "max_ttl_seconds": 3600,
+  "max_memory_gib": 4
+ },
+ "status": 200,
+ "response_headers": {
+  "Content-Type": "application/json"
+ },
+ "response_body": {
+  "cap": 3,
+  "guest": "g-small",
+  "issue": 20,
+  "lease_fresh": true,
+  "lease_seconds": 600,
+  "lease_seconds_left": 599,
+  "ledger_seen_at": "2026-11-21T11:19:50.365832Z",
+  "live_rooms": 0,
+  "max_memory_gib": 4,
+  "max_ttl_seconds": 3600,
+  "metered": true,
+  "recount_pending": false
+ }
+}

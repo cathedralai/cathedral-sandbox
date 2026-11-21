@@ -502,6 +502,13 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	h := newHotel(hc, req.Key)
 	h.runtime = true
 	h.pinChip = joinChip
+	b.markUnlisted(h) // metered admission waits for its first room list (allowance.go)
+	published := false
+	defer func() {
+		if !published {
+			b.unmarkUnlisted(h) // the join failed: nothing stays behind
+		}
+	}()
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {
@@ -602,6 +609,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	}
 	b.saveProbationLogged() // a rejoin under an old id must not inherit its saved probation
+	published = true
 	go b.syncLoop(ctx, h)
 	writeJSON(w, 201, b.hotelDoc(h))
 }
