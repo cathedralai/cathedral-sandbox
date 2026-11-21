@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -209,6 +210,8 @@ func TestPoolRoomsGoneAfterGuestReboot(t *testing.T) {
 	pc.target(2)
 	pc.fill("a", 2)
 	gate := make(chan struct{})
+	var open sync.Once
+	t.Cleanup(func() { open.Do(func() { close(gate) }) }) // a failed test must not leave a pre-pull hanging
 	f.set(func(f *fakePoolHotel) {
 		f.healthFail = true
 		f.rooms = map[string]*fakePoolRoom{}
@@ -248,7 +251,7 @@ func TestPoolRoomsGoneAfterGuestReboot(t *testing.T) {
 			}
 		}
 	}
-	close(gate)
+	open.Do(func() { close(gate) })
 	waitFor(t, "warm again", func() bool {
 		pc.b.mu.Lock()
 		defer pc.b.mu.Unlock()
