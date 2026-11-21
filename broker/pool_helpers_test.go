@@ -63,6 +63,8 @@ type fakePoolHotel struct {
 	attestFail    bool
 	deleteFail    bool
 	createFail    bool            // answer creates 503 and start no room
+	createGate    chan struct{}   // non-nil: a create lists its room at once, then answers when this is closed
+	createLost    bool            // a create makes its room and receipt 1, but its answer is a 503
 	deleteDelay   time.Duration   // wait before answering a room delete
 	slots         int             // /room/health slots (default 1,000)
 	memPct        float64         // /room/health live.host_mem_used_pct (default 10, of 384 GiB)
@@ -271,6 +273,14 @@ func (f *fakePoolHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		rm := &fakePoolRoom{id: id, labels: doc.Labels, expires: time.Now().Add(ttl)}
 		f.rooms[id] = rm
+		if gate := f.createGate; gate != nil {
+			// As the hotel does (sandbox_guest.py: the record first, then the
+			// guest start): the room is listed from here, with no receipt yet;
+			// the answer and the front's receipt 1 come once the guest runs.
+			f.mu.Unlock()
+			<-gate
+			f.mu.Lock()
+		}
 		named := id
 		if f.signOtherRoom {
 			named = "sbx-other"
@@ -281,6 +291,10 @@ func (f *fakePoolHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		rc := f.receipt(priv, f.createStatement(named, doc.Image, !f.signNoPool))
 		rm.receipts = append(rm.receipts, rc)
+		if f.createLost {
+			reply(503, map[string]any{"error": "answer lost"})
+			return
+		}
 		if !f.noReceipt {
 			w.Header().Set("X-Room-Receipt", base64.URLEncoding.EncodeToString(rc))
 		}

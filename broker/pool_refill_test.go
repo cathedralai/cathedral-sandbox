@@ -4,6 +4,8 @@ package main
 // work order PR 3; design 6.1, 6.3).
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -436,5 +438,120 @@ func TestPoolBoundTrimIgnoresRoomsAlreadyDeleted(t *testing.T) {
 	pc.steps("a", 2)
 	if c := pc.counts("a"); c.ready != 10 {
 		t.Fatalf("bound 10 with 5 rooms deleted and not yet gone: %+v, want 10 ready", c)
+	}
+}
+
+// heldCreate fills hotel a of a 25-slot chain (bound 5) with 4 ready rooms,
+// then starts a 5th create that the hotel lists at once and answers only
+// when the returned gate is closed. lost: that answer is a 503, though the
+// room and its receipt 1 were made. It returns the chain and the room's id
+// once a sync has taken the listed room into the broker's room map.
+func heldCreate(t *testing.T, lost bool) (*poolChain, string, chan struct{}) {
+	t.Helper()
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	f.set(func(f *fakePoolHotel) { f.slots = 25 })
+	h := pc.b.hotelByID("a")
+	pc.up("a")
+	pc.target(4)
+	pc.fill("a", 4)
+	gate := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
+	f.set(func(f *fakePoolHotel) { f.createGate, f.createLost = gate, lost })
+	pc.target(5)
+	pc.b.poolStep(context.Background(), h) // the 5th create starts and waits at the hotel
+	waitFor(t, "the 5th room listed while its create is held", func() bool { return f.roomCount() == 5 })
+	hid := ""
+	f.set(func(f *fakePoolHotel) { hid = fmt.Sprintf("sbx-%d", f.n) })
+	pc.sync("a")
+	pc.b.mu.Lock()
+	rm := h.rooms[hid]
+	pc.b.mu.Unlock()
+	if rm == nil || rm.guest != poolGuestID {
+		t.Fatalf("the sync did not take in the listed room %s: the window under test is not open", hid)
+	}
+	return pc, hid, gate
+}
+
+// inFlightWindow runs syncs and pool steps of hotel a while the held create
+// is in flight, and checks that the room counts once, through the create.
+func inFlightWindow(t *testing.T, pc *poolChain, hid string) {
+	t.Helper()
+	h, f := pc.b.hotelByID("a"), pc.hotels["a"]
+	for i := 0; i < 5; i++ {
+		pc.b.poolStep(context.Background(), h)
+		pc.sync("a")
+	}
+	if c := pc.counts("a"); c.ready != 4 || c.creating != 1 || c.held != 5 || c.stale != 0 || c.unverified != 0 || c.quarantined != 0 {
+		t.Fatalf("a create in flight that the hotel lists already: %+v, want 4 ready, 1 creating, held 5 (the bound)\n%s", c, pc.debug("a"))
+	}
+	if d := f.roomDeletes(); len(d) != 0 {
+		t.Fatalf("%d deletes while the create was in flight (first %s), want none", len(d), d[0].path)
+	}
+	if r := f.callsOf("GET", "/v1/sandboxes/"+hid+"/receipts"); len(r) != 0 {
+		t.Fatalf("%d receipts reads of %s while its create was in flight, want none", len(r), hid)
+	}
+	pc.b.mu.Lock()
+	alarm := pc.b.pool.hotel("a").alarm
+	pc.b.mu.Unlock()
+	if alarm != "" {
+		t.Fatalf("alarm while the create was in flight: %s", alarm)
+	}
+}
+
+// The hotel lists a room from the start of its create, before the create
+// answers, and the sync loop takes in every listed room it does not know.
+// A pool create in flight that a sync caught counts once: no ready room
+// trimmed for it, no receipts read of it, no quarantine, no alarm; once the
+// create answers the room is ready, once (coordinator's read of #663 at
+// 18c6b5c, finding 1).
+func TestPoolCreateInFlightListedCountsOnce(t *testing.T) {
+	pc, hid, gate := heldCreate(t, false)
+	inFlightWindow(t, pc, hid)
+	close(gate)
+	pc.quiesce()
+	pc.steps("a", 2)
+	h, f := pc.b.hotelByID("a"), pc.hotels["a"]
+	if c := pc.counts("a"); c.ready != 5 || c.held != 5 || c.creating != 0 || c.unverified != 0 || c.quarantined != 0 || c.stale != 0 {
+		t.Fatalf("after the create answered: %+v, want 5 ready, held 5\n%s", c, pc.debug("a"))
+	}
+	pc.b.mu.Lock()
+	used, placed := h.used(), 0
+	for _, r := range h.grid {
+		if r != nil {
+			placed++
+		}
+	}
+	pr := pc.b.pool.hotel("a").rooms[hid]
+	pc.b.mu.Unlock()
+	if used != 5 || placed != 5 || pr == nil || pr.state != poolReady {
+		t.Fatalf("after the create answered: %d slots used, %d placed, room %s %+v; want 5, 5 and the room ready", used, placed, hid, pr)
+	}
+	if len(f.roomDeletes()) != 0 || len(f.callsOf("GET", "/v1/sandboxes/"+hid+"/receipts")) != 0 {
+		t.Fatalf("deletes %d, receipts reads of %s %d; want none", len(f.roomDeletes()), hid, len(f.callsOf("GET", "/v1/sandboxes/"+hid+"/receipts")))
+	}
+}
+
+// A create whose answer is lost may still have made its room: once no create
+// that could be its own is in flight, the listed room is taken in as
+// unverified and its receipts decide, as before.
+func TestPoolCreateLostAnswerRoomIsDecidedByItsReceipts(t *testing.T) {
+	pc, hid, gate := heldCreate(t, true)
+	inFlightWindow(t, pc, hid)
+	close(gate)
+	pc.quiesce()
+	pc.sync("a")
+	pc.steps("a", 3)
+	if c := pc.counts("a"); c.ready != 5 || c.held != 5 || c.unverified != 0 || c.quarantined != 0 {
+		t.Fatalf("after the lost answer: %+v, want the room read and ready (5 ready)\n%s", c, pc.debug("a"))
+	}
+	if r := pc.hotels["a"].callsOf("GET", "/v1/sandboxes/"+hid+"/receipts"); len(r) != 1 {
+		t.Fatalf("%d receipts reads of %s, want 1 (after its create ended)", len(r), hid)
 	}
 }
