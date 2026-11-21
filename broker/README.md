@@ -196,9 +196,12 @@ answer, or the first room list that shows it), every
 two sightings (a hotel that stops answering, a broker restart) adds nothing,
 and a delete adds its tail only when the hotel's last answered list still
 showed the room. A bulk delete ends its rooms at the list it takes just
-before the delete; a room in that list the meter has no run for yet (no list
-of its hotel has answered since start) gets its first reading from that
-list, by the sync's rules, so the delete never removes an unrecorded room.
+before the delete. A room in that list the meter has no run for yet (no
+list of its hotel has answered since start, or a create still in flight)
+gets, when the delete succeeds, a first reading at that list's time and its
+ended reading, both not billable: the meter has no proof the guest was given
+it, and it has 0 observed seconds. A failed delete writes nothing for it; the
+next sync meters it as usual.
 A room the broker took back from a cancelled or failed
 create (its reap, the orphan cleanup, or a recorded leftover) is metered
 too, with `"billable": false` (absent means billable).

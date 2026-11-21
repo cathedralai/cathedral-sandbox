@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -2121,8 +2123,9 @@ func unseen(t *testing.T, tc *testChain, run string) {
 // Codex finding on #622: a room that no sync list has shown (here no list of
 // its hotel has answered since the broker started, as right after a deploy)
 // and that a bulk delete removes gets its first reading from the delete's
-// own list, built as the sync builds it, and its ended reading from the
-// delete: once each, with the guest and size of the list.
+// own list and its ended reading from the delete: once each, with the guest
+// and size of the list, and not billable (Bugbot on #656: the meter has no
+// proof the guest was given the room; it has 0 observed seconds anyway).
 func TestUsageMeterBulkDeleteMetersARoomNoSyncSaw(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	seedListedRoom(tc.hotels["b"], "sbx_old", map[string]any{guestLabel: "g1", "job": "x"}, 2, 8)
@@ -2138,8 +2141,8 @@ func TestUsageMeterBulkDeleteMetersARoomNoSyncSaw(t *testing.T) {
 	}
 	for i, r := range got {
 		want := []string{"running", "ended"}[i]
-		if r.State != want || r.Guest != "g1" || r.Hotel != "b" || r.VCPU != 2 || r.MemoryGiB != 8 || r.Billable != nil || r.Seconds != 0 || r.StartedAt != got[0].StartedAt {
-			t.Fatalf("reading %d: %+v, want %s for g1 with 2 vCPU, 8 GiB, billable", i, r, want)
+		if r.State != want || r.Guest != "g1" || r.Hotel != "b" || r.VCPU != 2 || r.MemoryGiB != 8 || r.Billable == nil || *r.Billable || r.Seconds != 0 || r.StartedAt != got[0].StartedAt {
+			t.Fatalf("reading %d: %+v, want %s for g1 with 2 vCPU, 8 GiB, not billable, 0 s", i, r, want)
 		}
 	}
 }
@@ -2166,10 +2169,10 @@ func TestUsageMeterBulkDeleteSkipsRoomsOutsideTheFilter(t *testing.T) {
 	}
 }
 
-// A bulk delete that fails after its list leaves the run open: the first
-// reading is written and there is no ended reading; the next sync observes
-// the run.
-func TestUsageMeterFailedBulkDeleteLeavesTheRunOpen(t *testing.T) {
+// A bulk delete that fails after its list writes nothing for a room the
+// meter had not seen: the next sync adopts the room as the guest's and
+// meters it billable, and its seconds grow, as before the fix.
+func TestUsageMeterFailedBulkDeleteLeavesAnUnseenRoomToTheSync(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	f := tc.hotels["b"]
 	seedListedRoom(f, "sbx_old", map[string]any{guestLabel: "g1", "job": "x"}, 2, 8)
@@ -2181,20 +2184,27 @@ func TestUsageMeterFailedBulkDeleteLeavesTheRunOpen(t *testing.T) {
 	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status == 200 {
 		t.Fatalf("bulk delete succeeded: %v", doc)
 	}
-	got := usageMeterRunsOf(t, tc, run)
-	if len(got) != 1 || got[0].State != "running" || got[0].Guest != "g1" || got[0].VCPU != 2 || got[0].MemoryGiB != 8 || got[0].Billable != nil {
-		t.Fatalf("readings after a failed delete %+v, want one first reading", got)
+	if got := usageMeterRunsOf(t, tc, run); len(got) != 0 {
+		t.Fatalf("readings after a failed delete %+v, want none from its list", got)
 	}
 	syncNow(tc, "b")
-	tc.b.usageMeter.mu.Lock()
-	open := tc.b.usageMeter.runs[run] != nil
-	tc.b.usageMeter.mu.Unlock()
-	if !open {
-		t.Fatal("the run is not open after a failed delete and a sync")
+	m := tc.b.usageMeter
+	m.mu.Lock()
+	r := m.runs[run]
+	if r == nil {
+		m.mu.Unlock()
+		t.Fatal("the sync did not meter the room")
 	}
-	for _, r := range usageMeterRunsOf(t, tc, run) {
-		if r.State == "ended" {
-			t.Fatalf("ended reading after a failed delete: %+v", r)
+	r.lastSeen, r.lastAt = r.lastSeen.Add(-20*time.Second), r.lastAt-61 // 20 s on, a reading due
+	m.mu.Unlock()
+	syncNow(tc, "b")
+	got := usageMeterRunsOf(t, tc, run)
+	if len(got) != 2 || got[0].Seconds != 0 || got[1].Seconds < 20 {
+		t.Fatalf("readings %+v, want a first reading and one with 20 s or more", got)
+	}
+	for _, r := range got {
+		if r.State != "running" || r.Billable != nil || r.Guest != "g1" || r.VCPU != 2 || r.MemoryGiB != 8 {
+			t.Fatalf("reading after a failed delete and a sync: %+v, want running and billable", r)
 		}
 	}
 }
@@ -2226,41 +2236,249 @@ func TestUsageMeterBulkDeleteMetersALeftoverAsNotBillable(t *testing.T) {
 	}
 }
 
-// The bulk delete's list and a sync that see a new room at the same time
-// write one first reading between them: seenLocked keeps one run per id. In
-// either order, and when both run at once.
-func TestUsageMeterBulkDeleteListAndSyncWriteOneFirstReading(t *testing.T) {
+// The write at a successful bulk delete and a sync that sees the same new
+// room give it one first reading and one ended reading between them, in
+// either order and when both run at once: unseen is decided under the meter
+// lock at the write.
+func TestUsageMeterBulkDeleteWriteAndSyncGiveOneFirstReading(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	f := tc.hotels["b"]
 	h := tc.b.hotelByID("b")
 	q := url.Values{"label": {"job=x", guestLabel + "=g1"}}
-	firsts := func(run string) int {
-		n := 0
+	count := func(run string) (firsts, ends int) {
 		for _, r := range usageMeterRunsOf(t, tc, run) {
-			if r.State == "running" && r.Seconds == 0 {
-				n++
+			switch {
+			case r.State == "ended":
+				ends++
+			case r.Seconds == 0:
+				firsts++
 			}
 		}
-		return n
+		return firsts, ends
 	}
-	seedListedRoom(f, "sbx_1", map[string]any{guestLabel: "g1", "job": "x"}, 1, 4)
-	tc.b.bulkDeleteTargets(context.Background(), h, q)
-	syncNow(tc, "b")
-	seedListedRoom(f, "sbx_2", map[string]any{guestLabel: "g1", "job": "x"}, 1, 4)
-	syncNow(tc, "b")
-	tc.b.bulkDeleteTargets(context.Background(), h, q)
-	for i := 3; i < 13; i++ {
+	for i := 1; i < 13; i++ {
 		seedListedRoom(f, fmt.Sprintf("sbx_%d", i), map[string]any{guestLabel: "g1", "job": "x"}, 1, 4)
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { defer wg.Done(); tc.b.bulkDeleteTargets(context.Background(), h, q) }()
-		go func() { defer wg.Done(); syncNow(tc, "b") }()
-		wg.Wait()
+		targets := tc.b.bulkDeleteTargets(context.Background(), h, q)
+		switch i {
+		case 1:
+			tc.b.usageMeterBulkDeleted(targets)
+			syncNow(tc, "b")
+		case 2:
+			syncNow(tc, "b")
+			tc.b.usageMeterBulkDeleted(targets)
+		default:
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() { defer wg.Done(); tc.b.usageMeterBulkDeleted(targets) }()
+			go func() { defer wg.Done(); syncNow(tc, "b") }()
+			wg.Wait()
+		}
 	}
 	for i := 1; i < 13; i++ {
 		run := fmt.Sprintf("b.sbx_%d", i)
-		if n := firsts(run); n != 1 {
-			t.Fatalf("run %s: %d first readings, want 1: %+v", run, n, usageMeterRunsOf(t, tc, run))
+		if firsts, ends := count(run); firsts != 1 || ends != 1 {
+			t.Fatalf("run %s: %d first and %d ended readings, want 1 and 1: %+v", run, firsts, ends, usageMeterRunsOf(t, tc, run))
+		}
+	}
+}
+
+// A room a sync adopts between the bulk delete's list and its 2xx is no
+// longer unseen: it ends once and stays billable.
+func TestUsageMeterRoomAdoptedBeforeTheBulkDeleteAnswerStaysBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	seedListedRoom(tc.hotels["b"], "sbx_old", map[string]any{guestLabel: "g1", "job": "x"}, 2, 8)
+	run := "b.sbx_old"
+	unseen(t, tc, run)
+	targets := tc.b.bulkDeleteTargets(context.Background(), tc.b.hotelByID("b"), url.Values{"label": {"job=x", guestLabel + "=g1"}})
+	syncNow(tc, "b") // adopts the room as the guest's
+	tc.b.usageMeterBulkDeleted(targets)
+	got := usageMeterRunsOf(t, tc, run)
+	if len(got) != 2 || got[0].State != "running" || got[1].State != "ended" {
+		t.Fatalf("readings %+v, want the sync's first reading and one ended reading", got)
+	}
+	for _, r := range got {
+		if r.Billable != nil {
+			t.Fatalf("an adopted room's reading is not billable: %+v", r)
+		}
+	}
+}
+
+// createAnswer is a create's answer as tc.call gives it.
+type createAnswer struct {
+	status int
+	doc    map[string]any
+}
+
+// inFlightCreate starts a create of g1 on hotel a with label job=x whose
+// room the hotel starts at once but whose answer reaches the broker only
+// when release is called. It returns once the room exists at the hotel.
+func inFlightCreate(t *testing.T, tc *testChain) (run string, release func(), done <-chan createAnswer) {
+	t.Helper()
+	f := tc.hotels["a"]
+	hold := make(chan struct{})
+	started := make(chan struct{}, 1)
+	wrap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/v1/sandboxes" {
+			rec := httptest.NewRecorder()
+			f.ServeHTTP(rec, r) // the hotel starts the room
+			started <- struct{}{}
+			<-hold // and its answer reaches the broker late
+			for k, v := range rec.Header() {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(rec.Code)
+			_, _ = w.Write(rec.Body.Bytes())
+			return
+		}
+		f.ServeHTTP(w, r)
+	}))
+	t.Cleanup(wrap.Close)
+	var once sync.Once
+	release = func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	tc.b.hotelByID("a").cfg.API = wrap.URL // no call in flight yet
+	answers := make(chan createAnswer, 1)
+	go func() {
+		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"a"}, "labels": map[string]any{"job": "x"}})
+		answers <- createAnswer{status, doc}
+	}()
+	<-started
+	f.mu.Lock()
+	run = "a." + f.rooms[len(f.rooms)-1]["id"].(string)
+	f.mu.Unlock()
+	unseen(t, tc, run)
+	return run, release, answers
+}
+
+// notBillableFirstAndEnd fails the test unless run has a first and an ended
+// reading, once each, both not billable and with 0 seconds.
+func notBillableFirstAndEnd(t *testing.T, tc *testChain, run string) {
+	t.Helper()
+	got := usageMeterRunsOf(t, tc, run)
+	if len(got) != 2 || got[0].State != "running" || got[1].State != "ended" {
+		t.Fatalf("readings %+v, want a first and an ended reading", got)
+	}
+	for _, r := range got {
+		if r.Billable == nil || *r.Billable || r.Seconds != 0 {
+			t.Fatalf("reading %+v, want not billable with 0 s", r)
+		}
+	}
+}
+
+// Bugbot on #656: a bulk delete's tombstone is planted before its list, so
+// the list can show a create the hotel started whose answer has not reached
+// the broker. When the delete succeeds that run gets its first and ended
+// readings, both not billable; the create then meets the tombstone
+// (deleted_during_create), and reapRoom's sighting meets the ended run and
+// is dropped. An importer that stops charging at a run's first not billable
+// reading charges nothing for it.
+func TestUsageMeterBulkDeleteCatchesAnInFlightCreateNotBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	run, release, done := inFlightCreate(t, tc)
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+		t.Fatalf("bulk delete: %d %v", status, doc)
+	}
+	release()
+	if a := <-done; a.status != 409 || errCode(a.doc) != "deleted_during_create" {
+		t.Fatalf("create: %d %v, want 409 deleted_during_create", a.status, a.doc)
+	}
+	notBillableFirstAndEnd(t, tc, run)
+}
+
+// The other order: the create's answer lands, and reapRoom writes its not
+// billable first reading, before the bulk delete answers. The delete's end
+// keeps it not billable and ends it once.
+func TestUsageMeterReapBeforeTheBulkDeleteAnswerStaysNotBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	run, release, done := inFlightCreate(t, tc)
+	f := tc.hotels["a"]
+	answer := make(chan struct{})
+	var once sync.Once
+	answerNow := func() { once.Do(func() { close(answer) }) }
+	t.Cleanup(answerNow) // a failing check must not leave the hotel's handler waiting
+	f.mu.Lock()
+	f.bulkDeleteHold = answer // the delete removes the room, its answer waits
+	f.mu.Unlock()
+	deleted := make(chan int, 1)
+	go func() {
+		status, _ := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil)
+		deleted <- status
+	}()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		f.mu.Lock()
+		n := len(f.bulkDeletes)
+		f.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the bulk delete never reached hotel a")
+		}
+	}
+	release()
+	if a := <-done; a.status != 409 || errCode(a.doc) != "deleted_during_create" {
+		t.Fatalf("create: %d %v, want 409 deleted_during_create", a.status, a.doc)
+	}
+	if got := usageMeterRunsOf(t, tc, run); len(got) != 1 || got[0].Billable == nil || *got[0].Billable {
+		t.Fatalf("after the reap: %+v, want one not billable first reading", got)
+	}
+	answerNow()
+	if status := <-deleted; status != 200 {
+		t.Fatalf("bulk delete: %d", status)
+	}
+	notBillableFirstAndEnd(t, tc, run)
+}
+
+// A run the meter already has keeps its billable state through a bulk
+// delete: a guest room created through the broker stays billable and ends
+// once.
+func TestUsageMeterBulkDeleteKeepsAKnownRunBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "labels": map[string]any{"job": "x"}})
+	syncNow(tc, "b")
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+		t.Fatalf("bulk delete: %d %v", status, doc)
+	}
+	letGo(tc, "b")
+	got := usageMeterRunsOf(t, tc, id)
+	if len(got) != 2 || got[0].State != "running" || got[1].State != "ended" {
+		t.Fatalf("readings %+v, want a first and one ended reading", got)
+	}
+	for _, r := range got {
+		if r.Billable != nil {
+			t.Fatalf("a guest room's reading lost its billable state: %+v", r)
+		}
+	}
+}
+
+// The other order: a run that is already not billable (a failed create's
+// room, marked by the orphan cleanup before the bulk delete lists it) stays
+// not billable through the bulk delete and ends once.
+func TestUsageMeterBulkDeleteKeepsANotBillableRunNotBillable(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	f := tc.hotels["b"]
+	f.mu.Lock()
+	f.createFail, f.createFailAfterStart, f.roomDeleteFail = 500, true, 500 // the room starts, the answer fails, the cleanup cannot delete it
+	f.mu.Unlock()
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "labels": map[string]any{"job": "x"}}); status < 500 {
+		t.Fatalf("create: %d %v, want a failure", status, doc)
+	}
+	f.mu.Lock()
+	run := "b." + f.rooms[len(f.rooms)-1]["id"].(string)
+	f.mu.Unlock()
+	if got := usageMeterRunsOf(t, tc, run); len(got) != 1 || got[0].Billable == nil || *got[0].Billable {
+		t.Fatalf("before the bulk delete: %+v, want one not billable reading", got)
+	}
+	if status, doc := tc.call(t, "key1", "DELETE", "/v1/sandboxes?label=job=x", nil); status != 200 {
+		t.Fatalf("bulk delete: %d %v", status, doc)
+	}
+	got := usageMeterRunsOf(t, tc, run)
+	if len(got) != 2 || got[1].State != "ended" {
+		t.Fatalf("readings %+v, want the first and one ended reading", got)
+	}
+	for _, r := range got {
+		if r.Billable == nil || *r.Billable {
+			t.Fatalf("a not billable run turned billable: %+v", r)
 		}
 	}
 }
