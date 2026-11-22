@@ -52,6 +52,9 @@ UNSIGNED = {
     ("GET", S + r"/desktop"): "read: desktop status",
     ("GET", S + r"/logs"): "read: a room's logs",
     ("GET", r"/v1/snapshots"): "read: lists snapshots",
+    ("POST", r"/v1/snapshots/(?P<id>[^/]+)/push"): (
+        "refused: the front answers 403 snapshot_push_refused, unsent; a sealed machine does not push a "
+        "snapshot to a registry (AB#604)"),
     ("GET", r"/v1/workspaces"): "read: lists workspaces",
     ("GET", r"/v1/workspaces/(?P<name>[^/]+)"): "read: one workspace",
     ("GET", r"/v1/workspaces/(?P<name>[^/]+)/versions"): "read: a workspace's versions",

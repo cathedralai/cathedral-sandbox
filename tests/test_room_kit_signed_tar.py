@@ -160,7 +160,9 @@ def test_failed_get_tar_is_signed_with_its_status(front) -> None:
 
 @pytest.mark.parametrize(("method", "path", "action", "status"), [
     ("DELETE", "/v1/sandboxes/sbx_9/processes/p_7", "process_stop", 200),
-    ("POST", "/v1/sandboxes/sbx_9/snapshot", "snapshot", 202),
+    # The fake answers 202 with no snapshot result: the front signs that 502 snapshot_unsigned (AB#604; a
+    # complete answer is in tests/test_room_kit_signed_snapshots.py).
+    ("POST", "/v1/sandboxes/sbx_9/snapshot", "snapshot", 502),
     ("POST", "/v1/sandboxes/sbx_9/freeze", "freeze", 200),
     ("POST", "/v1/sandboxes/sbx_9/thaw", "thaw", 200),
     ("POST", "/v1/sandboxes/sbx_9/expose", "expose", 200),
