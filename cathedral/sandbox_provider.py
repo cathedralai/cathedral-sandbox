@@ -1241,9 +1241,16 @@ class InMemorySandboxProvider:
     def make_directory(self, sandbox_id: str, path: str) -> bool:
         """Create one directory beneath /work, without following room links."""
         parent, name = _work_entry_parent(path)
+        # A capture refuses and waits for every write from outside the room (AB#604).
         with self._lock:
-            sandbox = self._require_running(sandbox_id)
+            sandbox = self._begin_api_write(sandbox_id)
             self._touch(sandbox)
+        try:
+            return self._make_directory_admitted(sandbox, path, parent, name)
+        finally:
+            self._end_api_write(sandbox_id)
+
+    def _make_directory_admitted(self, sandbox: _Sandbox, path: str, parent: str, name: str) -> bool:
         try:
             parent_fd = _open_beneath(sandbox.root, parent, os.O_RDONLY | os.O_DIRECTORY)
         except FileNotFoundError:
@@ -1266,9 +1273,16 @@ class InMemorySandboxProvider:
     def remove_entry(self, sandbox_id: str, path: str) -> bool:
         """Remove one plain file or empty directory by path; never recurse."""
         parent, name = _work_entry_parent(path)
+        # A capture refuses and waits for every write from outside the room (AB#604).
         with self._lock:
-            sandbox = self._require_running(sandbox_id)
+            sandbox = self._begin_api_write(sandbox_id)
             self._touch(sandbox)
+        try:
+            return self._remove_entry_admitted(sandbox, path, parent, name)
+        finally:
+            self._end_api_write(sandbox_id)
+
+    def _remove_entry_admitted(self, sandbox: _Sandbox, path: str, parent: str, name: str) -> bool:
         try:
             parent_fd = _open_beneath(sandbox.root, parent, os.O_RDONLY | os.O_DIRECTORY)
         except FileNotFoundError:
