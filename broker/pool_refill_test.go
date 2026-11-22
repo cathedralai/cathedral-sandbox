@@ -686,3 +686,73 @@ func TestPoolCreatesNeverWaitForAHotelConnection(t *testing.T) {
 		t.Fatalf("first create %s after the connections were free, want within one spacing", starts[0].Sub(freed))
 	}
 }
+
+// A front that signs creates without "pool": true fails every receipt-1
+// proof. The real refill loop backs off 5 s, doubling to 1 min, so creates
+// stay at or under the 1 a second the 1 s limit of #658 allowed (the bound
+// never trips: each stale room is deleted at once), and after
+// poolProofAlarmAfter failures in a row the ready_rooms alarm is set. A ready
+// create resets the count and the alarm.
+func TestPoolProofFailuresBackOffAndAlarm(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, nil)
+	f := pc.hotels["a"]
+	f.set(func(f *fakePoolHotel) { f.signNoPool = true })
+	pc.up("a")
+	pc.putRefill(10, 4, 4)
+	poolSpacingFactor = 1.05
+	alarmed := func() string {
+		pc.b.mu.Lock()
+		defer pc.b.mu.Unlock()
+		return pc.b.pool.hotel("a").alarm
+	}
+	stop := make(chan struct{})
+	go func() {
+		defer close(stop)
+		end := time.Now().Add(25 * time.Second)
+		for time.Now().Before(end) && alarmed() == "" {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	t0 := time.Now()
+	pc.runPool(26*time.Second, stop)
+	elapsed := time.Since(t0)
+	a := alarmed()
+	if !strings.Contains(a, "receipt 1 proof") {
+		t.Fatalf("alarm %q after %s, want the receipt 1 proof alarm", a, elapsed)
+	}
+	creates, deletes := len(f.creates()), len(f.roomDeletes())
+	// Failures 1, 2, 3 at about 0, 5 and 15 s: at most a few creates in
+	// flight each time, far under 4 a second.
+	if limit := int(elapsed/time.Second) + 1; creates > limit || creates < poolProofAlarmAfter {
+		t.Fatalf("%d creates in %s, want %d to %d (no more than 1 a second)", creates, elapsed, poolProofAlarmAfter, limit)
+	}
+	if deletes != creates {
+		t.Fatalf("%d creates, %d deletes: every unproven room is deleted", creates, deletes)
+	}
+	starts := f.createStarts()
+	if g := starts[len(starts)-1].Sub(starts[0]); g < 14*time.Second {
+		t.Fatalf("first to last of %d creates %s apart, want the 5 s then 10 s backoff (about 15 s)", creates, g)
+	}
+	pc.b.mu.Lock()
+	ph := pc.b.pool.hotel("a")
+	fails, wait := ph.proofFails, time.Until(ph.backoff)
+	pc.b.mu.Unlock()
+	if fails < poolProofAlarmAfter || wait < 10*time.Second {
+		t.Fatalf("proof failures %d, backoff left %s; want at least %d and the doubled backoff", fails, wait, poolProofAlarmAfter)
+	}
+
+	// An honest front: past the backoff, the next ready create resets both.
+	f.set(func(f *fakePoolHotel) { f.signNoPool = false })
+	pc.b.mu.Lock()
+	ph.backoff = time.Time{}
+	pc.b.mu.Unlock()
+	poolSpacingFactor = 0
+	pc.fill("a", 1)
+	pc.step("a") // the next step's alarm check sees the reset
+	pc.b.mu.Lock()
+	fails = ph.proofFails
+	pc.b.mu.Unlock()
+	if fails != 0 || alarmed() != "" {
+		t.Fatalf("after a ready create: proof failures %d, alarm %q; want 0 and none", fails, alarmed())
+	}
+}

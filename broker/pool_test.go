@@ -128,6 +128,15 @@ func TestPoolRoomWithoutPoolReceiptIsDeleted(t *testing.T) {
 			if len(rs) != 2 || !notBillable(rs[0]) || !notBillable(rs[1]) || rs[1].State != "ended" || rs[0].Guest != poolGuestID {
 				t.Fatalf("readings of the deleted room %+v", rs)
 			}
+			// The failed proof backs the hotel's creates off 5 s.
+			pc.b.mu.Lock()
+			ph := pc.b.pool.hotel("a")
+			fails, wait := ph.proofFails, time.Until(ph.backoff)
+			ph.backoff = time.Time{} // past the backoff
+			pc.b.mu.Unlock()
+			if fails != 1 || wait < 4*time.Second || wait > poolRetryFirst {
+				t.Fatalf("proof failures %d, backoff left %s; want 1 and about 5 s", fails, wait)
+			}
 			// The same hotel with an honest receipt: the next room is ready.
 			f.set(func(f *fakePoolHotel) {
 				f.signNoPool, f.signOtherKey, f.signOtherRoom, f.noReceipt = false, false, false, false
