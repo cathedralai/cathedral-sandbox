@@ -403,3 +403,47 @@ def test_plant_after_the_room_id_is_answered_again_is_refused(tmp_path, monkeypa
     status, _h, out = front.plant(room, {**FRESH, "create_receipt_sha256": create["receipt_sha256"]})
     assert status == 409 and b"escape_fresh_mismatch" in out
     assert not front.plant_dir.exists()
+
+
+@pytest.mark.parametrize("lifecycle", ["delete", "room_end", "replacement_create"])
+def test_lifecycle_change_after_admission_refuses_the_plant(tmp_path, monkeypatch, lifecycle) -> None:
+    # discussion_r4657456482: the incarnation moves after admit_fresh_plant() but before the nonce is
+    # written and signed. prune_escape_windows() runs in that interval, outside the ledger lock.
+    front = Front(tmp_path, monkeypatch)
+    front.rooms = iter(["room-1", "room-1"])
+    room, create = _created(front)
+    real_prune = rr.prune_escape_windows
+
+    def racing_prune(*args, **kwargs):
+        if lifecycle == "delete":
+            assert front.request("DELETE", f"/v1/sandboxes/{room}")[0] == 200
+        elif lifecycle == "room_end":
+            assert front.ledger.end_room(room, create["receipt_sha256"], 200, "exited", "0" * 64) is not None
+        else:
+            status, headers, _out = front.create(fresh=None)
+            assert status == 202 and _receipt(headers)["statement"]["sandbox_id"] == room
+        return real_prune(*args, **kwargs)
+
+    monkeypatch.setattr(rr, "prune_escape_windows", racing_prune)
+    status, headers, out = front.plant(room, {**FRESH, "create_receipt_sha256": create["receipt_sha256"]})
+    assert status == 409 and b"escape_fresh_mismatch" in out
+    assert "X-Room-Receipt" not in headers and "X-Room-Receipt-Error" not in headers
+    actions = [front.ledger.chain[i]["statement"]["action"] for i in front.ledger.by_room[room]]
+    assert actions == ["create", {"delete": "delete", "room_end": "room_end"}.get(lifecycle, "create")]
+    assert rr.PLANT_ACTION not in [r["statement"]["action"] for r in front.ledger.chain]
+    assert not (front.plant_dir / "win-1" / "nonce").exists()
+
+
+def test_plant_write_failure_signs_nothing(tmp_path, monkeypatch) -> None:
+    front = Front(tmp_path, monkeypatch)
+    room, create = _created(front)
+
+    def failing_write(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rr, "write_escape_nonce", failing_write)
+    chain = len(front.ledger.chain)
+    status, headers, out = front.plant(room, {**FRESH, "create_receipt_sha256": create["receipt_sha256"]})
+    assert status == 500 and b"plant_failed" in out
+    assert "X-Room-Receipt" not in headers
+    assert len(front.ledger.chain) == chain

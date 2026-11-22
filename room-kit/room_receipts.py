@@ -2737,6 +2737,23 @@ class Ledger:
             self.fresh_planted.add(assignment["attempt_id"])
             return True
 
+    def write_and_sign_fresh_plant(self, room: str, create_sha: str, write, fields: dict):
+        """Write a fresh plant's nonce and sign its receipt while *room* is still *create_sha*: one locked step.
+
+        admit_fresh_plant() checked the incarnation, but a delete, room_end or replacement create may sign in
+        between. Holding self.lock across the check, the write and the sign means no lifecycle receipt can land
+        inside that interval. None: the incarnation moved, nothing was written or signed. Otherwise (path,
+        receipt or the exception signing raised); an OSError from *write* propagates with nothing signed.
+        """
+        with self.lock:
+            if self.incarnations.get(room) != create_sha:
+                return None
+            path = write()
+            try:
+                return path, self._sign_locked({**fields, "path": path})
+            except Exception as exc:  # noqa: BLE001 the file is written: the caller answers and says why
+                return path, exc
+
     def snapshot_entry(self, snapshot_id: str) -> dict | None:
         """A copy of what this boot signed for *snapshot_id*, or None."""
         with self.lock:
@@ -4809,26 +4826,47 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return self.reply(500, b'{"error":{"code":"plant_failed","message":"the nonce file could not be written"}}')
         prune_escape_windows(base_dir, window_id)
+        fields = {
+            "action": PLANT_ACTION,
+            "target": "POST /room/escape-nonce",
+            "sandbox_id": doc["sandbox_id"] if fresh is not None else None,
+            "window_id": window_id,
+            "nonce_sha256": sha(nonce.encode()),
+            "encrypted": encrypted,
+            "status": 200,
+            **({"escape_fresh": dict(fresh)} if fresh is not None else {}),
+        }
+        extra = {}
+        if fresh is not None:
+            # The incarnation admitted above is checked again under the lock that writes and signs, so a
+            # delete, room_end or replacement create in between refuses the plant: no nonce, no receipt.
+            try:
+                done = ledger.write_and_sign_fresh_plant(
+                    doc["sandbox_id"], fresh["create_receipt_sha256"],
+                    lambda: write_escape_nonce(base_dir, window_id, nonce), fields)
+            except OSError:
+                traceback.print_exc()
+                return self.reply(500, b'{"error":{"code":"plant_failed","message":"the nonce file could not be written"}}')
+            nonce = None
+            if done is None:
+                return self.reply(409, b'{"error":{"code":"escape_fresh_mismatch","message":"the plant does not match a fresh create of this room, or was already made"}}')
+            path, receipt = done
+            if isinstance(receipt, Exception):
+                traceback.print_exception(receipt)
+                extra["X-Room-Receipt-Error"] = type(receipt).__name__
+            else:
+                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
+            return self.reply(200, canonical({
+                "ok": True, "window_id": window_id, "path": path, "encrypted": encrypted,
+            }), extra)
         try:
             path = write_escape_nonce(base_dir, window_id, nonce)
         except OSError:
             traceback.print_exc()
             return self.reply(500, b'{"error":{"code":"plant_failed","message":"the nonce file could not be written"}}')
-        nonce_sha = sha(nonce.encode())
         nonce = None
-        extra = {}
         try:
-            receipt = ledger.sign({
-                "action": PLANT_ACTION,
-                "target": "POST /room/escape-nonce",
-                "sandbox_id": doc["sandbox_id"] if fresh is not None else None,
-                "window_id": window_id,
-                "nonce_sha256": nonce_sha,
-                "path": path,
-                "encrypted": encrypted,
-                "status": 200,
-                **({"escape_fresh": dict(fresh)} if fresh is not None else {}),
-            })
+            receipt = ledger.sign({**fields, "path": path})
             extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
         except Exception as exc:  # noqa: BLE001 the file is written: answer, and say the receipt is missing
             traceback.print_exc()
