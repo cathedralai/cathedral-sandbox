@@ -270,7 +270,7 @@ func TestAlertWebhookPostsChatAndTextAndNeverLogsTheURL(t *testing.T) {
 
 func TestAlertChatAtJoinAndPatch(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 4, map[string]any{"alert_chat_id": "777"})
+	joinMiner(t, tc, "m1", 4, map[string]any{"alert_chat_id": "777"})
 	if got := tc.b.hotelByID("m1").alertChat(); got != "777" {
 		t.Fatalf("alert chat after join: %q", got)
 	}
@@ -801,5 +801,46 @@ drained:
 done:
 	if ops != 1 {
 		t.Fatalf("want one ops alert after continued downtime, got %d", ops)
+	}
+}
+
+// AB#330 (Toby 19 Nov): every hotel alerts one chat. A hotel without its own
+// alert_chat_id uses alerts.hotel_chat_id; a hotel's own chat still wins.
+func TestHotelChatIDIsTheDefaultOperatorChat(t *testing.T) {
+	tc := newChain(t)
+	take, _ := captureAlerts(t, tc, "-1003861198283")
+	tc.b.alerts.hotelChat = "-1003861198283"
+	setHotel(tc, "b", func(h *hotel) { h.cfg.AlertChatID = "4242" })
+	syncNow(tc, "a")
+	syncNow(tc, "b")
+	setHealthFail(tc, "a", true)
+	setHealthFail(tc, "b", true)
+	syncNow(tc, "a")
+	syncNow(tc, "b")
+	got := take()
+	if len(got) != 2 {
+		t.Fatalf("want one miss alert per hotel: %+v", got)
+	}
+	chats := map[string]string{}
+	for _, m := range got {
+		switch {
+		case strings.Contains(m.Text, "hotel a"):
+			chats["a"] = m.ChatID
+		case strings.Contains(m.Text, "hotel b"):
+			chats["b"] = m.ChatID
+		}
+	}
+	if chats["a"] != "-1003861198283" || chats["b"] != "4242" {
+		t.Fatalf("chats: %v", chats)
+	}
+}
+
+func TestHotelChatIDConfigIsValidated(t *testing.T) {
+	if _, err := newAlerter(&alertsConfig{HotelChatID: "not a chat"}); err == nil || !strings.Contains(err.Error(), "hotel_chat_id") {
+		t.Fatalf("bad hotel_chat_id accepted: %v", err)
+	}
+	a, err := newAlerter(&alertsConfig{OpsChatID: "-1003861198283", HotelChatID: "-1003861198283"})
+	if err != nil || a.hotelChat != "-1003861198283" || a.opsChat != "-1003861198283" {
+		t.Fatalf("one chat for ops and hotels: %+v %v", a, err)
 	}
 }

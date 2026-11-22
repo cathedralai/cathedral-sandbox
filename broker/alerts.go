@@ -11,8 +11,9 @@
 // Delivery is a JSON POST {"chat_id", "text"} to the URL in
 // alerts.webhook_url_file (a Telegram sendMessage URL with the bot token,
 // https only; the URL is never logged). The miner operator's chat is the
-// hotel's alert_chat_id; ops is alerts.ops_chat_id. Without a URL or a chat
-// id the alert is a log line only. Every alert is a log line.
+// hotel's alert_chat_id, else alerts.hotel_chat_id (one chat for every hotel,
+// AB#330: the Core Engineering group); ops is alerts.ops_chat_id. Without a
+// URL or a chat id the alert is a log line only. Every alert is a log line.
 //
 // An alert carries no customer data: hotel id, name, miner hotkey, how long
 // health has been missing and a room count. No guest, room id, label, image
@@ -39,6 +40,9 @@ type alertsConfig struct {
 	// because a Telegram URL carries the bot token.
 	WebhookURLFile string `json:"webhook_url_file,omitempty"`
 	OpsChatID      string `json:"ops_chat_id,omitempty"`
+	// HotelChatID receives the missed-heartbeat alert of every hotel that has
+	// no alert_chat_id of its own.
+	HotelChatID string `json:"hotel_chat_id,omitempty"`
 }
 
 // alertCooldown is the least time between two alerts of one audience about
@@ -67,7 +71,8 @@ type alertJob struct {
 }
 
 type alerter struct {
-	opsChat string
+	opsChat   string
+	hotelChat string // default operator chat for a hotel without alert_chat_id
 	// post sends one alert. nil: log lines only. Tests replace it.
 	post   func(ctx context.Context, m alertMsg) error
 	queue  chan alertJob
@@ -96,6 +101,10 @@ func newAlerter(c *alertsConfig) (*alerter, error) {
 		return nil, errors.New("config: alerts.ops_chat_id must be a Telegram chat id (digits) or @channel")
 	}
 	a.opsChat = c.OpsChatID
+	if !validAlertChat(c.HotelChatID) {
+		return nil, errors.New("config: alerts.hotel_chat_id must be a Telegram chat id (digits) or @channel")
+	}
+	a.hotelChat = c.HotelChatID
 	if c.WebhookURLFile == "" {
 		return a, nil
 	}
@@ -260,6 +269,9 @@ func (b *broker) alertHealth(h *hotel, herr error, hadHealth bool) {
 	} else if hadHealth && !st.missSent && !st.missInflight {
 		if st.operatorLast.IsZero() || now.Sub(st.operatorLast) >= alertCooldown {
 			chat := h.alertChat()
+			if chat == "" {
+				chat = a.hotelChat
+			}
 			text := fmt.Sprintf("Cathedral: %s missed a heartbeat (no /room/health answer for %s). Check the machine.",
 				hotelAlertName(h), now.Sub(h.lastOK).Round(time.Second))
 			gen := st.missGen

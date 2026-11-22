@@ -40,7 +40,7 @@ func joinedBindingSHA(t *testing.T, tc *testChain, id string) string {
 
 func TestBindingArchivedAndServedByOperator(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	sha := joinedBindingSHA(t, tc, "m1")
 	status, raw := tc.getRaw(t, "operator-key", "/v1/broker/bindings/"+sha)
 	if status != 200 {
@@ -54,7 +54,7 @@ func TestBindingArchivedAndServedByOperator(t *testing.T) {
 
 func TestBindingSurvivesRestart(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	sha := joinedBindingSHA(t, tc, "m1")
 	tc.start(t)
 	status, raw := tc.getRaw(t, "operator-key", "/v1/broker/bindings/"+sha)
@@ -65,7 +65,7 @@ func TestBindingSurvivesRestart(t *testing.T) {
 
 func TestBindingRouteIsOperatorOnly(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	sha := joinedBindingSHA(t, tc, "m1")
 	for _, key := range []string{"", "reader-key", "enroller-key", "key1", "wrong"} {
 		status, _ := tc.getRaw(t, key, "/v1/broker/bindings/"+sha)
@@ -93,7 +93,7 @@ func TestBindingGetRefusesBadAndUnknownSHA(t *testing.T) {
 func TestBindingArchiveHoldsBindingOnly(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	sha := joinedBindingSHA(t, tc, "m1")
 	files, _ := filepath.Glob(filepath.Join(dir, "bindings", "*"))
 	if len(files) == 0 {

@@ -223,10 +223,10 @@ func TestUndecodableClientStateIsReplacedByTheFirstSave(t *testing.T) {
 func TestRuntimeHotelCapsAreNotRestoredInMainOrder(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{chip: chipOf("r1")})}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
-	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "r1", "api": hs.URL, "key": strings.Repeat("k", 40), "verify": false})
+	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "r1", "api": hs.URL, "key": strings.Repeat("k", 40), "sealed": true})
 	if status != 201 {
 		t.Fatalf("join: %d %v", status, doc)
 	}
@@ -278,7 +278,7 @@ func TestBatchCreateMultipliesTheBodyByCount(t *testing.T) {
 	if err := os.WriteFile(key, []byte("hotel-key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config{Hotels: []hotelConfig{{ID: "x", Name: "x", API: hotel.URL, Health: hotel.URL, KeyFile: key, Concurrency: 16}},
+	cfg := config{Hotels: []hotelConfig{{ID: "x", Name: "x", API: hotel.URL, Health: hotel.URL, KeyFile: key, Concurrency: 16, Sealed: true, SealedAdmission: sealedAdmissionOff}},
 		Guests: []guestConfig{{ID: "g1", KeySHA256: sha("key1")}}}
 	raw, _ := json.Marshal(cfg)
 	cfgPath := filepath.Join(dir, "config.json")
@@ -488,14 +488,11 @@ func (zeros) Read(p []byte) (int, error) {
 
 // Run with -race. An operator PATCH writes h.cfg.Labels and h.cfg.Drain
 // while creates (pick, selects, noRoomReason), the hotel list, the stats,
-// the live view, the build starter and the PATCH answer itself read them.
+// the live view and the PATCH answer itself read them.
 // Every reader takes cfgMu through labels() and drain().
 func TestLabelsPatchRacesWithHotelSelection(t *testing.T) {
 	tc := newChain(t)
-	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
-	_, img := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	imageID, _ := img["image_id"].(string)
-	// A fork by a guest with the sealed default reads the snapshot hotel's labels (placementFor).
+	// A fork reads the snapshot hotel's labels (placementFor).
 	room := tc.room(t, "key2", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	_, snap := tc.call(t, "key2", "POST", "/v1/sandboxes/"+room+"/snapshot", map[string]any{})
 	snapID, _ := snap["result"].(map[string]any)["snapshot_id"].(string)
@@ -524,7 +521,6 @@ func TestLabelsPatchRacesWithHotelSelection(t *testing.T) {
 		_, _, _ = rawCall(tc, "key1", "", "POST", "/v1/sandboxes", []byte(`{"image":"alpine:3.20","hotels":["b"]}`))               // pick; noRoomReason while b drains
 		_, _, _ = rawCall(tc, "key1", "", "GET", "/v1/broker/hotels", nil)                                                         // handleHotels
 		_, _, _ = rawCall(tc, "key1", "", "GET", "/v1/broker/stats", nil)                                                          // handleStats
-		_, _, _ = rawCall(tc, "key1", "cathedral-harbor/0.1.5", "GET", "/v1/images/"+imageID, nil)                                 // ensureBuilds
 		_, _, _ = rawCall(tc, "key2", "", "POST", "/v1/sandboxes", []byte(`{"snapshot_id":"`+snapID+`"}`))                         // placementFor
 		tc.b.snapshot(g)                                                                                                           // the live view
 	}

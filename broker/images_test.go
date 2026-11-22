@@ -27,9 +27,13 @@ type fakeHotel struct {
 	receiptTag    string                    // appended to the X-Room-Receipt of a create, to tell hotels apart
 	authFail      bool                      // answer creates 401, like a hotel whose API key changed
 	pullOutage    bool                      // answer creates 502 image_pull_failed for a registry outage
+	pullLimited   bool                      // answer creates 502 image_pull_failed for the registry's rate limit (registry_auth_test.go)
 	calls         []string                  // "METHOD /path?query" of every request
 	snaps         map[string]map[string]any // hotel snapshot id -> document
 	prefetch      []map[string]any
+	prefetchGuest []string        // the guest header of every prefetch (AB#859)
+	failRef       string          // a prefetch of this ref answers 502 (AB#859)
+	cached        map[string]bool // GET /v1/images/<ref> answers cached (AB#859 replay)
 	pushes        []map[string]any
 	deleted       []string
 	failPull      bool
@@ -41,7 +45,12 @@ type fakeHotel struct {
 	createDelay   time.Duration
 	healthFail    bool
 	healthRuntime string           // "runtime" in the /room/health answer; empty: omitted
+	healthLive    map[string]any   // "live" in the /room/health answer; nil: omitted (disk_test.go)
+	answerDelay   time.Duration    // wait between starting a room and answering its create (disk_test.go)
+	listFail      bool             // answer every room list 503 (disk_test.go)
+	snapListFail  bool             // answer GET /v1/snapshots 500, like a hotel API that is down (AB#866)
 	rooms         []map[string]any // id + labels, for the room list
+	listExtra     map[string]any   // top-level fields added to the room list answer (ended_test.go)
 	networks      []map[string]any // bodies of PUT /v1/sandboxes/{id}/network
 	receipts      []byte           // body of GET /room/receipts
 	attestIn      [][]byte         // bodies of POST /room/attest
@@ -90,6 +99,20 @@ type fakeHotel struct {
 	// with this status and keep the room (AB#338).
 	labelListFail  int
 	roomDeleteFail int
+	// absentDelete204: answer 204 to a delete of a room the hotel does not
+	// hold, as the real hotel does (usage_meter_test.go).
+	absentDelete204 bool
+	// listIgnoresLabels: a room list that ignores its label filters and lists
+	// every room (usage_meter_test.go).
+	listIgnoresLabels bool
+	// bulkDeleteHold: when set, a bulk delete removes its rooms at once but
+	// answers only when the channel closes (usage_meter_test.go).
+	bulkDeleteHold chan struct{}
+	// Freeze (POST /v1/sandboxes/{id}/freeze, meter_test.go): the room ids and
+	// guest headers of every freeze, and a status to answer for a room id.
+	freezes     []string
+	freezeGuest []string
+	freezeFail  map[string]int
 	// upgrade answers WebSocket handshakes when set (terminal_ws_test.go). It
 	// runs without f.mu so it may hijack and hold the connection.
 	upgrade http.HandlerFunc
@@ -137,6 +160,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 502, "image_pull_failed", "docker pull failed for nosuch/x:1: Error response from daemon: pull access denied for nosuch/x, repository does not exist")
 			return
 		}
+		if f.pullLimited {
+			writeErr(w, 502, "image_pull_failed", "docker pull failed for acme/private:1: Error response from daemon: toomanyrequests: You have reached your pull rate limit.")
+			return
+		}
 		if f.pullOutage {
 			writeErr(w, 502, "image_pull_failed", "docker pull failed for alpine:3.20: Error response from daemon: Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host")
 			return
@@ -163,7 +190,12 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.n++
 		id := fmt.Sprintf("sbx_%d", f.n)
-		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"]})
+		f.rooms = append(f.rooms, map[string]any{"id": id, "state": "running", "labels": req["labels"], "resources": req["resources"]})
+		if d := f.answerDelay; d > 0 { // the room is listed before the create answers (disk_test.go)
+			f.mu.Unlock()
+			time.Sleep(d)
+			f.mu.Lock()
+		}
 		if f.createFail != 0 {
 			writeErr(w, f.createFail, "create_failed", "the room started but the answer is an error")
 			return
@@ -175,17 +207,23 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			out["tunables"] = map[string]any{"status": "applied", "sha256": sha(string(raw)), "values": t}
 		}
 		writeJSON(w, 202, out)
+	case p == "/v1/sandboxes" && r.Method == "GET" && f.listFail:
+		writeErr(w, 503, "list_failed", "the hotel could not list its rooms")
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		if f.labelListFail != 0 && len(r.URL.Query()["label"]) > 0 {
 			writeErr(w, f.labelListFail, "list_failed", "the hotel could not list its rooms")
 			return
 		}
-		// Like a hotel: every "label" filter must match.
+		// Like a hotel: every "label" filter must match (listIgnoresLabels:
+		// a hotel that ignores the filter and lists every room).
 		out := []map[string]any{}
 		for _, rm := range f.rooms {
 			labels, _ := rm["labels"].(map[string]any)
 			keep := true
 			for _, want := range r.URL.Query()["label"] {
+				if f.listIgnoresLabels {
+					break
+				}
 				k, v, _ := strings.Cut(want, "=")
 				if labels[k] != v {
 					keep = false
@@ -195,7 +233,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				out = append(out, rm)
 			}
 		}
-		writeJSON(w, 200, map[string]any{"sandboxes": out})
+		doc := map[string]any{"sandboxes": out}
+		for k, v := range f.listExtra {
+			doc[k] = v
+		}
+		writeJSON(w, 200, doc)
 	case p == "/v1/sandboxes" && r.Method == "DELETE":
 		f.bulkDeletes = append(f.bulkDeletes, r.URL.Query()["label"])
 		if f.bulkClaimBusy != 0 {
@@ -225,6 +267,11 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.rooms = kept
+		if hold := f.bulkDeleteHold; hold != nil {
+			f.mu.Unlock()
+			<-hold
+			f.mu.Lock()
+		}
 		w.WriteHeader(204)
 	case p == "/room/attest" && r.Method == "POST":
 		f.attestIn = append(f.attestIn, body)
@@ -311,6 +358,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(f.attestation)
 	case p == "/room/health" && f.healthFail:
 		writeErr(w, 503, "busy", "health did not answer")
+	case p == "/room/health" && f.healthLive != nil:
+		writeJSON(w, 200, map[string]any{"live": f.healthLive})
 	case p == "/room/health" && f.healthRuntime != "":
 		writeJSON(w, 200, map[string]any{"runtime": f.healthRuntime, "kernel_isolation": true})
 	case p == "/room/health" || p == "/v1/quota" || p == "/v1/status":
@@ -325,6 +374,26 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		policy := map[string]any{"mode": req["mode"], "allow": req["allow"]}
 		writeJSON(w, 200, map[string]any{"sandbox_id": strings.Split(p, "/")[3],
 			"network": map[string]any{"mode": req["mode"], "allow": req["allow"], "policy": policy, "policy_sha256": "abc"}})
+	case strings.HasPrefix(p, "/v1/sandboxes/") && strings.HasSuffix(p, "/freeze") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(p, "/v1/sandboxes/"), "/freeze")
+		f.freezes = append(f.freezes, id)
+		f.freezeGuest = append(f.freezeGuest, r.Header.Get(guestHeader))
+		if st := f.freezeFail[id]; st != 0 {
+			writeErr(w, st, "freeze_failed", "the hotel could not freeze "+id)
+			return
+		}
+		for _, rm := range f.rooms {
+			if rm["id"] == id {
+				if rm["state"] != "running" && rm["state"] != "frozen" {
+					writeErr(w, 409, "sandbox_not_running", "cannot freeze sandbox in state "+fmt.Sprint(rm["state"]))
+					return
+				}
+				rm["state"] = "frozen"
+				writeJSON(w, 200, map[string]any{"id": id, "state": "frozen"})
+				return
+			}
+		}
+		writeErr(w, 404, "sandbox_not_found", id)
 	case strings.HasSuffix(p, "/sealed-exec") && r.Method == "POST":
 		f.sealedExecPaths = append(f.sealedExecPaths, p)
 		f.sealedExecBodies = append(f.sealedExecBodies, body)
@@ -361,6 +430,8 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.snaps[sid] = doc
 		writeJSON(w, 202, map[string]any{"operation_id": "op_1", "status": "done", "result": doc})
+	case p == "/v1/snapshots" && r.Method == "GET" && f.snapListFail:
+		writeErr(w, 500, "internal", "snapshot store unavailable")
 	case p == "/v1/snapshots" && r.Method == "GET":
 		want := r.URL.Query().Get("label")
 		k, v, _ := strings.Cut(want, "=")
@@ -393,8 +464,16 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		delete(f.snaps, sid)
 		f.deleted = append(f.deleted, sid)
 		writeJSON(w, 200, map[string]any{"deleted": true})
+	case strings.HasPrefix(p, "/v1/images/") && r.Method == "GET" && !strings.HasPrefix(p, "/v1/images/prefetch"):
+		ref := strings.TrimPrefix(p, "/v1/images/")
+		writeJSON(w, 200, map[string]any{"ref": ref, "cached": f.cached[ref]})
 	case p == "/v1/images/prefetch":
 		f.prefetch = append(f.prefetch, req)
+		f.prefetchGuest = append(f.prefetchGuest, r.Header.Get(guestHeader))
+		if refs, _ := req["images"].([]any); f.failRef != "" && len(refs) > 0 && refs[0] == f.failRef {
+			writeErr(w, 502, "image_pull_failed", "manifest unknown")
+			return
+		}
 		if f.pullDelay > 0 {
 			f.mu.Unlock()
 			time.Sleep(f.pullDelay)
@@ -450,6 +529,10 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if f.absentDelete204 {
+			w.WriteHeader(204)
+			return
+		}
 		writeErr(w, 404, "sandbox_not_found", "no sandbox "+id)
 	default:
 		writeErr(w, 404, "route_not_found", p)
@@ -464,7 +547,7 @@ type testChain struct {
 	cfgPath string
 }
 
-// newChain builds a broker over fake hotels "a" (sealed), "b" and "c".
+// newChain builds a broker over fake sealed hotels "a", "b" and "c".
 func newChain(t *testing.T) *testChain { return newChainState(t, "") }
 
 // newChainState is newChain with a broker state_dir.
@@ -483,10 +566,10 @@ func newChainState(t *testing.T, stateDir string) *testChain {
 		hs := httptest.NewServer(f)
 		t.Cleanup(hs.Close)
 		tc.hotels[id] = f
-		hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4}
-		if id == "a" {
-			hc.Labels = map[string]string{"sealed": "true"}
-		}
+		// Every hotel is sealed (AB#776). The fake hotels have no attestation,
+		// so they use the config-only ops escape (AB#596); sealed_admission_test.go
+		// covers the real gate.
+		hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4, Sealed: true, SealedAdmission: sealedAdmissionOff}
 		cfg.Hotels = append(cfg.Hotels, hc)
 	}
 	raw, _ := json.Marshal(cfg)
@@ -723,13 +806,23 @@ func TestSnapshotCallsCarryTheGuestToOwnerScopedHotel(t *testing.T) {
 	}
 }
 
+// zoneHotel adds the label zone=v to hotel id (it keeps its sealed label).
+func zoneHotel(tc *testChain, id, v string) {
+	setHotel(tc, id, func(h *hotel) {
+		h.cfgMu.Lock()
+		h.cfg.Labels = map[string]string{"sealed": "true", "zone": v}
+		h.cfgMu.Unlock()
+	})
+}
+
 func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 	tc := newChain(t)
+	zoneHotel(tc, "a", "eu")
 	for i := 0; i < 5; i++ {
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "true"}}); !strings.HasPrefix(id, "a.") {
-			t.Fatalf("sealed room on %s", id)
+		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"zone": "eu"}}); !strings.HasPrefix(id, "a.") {
+			t.Fatalf("zone=eu room on %s", id)
 		}
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "exclude_hotel_labels": map[string]string{"sealed": "true"}}); strings.HasPrefix(id, "a.") {
+		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "exclude_hotel_labels": map[string]string{"zone": "eu"}}); strings.HasPrefix(id, "a.") {
 			t.Fatalf("excluded hotel used: %s", id)
 		}
 	}
@@ -743,7 +836,7 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 			}
 		}
 	}
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "maybe"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"zone": "mars"}})
 	if status != 409 || errCode(doc) != "no_matching_hotel" {
 		t.Fatalf("no match: %d %v", status, doc)
 	}
@@ -756,9 +849,9 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 	tc.b.mu.Lock()
 	tc.b.hotelByID("a").slots = len(tc.b.hotelByID("a").rooms)
 	tc.b.mu.Unlock()
-	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"sealed": "true"}})
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotel_labels": map[string]string{"zone": "eu"}})
 	if status != 429 || errCode(doc) != "no_free_rooms" {
-		t.Fatalf("full sealed hotel: %d %v", status, doc)
+		t.Fatalf("full selected hotel: %d %v", status, doc)
 	}
 	// Selected hotel down: 503 hotels_unavailable — not "all hotels are full".
 	setHotel(tc, "a", func(h *hotel) { h.ok = false; h.slots = 100 })
@@ -774,10 +867,11 @@ func TestCreateByHotelLabelsAndIDs(t *testing.T) {
 
 func TestForkOutsideTheHotelSelectionIs409(t *testing.T) {
 	tc := newChain(t)
+	zoneHotel(tc, "a", "eu")
 	room := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	_, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+room+"/snapshot", map[string]any{})
 	snapID := doc["result"].(map[string]any)["snapshot_id"].(string)
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"snapshot_id": snapID, "hotel_labels": map[string]string{"sealed": "true"}})
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"snapshot_id": snapID, "hotel_labels": map[string]string{"zone": "eu"}})
 	if status != 409 || errCode(doc) != "snapshot_hotel_excluded" {
 		t.Fatalf("%d %v", status, doc)
 	}
@@ -800,6 +894,7 @@ func waitPrefetch(t *testing.T, tc *testChain, key, id string) map[string]any {
 
 func TestPrefetchToChosenHotelsWithLoginAndStatus(t *testing.T) {
 	tc := newChain(t)
+	zoneHotel(tc, "a", "eu")
 	tc.hotels["c"].failPull = true
 	tc.hotels["a"].pullDelay = 200 * time.Millisecond
 	auth := map[string]any{"username": "robot", "password": "s3cret"}
@@ -841,7 +936,7 @@ func TestPrefetchToChosenHotelsWithLoginAndStatus(t *testing.T) {
 		t.Fatalf("foreign status: %d", status)
 	}
 	// By label, no login.
-	status, doc = tc.call(t, "key1", "POST", "/v1/images/prefetch", map[string]any{"images": []string{"alpine:3.20"}, "hotel_labels": map[string]string{"sealed": "true"}})
+	status, doc = tc.call(t, "key1", "POST", "/v1/images/prefetch", map[string]any{"images": []string{"alpine:3.20"}, "hotel_labels": map[string]string{"zone": "eu"}})
 	if status != 202 || len(doc["hotels"].(map[string]any)) != 1 {
 		t.Fatalf("label prefetch: %d %v", status, doc)
 	}
@@ -891,22 +986,22 @@ func TestCompatUnknownTemplateIsAnErrorNotABaseImageRoom(t *testing.T) {
 	}
 }
 
-func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
+// AB#776: every hotel is sealed, so a plain create, "sealed": true and a
+// named hotel all place, "sealed": false is refused, and the broker field
+// never reaches a hotel.
+func TestEveryCreateIsSealed(t *testing.T) {
 	tc := newChain(t)
-	// Make "b" a config-sealed hotel: exclusive, label added by the broker.
-	h := tc.b.hotelByID("b")
-	h.cfg.Sealed, h.cfg.SealedAdmission = true, sealedAdmissionOff // past the gate: placement only
-	h.cfg.Labels = map[string]string{"sealed": "true"}
-	for i := 0; i < 20; i++ {
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"}); strings.HasPrefix(id, "b.") {
-			t.Fatalf("plain create landed on the sealed hotel: %s", id)
-		}
-		if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "sealed": true}); strings.HasPrefix(id, "c.") {
-			t.Fatalf("sealed create landed on an unsealed hotel: %s", id)
-		}
+	for i := 0; i < 5; i++ {
+		tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+		tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "sealed": true})
 	}
 	if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}); !strings.HasPrefix(id, "b.") {
-		t.Fatalf("named sealed hotel not used: %s", id)
+		t.Fatalf("named hotel not used: %s", id)
+	}
+	before := totalCreates(tc)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": false, "hotels": []string{"b"}})
+	if status != 400 || errCode(doc) != "sealed_only" || totalCreates(tc) != before {
+		t.Fatalf(`"sealed": false: %d %v`, status, doc)
 	}
 	for _, f := range tc.hotels {
 		for _, c := range f.creates {
@@ -915,7 +1010,7 @@ func TestSealedHotelTakesOnlySealedCreates(t *testing.T) {
 			}
 		}
 	}
-	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": "yes"})
+	status, doc = tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "sealed": "yes"})
 	if status != 400 || errCode(doc) != "invalid_hotel_selection" {
 		t.Fatalf("bad sealed value: %d %v", status, doc)
 	}

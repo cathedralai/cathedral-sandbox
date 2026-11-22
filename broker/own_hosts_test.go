@@ -34,7 +34,7 @@ func optIntoMiners(t *testing.T, tc *testChain) {
 	t.Helper()
 	status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"policy": map[string]any{
 		"prefer": []any{map[string]any{"label": map[string]any{"miner": "true"}}},
-		"allow":  []any{map[string]any{"class": "unsealed"}, map[string]any{"class": "sealed"}},
+		"allow":  []any{map[string]any{"class": "sealed"}},
 	}})
 	if status != 200 {
 		t.Fatalf("set policy: %d %v", status, doc)
@@ -121,11 +121,11 @@ func TestOwnHostsOnlyMustBeABool(t *testing.T) {
 	}
 }
 
-// Failover 1: the named own hotel is down and "prefer" would fall back to a
-// hotel of the same class. The only one is a miner hotel, so there is no
-// fallback.
+// Failover 1: the named own hotel is down and "prefer" would fall back to
+// another hotel in the guest's list. The only one is a miner hotel, so there
+// is no fallback.
 func TestOwnHostsOnlyPreferFallbackSkipsMinerHotels(t *testing.T) {
-	tc := newChain(t)
+	tc := limitedChain(t, guestLimits{Hotels: []string{"b", "c"}})
 	markMiner(tc, "c", false)
 	downHotel(tc, "b")
 	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}, "placement": "prefer"})

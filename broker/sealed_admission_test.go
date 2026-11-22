@@ -251,7 +251,7 @@ func TestSealedAdmissionOffIsRefusedForMinersJoinsAndContradictions(t *testing.T
 		return config{SealedMeasurements: []string{strings.Repeat("ab", 48)}, Hotels: []hotelConfig{hc}}
 	}
 	mustNotLoad(t, base(hotelConfig{ID: "m", Sealed: true, MinerHotkey: minerHotkey, SealedAdmission: "off"}), `sealed_admission "off" is refused for a miner hotel`)
-	mustNotLoad(t, base(hotelConfig{ID: "u", SealedAdmission: "off"}), `sealed_admission "off" needs "sealed": true`)
+	mustNotLoad(t, base(hotelConfig{ID: "u", SealedAdmission: "off"}), `every hotel must be "sealed": true`) // AB#776
 	mustNotLoad(t, base(hotelConfig{ID: "r", Sealed: true, RequireAttestation: true, SealedAdmission: "off"}), "contradict")
 	mustNotLoad(t, base(hotelConfig{ID: "t", Sealed: true, SealedAdmission: "of"}), `use "gate" (the default) or "off"`)
 	floorWithEscape := base(hotelConfig{ID: "s", Sealed: true, SealedAdmission: "off"})
@@ -261,6 +261,14 @@ func TestSealedAdmissionOffIsRefusedForMinersJoinsAndContradictions(t *testing.T
 		cfg := base(hotelConfig{ID: "s", Sealed: true})
 		cfg.MinGenoaSNPSPL = bad
 		mustNotLoad(t, cfg, "min_genoa_snp_spl must be an 8-bit")
+	}
+	microcodeWithEscape := base(hotelConfig{ID: "s", Sealed: true, SealedAdmission: "off"})
+	microcodeWithEscape.MinGenoaMicrocodeSPL = 0x5b
+	mustNotLoad(t, microcodeWithEscape, "sealed_admission off bypasses min_genoa_microcode_spl")
+	for _, bad := range []int{-1, 256} {
+		cfg := base(hotelConfig{ID: "s", Sealed: true})
+		cfg.MinGenoaMicrocodeSPL = bad
+		mustNotLoad(t, cfg, "min_genoa_microcode_spl must be an 8-bit")
 	}
 	top := base(hotelConfig{ID: "s", Sealed: true})
 	top.SealedAdmission = "off"
@@ -361,30 +369,67 @@ func TestJoinedOperatorSealedHotelNeedsThePinAndTheChain(t *testing.T) {
 	}
 }
 
-func TestUnsealedHotelsAreUnchanged(t *testing.T) {
-	// No pin list and no verifier: an unsealed hotel needs neither.
+// AB#776: the config loader refuses a hotel without "sealed": true, and a
+// guest policy that names any class but "sealed".
+func TestConfigLoadRefusesTheUnsealedClass(t *testing.T) {
+	key := filepath.Join(t.TempDir(), "hotel.key")
+	_ = os.WriteFile(key, []byte("hotel-key"), 0o600)
+	hotel := func(id string, sealed bool) hotelConfig {
+		return hotelConfig{ID: id, API: "http://127.0.0.1:1", Health: "http://127.0.0.1:1", KeyFile: key, Sealed: sealed}
+	}
+	base := func(hotels ...hotelConfig) config {
+		return config{SealedMeasurements: []string{strings.Repeat("ab", 48)}, Hotels: hotels}
+	}
+	mustNotLoad(t, base(hotel("s", true), hotel("plain", false)), `hotel "plain": every hotel must be "sealed": true`)
+	labelled := hotel("label-only", false)
+	labelled.Labels = map[string]string{"sealed": "true"} // a label is not the field
+	mustNotLoad(t, base(labelled), `hotel "label-only": every hotel must be "sealed": true`)
+	if _, err := loadBroker(writeConfig(t, base(hotel("s", true)))); err != nil {
+		t.Fatalf("an all-sealed config was refused: %v", err)
+	}
+	unsealedPolicy := base(hotel("s", true))
+	unsealedPolicy.Guests = []guestConfig{{ID: "g", KeySHA256: sha("k"), guestLimits: guestLimits{Policy: &guestPolicy{Allow: []selector{{Class: "unsealed"}}}}}}
+	mustNotLoad(t, unsealedPolicy, `class must be "sealed"`)
+}
+
+// A hotel that joined unsealed before AB#776 is in an older hotels.json. A
+// restart skips it, so it never becomes a placement target again.
+func TestRestartSkipsAnUnsealedRuntimeHotel(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	key := filepath.Join(dir, "old.key")
+	_ = os.WriteFile(key, []byte(joinKey), 0o600)
+	m, url := newOperatorHotel(t, 5, nil)
+	tc.hotels["old"] = m.fakeHotel
+	raw, _ := json.Marshal([]hotelConfig{{ID: "old", Name: "old", API: url, Health: url, KeyFile: key, Concurrency: 4}})
+	if err := os.WriteFile(filepath.Join(dir, runtimeHotelsFile), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.start(t)
+	if tc.b.hotelByID("old") != nil {
+		t.Fatal("an unsealed runtime hotel was restored")
+	}
+}
+
+// AB#776: there is no unsealed class, so an unsealed hotel cannot join at
+// all, with or without verify, and is never asked for anything.
+func TestUnsealedJoinIsRefused(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	tc.b.cfg.SealedMeasurements, tc.b.cfg.AMDVerifier = nil, nil
 	m, url := newOperatorHotel(t, 5, nil)
 	tc.hotels["u"] = m.fakeHotel
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "u", "api": url, "key": joinKey}); status != 201 {
-		t.Fatalf("unsealed join: %d %v", status, doc)
+	for _, join := range []map[string]any{
+		{"id": "u", "api": url, "key": joinKey},
+		{"id": "u", "api": url, "key": joinKey, "sealed": false},
+		{"id": "u", "api": url, "key": joinKey, "verify": false},
+		{"id": "u", "api": url, "key": joinKey, "labels": map[string]string{"sealed": "true"}},
+	} {
+		status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", join)
+		if status != 400 || errCode(doc) != "invalid_hotel" || tc.b.hotelByID("u") != nil {
+			t.Fatalf("unsealed join %v: %d %v, want 400 invalid_hotel", join, status, doc)
+		}
 	}
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "u2", "api": url, "key": joinKey, "verify": false}); status != 201 {
-		t.Fatalf("unsealed join with verify false: %d %v", status, doc)
-	}
-	syncNow(tc, "u")
-	for _, id := range []string{"b", "u"} { // a config hotel and a joined hotel
-		a := admissionOf(t, tc, id)
-		if a["state"] != "admitted" || a["attestation_required"] != false || a["amd_chain_required"] != false || a["reason"] != nil {
-			t.Fatalf("unsealed hotel %s: %v", id, a)
-		}
-		if attestationAsked(tc, id) {
-			t.Fatalf("unsealed hotel %s was asked for its attestation", id)
-		}
-		if got := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{id}}); !strings.HasPrefix(got, id+".") {
-			t.Fatalf("room for %s on %s", id, got)
-		}
+	if attestationAsked(tc, "u") {
+		t.Fatal("a refused join was asked for its attestation")
 	}
 }
 

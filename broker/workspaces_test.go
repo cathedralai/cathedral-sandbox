@@ -90,10 +90,7 @@ func newWSChain(t *testing.T) *wsChain {
 		t.Cleanup(hs.Close)
 		wc.hotels[id] = f
 		wc.ws[id] = wh
-		hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4}
-		if id == "a" {
-			hc.Labels = map[string]string{"sealed": "true"}
-		}
+		hc := hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4, Sealed: true, SealedAdmission: sealedAdmissionOff} // AB#776, see newChainState
 		cfg.Hotels = append(cfg.Hotels, hc)
 	}
 	raw, _ := json.Marshal(cfg)

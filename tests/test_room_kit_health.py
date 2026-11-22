@@ -148,3 +148,36 @@ def test_verifier_reads_the_whole_chain_page_by_page(tmp_path, total) -> None:
     assert [r["statement"]["sequence"] for r in doc["receipts"]] == list(range(1, total + 1))
     assert doc["head"] == f"h{total}"
     assert [a for a, _ in _Broker.seen] == list(range(0, total + 1, 10_000))
+
+
+def test_health_reports_image_count_and_bytes_without_refs(monkeypatch, tmp_path) -> None:
+    """AB#860: totals of the room daemon's images, sampled in the background."""
+    monkeypatch.setenv("ROOM_DOCKER_SOCK", "/nonexistent.sock")
+    health = _load("room_health")
+    ids = "sha256:" + "a" * 64 + "\nsha256:" + "b" * 64 + "\nsha256:" + "a" * 64
+
+    def fake_run(argv, timeout=60):
+        if argv[-4:] == ["image", "ls", "-a", "-q"] or "ls" in argv:
+            return 0, ids
+        if "inspect" in argv:
+            return 0, "100\n250"
+        return 127, ""
+
+    monkeypatch.setattr(health, "run", fake_run)
+    health.images_once()
+    assert health._live["images_count"] == 2 and health._live["images_bytes"] == 350
+    files = {
+        "room.env": {"ROOM_DATA_DIR": str(tmp_path)},
+        "machine.json": {"cpu": {"model": "m", "threads": 4}, "memory": {"total_bytes": 2**34}, "kernel": "k",
+                         "os": {}, "tee": None, "assessed_at": "t"},
+        "size.json": {"already_used": {}, "shape": {}, "slots": 1, "limiting": "ram", "slots_by_resource": {}},
+    }
+    monkeypatch.setattr(health, "_cached", lambda path, parse: files[path.name])
+    health._live.update(containers=0, containers_at=1.0)
+    live = health.document()["live"]
+    assert live["images_count"] == 2 and live["images_bytes"] == 350
+    assert "sha256:" not in json.dumps(health.document())
+    # A daemon that does not answer: unknown, not zero.
+    monkeypatch.setattr(health, "run", lambda argv, timeout=60: (1, ""))
+    health.images_once()
+    assert health._live["images_count"] is None and health._live["images_bytes"] is None

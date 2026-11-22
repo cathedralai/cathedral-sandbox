@@ -89,8 +89,15 @@ class Response:
         return cls(status, data, {"Content-Type": JSON, **(headers or {})})
 
     @classmethod
-    def error(cls, status: int, code: str, message: str, headers: Mapping[str, str] | None = None) -> "Response":
-        return cls.json(status, {"error": {"code": code, "message": message}}, headers)
+    def error(
+        cls,
+        status: int,
+        code: str,
+        message: str,
+        headers: Mapping[str, str] | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> "Response":
+        return cls.json(status, {"error": {**(detail or {}), "code": code, "message": message}}, headers)
 
     @classmethod
     def no_content(cls) -> "Response":
@@ -198,6 +205,19 @@ def install_stop_signal() -> None:
 # The broker caps room bodies at 256 MiB (files and tar). Anything larger is
 # refused before it is read, so a client cannot hold a thread on a slow body.
 MAX_BODY_BYTES = 256 << 20
+
+
+PIN_MAX_HEADER = "X-Pin-Max-Bytes"
+
+
+def _pin_cap(headers: Mapping[str, str]) -> int | None:
+    """The broker's per-owner pin cap in bytes (AB#860). None: absent (a direct hotel-key call)."""
+    raw = next((str(v) for k, v in dict(headers).items() if k.lower() == PIN_MAX_HEADER.lower()), None)
+    if raw is None:
+        return None
+    if not raw.strip().isdigit():
+        raise api.SandboxContractError("invalid_pin_cap", f"{PIN_MAX_HEADER} must be a whole number of bytes")
+    return int(raw.strip())
 
 
 class SandboxApplication:
@@ -331,6 +351,9 @@ class SandboxApplication:
         self._add("GET", r"/v1/sandbox-templates/(?P<uid>[^/]+)", self.get_template)
         self._add("POST", r"/v1/images/prefetch", self.prefetch)
         self._add("POST", r"/v1/images/build", self.build_image)
+        # Routes are anchored: the list never takes GET /v1/images/<ref>.
+        self._add("GET", r"/v1/images", self.list_images)
+        self._add("DELETE", r"/v1/images/pins/(?P<ref>.+)", self.unpin_image)
         self._add("GET", r"/v1/images/(?P<ref>.+)", self.image_lookup)
         self._add("GET", r"/v1/quota", self.quota)
         self._add("GET", r"/v1/usage", self.usage)
@@ -365,7 +388,7 @@ class SandboxApplication:
             return Response.error(status, exc.code, str(exc))
         except SandboxOpError as exc:
             hdrs = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
-            return Response.error(exc.http_status, exc.code, str(exc), hdrs)
+            return Response.error(exc.http_status, exc.code, str(exc), hdrs, exc.detail)
         except AfflineRerunError as exc:
             return Response.error(exc.http_status, exc.category, str(exc))
         except json.JSONDecodeError as exc:
@@ -491,7 +514,16 @@ class SandboxApplication:
         # collected sandbox never lingers in the list or counts against quota.
         self._sweep_inline()
         docs = self.provider.list(labels=query.get("label", []), state=(query.get("state") or [None])[0])
-        return Response.json(200, {"sandboxes": docs})
+        payload: dict[str, Any] = {"sandboxes": docs}
+        # AB#864: rooms that left in the last 10 min and why, and when this API
+        # started, so the broker can tell an end from a hotel restart.
+        ended = getattr(self.provider, "ended", None)
+        if callable(ended):
+            payload["ended"] = ended()
+        started = getattr(self.provider, "api_started_at", None)
+        if callable(started):
+            payload["api_started_at"] = started()
+        return Response.json(200, payload)
 
     def bulk_delete(self, *, query, headers, body, api_key, **_):
         labels = query.get("label", [])
@@ -832,16 +864,42 @@ class SandboxApplication:
     def prefetch(self, *, headers, body, api_key, **_):
         payload = self._json(body)
         idem = headers.get("Idempotency-Key") or headers.get("idempotency-key")
+        pin = payload.get("pin")
+        if pin not in (None, True, False):
+            raise api.SandboxContractError("invalid_prefetch", "pin must be true or false")
+        pin_cap = _pin_cap(headers) if pin else None
         owner = self._owner(headers, api_key) if getattr(self.provider, "takes_owner", False) else None
-        op = self.provider.prefetch(
-            PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth")),
-            owner=owner,
-        )
+        request = PrefetchRequest(images=tuple(payload.get("images", ())), registry_auth=payload.get("registry_auth"))
+        op = self.provider.prefetch(request, owner=owner)
         result = self.provider.get_operation(op)
+        out = result["result"]
+        pin_images = getattr(self.provider, "pin_images", None)
+        if pin and pin_images is not None:
+            # After the pull: the sizes are known only now. Over a cap the
+            # images stay pulled and nothing is pinned (507). No echo when
+            # the hotel has no pins file, so the broker shows not_supported.
+            pinned = pin_images(request.images, owner if owner is not None else owner_id(None, None), pin_cap)
+            if pinned is not None:
+                out = {**(out or {}), "pinned": pinned}
         return Response.json(
             202,
-            {"operation_id": op, "idempotent": idem is not None, "status": result["status"], "result": result["result"]},
+            {"operation_id": op, "idempotent": idem is not None, "status": result["status"], "result": out},
         )
+
+    # ------------------------------------------------------------------ AB#860 image list and pins
+    def list_images(self, *, headers, api_key, **_):
+        lister = getattr(self.provider, "list_images", None)
+        if lister is None:
+            return Response.error(501, "images_list_unavailable", "this runtime cannot list its images")
+        images = lister(self._owner(headers, api_key))
+        return Response.json(200, {"images": images, "count": len(images)})
+
+    def unpin_image(self, *, headers, api_key, ref, **_):
+        unpin = getattr(self.provider, "unpin_image", None)
+        if unpin is None:
+            return Response.error(501, "pins_unavailable", "this hotel has no image pins")
+        unpin(self._owner(headers, api_key), ref)
+        return Response.json(200, {"ref": ref, "pinned": False})
 
     # Largest build context, after base64 decoding.
     BUILD_CONTEXT_MAX_BYTES = 256 * 1024 * 1024
@@ -985,6 +1043,8 @@ _PATH_ITEMS: list[tuple[str, str, str, str]] = [
     ("/v1/snapshots/{id}/push", "post", "Push a snapshot image to a registry", "§3.5"),
     ("/v1/images/prefetch", "post", "Prefetch an image", "§3.9"),
     ("/v1/images/build", "post", "Build an image from a Dockerfile and a context", "§3.9"),
+    ("/v1/images", "get", "Images this caller holds on the hotel", "§3.9"),
+    ("/v1/images/pins/{ref}", "delete", "Unpin an image", "§3.9"),
     ("/v1/images/{ref}", "get", "Image cache status", "§3.9"),
     ("/v1/quota", "get", "Project quota + usage", "§3.8"),
     ("/v1/usage", "get", "Metered usage + cost", "§3.13/§3.16; grouped by label"),

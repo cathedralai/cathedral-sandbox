@@ -179,6 +179,11 @@ func startWithHotels(t *testing.T, tc *testChain, require bool, extra ...hotelCo
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatal(err)
 	}
+	if require {
+		// The fake config hotels are sealed (AB#776) without guest TLS, which
+		// the switch refuses at load: keep only the hotels under test.
+		cfg.Hotels = nil
+	}
 	cfg.Hotels = append(cfg.Hotels, extra...)
 	cfg.RequireSealedGuestTLS = require
 	raw, _ = json.Marshal(cfg)
@@ -358,7 +363,7 @@ func TestGuestTLSConfigLoadRules(t *testing.T) {
 		require bool
 		want    string
 	}{
-		"unsealed":         {func(h *hotelConfig) { h.Sealed = false }, false, `guest_tls needs "sealed": true`},
+		"unsealed":         {func(h *hotelConfig) { h.Sealed = false }, false, `every hotel must be "sealed": true`},
 		"plain api":        {func(h *hotelConfig) { h.API = "http://10.0.0.1:18090" }, false, "https:// api and health"},
 		"plain health":     {func(h *hotelConfig) { h.Health = "http://10.0.0.1:18091" }, false, "https:// api and health"},
 		"typed pin":        {func(h *hotelConfig) { h.TLSSPKISHA256 = strings.Repeat("ab", 32) }, false, "derived from the hotel's attestation"},
@@ -456,6 +461,9 @@ func TestRequireSealedGuestTLSSkipsPlainRuntimeHotelsOnRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.RequireSealedGuestTLS = true
+	// The fake config hotels are sealed without guest TLS, which the switch
+	// refuses at load; this test is about the runtime hotel only.
+	cfg.Hotels = nil
 	raw, _ = json.Marshal(cfg)
 	if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
 		t.Fatal(err)

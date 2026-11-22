@@ -1,5 +1,6 @@
-// Compatibility layer for the published Cathedral clients (the Harbor plugin
-// and ctcli). They speak the Cathedral cloud API, not the hotel /v1 API.
+// Compatibility layer for the published Cathedral clients (the Harbor plugin,
+// ctcli and the ComputeSDK provider). They speak the Cathedral cloud API, not
+// the hotel /v1 API.
 // A request is a client request when its User-Agent starts with one of
 // compatAgents. Native /v1 callers are not affected.
 //
@@ -34,7 +35,9 @@ import (
 	"time"
 )
 
-var compatAgents = []string{"cathedral-harbor/", "ctcli/"}
+// computesdk-cathedral/ is the ComputeSDK provider (@computesdk/cathedral) in
+// front-door mode: it sends the cloud API shape straight here (AB#894).
+var compatAgents = []string{"cathedral-harbor/", "ctcli/", "computesdk-cathedral/"}
 
 const (
 	defaultMaxExecSeconds = 14400    // Harbor asks for up to 4 hours; the hotels allow it by default
@@ -66,14 +69,10 @@ type compatImage struct {
 	CPU       float64
 	MemoryGiB float64
 	DiskGiB   float64
-	// A built image (build.go): the Dockerfile, the context and the build
-	// state on each hotel. The context is kept in state_dir, not in the state file.
+	// A built image from older state (build.go): no hotel builds now, so it
+	// is never ready. The fields stay so that state still loads and saves.
 	Build      bool
 	Dockerfile string
-	buildCtx   []byte
-	ctxMissing bool
-	builds     map[string]*buildHotel
-	failedAt   map[string]time.Time
 }
 
 type compatExec struct {
@@ -242,10 +241,7 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 			compatErr(w, 404, "image_not_found", "no image "+id, 0)
 			return
 		}
-		if img.Build {
-			b.ensureBuilds(img, g)
-		}
-		writeJSON(w, 200, b.imageView(img, g))
+		writeJSON(w, 200, b.imageView(img))
 	case p == "/v1/sandboxes" && r.Method == "POST":
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, body []byte) { b.compatCreate(w, r, g, body) })
 	case p == "/v1/sandboxes" && r.Method == "GET":
@@ -253,11 +249,8 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 	case p == "/v1/quota" && r.Method == "GET":
 		b.compatQuota(w, r, g)
 	case p == "/v1/usage" && r.Method == "GET":
-		c := &capture{hdr: http.Header{}, status: 200}
-		b.handleUsage(c, r, g)
-		var doc map[string]any
-		_ = json.Unmarshal(c.buf.Bytes(), &doc)
-		writeJSON(w, 200, map[string]any{"as_of": time.Now().UTC().Format(time.RFC3339), "groups": []any{}, "hotels": doc["hotels"]})
+		writeJSON(w, 200, map[string]any{"as_of": time.Now().UTC().Format(time.RFC3339), "groups": []any{},
+			"hotels": b.usageParts(r, g), "cost": usageCostNote, "price_doc": usagePriceDoc})
 	case strings.HasPrefix(p, "/v1/sandboxes/"):
 		b.compatRoom(w, r, g, strings.TrimPrefix(p, "/v1/sandboxes/"))
 	default:
@@ -278,7 +271,8 @@ func (b *broker) compatCatalog(w http.ResponseWriter, g *guestState) {
 			"ipv4_cidrs": true, "ipv6": false, "hostname_ports": []int{80, 443}},
 		"available": free > 0, "free_rooms": free, "max_lifetime_seconds": 23 * 3600, "cleanup_margin_seconds": 0,
 		"exec_output_limit_bytes": 16 << 20, "max_exec_seconds": b.maxExec(),
-		"templates": catalogTemplateViews(),
+		"default_exec_seconds": min(compatExecDefaultSeconds, b.maxExec()),
+		"templates":            catalogTemplateViews(),
 	})
 }
 
@@ -292,7 +286,7 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, 400, "invalid_image", "image is required", 0)
 		return
 	}
-	if e := localImageRefusal(req.Image); e != nil {
+	if e := imageRefRefusal(req.Image, true); e != nil {
 		compatErr(w, e.status, e.code, e.msg, 0)
 		return
 	}
@@ -311,14 +305,19 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	b.compat.mu.Unlock()
 	b.markDirty()
 	// Warm every hotel in the background; a create pulls a missing image anyway.
-	pf, _ := json.Marshal(map[string]any{"images": []string{img.Ref}})
+	// As the guest (AB#859): the hotel grants the image to the guest, and the
+	// guest's creates of it then prefer the hotels that hold it.
 	for _, ht := range b.hotelList() {
 		if !g.limitsAllow(b, ht.cfg.ID) { // never touch a hotel outside the guest's list
 			continue
 		}
-		go func(ht *hotel) {
-			_, _, _, _ = ht.do(context.Background(), "POST", "/v1/images/prefetch", nil, pf, 10*time.Minute)
-		}(ht)
+		b.mu.Lock()
+		full, gen := b.prefetchDiskFull(ht), ht.warmGen
+		b.mu.Unlock()
+		if full { // AB#861
+			continue
+		}
+		go b.prefetchRef(ht, g, img.Ref, nil, gen, true)
 	}
 	writeJSON(w, 200, map[string]any{"image_id": img.ID, "state": "ready", "image": img.Ref})
 }
@@ -371,14 +370,85 @@ func (b *broker) compatIdemLimit(w http.ResponseWriter, r *http.Request, g *gues
 	_, _ = w.Write(e.body)
 }
 
+// compatMaxCount bounds count on one compat create (AB#865). The call is
+// synchronous and its answer is kept for Idempotency-Key replays.
+const compatMaxCount = 1000
+
+// compatCreateErr is the client error code and message of a failed create.
+func compatCreateErr(out createResult) (string, string) {
+	code, msg := "create_failed", "the hotel refused the room"
+	if e, ok := out.doc["error"].(map[string]string); ok {
+		code, msg = e["code"], e["message"]
+	} else if len(out.body) > 0 {
+		var d map[string]any
+		if json.Unmarshal(reEnvelope(out.status, out.header, out.body), &d) == nil {
+			if dd, ok := d["detail"].(map[string]any); ok {
+				code, _ = dd["error"].(string)
+				msg, _ = dd["message"].(string)
+			}
+		}
+	}
+	return code, msg
+}
+
+// compatCreateBatch answers a compat create with count > 1 (AB#865): 201
+// with the rooms that started, a short view each (GET /v1/sandboxes/{id}
+// has the rest), and the failures counted by "<status> <code>". When none
+// started, the first failure as a single create answers it.
+func (b *broker) compatCreateBatch(w http.ResponseWriter, results []createResult) {
+	rooms := []any{}
+	errs := map[string]int{}
+	for _, out := range results {
+		if out.status != 202 {
+			code, _ := compatCreateErr(out)
+			errs[strconv.Itoa(out.status)+" "+code]++
+			continue
+		}
+		bid, _ := out.doc["id"].(string)
+		b.mu.Lock()
+		u := ""
+		if rm := b.byBID(bid); rm != nil {
+			u = rm.uuid
+		}
+		b.mu.Unlock()
+		v := map[string]any{"id": u, "hotel": out.doc["hotel"], "state": "running"}
+		if st, ok := out.doc["state"]; ok {
+			v["state"] = st
+		}
+		for _, k := range []string{"image", "expires_at", "created_at", "placement_tier"} {
+			if x, ok := out.doc[k]; ok {
+				v[k] = x
+			}
+		}
+		if ttl, ok := out.doc["ttl_seconds"]; ok {
+			v["lifetime_seconds"] = ttl
+		}
+		rooms = append(rooms, v)
+	}
+	if len(rooms) == 0 {
+		out := results[0]
+		code, msg := compatCreateErr(out)
+		ra, _ := strconv.Atoi(out.header.Get("Retry-After"))
+		compatErr(w, out.status, code, msg, ra)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"sandboxes": rooms, "count": len(rooms), "errors": errs})
+}
+
 func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestState, raw []byte) {
+	tRecv := time.Now()
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
 		compatErr(w, 400, "invalid_json", "request body is not JSON", 0)
 		return
 	}
+	// A metered guest out of its allowance: refused before any hotel or build call (allowance.go).
+	if e, retry := b.meteredRefusal(g, compatCountOf(req)); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
+	}
 	if ref, _ := req["image"].(string); ref != "" {
-		if e := localImageRefusal(ref); e != nil {
+		if e := imageRefRefusal(ref, true); e != nil {
 			compatErr(w, e.status, e.code, e.msg, 0)
 			return
 		}
@@ -387,32 +457,29 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		compatErr(w, e.status, e.code, e.msg, 0)
 		return
 	}
+	// Every room is sealed (AB#776): there is no unsealed class to ask for.
+	if v, ok := req["sealed"].(bool); ok && !v {
+		compatErr(w, errSealedOnly.status, errSealedOnly.code, errSealedOnly.msg, 0)
+		return
+	}
 	native := map[string]any{"labels": req["labels"]}
 	res := map[string]any{"vcpu": 1, "memory_gib": 4, "disk_gib": 10}
 	var pl placement
 	if id, _ := req["image_id"].(string); id != "" {
 		b.compat.mu.Lock()
 		img := b.compat.images[id]
-		ref := ""
-		if img != nil && img.Build {
-			// A built image is only on the hotels that built it.
-			pl.images, ref = img.builtOn()
-		} else if img != nil {
-			ref = img.Ref
-		}
 		b.compat.mu.Unlock()
 		if img == nil {
 			compatErr(w, 404, "image_not_found", "no image "+id+"; import it first", 0)
 			return
 		}
-		if ref == "" {
-			// After a restart no hotel holds the build until something asks
-			// for it; a client that only retries the create would wait forever.
-			b.ensureBuilds(img, g)
-			compatErr(w, 409, "image_not_ready", "image "+id+" is not built yet; poll /v1/images/"+id, 5)
+		if img.Build {
+			// No hotel builds (build.go), so this image never becomes ready:
+			// a retrying image_not_ready would make the client wait forever.
+			compatErr(w, 409, "shared_hotel_build_refused", buildRefusedMsg, 0)
 			return
 		}
-		native["image"] = ref
+		native["image"] = img.Ref
 		res = map[string]any{"vcpu": img.CPU, "memory_gib": img.MemoryGiB, "disk_gib": img.DiskGiB}
 	} else if ref, _ := req["image"].(string); ref != "" {
 		native["image"] = ref
@@ -457,48 +524,47 @@ func (b *broker) compatCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		ttl = 48 * 3600
 	}
 	native["ttl_seconds"] = ttl
-	// Hotel choice: the guest's hotel set and sealed default apply; "sealed"
-	// true or false in the request chooses explicitly.
-	sealed, sealedField := req["sealed"].(bool)
-	if sealedField {
-		if sealed {
-			pl.match = map[string]string{"sealed": "true"}
-		} else {
-			pl.exclude = map[string]string{"sealed": "true"}
-		}
+	// A metered guest: allowance, size and lifetime before any hotel call (allowance.go).
+	if e, retry := b.meteredCreate(g, native, compatCountOf(req)); e != nil {
+		compatErr(w, e.status, e.code, e.msg, retry)
+		return
 	}
-	b.scope(g, &pl, false, sealedField)
+	// Hotel choice: the guest's hotel set or policy applies. "sealed": false
+	// was refused above, and every hotel is sealed, so "sealed": true adds
+	// nothing.
+	b.scope(g, &pl)
+	// create_timeout_seconds (AB#862): the native rule; compat builds the
+	// hotel body field by field, so the value never reaches a hotel.
+	deadline, derr := createDeadline(req, tRecv)
+	if derr != nil {
+		compatErr(w, derr.status, derr.code, derr.msg, 0)
+		return
+	}
+	pl.deadline = deadline
 	// The warm preference (prewarm.go) reads pl.image; the native path sets it
 	// in handleCreate. Only catalog images are ever marked warm, so any other
 	// ref leaves placement unchanged.
 	pl.image, _ = native["image"].(string)
-	if len(pl.images) > 0 && !b.anyHotel(pl) {
-		// Built, but not on a hotel this create may use (for example only on
-		// an unsealed hotel for a sealed create). Build it there and say so.
-		if img := b.compatImageByID(req["image_id"]); img != nil {
-			b.ensureBuilds(img, g)
+	count := 1
+	if v, ok := req["count"]; ok && v != nil {
+		f, isNum := v.(float64)
+		if !isNum || f != math.Trunc(f) || f < 1 || f > compatMaxCount {
+			compatErr(w, 400, "invalid_count", "count must be a whole number from 1 to "+strconv.Itoa(compatMaxCount), 0)
+			return
 		}
-		compatErr(w, 409, "image_not_ready", "the image is not built yet on a hotel this create may use (sealed hotels unless the create says \"sealed\": false); the broker is building it there, retry", 10)
-		return
+		count = int(f)
 	}
-	if e, retry := b.admit(g, 1); e != nil {
+	if e, retry := b.admitCreate(g, count, native); e != nil {
 		compatErr(w, e.status, e.code, e.msg, retry)
 		return
 	}
-	out := b.createMany(r.Context(), g, native, 1, time.Now(), pl)[0]
+	if count > 1 {
+		b.compatCreateBatch(w, b.createMany(r.Context(), g, native, count, tRecv, pl))
+		return
+	}
+	out := b.createMany(r.Context(), g, native, 1, tRecv, pl)[0]
 	if out.status != 202 {
-		code, msg := "create_failed", "the hotel refused the room"
-		if e, ok := out.doc["error"].(map[string]string); ok {
-			code, msg = e["code"], e["message"]
-		} else if len(out.body) > 0 {
-			var d map[string]any
-			if json.Unmarshal(reEnvelope(out.status, out.header, out.body), &d) == nil {
-				if dd, ok := d["detail"].(map[string]any); ok {
-					code, _ = dd["error"].(string)
-					msg, _ = dd["message"].(string)
-				}
-			}
-		}
+		code, msg := compatCreateErr(out)
 		ra, _ := strconv.Atoi(out.header.Get("Retry-After"))
 		compatErr(w, out.status, code, msg, ra)
 		return
@@ -661,11 +727,24 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		t, dead := b.compat.tombs[id]
 		b.compat.mu.Unlock()
 		if dead && r.Method == "GET" && tail == "" {
-			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid)})
+			// An operator forget also writes a tombstone; its end record says
+			// hotel_removed, which the client must see (review F1 on #637).
+			reason, goneAt := endDeleted, t.at
+			if rec := b.endedByUUID(g.cfg.ID, id); rec != nil {
+				reason, goneAt = rec.Reason, rec.GoneAt
+			}
+			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid),
+				"end_reason": reason, "gone_at": goneAt.UTC().Format(time.RFC3339Nano)})
 			return
 		}
 		if dead && r.Method == "DELETE" && tail == "" {
 			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": b.cleanupState(r.Context(), t.bid)})
+			return
+		}
+		// A room that vanished reads as deleted, with why (AB#864).
+		if rec := b.endedByUUID(g.cfg.ID, id); rec != nil && r.Method == "GET" && tail == "" {
+			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "end_reason": rec.Reason,
+				"gone_at": rec.GoneAt.UTC().Format(time.RFC3339Nano)})
 			return
 		}
 		compatErr(w, 404, "sandbox_not_found", "no sandbox "+id, 0)
@@ -680,7 +759,16 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			return
 		}
 		if status == 404 {
-			writeJSON(w, 200, map[string]any{"id": id, "state": "deleted", "cleanup_state": "confirmed"})
+			doc := map[string]any{"id": id, "state": "deleted", "cleanup_state": "confirmed"}
+			b.mu.Lock()
+			if rm.deleteSent { // the client's delete, before the sync loop lets the room go
+				doc["end_reason"] = endDeleted
+				if !rm.vanished.IsZero() {
+					doc["gone_at"] = rm.vanished.UTC().Format(time.RFC3339Nano)
+				}
+			}
+			b.mu.Unlock()
+			writeJSON(w, 200, doc)
 			return
 		}
 		var doc map[string]any
@@ -777,6 +865,17 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		if ttl > 48*3600 {
 			ttl = 48 * 3600
 		}
+		// A metered guest: the extension is a new admission, checked after
+		// the body is read and the hotel lookup is done, right before the
+		// heartbeat goes out (allowance.go).
+		maxTTL, e, retry := b.meteredExtension(g)
+		if e != nil {
+			compatErr(w, e.status, e.code, e.msg, retry)
+			return
+		}
+		if maxTTL > 0 && ttl > float64(maxTTL) {
+			ttl = float64(maxTTL)
+		}
 		hb, _ := json.Marshal(map[string]any{"ttl_seconds": int(ttl)})
 		status, hdr, out, err := rm.h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(rm.hid)+"/heartbeat", nil, hb, 30*time.Second)
 		if err != nil {
@@ -855,6 +954,10 @@ func spillToken(v any) (string, bool) {
 	return s, true
 }
 
+// compatExecDefaultSeconds is the time limit of a compat exec that sends no
+// timeout_seconds (AB#862).
+const compatExecDefaultSeconds = 600
+
 func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 	var req map[string]any
 	if json.Unmarshal(raw, &req) != nil {
@@ -892,7 +995,9 @@ func compatExecBody(raw []byte, maxExec int) (map[string]any, int, error) {
 		}
 		body["spill_token"] = token
 	}
-	timeout := maxExec
+	// No timeout_seconds: 600 s, not the 14,400 s ceiling. An exec holds a
+	// hotel data connection for its whole run (AB#862).
+	timeout := min(compatExecDefaultSeconds, maxExec)
 	if v, ok := req["timeout_seconds"].(float64); ok && v > 0 {
 		timeout = int(v)
 	}

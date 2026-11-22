@@ -56,12 +56,13 @@ type catalogTemplate struct {
 	SealedOnly bool
 }
 
-// LFM3-1.7B image. llama.cpp b11960, Q4_K_M GGUF. Published from #574
-// (dd39ce17, AB#763): llama-server, llama-bench, python and curl ship next to
-// llama-cli for the sealed benchmark.
+// LFM3-1.7B image. llama.cpp b11960, Q4_K_M GGUF. Published from #488
+// (9bb0f1cc, AB#589, publish run 44324981481): #574's image (dd39ce17, AB#763:
+// llama-server, llama-bench, python and curl next to llama-cli) plus lfm3-ask
+// printing only the answer for long prompts.
 const (
 	lfm31_7bRepo   = "ghcr.io/cathedralai/room-lfm3-1.7b"
-	lfm31_7bDigest = "sha256:7d0aa94f7bf7d0356a02c65adfc2f3d08f6a26bf750d6d3127780ff8f68d54cb"
+	lfm31_7bDigest = "sha256:0c5757f472f61228e66e34555cda07f7ac5e2eb8a4edf1707b3a6810242398d2"
 )
 
 var digestPin = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -121,7 +122,7 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
 		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:4f9ab1457d67d8fba8c9890a612c81ad4274e5f83ea1903becafc5c51a14d5f9"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:a921557db976002b91c5a48478831edf31a36578427bc63bb1bdc58b482e92c8"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-omni-2b", DisplayName: "d1 Omni 2B (CPU)",
@@ -135,7 +136,20 @@ var catalogTemplates = []catalogTemplate{
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:b48013ae60249c18cc756d6b449e3320ec63e5861dd0e3cb87c38be11e775e08"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
+	// node-22 is the ComputeSDK benchmark's template (AB#894). The digest is
+	// the node:22-slim manifest list (holds linux/amd64) that the benchmark
+	// participant names. Sealed-only keeps the pre-pull off unsealed hotels
+	// (prewarmsTemplate) and forces every create onto the sealed pool.
+	{
+		Name: "node-22", DisplayName: "node-22",
+		Description: "1 vCPU, 4 GiB room with Node.js 22 (node:22-slim)",
+		CPU:         1, MemoryGiB: 4, DiskGiB: 10,
+		Image: pinnedImage("node", nodeDigest), Live: true, Sealed: sealedReady, SealedOnly: true,
+	},
 }
+
+// nodeDigest is node:22-slim (22-bookworm-slim).
+const nodeDigest = "sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee"
 
 // pinnedImage is repository@sha256:hex. The hotel image grammar is a tag or a
 // digest, not both. Live model templates use this for the published digest.
@@ -235,7 +249,7 @@ func applyCatalogTemplate(req map[string]any) *apiErr {
 	if id, _ := req["image_id"].(string); id != "" {
 		return nil
 	}
-	if ref, _ := req["image"].(string); ref != "" {
+	if createImageRef(req) != "" {
 		return nil
 	}
 	name, _ := req["template"].(string)

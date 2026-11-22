@@ -50,6 +50,10 @@ def _resident(provider: DockerGuestProvider) -> int:
     return provider.quota()["usage"]["resident_sandboxes"]
 
 
+def _removing(provider: DockerGuestProvider) -> int:
+    return provider.quota()["usage"]["removing_sandboxes"]
+
+
 def test_guest_containers_carry_owner_and_sandbox_labels(fake: FakeDocker) -> None:
     provider = DockerGuestProvider()
     try:
@@ -85,7 +89,7 @@ def test_one_sweep_removes_many_expired_containers(fake: FakeDocker, monkeypatch
         provider.close()
 
 
-def test_rm_timeout_keeps_quota_then_retry_removes(fake: FakeDocker, monkeypatch) -> None:
+def test_rm_timeout_keeps_the_record_then_retry_removes(fake: FakeDocker, monkeypatch) -> None:
     monkeypatch.setenv("CATHEDRAL_SANDBOX_RM_TIMEOUT", "0.5")
     provider = DockerGuestProvider()
     try:
@@ -104,8 +108,9 @@ def test_rm_timeout_keeps_quota_then_retry_removes(fake: FakeDocker, monkeypatch
         assert provider.list(labels=[], state=None) == []
         assert cid in fake.containers
         assert provider.pending_removals() == {sid: cid}
-        assert _resident(provider) == 1
-        assert provider.quota()["usage"]["deleting_sandboxes"] == 1
+        # Killed, so out of resident quota; the record waits for rm (AB#863).
+        assert _resident(provider) == 0 and _removing(provider) == 1
+        assert provider.quota()["usage"]["deleting_sandboxes"] == 0
 
         provider.sweep()
 
@@ -128,9 +133,9 @@ def test_rm_daemon_error_is_not_swallowed(fake: FakeDocker) -> None:
         _expire(provider, sid)
         provider.sweep()
         provider.sweep()
-        assert cid in fake.containers and _resident(provider) == 1
+        assert cid in fake.containers and _removing(provider) == 1 and provider.has_record(sid)
         provider.sweep()
-        assert fake.containers == {} and _resident(provider) == 0
+        assert fake.containers == {} and _resident(provider) == 0 and not provider.has_record(sid)
     finally:
         provider.close()
 
@@ -163,14 +168,14 @@ def test_two_concurrent_sweeps_remove_each_container_once(fake: FakeDocker) -> N
         provider.close()
 
 
-def test_delete_with_failed_rm_keeps_quota_until_sweep(fake: FakeDocker) -> None:
+def test_delete_with_failed_rm_keeps_the_record_until_sweep(fake: FakeDocker) -> None:
     provider = DockerGuestProvider()
     try:
         (sid,) = _create(provider, 1)
         (cid,) = fake.containers
         fake.set(rm_fail={cid: 1})  # DELETE's docker rm fails once; sweep's retry clears it
         provider.delete(sid)  # still idempotent: no error
-        assert _resident(provider) == 1 and cid in fake.containers
+        assert _resident(provider) == 0 and _removing(provider) == 1 and cid in fake.containers
         with pytest.raises(SandboxOpError) as err:
             provider.get(sid)
         assert err.value.code == "sandbox_deleting" and err.value.http_status == 409
@@ -283,7 +288,7 @@ def test_each_room_leaves_quota_when_its_own_container_is_gone(fake: FakeDocker,
         assert worker.is_alive()
         assert not provider.has_record(fast)
         assert provider.has_record(slow)
-        assert _resident(provider) == 1
+        assert _resident(provider) == 0 and _removing(provider) == 1  # killed, rm still running
         worker.join(timeout=20)
         assert slow in provider.pending_removals()  # the slow one stays queued for retry
     finally:

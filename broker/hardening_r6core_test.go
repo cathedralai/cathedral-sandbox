@@ -37,7 +37,7 @@ func TestConfigLoaderRefusesTyposAndDuplicates(t *testing.T) {
 		}
 		return loadBroker(p)
 	}
-	hotels := `"hotels":[{"id":"h1","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + keyFile + `"},{"id":"h2","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + keyFile + `"}]`
+	hotels := `"hotels":[{"id":"h1","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + keyFile + `","sealed":true},{"id":"h2","api":"http://127.0.0.1:1","health":"http://127.0.0.1:1","key_file":"` + keyFile + `","sealed":true}]`
 
 	// Control: a valid file loads.
 	if _, err := load(`{"listen":"127.0.0.1:0",` + hotels + `,"guests":[{"id":"acme","key_sha256":"ab","hotels":["h1"]}]}`); err != nil {
@@ -91,8 +91,7 @@ func TestEmptyGuestIDOwnsUnlabeledRooms(t *testing.T) {
 // PATCH labels on a sealed hotel replaces the label map, and the sealed
 // label newHotel forced is gone: no create can select the hotel any more.
 func TestPatchLabelsDropsTheSealedLabel(t *testing.T) {
-	tc := newChain(t)
-	ungatedSealed(tc.b.hotelByID("a"))
+	tc := limitedChain(t, guestLimits{Hotels: []string{"a"}})
 	// Sanity: a sealed create lands on a.
 	if id := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "sealed": true}); hotelOf(id) != "a" {
 		t.Fatalf("sealed create on %s before the patch", id)
@@ -248,10 +247,10 @@ func TestLongExecsDoNotStarveTheSyncLoop(t *testing.T) {
 func TestRuntimeHotelCapsLostAtRestart(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{chip: chipOf("d")})}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
-	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey, "sealed": true}); status != 201 {
 		t.Fatalf("join: %d %v", status, doc)
 	}
 	tc.b.mu.Lock()
@@ -406,24 +405,8 @@ func TestCompatExecIsForgottenAtRestart(t *testing.T) {
 
 // ---------------------------------------------------------------- guests
 
-// A batch larger than max_creates_per_minute can never pass; the answer is
-// 429 with Retry-After 60 every time, so a client that obeys it loops.
-func TestBatchOverRateLimitRetriesForever(t *testing.T) {
-	tc := limitedChain(t, guestLimits{MaxCreatesPerMinute: 2})
-	for i := 0; i < 2; i++ {
-		req, _ := http.NewRequest("POST", tc.srv.URL+"/v1/sandboxes", strings.NewReader(`{"image":"alpine:3.20","count":3}`))
-		req.Header.Set("Authorization", "Bearer key1")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != 429 || resp.Header.Get("Retry-After") != "60" {
-			t.Fatalf("batch of 3 over a limit of 2: %d Retry-After %q", resp.StatusCode, resp.Header.Get("Retry-After"))
-		}
-	}
-	t.Logf("observation: a count above the per-minute limit is 429 with Retry-After 60 on every try; the message does not say to lower count")
-}
+// A batch larger than max_creates_per_minute: TestCountOverTheRateLimitIs400NotARetryLoop
+// (compatcount_test.go, AB#865) replaces the old 429 observation.
 
 // g.recent grows on every create and is pruned only in snapshot (live view).
 func TestRecentCreatesPrunedOnlyByTheLiveView(t *testing.T) {
@@ -452,10 +435,10 @@ func TestRecentCreatesPrunedOnlyByTheLiveView(t *testing.T) {
 func TestEmptyRuntimeHotelsFileLoads(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
-	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}}
+	f := &fakeHotel{t: t, snaps: map[string]map[string]any{}, attestation: snpAttestation(t, attestOpts{chip: chipOf("d")})}
 	hs := httptest.NewServer(f)
 	t.Cleanup(hs.Close)
-	if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey}); status != 201 {
+	if status, _ := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "d", "api": hs.URL, "key": joinKey, "sealed": true}); status != 201 {
 		t.Fatalf("join %d", status)
 	}
 	if status, _ := tc.call(t, "operator-key", "DELETE", "/v1/broker/hotels/d", nil); status != 204 {

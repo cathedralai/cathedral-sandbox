@@ -31,6 +31,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 )
@@ -43,19 +44,38 @@ const (
 	defaultMemFullPct   = 90.0 // host memory use at which a hotel takes no new rooms
 )
 
-// memFull reports whether h is at the memory limit (config mem_full_pct).
+// memFullLimit is the host memory use (percent) at which h takes no new
+// rooms: the hotel's own mem_full_pct, else the broker-wide one (default
+// 90). -1: no memory limit. Caller holds b.mu.
+func (b *broker) memFullLimit(h *hotel) float64 {
+	if p := h.cfg.MemFullPct; p != nil {
+		return *p
+	}
+	switch limit := b.cfg.MemFullPct; {
+	case limit < 0:
+		return -1
+	case limit == 0:
+		return defaultMemFullPct
+	default:
+		return limit
+	}
+}
+
+// memFull reports whether h is at its memory limit (memFullLimit).
 // The reading is the hotel's host_mem_used_pct (MemTotal minus MemAvailable,
 // so page cache does not count). A hotel with no reading yet has memPct 0,
 // which is under any limit. Caller holds b.mu.
 func (b *broker) memFull(h *hotel) bool {
-	limit := b.cfg.MemFullPct
-	switch {
-	case limit < 0:
-		return false
-	case limit == 0:
-		limit = defaultMemFullPct
+	limit := b.memFullLimit(h)
+	return limit >= 0 && h.memPct >= limit
+}
+
+// checkMemFullPct validates a hotel's mem_full_pct (config, join or PATCH).
+func checkMemFullPct(p *float64) error {
+	if p != nil && (math.IsNaN(*p) || *p < 1 || *p > 100) {
+		return fmt.Errorf("mem_full_pct must be absent (the broker-wide value) or 1 to 100")
 	}
-	return h.memPct >= limit
+	return nil
 }
 
 // freeFor is the number of rooms h can take now: its free slots, or 0 when
@@ -216,7 +236,8 @@ func (h *hotel) weight(free int) float64 {
 // waitSlot waits for a create slot at h. h.queued and g.queued count the
 // create while it waits. After the queue wait limit it moves the create to
 // another eligible hotel that pick chooses, if there is one. It returns the
-// hotel whose slot it holds, or nil when ctx ends (counts released).
+// hotel whose slot it holds, or nil when ctx ends or pl.deadline passes
+// (counts released).
 func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl placement, tried map[*hotel]bool) *hotel {
 	limit := b.maxQueueWait()
 	var timer <-chan time.Time
@@ -224,6 +245,19 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 		t := time.NewTimer(limit)
 		defer t.Stop()
 		timer = t.C
+	}
+	// The create's own deadline (create_timeout_seconds, AB#862). A free
+	// slot wins over a deadline that has passed: the create is sent.
+	var deadline <-chan time.Time
+	if !pl.deadline.IsZero() {
+		select {
+		case h.sem <- struct{}{}:
+			return h
+		default:
+		}
+		t := time.NewTimer(time.Until(pl.deadline))
+		defer t.Stop()
+		deadline = t.C
 	}
 	for {
 		select {
@@ -233,6 +267,16 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 			b.mu.Lock()
 			h.queued--
 			g.queued--
+			h.holdDisk(pl, -1)
+			b.mu.Unlock()
+			return nil
+		case <-deadline:
+			// Same release as a guest that went away; createOne tells the
+			// two apart by the deadline (createDeadlinePassed).
+			b.mu.Lock()
+			h.queued--
+			g.queued--
+			h.holdDisk(pl, -1)
 			b.mu.Unlock()
 			return nil
 		case <-timer:
@@ -255,6 +299,8 @@ func (b *broker) waitSlot(ctx context.Context, g *guestState, h *hotel, pl place
 			h.queued--
 			if alt := b.pick(map[*hotel]bool{h: true}, mpl); alt != nil && alt.expectedWait(1) < waitHere/2 {
 				alt.queued++
+				h.holdDisk(pl, -1) // the disk reservation moves with the create (disk.go)
+				alt.holdDisk(pl, 1)
 				h.moved++
 				tried[alt] = true
 				h = alt

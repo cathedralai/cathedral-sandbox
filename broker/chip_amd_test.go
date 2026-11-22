@@ -104,7 +104,7 @@ func TestOneHotelPerChip(t *testing.T) {
 		t.Fatalf("m1 got %d creates", n)
 	}
 	// Another chip is another machine.
-	joinMiner(t, tc, "m3", true, 5, nil)
+	joinMiner(t, tc, "m3", 5, nil)
 	if !bothAdmitted(tc, "m2", "m3") {
 		t.Fatalf("hotels on two chips are not both placeable")
 	}
@@ -276,8 +276,8 @@ func TestMinerAdmissionRequiresMeasurementAllowlist(t *testing.T) {
 func TestMinerHotkeyCapRefusesNextMachine(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
-	joinMiner(t, tc, "m1", true, 1, nil)
-	joinMiner(t, tc, "m2", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
+	joinMiner(t, tc, "m2", 1, nil)
 	_, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m3")}))
 	third := map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_cap_reached" {
@@ -308,8 +308,8 @@ func TestMinerGlobalCapCountsAllHotkeysAndDrainingHotels(t *testing.T) {
 	tc.b.cfg.MinerHotkeyCaps[minerHotkey] = 2
 	tc.b.cfg.MinerHotkeyCaps[otherHotkey] = 2
 	tc.b.cfg.MinerMaxHotels = 2
-	joinMiner(t, tc, "m1", true, 1, nil)
-	joinMiner(t, tc, "m2", true, 1, map[string]any{"miner_hotkey": otherHotkey})
+	joinMiner(t, tc, "m1", 1, nil)
+	joinMiner(t, tc, "m2", 1, map[string]any{"miner_hotkey": otherHotkey})
 	_, url := newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m3")}))
 	third := map[string]any{"id": "m3", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": minerHotkey}
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 409 || errCode(doc) != "miner_global_cap_reached" {

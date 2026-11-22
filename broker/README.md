@@ -8,8 +8,8 @@ The broker does four things:
 
 | Function | Routes | What it does |
 |---|---|---|
-| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
-| Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. |
+| Scatter | `POST /v1/sandboxes` (also `count` up to 10,000; the compat create takes `count` up to 1,000 and answers 201 `{sandboxes, count, errors}`) | Picks a hotel at random, with weight = free rooms. Each hotel has a fixed number of creates in flight (`concurrency`). If a hotel answers 429, the broker tries another hotel. If no hotel has a free room, it answers 429 `no_free_rooms`. If all matching hotels are down or draining, it answers 503 `hotels_unavailable`. |
+| Gather | `GET /v1/sandboxes`, `GET /v1/quota`, `GET /v1/usage`, `DELETE /v1/sandboxes?label=` | Asks all hotels in parallel and merges the answers. A guest sees only its own rooms. `/v1/usage` gives hours per hotel, not prices (`"cost": "not_priced_here"`, AB#870). |
 | Route | `/v1/sandboxes/<hotel>.<id>/...` | Sends exec, files, tar, heartbeat, delete and the other room calls to the hotel that has the room. |
 | Show | `/<guest>/live` | Live view: one tile per hotel, one square per room, live counters. Private: open with the view token or a share link (`POST /v1/live/shares`). |
 
@@ -28,6 +28,44 @@ Creates in flight:
   `deleted_during_create`. A create received after the delete runs as usual.
   The broker keeps each delete filter for 15 minutes.
 
+## Room end reasons (AB#864)
+
+When a room of a guest leaves for good, the broker keeps an end record for
+24 hours (at most 50,000 per guest, oldest dropped first; kept in
+`client-state.json` section `ended_rooms`).
+
+- Any `/v1/sandboxes/<hotel>.<id>[/...]` call on that room answers 410
+  `sandbox_gone`:
+  `{"error":{"code":"sandbox_gone","message":"..."},"sandbox":{"id":"...","state":"gone","gone_at":"<RFC 3339>","reason":"...","hotel":"..."}}`.
+  Background exec results (`GET /v1/sandboxes/<id>/execs/<exec id>`) still
+  read. Another guest's room id, or a wrong id, stays 404 `sandbox_not_found`.
+- `GET /v1/sandboxes/ended?since=<RFC 3339>&limit=<1..1000, default 100>`
+  lists the guest's records gone at or after `since`, newest first:
+  `{"ended":[{"id","uuid"?,"hotel","created_at"?,"gone_at","reason","detail"?}],"count":n}`.
+- The live stream (`/<guest>/live/events`, also through a share link) sends
+  one `event: room_gone` per new record, with the record as `data`. A new
+  stream gets records of the last 60 seconds, no older backlog.
+- Client path: `GET /v1/sandboxes/<uuid>` of a vanished room answers 200
+  `{"id","state":"deleted","end_reason","gone_at"}`; a client delete reads
+  `end_reason` `deleted`.
+
+`reason`, best known first:
+
+| Reason | When |
+|---|---|
+| `oom_killed`, `container_exited` | The hotel listed the room's container as dead before the room ended (`detail` then carries the hotel's removal reason). |
+| `deleted`, `ttl_expired`, `idle_timeout`, `key_revoked` | The hotel's `ended` list named the room with this reason. |
+| `deleted` | The guest deleted the room, by id or by label. |
+| `hotel_removed` | The operator forgot the rooms of a dead miner hotel, or a miner hotel came back without the room. |
+| `ttl_expired` | The room left at most 10 s before its listed `expires_at`, or after it. |
+| `hotel_restarted` | The room left with a new hotel API start time (`api_started_at` in the hotel list). |
+| `unknown` | Anything else. |
+
+The hotel fields (`end_reason` and `container_state` per room, top-level
+`ended` and `api_started_at` in the room list) come with a sealed guest
+rebuild; a hotel without them gives `deleted`, `ttl_expired`,
+`hotel_removed` and `unknown` only.
+
 ## Placement
 
 - The broker picks a hotel at random. The weight is free rooms x CPU
@@ -39,16 +77,48 @@ Creates in flight:
 - A create that waits longer than `max_queue_wait_seconds` (config, default
   10; -1 turns it off) for a create slot moves to another eligible hotel
   with a free room. If there is none, it keeps waiting.
+- A create may send `create_timeout_seconds` (1 to 720, native and compat).
+  If no create slot (or data connection) at a hotel comes free in that time,
+  the create answers 503 `create_timeout` with `Retry-After: 5` and no room
+  is started. A create already sent to a hotel is not cut: it runs to the
+  hotel's answer. In a batch, rooms not sent by then count as
+  `503 create_timeout` in `errors`. Without the field a create waits as before.
+- A compat exec (`/exec`, `/execs`) without `timeout_seconds` runs under 600 s
+  (`default_exec_seconds` in the catalog), not `max_exec_seconds`.
 - A hotel whose host memory use is at or above `mem_full_pct` (config,
-  default 90; -1 turns it off) takes no new rooms. The value is the hotel
+  default 90; -1 turns it off) takes no new rooms. A hotel may carry its own
+  `mem_full_pct` (1 to 100; config, operator join, or PATCH
+  `{"mem_full_pct": n}`, `null` back to the broker-wide value; AB#855). It
+  replaces the broker-wide value for that hotel, even when that one is -1. A
+  PATCH of a config file hotel is not saved: the file keeps the durable
+  value. Hotel docs and `/v1/broker/stats` show the limit in force. The value is the hotel
   health value `host_mem_used_pct` (MemTotal minus MemAvailable, so page
   cache does not count). Hotel slots come from an install-time sizing with
   memory overcommit, so free slots alone cannot see rooms that use their
   full memory limit. Such a hotel shows 0 free rooms, and the operator stats
   show `mem_full: true`. When every eligible hotel is full this way, a
   create gets 429 `no_free_rooms`.
+- Disk budget (AB#831, `disk.go`). A room's disk is its
+  `resources.disk_gib` (hotel default 10 GiB). A hotel with
+  `"disk_extra_gib": N` in its config entry takes a room above 10 GiB only
+  while the extra of its rooms (`disk_gib - 10` each, rooms queued and
+  creating included) plus the new room's extra is at most N, and while its
+  last health `live.room_data_used_pct` is under 80 (no reading yet passes).
+  `0`: rooms of 10 GiB or less only. Absent: no disk limit and no
+  `room_data_used_pct` check (the behaviour before AB#831). Rooms of 10 GiB
+  or less are never affected. The broker learns each room's disk from the
+  create and from the hotel room list, so a restart keeps the count; until
+  a hotel's first room list answers after a start, it takes no room above
+  10 GiB. When a
+  hotel would take the room but none has the disk, the create gets 429
+  `disk_sold_out` with `Retry-After: 60` (native and compat).
 
 ## Hotel choice
+
+Every hotel is sealed (AB#776): there is no unsealed hotel class. The config
+loader refuses a hotel without `"sealed": true`, a join without it gets 400
+`invalid_hotel`, and a create (native or client path) with `"sealed": false`
+gets 400 `sealed_only`. `"sealed": true` is accepted and changes nothing.
 
 A create can limit the hotels it may use. The broker removes these fields
 before it calls the hotel.
@@ -59,7 +129,7 @@ before it calls the hotel.
 | `"hotel_labels": {"sealed": "true"}` | Only hotels with every pair. |
 | `"exclude_hotel_labels": {"sealed": "true"}` | No hotel with any pair. |
 | `"placement": "require"` | The default. A create that names hotels uses only those hotels. |
-| `"placement": "prefer"` | Try the named hotels first. If all of them are down, full or fail the create, use another hotel of the same class: sealed for sealed, unsealed for unsealed. The other label rules and the guest's hotel list still apply. A sealed create falls back only when the guest has its own hotel list. A fork and a mix of sealed and unsealed hotels never fall back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
+| `"placement": "prefer"` | Try the named hotels first. If all of them are down, full or fail the create, use another sealed hotel. The other label rules and the guest's hotel list or policy still apply. A create falls back only when the guest has its own hotel list or a policy. A fork never falls back. The answer has `"placement_fallback": true` and the header `X-Broker-Fallback: true`. |
 | `"own_hosts_only": true` | Only Cathedral's own hotels: never a miner hotel (one with `miner_hotkey`, the label `miner=true`, or an id that starts with `miner-`), even when the guest policy opts into miner hotels. It holds on every retry, `"prefer"` fallback and queue move. With no own hotel left the create gets the usual 409, 429 or 503. A fork or workspace whose hotel is a miner hotel gets 409. `false` or absent: no limit. Any other value: 400 `invalid_hotel_selection`. |
 
 Hotel labels come from the `labels` object of each hotel in the config.
@@ -68,7 +138,7 @@ hotel matches, the broker answers 409 `no_matching_hotel`. When the
 matching hotels are full, it answers 429 `no_free_rooms`. If matching hotels
 are down or draining (not full), it answers 503 `hotels_unavailable` instead of
 claiming they are full. It never uses
-a hotel outside the choice, except a `"prefer"` fallback inside the same class.
+a hotel outside the choice, except a `"prefer"` fallback.
 Each hotel in `GET /v1/broker/hotels` has `down_since`: the time the broker last
 saw it go down, or null while it is up. The broker logs each change between
 down and up.
@@ -79,13 +149,15 @@ Each guest in the config can have limits (`guests.go`):
 
 | Field | Meaning |
 |---|---|
-| `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. |
-| `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. |
-| `default_sealed` | `true`: a create with no hotel choice goes to sealed hotels only. The guest gets an unsealed room only when the create says `"sealed": false`, names hotels with `"hotels"`, or excludes sealed hotels with `"exclude_hotel_labels"`. A fork goes to the hotel of its snapshot. |
+| `max_rooms` | Rooms running or starting at one time. Absent or 0: 1,000. Over the limit, a create gets 429 `room_limit`. A batch that does not fit is refused as a whole. A single `count` above the limit itself can never fit: 400 `count_over_room_limit`. |
+| `max_creates_per_minute` | Rooms the guest may ask for in any 60 s. Absent or 0: no limit. Over the limit, a create gets 429 `create_rate_limit` with `Retry-After`. A single `count` above the limit itself: 400 `count_over_rate_limit` (send at most that many in one call). |
+| `default_sealed` | Kept for existing configs and echoed by `GET /v1/quota` and the guest views; it no longer changes placement, since every hotel is sealed (AB#776). |
 | `hotels` | The hotel ids the guest may use. Absent: all hotels. Other hotels are not in the guest's hotel list, and a create that names one gets 409 `unknown_hotel`. |
-| `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels` and `default_sealed`. See "Guest policy and capacity catalog". |
+| `policy` | Hotels by selector, in order: `prefer`, `allow`, `deny`. Replaces `hotels`. See "Guest policy and capacity catalog". |
 | `own_hosts_only` | `true`: every create of the guest stays on Cathedral's own hotels, never a miner hotel (the same rule as the create flag `"own_hosts_only": true`), even when its `policy` opts into miner hotels. A create cannot turn it off. Miner hotels also leave the guest's capacity catalog. For reserved customers (const). |
+| `pin_max_gib` | Image bytes the guest may pin on each hotel (prefetch `"pin": true`). Absent or 0: no pins; a pin gets 403 `pins_not_enabled`. Config only. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
+| `metered` | `true`: the guest is admitted only on the ledger's allowance, and it starts closed. Needs `state_dir`. See "Metered guests". |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
 routes. `GET /v1/quota` shows the guest its limits.
@@ -100,6 +172,129 @@ limits without a restart:
 
 A runtime change stays in memory. A restart goes back to the config file.
 
+### Meter routes (AB#890)
+
+`meter_key_sha256` is the SHA-256 of a narrow key for an external meter (the
+Polaris API meters const's broker-guest rooms against a Gamma hotkey
+account). It allows the two routes below and no other route. The operator
+key, the operator read key, the miner enrollment key and guest keys get 401
+on them. Without `meter_key_sha256` both answer 404. The digest must be a
+SHA-256 hex digest and must differ from the operator key, the operator read
+key, the miner enrollment key, and every guest key, next key and view token.
+An unknown guest id gets 404 `guest_not_found`.
+
+| Route (meter key) | What it does |
+|---|---|
+| `GET /v1/broker/guests/<id>/rooms` | The guest's rooms on the hotels it may use, asked like the guest's own `GET /v1/sandboxes` (label `broker_guest=<id>`): `{"rooms": [{"id": "<hotel>.<room>", "hotel", "state", "memory_gib", "vcpu", "created_at"}], "hotel_errors": {"<hotel>": "unavailable"}}`. `state` and `created_at` are the hotel's; `memory_gib` and `vcpu` are the hotel's `resources.memory_gib` and `resources.vcpu` (whole numbers, the ones the hotel's usage multiplies), null when the hotel did not send one. A hotel that does not answer is in `hotel_errors` and its rooms are left out; the call still answers 200. |
+| `POST /v1/broker/guests/<id>/freeze-all` | Calls the hotel's `POST /v1/sandboxes/<room>/freeze` for the guest on every room of the list above in state `running`: `{"frozen": [ids], "failed": {"<id>": "<hotel error code>"}, "hotel_errors": {...}}` (`unavailable` when a hotel call got no answer). Rooms in any other state are not touched. It never deletes and never thaws; a second call freezes nothing new. A frozen room still counts in the hotel's own usage and may still be removed by the hotel's TTL or idle sweep. |
+
+## Usage meter
+
+With `state_dir` set, the broker writes a numbered usage reading log for
+every room of every guest (`usage_meter.go`): one JSON line per reading in
+`state_dir/usage/<first seq>.jsonl`, schema `cathedral_usage_reading_v1`,
+fields `seq`, `run` (the broker room id), `guest`, `hotel`, `miner_hotkey`,
+`vcpu`, `memory_gib`, `started_at`, `seconds`, `state` (`running` or
+`ended`) and `at`. A run gets a reading at first sight (the broker's create
+answer, or the first room list that shows it), every
+`usage_meter_every_seconds` (default 60) while lists show it, and once
+`ended` when it leaves. `seconds` is observed time: a gap over 30 s between
+two sightings (a hotel that stops answering, a broker restart) adds nothing,
+and a delete adds its tail only when the hotel's last answered list still
+showed the room. A bulk delete ends its rooms at the list it takes just
+before the delete. A room in that list the meter has no run for yet (no
+list of its hotel has answered since start, or a create still in flight)
+gets, when the delete succeeds, a first reading at that list's time and its
+ended reading, both not billable: the meter has no proof the guest was given
+it, and it has 0 observed seconds. A failed delete writes nothing for it; the
+next sync meters it as usual.
+A room the broker took back from a cancelled or failed
+create (its reap, the orphan cleanup, or a recorded leftover) is metered
+too, with `"billable": false` (absent means billable).
+Readings are cumulative, so a reader keeps the largest per run.
+`seconds` is truncated to whole seconds, so a room used and deleted within
+one observed second ends at 0. With `usage_meter_min_second` (default
+false) the ended reading of a billable run rounds up to the next whole
+second, at least 1; running readings and runs that are not billable are
+never rounded. Turning it on changes what customers pay: a pricing decision.
+
+| Route (operator key) | What it does |
+|---|---|
+| `GET /v1/broker/usage-meter?after=<seq>&limit=<n>` | Readings after `after` (default 0) in seq order, at most `limit` (default 500, at most 1,000): `{"readings", "next", "head", "observed_at", "write_errors", "unobserved_hotels", "pending_readings"}`. `pending_readings` counts readings observed but not durable yet (an append waiting for its retry); 0 when all is durable. `next` is the seq of the last reading returned (or `after`), so a reader never skips one. `head` is the highest seq written. `observed_at` is the oldest last answered room list among hotels with live rooms (now if none), leaving out a hotel whose latest list failed and that takes no new room (down, leaving or draining); `unobserved_hotels` counts those. Only durable (fsynced) readings are served; a file whose sync fails at start is served once a retry syncs it. The highest `after` is the acknowledged cursor, kept with the durable head and the highest issued seq in `state_dir/usage/acked.json`, so a seq is never issued twice: a file whose seqs are all at or below the cursor and that is older than 7 days is deleted, after the newest reading of each open run in it is written again under a new seq. Without `state_dir`: 404 `usage_meter_off`. |
+
+Operator note: a usage file that can never be synced (a failing disk)
+stalls the feed by design. The route serves nothing above it, so `head`
+stops, the ledger stops renewing leases and metered keys close. It shows as
+`pending_readings` staying above 0, `write_errors` growing, and the log line
+`usage meter: <file>: sync before replay failed`. Fix the disk first. Only
+if that fails, as a last resort, stop the broker, move that file out of
+`state_dir/usage/` and start the broker again. What that does:
+
+- No served seq is reused: `acked.json` holds the highest issued seq,
+  saved before any page served it.
+- Every reading in that file leaves the log, also ones already served (the
+  ledger has those).
+- A run whose newest state was in that file goes back to its last reading
+  in another file, or to zero seconds if it has none. The ledger already
+  holds a higher mark for it, so it charges nothing more for that run until
+  the run passes that mark (the customer's favour).
+- An ended run whose end was in that file may never show its final reading.
+
+Known limits (stage 1):
+
+- The readings are the front door's observation, not proof: nothing is
+  guest-signed (stage 2).
+- A front door crash loses the observed time since each run's last durable
+  reading (at most `usage_meter_every_seconds`, plus a delete's tail), in
+  the customer's favour. Nothing in a durable reading is lost.
+- A delete can count the time from the last sighting to the delete for a
+  room that vanished in between: at most one sync interval (2 s) while
+  lists answer, at most 30 s when its hotel's lists fail in between.
+- If the broker dies between learning that a create failed or was cancelled
+  and that reading reaching the disk (milliseconds: the writer is woken at
+  once and the path waits up to 3 s for it, outside the broker lock), the
+  restarted broker has no record of the failure. It adopts the surviving
+  room under the guest's label and meters it as billable until it leaves:
+  at most that one room's remaining lifetime, and the room is in the
+  guest's own list, so the guest can delete it. Persisting create outcomes
+  is a follow-up.
+- A room a sync adopted while its create was in flight has billable
+  readings until the orphan cleanup lists it, which is as soon as the
+  request's creates end (each bounded by the 12 minute create timeout);
+  from then on it is `billable: false`.
+- A hung disk stalls no broker work: no disk I/O happens under the broker
+  lock, a path that saw a turn to not billable waits at most 3 s, and a
+  route read waits at most 5 s for a write in progress, then answers what is
+  durable without acknowledging or pruning.
+- A file that can never be synced stalls the feed (operator note above).
+- The broker trusts each hotel's room list. The sync loop adopts any room
+  a hotel lists under a guest's label and meters it as that guest's
+  billable room, with no check against a create the broker made or against
+  the hotels the guest may use. Whoever can make a hotel list such a room
+  can bill that guest: anyone holding the hotel's key, or a host that can
+  alter the hotel's answers. Today an admitted miner hotel answers over its
+  attested guest TLS from the measured guest, and its key is installed in
+  the guest so the host never holds it; operator hotels are ours. The
+  broker sets no bound on the cost: the count, size and duration of such
+  rooms come from the hotel's list, and only the ledger's balance rules
+  limit the charge. A room limit does not bound it either: adopted rooms
+  count against the guest's `max_rooms`, so they can also refuse the
+  guest's own creates. The guest sees such a room in its own list when its
+  policy reaches that hotel, and can delete it by id there; a hotel that
+  goes on listing a deleted room is metered again after 24 h. This must be
+  closed before a hotel we do not operate, or one whose host holds its key,
+  carries a metered guest.
+- A room seen again after its ended reading is logged and not metered
+  again for 24 h.
+- While the disk refuses writes, readings queue in memory (about one per
+  live room per minute); `pending_readings` counts them.
+- If the whole `usage/` is lost, `acked.json` with it, seq restarts at 1: a
+  reader whose cursor is above `head` must treat that as an alarm.
+- A hotel left out of `observed_at` holds rooms whose seconds are not
+  growing; `unobserved_hotels` counts such hotels, not their rooms.
+- Replay reads and syncs every retained file at start; its time grows with
+  the readings kept (7 days plus whatever is unacknowledged).
+
 ## Guest policy and capacity catalog
 
 A guest `policy` chooses hotels by selector, not by a fixed id list
@@ -108,15 +303,15 @@ with no config edit.
 
 ```json
 "policy": {
-  "prefer": [{"class": "sealed"}],
-  "allow":  [{"class": "unsealed"}],
+  "prefer": [{"label": {"region": "eu"}}],
+  "allow":  [{"class": "sealed"}],
   "deny":   [{"hotel": "nc-sealed"}]
 }
 ```
 
 | Part | Meaning |
 |---|---|
-| Selector | Exactly one of `{"class": "sealed"\|"unsealed"}`, `{"hotel": "<id>"}` or `{"label": {"k": "v"}}` (every pair). Class is `sealed` when the hotel has the label `sealed=true` (every `"sealed": true` hotel has it). A hotel id need not exist yet. |
+| Selector | Exactly one of `{"class": "sealed"}`, `{"hotel": "<id>"}` or `{"label": {"k": "v"}}` (every pair). `sealed` is the only class (AB#776); any other class is refused (`invalid_policy`, or a config load error). A hotel id need not exist yet. |
 | `prefer` | Tried first. |
 | `allow` | Tried only when no preferred hotel has a free room. |
 | `deny` | Never used. Wins over `prefer`, `allow` and named `hotels`. |
@@ -126,10 +321,6 @@ with no config edit.
   free room, else to an allowed hotel. Inside a tier the pick is the usual
   weighted random pick. The answer has `"placement_tier": "prefer"|"allow"`
   and the header `X-Broker-Placement-Tier` (client routes too).
-- The policy is the class choice: a plain create may land on a sealed or an
-  unsealed hotel only when the policy reaches that class. `"sealed": true`
-  still stays on sealed hotels (429 `no_free_rooms` when they are full, never
-  an unsealed room), and `"sealed": false` stays on unsealed hotels.
 - Named `hotels` must be in the policy's reach (prefer or allow, minus deny),
   else 409 `unknown_hotel`. Tiers still apply among them.
 - `max_rooms` is still the cap: at the cap a create gets 429 `room_limit`.
@@ -139,15 +330,14 @@ with no config edit.
   protects existing customer and Escape guests from newly joined miners.
   Do not opt a customer guest in until the miner-host data isolation and
   attested guest TLS path are proven.
-- A guest with no policy keeps `hotels` and `default_sealed` for non-miner hotels.
+- A guest with no policy keeps `hotels` for non-miner hotels.
 
-Example: `polaris-sealed` gets sealed rooms first, unsealed rooms when sealed
-is full, never `nc-sealed`, at most 10 rooms:
+Example: `polaris-sealed` gets any sealed hotel except `nc-sealed`, at most
+10 rooms:
 
 ```json
 {"id": "polaris-sealed", "max_rooms": 10,
- "policy": {"prefer": [{"class": "sealed"}], "allow": [{"class": "unsealed"}],
-            "deny": [{"hotel": "nc-sealed"}]}}
+ "policy": {"prefer": [{"class": "sealed"}], "deny": [{"hotel": "nc-sealed"}]}}
 ```
 
 ### Placement policy for miner hotels (AB#336)
@@ -240,14 +430,18 @@ a re-seal (`lend.go`, design in `docs/DEDICATED_SEALED.md`).
 `GET /v1/broker/capacity`:
 
 - Operator key: every hotel with `id`, `class`, `labels`, `up`, `drain`,
-  `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`
-  and `admission`, plus `classes`: per class (`sealed`, `unsealed`) the totals
+  `free_rooms`, `slots`, `reserved_for`, `lent_from`, `down_since`, `source`,
+  `admission`, `disk_extra_gib` (null: no disk limit), `disk_extra_used_gib`
+  and `room_data_used_pct` (null: no reading yet), plus `classes`: for the one class (`sealed`) the totals
   `hotels`, `joined`, `up`, `placeable`, `pending_admission`, `draining`,
   `slots` and `free_rooms`.
 - Guest key: only the hotels the guest can reach, each with `tier`
   (`prefer`, `allow`, or `hotels` for a guest with no policy), preferred
   first, plus `guest` with `max_rooms` and `active_rooms`, and `classes`
-  over those hotels only.
+  over those hotels only. Each hotel also has `disk_used_pct` (how full its
+  data volume is; null: no reading yet) and `disk_admit_used_pct` (the fill
+  at which it takes no more rooms; null: not set). The disk budget fields
+  stay operator only.
 
 `free_rooms` comes from the function the placer uses (`admissibleFree`: 0
 when the hotel is down, draining, resting after a failure, at
@@ -276,6 +470,7 @@ still omit commands, files, and outputs. One room's own receipts are
 | Route (guest key) | What it does |
 |---|---|
 | `POST /v1/hotels/<id>/attest` `{"report_data_hex": "<128 hex>"}` | Passes the body to the hotel's `POST /room/attest` and returns the hotel's status, JSON and `Retry-After` unchanged: a fresh SEV-SNP report whose REPORT_DATA is those 64 bytes verbatim (see room-kit README). A hotel outside the guest's hotel list answers 404, as for receipts. Body cap 4096 bytes (413). An optional `"sandbox_id"` must name a room of this guest on that hotel (404 `room_not_found` otherwise) and goes to the hotel as the hotel's room id. |
+| `POST /v1/sandboxes/<hotel>.<room>/release-proof` | For an owned room on an allowed hotel, wraps the JSON challenge body as `{"sandbox_id":"<local-room>","challenge":...}` and sends it to the hotel's Health front at `/room/release-proof`. The local room comes only from the owned URL. Request cap 2048 bytes, reply cap 8192 bytes, 10-second guest deadline. Exact route and POST only. No redirects or application retries. Existing hotel credential and attested-TLS gate apply. The response is unverified guest evidence for the release service, not delivery or command permission. Requires a guest image implementing this endpoint. |
 
 A hotel signs receipts only for calls that pass through its receipt front
 (room kit, `127.0.0.1:18092` on a shared hotel; `:18090` in a sealed
@@ -296,6 +491,117 @@ For a hotel behind an SSH tunnel, forward 18092 as well: a fourth port in
 and `permitopen="127.0.0.1:18092"` on the tunnel key in the hotel's
 `authorized_keys`. Live since 2026-10-24 00:06Z: nc on 18092, c46 on 38092
 and c48 on 48092.
+
+## Metered guests
+
+A metered guest is admitted only on the ledger's word (`allowance.go`). A
+guest is metered when its config says `"metered": true` (the config decides,
+so a lost state file never opens a guest). It starts closed: cap 0 and no
+lease, so every create is refused until the ledger sends an allowance. A
+guest that is not metered behaves as before.
+
+| Route (operator key) | What it does |
+|---|---|
+| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. |
+| `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`. A guest that is not metered: `{"metered": false, "live_rooms"}`. |
+
+A metered create, and each lifetime extension of a metered room, is refused:
+
+| Answer | When |
+|---|---|
+| 503 `allowance_recount`, `Retry-After: 5` | Until every hotel the guest may use (or has had rooms on) has answered one room list since the broker started or the hotel joined: its rooms there are not counted yet. |
+| 402 `allowance_lease_expired`, `Retry-After: 30` | `now - ledger_seen_at > lease_seconds`, or no allowance yet. The message says the key is sold out right now. |
+| 402 `allowance_exhausted` | Live rooms plus the new ones would pass `cap` (an extension: the live rooms pass it). `cap` may be 0. At cap 0 the message says the key's allowance is 0 and to check the account's balance and status: the ledger sends cap 0 for more than a lack of credit. |
+
+Live rooms are the guest's creates in flight, every room the broker still
+holds for it (rooms being removed included, until the sync loop lets them
+go), and every create attempt whose answer was lost. A lost attempt counts
+until the hotel has listed its room and the broker has removed it, or until
+a hold of `uncertain_create_hold_seconds` has passed (config; default and
+minimum 720, the broker's create timeout to a hotel, `hotelCreateTimeout`):
+a proxy may time out while the hotel goes on, so a cleanup that finds no
+room, at once or after failed tries, does not end the count early, and only
+a list asked for after the hold's deadline ends it (an older answer that
+arrives late does not). A room the hotel lists in that time is reaped as an
+orphan. In a batch each lost attempt counts on its own: removing one late
+room does not release the others. A hold still counts after its hotel
+leaves, until its deadline; the leave itself is not blocked. Every retry of a
+create on another hotel is a new admission: the lease must be fresh, the cap
+must hold the live rooms with the room the failed attempt may hold, and the
+create's `ttl_seconds` and memory must fit the allowance of that moment (409
+`allowance_changed` when they no longer do); a retry that does not fit is
+not sent, and the guest gets the last attempt's error. Lease, cap, size and
+lifetime are checked against one allowance, under the lock that reserves the
+rooms. `max_rooms` still applies on top (429 `room_limit`).
+
+Size and lifetime of a metered room:
+
+- A create always sends `ttl_seconds` of at most `max_ttl_seconds` (the
+  maximum when absent) and an explicit `resources.memory_gib` (4, the hotel
+  default, when absent). A create that asks for more memory than
+  `max_memory_gib` gets 400 `memory_limit` before any hotel call.
+- Every route that resets a room's deadline at the hotel is a new admission:
+  `PATCH /v1/sandboxes/<id>`, `POST .../heartbeat`, `POST` and `PATCH
+  .../lifetime`, and the client lifetime route. It is checked after the body
+  is read and any hotel lookup is done, right before the hotel call. It sends
+  `ttl_seconds` of at most `max_ttl_seconds`; with no `ttl_seconds` it sends
+  the room's own, read from the hotel. A refused extension sends nothing, so
+  the room keeps the deadline it has.
+- A room claim (`POST .../claim`, room kit) gets 403 `claim_refused_metered`:
+  it sets a lifetime outside the allowance.
+- An owner-signed create on a dedicated machine signs the body the hotel
+  receives: send `ttl_seconds` and `resources.memory_gib` within the
+  allowance, so the broker changes nothing.
+
+Nothing here stops or deletes a running room. After a restart the file is
+read again: a cap of 0 stays 0, the issue is kept, and a lease keeps its
+`ledger_seen_at`, so it can expire across the restart. A missing file leaves
+every metered guest closed. A file that does not parse is moved aside
+(`guest-allowances.json.corrupt-<time>`) and closes every metered guest; its
+issues are lost, so only an issue above the broker clock at start, in unix
+milliseconds, opens a guest again. An entry that cannot open admission
+closes that guest and keeps its issue (or that clock value when the issue
+itself is not usable). In both cases the broker writes the closed entries
+and their watermarks to a fresh file at once, so every later start keeps
+them; if it cannot, it does not start. The ledger sends
+`issue = max(last + 1, unix ms)`.
+
+Known limits:
+
+- A hotel answers DELETE 204 even when the container removal fails, and
+  then hides the room from its list (`cathedral/sandbox_guest.py`). A room
+  the hotel hides while its removal is failing is not counted against the
+  cap, with or without a broker restart: an orphan stops counting at its
+  DELETE, one of the guest's rooms when the sync loop releases it (which
+  keeps at most as many gone rooms as the hotel reports deleting). The
+  bound is one extra room per such hidden room, until the hotel removes it,
+  so repeated failed removals can add up. A hidden room is not listed, so it
+  is not metered or billed. Confirming each removal would need a probe per
+  delete; that is left for a follow-up.
+- A lost create that the hotel completes after the hold escapes the count
+  until its room is listed (then it counts as one of the guest's rooms).
+- A hold on a hotel that is removed or replaced during the hold ends at its
+  deadline with no further list of that hotel. A room that started there
+  before the deadline and keeps running is then not counted: one extra room
+  per unresolved attempt on a removed or replaced hotel, until the room ends
+  or the hotel rejoins and lists it (then it counts as one of the guest's
+  rooms). Repeated removals can add up.
+- Holds and unreaped records of lost create attempts live in memory. A
+  broker restart forgets them: one extra room per lost attempt in flight at
+  the restart, and only when the hotel had not yet listed that room. A room
+  the hotel lists counts as one of the guest's rooms after the restart.
+- After a failed save (500) the guest is closed in memory only. A restart
+  loads whatever the file holds: the allowance the ledger just sent (the
+  rename was done, the directory sync failed) or the previous one (the write
+  failed before the rename), which keeps its original `ledger_seen_at`.
+  Either is an allowance the ledger sent, so admission after the restart
+  lasts at most one `lease_seconds` from that allowance's own stamp, and the
+  next push replaces it.
+- A hotel that never answers a list after a restart or a join keeps its
+  metered guests at 503 until it lists or is removed.
+- Between the check and the hotel call an extension can wait for a hotel
+  data connection: `data_conn_wait_seconds` (default 10 s), or the call's
+  own deadline (30 s to 2 min) when that is negative.
 
 ## Per-room tunables
 
@@ -427,7 +733,7 @@ and the client routes) carries an `isolation` object:
 ```
 
 `hotel_sealed` is true when the room's hotel is a sealed (SEV-SNP) guest;
-`hotel_tee` is the TEE kind, or null on an unsealed hotel. `room_runtime` is
+`hotel_tee` is the TEE kind: `amd_sev_snp`, or the hotel label `tee` when set. `room_runtime` is
 the `runtime` of the room document when it has one, else the runtime the
 hotel last reported in `/room/health` (`runsc`, `docker`, `kata`), else
 `unknown`. The broker never guesses it; a failed health fetch keeps the last
@@ -453,6 +759,16 @@ labels each snapshot with the guest). An unknown or foreign snapshot gives
 404 `snapshot_not_found`. A fork whose hotel is full, draining or down gives
 503 `snapshot_hotel_unavailable`. A fork whose hotel is outside the hotel
 choice gives 409 `snapshot_hotel_excluded`.
+
+A bare name (or bare id) asks every hotel of the guest (AB#866). If none has
+it and a hotel that is up did not answer, the answer is 502
+`hotel_unreachable` naming that hotel: it may hold the snapshot, so retry, or
+use the `<hotel>.<snapshot id>` id. A busy hotel gives 503 `sold_out`
+(AB#819). A hotel already known down is not a reason to retry: the answer
+stays 404 `snapshot_not_found` and names it. The `<hotel>.<snapshot id>` id
+asks only that hotel: 502 `hotel_unreachable` if it does not answer, 404 if
+it answers without the snapshot. A snapshot lives only on its hotel: a hotel
+restart or roll drops it before its ttl.
 
 ## Workspaces
 
@@ -501,6 +817,51 @@ does not keep it and does not show it. The answer (202) gives a
 hotel (`pulling`, `done` with image sizes, or `failed` with the error).
 The broker keeps a job for 24 hours, in memory.
 
+Each image is its own hotel call, up to 4 at once per hotel, so a long list
+does not run past one call's limit. Each entry of a hotel's `images` has
+its own `state` (`pulling`, `done`, `failed`) and `error`. A hotel is
+`failed` when any image failed; its `error` is the first failed image's
+error (with 2 or more: "n of m images failed; first: ...").
+
+A hotel whose scratch is at its admission line (`disk_admit_used_pct`, or
+80% used) pulls nothing: it reads `failed` with `image_store_full` (AB#861).
+
+Warm steering (AB#859): once an image is `done` on a hotel, that guest's
+creates of the same image reference prefer the hotels that hold it. Like
+the catalog prewarm, it only narrows the hotels that have a free room; when
+none of them does, a cold hotel serves. The reference must match exactly
+(`alpine` does not warm `alpine:latest`). Other guests are not steered.
+Config `"prefer_guest_warm": false` turns steering off. A compat
+`POST /v1/images/import` pulls as the guest and warms the same way.
+
+When a hotel comes back after being down, the broker asks it, as the guest,
+whether it still holds each image the guest prefetched there in the last
+7 days (up to 256 per guest and hotel). A held image is warm again with no
+pull; a missing one (a reboot wiped the scratch) is pulled again. Images
+pulled with `registry_auth` are not pulled again: the broker never keeps
+the login, so prefetch those again after a hotel restart. A broker restart
+forgets the list.
+
+`"pin": true` also asks each hotel to keep the images from its image
+cleanup. It needs the guest limit `pin_max_gib` (else 403
+`pins_not_enabled`); the broker sends it in bytes in `X-Pin-Max-Bytes`. A
+hotel answers 507 `pin_cap_exceeded` when the guest's pins there would pass
+the cap (or the hotel's own pin ceiling). Each image entry then has `pin`
+(`pinned`, `not_pinned`, or `not_supported` for a room kit without pins),
+and each hotel `pin` (`pinned`, or `not_supported` when any image there was
+pulled without a pin; `partial` when only some were pinned) with the `pinned`
+refs. The hotel-up replay pins a pinned ref again after a reboot; an unpin
+stops that.
+`DELETE /v1/images/pins?ref=<ref>&hotel=<id>` unpins one image there.
+
+`GET /v1/images?hotel=<id>` lists the images the guest pulled or was given
+on that hotel: `ref`, `digest`, `size_bytes`, `last_used_at`, `pinned`.
+Without `hotel`, the broker asks every hotel the guest reaches that is up
+(4 at a time, 10 s each) and answers `{"hotels": [...]}`, one entry per
+hotel, with `error` for a hotel that did not answer. A hotel outside the
+guest's reach is 404 `hotel_not_found`; a hotel whose room kit has no list
+says `"images_list": "not_supported"`.
+
 `GET /v1/broker/stats` gives per-hotel counts and latency percentiles
 (hotel call, wait in the broker queue, broker overhead). `POST` resets them.
 Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
@@ -516,15 +877,15 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
   `invalid_exec`. The native `/v1` route reads `cmd` only and runs a string
   through `sh -c`. Exec output is capped by the hotel at 16 MiB per stream;
   the response includes `"truncated": true` when that happens.
-- Image build (client path): `POST /v1/images/build` takes the Dockerfile
-  and the build context. The broker asks each hotel that takes new rooms
-  to build it. The image is `ready` when one hotel has it, and a create
-  with it goes only to hotels that have it. A failed build gives state
-  `failed` with error `image_build_failed`.
+- Image build (client path): `POST /v1/images/build` answers 409
+  `shared_hotel_build_refused`. Every hotel is a shared sealed hotel, and a
+  shared hotel never builds (AB#650, AB#776): a Dockerfile could reach
+  another guest's local snapshot on the hotel's Docker store. Push the image
+  to a registry and create from it. A built image left in older state reads
+  as `failed` with the same error, and a create from it gets the same 409.
 - With `state_dir` set, the broker keeps client room ids, Idempotency-Key
-  answers (48 hours), deleted-room tombstones, images, and guest→hotel→room
-  mappings in `state_dir/client-state.json` (mode 0600), and build contexts
-  in `state_dir/build-contexts/`. After a restart, a repeated create with
+  answers (48 hours), deleted-room tombstones, room end records (24 hours),
+  images, and guest→hotel→room mappings in `state_dir/client-state.json` (mode 0600). After a restart, a repeated create with
   the same key returns the first answer, a room keeps its client id, and
   `GET /v1/hotels/<id>/receipts` still filters correctly for each guest
   (the room→guest mapping is persisted, so a reload does not expose another
@@ -552,7 +913,9 @@ view (every hotel and the admission policy) and `GET /v1/broker/miner-exits`,
 and no other route: it cannot
 read hotel documents, join, change or leave hotels, read or change guests, or
 open rooms. The digest must differ from the operator key, the miner
-enrollment key, and every guest key or view token.
+enrollment key, and every guest key or view token. `meter_key_sha256` is a
+separate key for the two meter routes (see "Meter routes" under Guest
+limits).
 The observed TLS key must match the AMD-verified binding before the broker
 sends the hotel key. Miner calls pin the guest key on both data and control
 connections. Plain HTTP, a client-supplied pin, and `verify=false` are refused.
@@ -571,9 +934,9 @@ receive this policy document.
 
 | Route (operator key) | What it does |
 |---|---|
-| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested) and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
-| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation for sealed hotels; `"verify": false` skips both for an unsealed hotel and is refused for a sealed one (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. An unsealed join cannot claim `labels.sealed=true` or set `require_attestation`. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
-| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). An unsealed runtime hotel cannot gain the sealed label. `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
+| `GET /v1/broker/hotels/<id>` | The hotel with `class`, `up`, `slots`, `max_slots`, `free_rooms`, `rooms_in_use` (rooms the broker holds there plus queued and in-flight creates; what a guest TLS re-seal waits to reach 0), `miner_hotkey`, `reserved_for`, `lent_from`, `lent_report_id`, `admission` (with `report_id` once attested, and `hotel_key_install` on a hotel the broker installs the key into), `disk_extra_gib`, `disk_extra_used_gib`, `room_data_used_pct` and `commitment` (null, or the declaration with its delivery; see Capacity commitment). |
+| `POST /v1/broker/hotels` | Adds a hotel: `{"id", "api", "key", "health"?, "name"?, "concurrency"?, "labels"?, "sealed"?, "threads"?, "ram_gib"?, "max_slots"?, "reserved_for"?, "miner_hotkey"?, "require_attestation"?, "guest_tls"?, "commitment"?}`. A sealed hotel with `"guest_tls": true`, or any sealed hotel when `require_sealed_guest_tls` is on, joins like a miner hotel: HTTPS, attested guest TLS pinned before the first keyed call, 409 `guest_tls_required` otherwise. A miner hotel must set `"sealed": true` and use HTTPS with attested guest TLS; the broker pins that key before its first keyed call. `"verify": false` is refused for miners (409 `guest_tls_required`). Every hotel must set `"sealed": true` (AB#776); a join without it gets 400 `invalid_hotel`. For operator hotels, the broker calls `GET /v1/status` with the key and checks attestation; `"verify": false` is refused (400 `verify_required`). `"sealed_admission": "off"` is refused at join (400 `invalid_hotel`): a joined hotel is always gated. `miner_hotkey` (SS58) adds `miner=true` and `miner_hotkey` labels, which a PATCH cannot remove. `commitment` is for miner hotels only (see Capacity commitment). |
+| `PATCH /v1/broker/hotels/<id>` | Sets `drain`, `labels`, `max_slots` (a per-hotel room cap; a lower cap applies at once) and `reserved_for` (a guest id, or null to release the hotel to the pool). `lend: true` lends a reserved sealed hotel to the pool; `reserved_for` on a lent hotel reclaims it (see Lend and reclaim). `drain_notice` (with `drain: true`, miner hotels only) records a miner-signed planned-maintenance notice and drains the hotel at once; see `drain_notice.go`. |
 
 | `DELETE /v1/broker/hotels/<id>` | Removes a runtime hotel that has no rooms. Drain it first. `?forget_rooms=true` (operator key only, miner hotels only): when the hotel is drained, has been down for 10 minutes and has no create in flight, it asks the old guest once more on its attested key (an answer refuses and starts the 10 minutes again), writes the rooms' `deleted` tombstones to disk, removes the hotel from the runtime list, and only then releases the rooms. A failed write answers 500 and leaves every room, client id and tombstone as before. Otherwise 409 `forget_refused` with the reason. |
 | `GET /v1/broker/miner-exits` | Also for the read-only operator key. Miner hotels that went down holding customer rooms, oldest first: `hotel`, `miner_hotkey`, `down_at`, `drained_at_down`, `ended` (`up` when the same guest answered again, `forgotten` after a forget, absent while down), `ended_at`, `rooms_checked` and `rooms` (`id`, `uuid`, `guest`, `lost`: null until known, then whether the room was gone when the hotel came back; every room of a forgotten exit is lost). `?since=<RFC 3339>` keeps records that went down at or after that time. Kept in the client state file for 8 days, at most 50 per hotel and 1,000 in all. It is the input for forfeiting the miner's delivered hours for that window (AB#329); the broker itself forfeits and re-creates nothing. `drained_at_down` is not proof of notice: the miner's enroll key can set drain. |
@@ -643,7 +1006,7 @@ curl -s "$BROKER/v1/broker/hotels/miner-a" -H "Authorization: Bearer $ENROLL_KEY
 Every sealed hotel (`"sealed": true`) takes rooms only after it passes
 admission (`admission.go`), whether it came from the config file or a
 runtime join, and every miner hotel is sealed (AB#596). It is the check
-miner hotels have always taken. Unsealed hotels are not gated.
+miner hotels have always taken.
 
 - Health: a good `/room/health` answer. A hotel that goes down leaves
   placement and must pass again (attestation too).
@@ -684,7 +1047,7 @@ list is the emergency ops escape: that hotel skips the gate, as config
 hotels did before AB#596. The broker logs one line for it at start, its
 hotel document shows `admission.sealed_admission: "off"`, and the operator
 capacity view lists it in `admission_policy.sealed_admission_off`. The
-config loader refuses `"off"` on a miner hotel, an unsealed hotel or a
+config loader refuses `"off"` on a miner hotel or a
 `require_attestation` hotel, and any value other than `"gate"` or `"off"`.
 A join refuses it, and a joined hotel is gated even if `state_dir` says
 otherwise. The top-level `"sealed_admission": "off"`, which ungated joined
@@ -714,6 +1077,21 @@ binding (`tls_spki_sha256`), with the hotel key installed inside the guest
 - The hotel key must be installed in the guest (`POST /room/hotel-key`)
   before the hotel answers keyed calls, and again after every reboot (the
   guest keeps it in memory). Until then the hotel is down (401).
+- `"hotel_key_install_signing_key_file"` (AB#817, needs `"guest_tls": true`)
+  makes the broker do that install. The file holds base64 of a 32-byte
+  Ed25519 seed, mode 600 or 640 (root:<broker group>, as the hotel key files), one per broker host; its public key (logged at
+  start, and `admission.hotel_key_install.signer_ed25519_b64` in the hotel
+  documents) must be in the guest build's `SEALED_HOTEL_KEY_INSTALL_SIGNERS`.
+  Right after the broker pins a new guest key it reads
+  `GET /room/hotel-key-install-key` over the pinned client (statement signed
+  by the binding's receipt key, for this binding, naming the binding's
+  install key), seals `key_file`'s key to it (the room-kit envelope, AAD
+  `hotel-key-install:<binding_sha256>`) and posts a signed
+  `cathedral_hotel_key_install_v1` request. `installed` or `unchanged` is
+  done. Anything else (a refusal code, a lost answer) is logged once by code
+  and tried again on the 5 s pin recheck. The hotel is not admitted until an
+  install on its current pin succeeded. No log line names the key or the seed.
+  Make a seed: `head -c 32 /dev/urandom | base64 > <file>; chmod 640 <file>; chgrp <broker group> <file>`.
 - `"require_sealed_guest_tls": true` (top level, default off) makes this
   every sealed hotel: a sealed config entry without `"guest_tls": true`
   stops the config from loading, and a sealed join must pass the same
@@ -743,6 +1121,7 @@ Config (all optional):
 | `miner_pool_share` | Share of the shared pool that miner hotels may hold, between 0 and 1 (exclusive). 0 or absent: no cap. Miner rooms on unreserved hotels stay at or under `share / (1 - share)` times the slots of our own unreserved sealed hotels, so a full pool is at most that share miner. The cap is checked when a create is placed; rooms already placed are never moved. The operator capacity view shows both values under `admission_policy` and, with a share set, `miner_pool` (`own_slots`, `miner_room_cap`, `miner_rooms`). A create refused only by a cap counts the hotel as `full` and adds `miner_capped` to the reason. |
 | `sealed_host_data` | Its HOST_DATA must be in this list. A dedicated sealed machine (one owner, `SEALED_OWNER_PUBKEY_FILE`) has its own HOST_DATA, which names the owner key: add that value (the sealed install prints it). On `POST /v1/sandboxes` the broker passes `X-Cathedral-Owner-Signature` and `X-Cathedral-Owner-Timestamp` to the hotel unchanged; the machine checks them (`room-kit/sealed/README.md`, "Dedicated machine"). Its 403 `owner_signature_*` does not rest the hotel. |
 | `min_genoa_snp_spl` | Optional Genoa SNP component floor, 0 to 255. Zero leaves it unset. When nonzero, after AMD-chain verification the broker checks current, reported, committed and launch TCB SNP bytes on every gated Genoa hotel. Missing or older values refuse admission; a sealed hotel with `sealed_admission: "off"` makes the config invalid. Set it to `30` (`0x1e`) only after a patched canary is verified and the operator approves the capacity impact. This checks the AMD-SB-3059 SNP TCB component; it does not prove the separate OEM PI or microcode mitigations in AMD-SB-3059 and AMD-SB-3061. |
+| `min_genoa_microcode_spl` | Optional Genoa microcode component floor, 0 to 255 (AB#809). Zero leaves it unset. Same checks as `min_genoa_snp_spl` but on the microcode byte (byte 7) of the current, reported, committed and launch TCBs; a newer SNP byte does not compensate. AMD-SB-3061 (CVE-2026-40671) is fixed by Genoa microcode 0x0A10115B (RS-B1) / 0x0A10125B (RS-B2), which only an OEM BIOS with Genoa_100J Patch 3 delivers; the floor for it is `91` (`0x5b`). Set it only after every admitted Genoa hotel reads microcode 0x5b or later, and the operator approves the capacity impact. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
 | `require_sealed_guest_tls` | Top level, default false. Every sealed hotel must be reached over its attested guest TLS key (above). Per hotel entry: `"guest_tls": true` (sealed, `https://` api and health, not with `sealed_admission: "off"`). |
 | `sealed_admission` | Top level: `"on"` or absent; `"off"` is refused. Per hotel entry: `"gate"` (default) or `"off"`, the ops escape for one operator hotel (above). |
@@ -752,11 +1131,40 @@ Config (all optional):
 `pending` or `refused` (with `reason`). `GET /v1/broker/hotels` (guest key) lists all
 hotels with labels and free rooms.
 
+## Preview URL certificates (DNS-01 challenge service)
+
+AB#423. One Let's Encrypt wildcard per sealed hotel, `*.<hotel id>.<zone>`,
+with the private key made in the guest. The guest's ACME client proves the
+name over DNS-01 through the broker, which lets each hotel set only its own
+record: `_acme-challenge.<hotel id>.<zone>`.
+
+`PUT /v1/broker/acme-challenge` takes no Bearer key. Body:
+
+```json
+{"purpose": "cathedral-acme-dns01-v1", "zone": "<zone>", "hotel": "<hotel id>",
+ "binding_sha256": "<current binding>", "values": ["<43 char base64url>"], "ts": <unix seconds>}
+```
+
+Header `X-Cathedral-Hotel-Signature`: standard base64 of the Ed25519
+signature, by the receipt key the hotel's binding names, over
+`cathedral-acme-dns01-v1\n` followed by the raw body. The broker uses the key
+it stored at admission, and only when the AMD chain passed for that binding,
+the measurement is on `sealed_measurements` and the hotel is admitted now.
+Every untrusted request gets the same `403 forbidden`. After that: up to 2
+values (the wildcard and the bare name share the record), `[]` removes the
+record, `ts` within 120 s of the broker clock and later than the last accepted
+one from that hotel. The record is replaced as a whole (TTL 60).
+
+| Key | Meaning |
+|---|---|
+| `acme_dns` | Absent: the route answers `404 not_enabled`. `{"zone": "hotels.example.com", "cloudflare_zone_id": "<32 hex>", "token_file": "<path>"}`. The zone must hold hotel names only (miners choose their hotel id). The token needs DNS edit on that zone only; it is read at each call and never logged. Hotel ids must be one lower-case DNS label to get a name. |
+
 ## Alerts
 
 - First missed heartbeat: the first `/room/health` call that fails after a
   hotel has answered health once sends `[OPERATOR-ALERT]` to the hotel's
-  `alert_chat_id` (the miner operator). One per miss streak; the streak ends
+  `alert_chat_id` (the miner operator), or to `alerts.hotel_chat_id` when the
+  hotel has none. One per miss streak; the streak ends
   at the next good health answer. A late health while room calls still answer
   counts as a miss.
 - Customer-affecting drop: a hotel that was up goes down while it holds guest
@@ -765,7 +1173,9 @@ hotels with labels and free rooms.
 - Each audience also waits 10 minutes between two alerts about one hotel, so
   a flapping hotel does not spam.
 - Delivery: `"alerts": {"webhook_url_file": "<file with the https URL>",
-  "ops_chat_id": "<chat>"}`. The URL is a Telegram
+  "ops_chat_id": "<chat>", "hotel_chat_id": "<chat>"}`. One chat for every
+  hotel (the Core Engineering group): set `hotel_chat_id` and `ops_chat_id`
+  to the same id and leave `alert_chat_id` unset. The URL is a Telegram
   `https://api.telegram.org/bot<token>/sendMessage`; the broker POSTs
   `{"chat_id", "text"}`, never logs the URL, and logs a failed delivery by
   kind only. Without a URL or a chat the alert is a log line only.

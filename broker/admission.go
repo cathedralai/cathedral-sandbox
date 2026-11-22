@@ -21,10 +21,10 @@
 //
 // The one way past the gate is "sealed_admission": "off" on an operator
 // hotel's entry in the config file, an emergency escape for ops. The config
-// loader refuses it on a miner hotel, an unsealed hotel or a
-// require_attestation hotel, and a join refuses it: a joined hotel and a
-// miner hotel are always gated. The top-level "sealed_admission": "off",
-// which ungated joined operator hotels, is refused at load.
+// loader refuses it on a miner hotel or a require_attestation hotel, and a
+// join refuses it: a joined hotel and a miner hotel are always gated. The
+// top-level "sealed_admission": "off", which ungated joined operator hotels,
+// is refused at load.
 //
 // What the broker checks is the check verify_receipts.py makes before the AMD
 // signature: binding_sha256 is the SHA-256 of the binding as served, the
@@ -158,8 +158,6 @@ func validateSealedAdmission(hc hotelConfig) error {
 	switch {
 	case hc.MinerHotkey != "":
 		return fmt.Errorf(`config: hotel %q: sealed_admission "off" is refused for a miner hotel: a miner hotel is always gated`, hc.ID)
-	case !hc.Sealed:
-		return fmt.Errorf(`config: hotel %q: sealed_admission "off" needs "sealed": true (an unsealed hotel has no gate to skip)`, hc.ID)
 	case hc.RequireAttestation:
 		return fmt.Errorf(`config: hotel %q: sealed_admission "off" and require_attestation contradict each other; remove one`, hc.ID)
 	}
@@ -202,16 +200,16 @@ func (b *broker) admitted(h *hotel, now time.Time) bool {
 	if strictAttestation(h) && len(b.cfg.SealedMeasurements) == 0 {
 		return false
 	}
-	// Older state may contain an unsealed miner or a runtime hotel that claimed
-	// a sealed label. Keep both out of placement after a restart as well.
-	if h.cfg.MinerHotkey != "" && !h.cfg.Sealed {
+	// Older state may hold a hotel that joined unsealed (before AB#776).
+	// Placement never takes it, whatever its labels say.
+	if !h.cfg.Sealed {
 		return false
 	}
 	if h.guestTLS() && (h.tlsPinErr != nil || h.guestPin.Load() == nil) {
 		return false // no verified guest TLS key: no hotel key goes there
 	}
-	if h.runtime && !h.cfg.Sealed && h.labels()["sealed"] == "true" {
-		return false
+	if h.installNeeded() {
+		return false // the guest has no hotel key yet: every keyed call would answer 401
 	}
 	if !b.needsAttestation(h) {
 		return true
@@ -248,6 +246,9 @@ func (b *broker) admissionDoc(h *hotel, now time.Time) map[string]any {
 	}
 	if h.adm.reason != "" {
 		d["reason"] = h.adm.reason
+	}
+	if inst := h.installDoc(); inst != nil {
+		d["hotel_key_install"] = inst
 	}
 	if !h.adm.attestedAt.IsZero() {
 		d["attested_at"] = h.adm.attestedAt.UTC().Format(time.RFC3339)
@@ -317,13 +318,13 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	// With a firmware floor, the check reads TCB bytes from this exact report.
 	// A binding can stay unchanged across reports, so the binding-keyed AMD
 	// cache cannot authenticate those bytes or the report signature.
-	if !known || b.cfg.MinGenoaSNPSPL > 0 {
+	if !known || b.cfg.MinGenoaSNPSPL > 0 || b.cfg.MinGenoaMicrocodeSPL > 0 {
 		if prev, err = b.verifyAMDChain(ctx, raw); err != nil {
 			return admission{}, err
 		}
 	}
 	res.amd, res.amdBinding = prev, res.bindingSHA
-	if err := checkGenoaSnpFloor(att.Report, prev, b.cfg.MinGenoaSNPSPL); err != nil {
+	if err := checkGenoaTCBFloor(att.Report, prev, b.cfg.MinGenoaSNPSPL, b.cfg.MinGenoaMicrocodeSPL); err != nil {
 		return admission{}, err
 	}
 	// Archive only after the AMD chain passed: a binding the chip did not vouch
@@ -385,14 +386,15 @@ func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI 
 	if err != nil {
 		return err
 	}
-	return checkGenoaSnpFloor(att.Report, amd, b.cfg.MinGenoaSNPSPL)
+	return checkGenoaTCBFloor(att.Report, amd, b.cfg.MinGenoaSNPSPL, b.cfg.MinGenoaMicrocodeSPL)
 }
 
-// checkGenoaSnpFloor compares the SNP component in all four TCBs. A scalar
-// comparison of the packed TCB can accept a newer unrelated component while
-// leaving SNP firmware below the required floor.
-func checkGenoaSnpFloor(reportB64 string, amd map[string]any, floor int) error {
-	if floor == 0 {
+// checkGenoaTCBFloor compares the SNP component (AMD-SB-3059) and the
+// microcode component (AMD-SB-3061) in all four TCBs, each on its own. A
+// scalar comparison of the packed TCB can accept a newer unrelated component
+// while leaving one of them below the required floor. A zero floor is unset.
+func checkGenoaTCBFloor(reportB64 string, amd map[string]any, snpFloor, microcodeFloor int) error {
+	if snpFloor == 0 && microcodeFloor == 0 {
 		return nil
 	}
 	product, ok := amd["product"].(string)
@@ -400,7 +402,7 @@ func checkGenoaSnpFloor(reportB64 string, amd map[string]any, floor int) error {
 		return errors.New("SNP firmware floor: AMD verifier did not identify the processor generation")
 	}
 	if product == "Milan" {
-		return nil // this floor is specific to the Genoa guidance in AMD-SB-3059
+		return nil // these floors are specific to the Genoa guidance in AMD-SB-3059 and AMD-SB-3061
 	}
 	if product != "Genoa" {
 		return errors.New("SNP firmware floor: unsupported AMD processor generation")
@@ -416,8 +418,12 @@ func checkGenoaSnpFloor(reportB64 string, amd map[string]any, floor int) error {
 		{"current", 0x38}, {"reported", 0x180},
 		{"committed", 0x1E0}, {"launch", 0x1F0},
 	} {
-		if int(report[field.offset+6]) < floor {
-			return fmt.Errorf("SNP firmware floor: %s TCB SNP component below %02x", field.name, floor)
+		// Genoa TCB_VERSION (SEV-SNP ABI 56860 table 4): byte 6 SNP, byte 7 microcode.
+		if int(report[field.offset+6]) < snpFloor {
+			return fmt.Errorf("SNP firmware floor: %s TCB SNP component below %02x", field.name, snpFloor)
+		}
+		if int(report[field.offset+7]) < microcodeFloor {
+			return fmt.Errorf("microcode floor: %s TCB microcode component below %02x", field.name, microcodeFloor)
 		}
 	}
 	return nil

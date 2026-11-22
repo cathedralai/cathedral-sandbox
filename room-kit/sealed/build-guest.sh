@@ -39,6 +39,61 @@ print(" ".join(dict.fromkeys(keys)) if ok else "")' "${SEALED_HOTEL_KEY_INSTALL_
   [ -n "$MINER_SIGNERS" ] || { echo "SEALED_MINER=1 needs SEALED_HOTEL_KEY_INSTALL_SIGNERS: 1 to 4 base64 Ed25519 public keys" >&2; exit 1; }
 fi
 
+# Guest ingress for Preview URLs (AB#422): SEALED_ROOM_GUEST_INGRESS=1 makes the key in the
+# guest. With SEALED_INGRESS_ZONE set the guest also serves HTTPS on SEALED_INGRESS_TLS_PORT
+# with it, opens that port in its firewall and gets a certificate through the broker
+# (SEALED_INGRESS_BROKER_URL). All of it is in the measured room.env. Checked before the long build.
+# >>> guest ingress (tests/test_ab422_guest_ingress_serve.py runs this block)
+GUEST_INGRESS=${SEALED_ROOM_GUEST_INGRESS:-0}
+case "$GUEST_INGRESS" in 0|1) ;; *) echo "SEALED_ROOM_GUEST_INGRESS must be 0 or 1" >&2; exit 1 ;; esac
+INGRESS_ZONE=""
+if [ "$GUEST_INGRESS" = 1 ] && [ -n "${SEALED_INGRESS_ZONE:-}" ]; then
+  INGRESS_ZONE=$SEALED_INGRESS_ZONE
+  INGRESS_TLS_PORT=${SEALED_INGRESS_TLS_PORT:-8443}
+  INGRESS_PUBLIC_PORT=${SEALED_INGRESS_PUBLIC_PORT:-443}
+  INGRESS_BROKER_URL=${SEALED_INGRESS_BROKER_URL:-}
+  ACME_DIRECTORY=${SEALED_ACME_DIRECTORY:-https://acme-v02.api.letsencrypt.org/directory}
+  if ! [[ "$INGRESS_ZONE" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+    echo "SEALED_INGRESS_ZONE must be a lower-case DNS name (the broker acme_dns zone)" >&2; exit 1
+  fi
+  for p in "$INGRESS_TLS_PORT" "$INGRESS_PUBLIC_PORT"; do
+    if ! [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$p" -gt 65535 ]; then
+      echo "SEALED_INGRESS_TLS_PORT and SEALED_INGRESS_PUBLIC_PORT must be TCP ports" >&2; exit 1
+    fi
+  done
+  if [ "$INGRESS_TLS_PORT" = 18090 ] || [ "$INGRESS_TLS_PORT" = 18091 ] || [ "$INGRESS_TLS_PORT" = 22 ] \
+     || { [ "$MINER" = 1 ] && [ "$INGRESS_TLS_PORT" = "$MINER_TLS_PORT" ]; }; then
+    echo "SEALED_INGRESS_TLS_PORT must not be 18090, 18091, 22 or the miner TLS port" >&2; exit 1
+  fi
+  if ! [[ "$INGRESS_BROKER_URL" =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$ ]]; then
+    echo "SEALED_INGRESS_ZONE needs SEALED_INGRESS_BROKER_URL: the broker https origin" >&2; exit 1
+  fi
+  if ! [[ "$ACME_DIRECTORY" =~ ^https://[A-Za-z0-9./:_-]+$ ]]; then
+    echo "SEALED_ACME_DIRECTORY must be an https URL" >&2; exit 1
+  fi
+fi
+# <<< guest ingress
+
+# Docker Hub mirrors for the guest's dockerd (daemon.json registry-mirrors, AB#854). Part of
+# the measured room.env. Unset keeps mirror.gcr.io, so a hotel that does not set it builds the
+# same room.env bytes as before. 1 to 4 https origins (host and optional port, no path, no
+# login): dockerd tries them in order, then Docker Hub; a mirror answering 404 is skipped.
+# Checked before the long build.
+# >>> registry mirrors (tests/test_ab854_sealed_registry_mirrors.py runs this block)
+read -r -d '' -a mirror_list <<< "${SEALED_ROOM_REGISTRY_MIRRORS:-https://mirror.gcr.io}" || true
+REGISTRY_MIRRORS="${mirror_list[*]}"  # one space between entries, whatever whitespace sealed.env used
+mirror_count=0
+for mirror in "${mirror_list[@]}"; do
+  if ! [[ "$mirror" =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$ ]]; then
+    echo "SEALED_ROOM_REGISTRY_MIRRORS: '$mirror' is not an https origin (https://host[:port], lower case, no path or login)" >&2; exit 1
+  fi
+  mirror_count=$((mirror_count + 1))
+done
+if [ "$mirror_count" -lt 1 ] || [ "$mirror_count" -gt 4 ]; then
+  echo "SEALED_ROOM_REGISTRY_MIRRORS needs 1 to 4 mirrors" >&2; exit 1
+fi
+# <<< registry mirrors
+
 # Persistent data volume (docs/SEALED_DATA_VOLUME.md): checked before the long
 # build. It holds workspaces only, so it needs them on.
 DATA_GIB=${SEALED_DATA_GIB:-0}
@@ -129,6 +184,11 @@ if [ "$MINER" = 1 ]; then
   INPUT_RULES="${SSH_RULE:+$SSH_RULE
     }iifname \"uplink\" tcp dport $MINER_TLS_PORT accept"
 fi
+if [ -n "$INGRESS_ZONE" ]; then
+  # Preview URL ingress (AB#422): from any source, like the miner port. Only the guest holds the key.
+  INPUT_RULES="${INPUT_RULES:+$INPUT_RULES
+    }iifname \"uplink\" tcp dport $INGRESS_TLS_PORT accept"
+fi
 cat > "$R/etc/sealed-guard.nft" <<EOF
 table inet sealed_guard {
   chain input {
@@ -208,7 +268,7 @@ ROOM_API_PORT=18090
 ROOM_HEALTH_PORT=18091
 ROOM_PUBLIC_PORT=443
 ROOM_TLS=off
-ROOM_REGISTRY_MIRRORS="https://mirror.gcr.io"
+ROOM_REGISTRY_MIRRORS="$REGISTRY_MIRRORS"
 ROOM_DATA_DIR=/srv/room-sealed
 ROOM_DATA_DEVICE=/dev/mapper/sealed-scratch
 ROOM_DATA_DEVICE_WIPE=yes
@@ -229,6 +289,7 @@ CPU_OVERCOMMIT=16
 MEM_OVERCOMMIT=20
 DISK_OVERCOMMIT=1000
 ROOM_MAX_SLOTS=$SEALED_ROOM_MAX_SLOTS
+ROOM_QUOTA_VCPU=pool
 ROOM_CREATES_PER_MINUTE=6000
 ROOM_GC_PARALLELISM=16
 ROOM_DIND_DOCKERD_ARGS="--iptables=false --ip6tables=false --bridge=none --default-network-opt bridge=com.docker.network.advertise_addr_nmsgs=0 --default-address-pool base=10.200.0.0/14,size=24"
@@ -249,6 +310,17 @@ ROOM_SEALED_EXEC=${SEALED_ROOM_SEALED_EXEC:-0}
 ROOM_GUEST_INGRESS=${SEALED_ROOM_GUEST_INGRESS:-0}
 # ROOM_HOTEL_NAME is not set here: guest-boot.sh exports it from fw_cfg (opt/cathedral/hotel-name).
 EOF
+if [ -n "$INGRESS_ZONE" ]; then
+  cat >> "$R/opt/room-kit/room.env" <<EOF
+# Preview URL ingress (AB#422): the front serves HTTPS here with the guest-made key,
+# certificate from the ACME directory over DNS-01 through the broker.
+ROOM_INGRESS_ZONE=$INGRESS_ZONE
+ROOM_INGRESS_BROKER_URL=$INGRESS_BROKER_URL
+ROOM_INGRESS_TLS_LISTEN=$SEALED_GUEST_IP:$INGRESS_TLS_PORT
+ROOM_INGRESS_PUBLIC_PORT=$INGRESS_PUBLIC_PORT
+ROOM_ACME_DIRECTORY=$ACME_DIRECTORY
+EOF
+fi
 if [ "$MINER" = 1 ]; then
   cat >> "$R/opt/room-kit/room.env" <<EOF
 # Miner hotel: guest TLS on its own key, plain HTTP for /room/attestation only,
