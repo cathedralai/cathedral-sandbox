@@ -1973,6 +1973,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			if json.Unmarshal(out, &doc) == nil {
 				doc["hotel"] = h.cfg.ID
 				doc["isolation"] = isolationDoc(h, doc)
+				b.claimedView(doc, rm) // a claimed room: the customer's labels and the win time
 				if re, err := json.Marshal(doc); err == nil {
 					out = re
 				}
@@ -2241,6 +2242,26 @@ func (b *broker) handleList(w http.ResponseWriter, r *http.Request, g *guestStat
 			all = append(all, s)
 		}
 	}
+	// Claimed rooms carry the pool's hotel labels: listed from the broker's
+	// mapping (claims_state.go). Nothing more is asked with none.
+	claimed, cerrs := b.claimedRoomDocs(r.Context(), g, r.URL.Query())
+	for hid, list := range claimed {
+		for _, s := range list {
+			if id, ok := s["id"].(string); ok {
+				s["id"] = hid + "." + id
+			}
+			s["hotel"] = hid
+			if h := b.hotelByID(hid); h != nil {
+				s["isolation"] = isolationDoc(h, s)
+			}
+			all = append(all, s)
+		}
+	}
+	for hid, e := range cerrs {
+		if _, ok := errs[hid]; !ok {
+			errs[hid] = e
+		}
+	}
 	sort.Slice(all, func(i, j int) bool { return fmt.Sprint(all[i]["id"]) < fmt.Sprint(all[j]["id"]) })
 	writeJSON(w, 200, map[string]any{"sandboxes": all, "count": len(all), "hotel_errors": errs})
 }
@@ -2344,6 +2365,7 @@ func (b *broker) usageParts(r *http.Request, g *guestState) map[string]any {
 	for hid, raw := range b.fanout(r.Context(), g, "/v1/usage", q) {
 		parts[hid] = usageHoursOnly(raw)
 	}
+	b.addClaimedUsage(parts, g, r.URL.Query()) // claimed rooms count from the win (claims_state.go)
 	return parts
 }
 

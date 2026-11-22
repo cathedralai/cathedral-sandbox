@@ -682,9 +682,12 @@ func TestMappedRunContinuesAcrossRestart(t *testing.T) {
 	}
 	time.Sleep(1100 * time.Millisecond)
 	pc.sync("a")
+	pc.b.usageMeter.checkpoint(time.Now()) // the reading a clean stop writes: seconds since the last one
 	after := pc.readingsOfRun(run)
-	if len(after) <= len(before) || endedCount(after) != 0 || after[len(after)-1].Guest != "g1" || after[len(after)-1].Billable != nil {
-		t.Fatalf("readings of %s after the restart: %+v, want more, g1's, billable, none ended", run, after)
+	last, first := after[len(after)-1], before[len(before)-1]
+	if len(after) <= len(before) || endedCount(after) != 0 || last.Guest != "g1" || last.Billable != nil ||
+		last.StartedAt != before[0].StartedAt || last.Seconds <= first.Seconds {
+		t.Fatalf("readings of %s after the restart: %+v, want the same run going on (g1's, billable, same start, more seconds than %d, none ended)", run, after, first.Seconds)
 	}
 	for i := 1; i < len(after); i++ {
 		if after[i].Seconds < after[i-1].Seconds {

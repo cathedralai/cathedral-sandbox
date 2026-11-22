@@ -13,9 +13,12 @@ package main
 // a person turns claims on) takes exactly the path it took before.
 
 import (
+	"context"
 	"encoding/json"
 	"log"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -193,4 +196,187 @@ func (b *broker) adoptMappedLocked(h *hotel, rm *room) bool {
 // always has one. TestUsageClaimRunShapes pins both shapes.
 func usageClaimRun(run string) bool {
 	return run != "" && !strings.Contains(run, ".")
+}
+
+// endClaim is what an end record keeps of a claimed room for the guest's
+// usage view once the room is gone.
+type endClaim struct {
+	Labels    map[string]string `json:"labels"`
+	VCPU      int64             `json:"vcpu"`
+	MemoryGiB int64             `json:"memory_gib"`
+}
+
+// claimedView puts a claimed room's customer labels and win time into its
+// hotel document (the hotel keeps the pool's labels and the pool room's
+// creation time). A room with no mapping is left as it is. The caller does
+// not hold b.mu.
+func (b *broker) claimedView(doc map[string]any, rm *room) {
+	b.mu.Lock()
+	m := rm.mapping
+	b.mu.Unlock()
+	if m == nil {
+		return
+	}
+	labels := make(map[string]any, len(m.customerLabels))
+	for k, v := range m.customerLabels {
+		labels[k] = v
+	}
+	doc["labels"] = labels
+	doc["created_at"] = m.wonAt.UTC().Format(time.RFC3339Nano)
+}
+
+// customerFilters is a guest's label filters without the broker's own guest
+// label filter, which every room of the guest meets by definition (a claimed
+// room's customer labels do not carry it).
+func customerFilters(g *guestState, q url.Values) []string {
+	var out []string
+	for _, f := range q["label"] {
+		if f != guestLabel+"="+g.cfg.ID {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// claimedRoomDocs is g's claimed rooms as their hotels document them, by
+// hotel id (ids are the hotel's), with the customer's labels and the win
+// time put in (claimedView): one pool-guest label list per hotel that holds
+// such a room, kept to g's claimed rooms whose customer labels hold every
+// label filter of q; q's other fields pass to the hotel. Nothing is asked
+// when g has no claimed room, so a guest without one sees exactly today's
+// answers. errs: hotels whose list failed. The caller does not hold b.mu.
+func (b *broker) claimedRoomDocs(ctx context.Context, g *guestState, q url.Values) (map[string][]map[string]any, map[string]string) {
+	filters := customerFilters(g, q)
+	want := map[*hotel]map[string]*room{}
+	b.mu.Lock()
+	for _, h := range b.hotelList() {
+		for hid, rm := range h.rooms {
+			if rm.mapping != nil && rm.guest == g.cfg.ID && labelsMatch(rm.mapping.customerLabels, filters) {
+				if want[h] == nil {
+					want[h] = map[string]*room{}
+				}
+				want[h][hid] = rm
+			}
+		}
+	}
+	b.mu.Unlock()
+	if len(want) == 0 {
+		return nil, nil
+	}
+	pq := url.Values{}
+	for k, v := range q {
+		if k != "label" {
+			pq[k] = v
+		}
+	}
+	pq.Set("label", guestLabel+"="+poolGuestID)
+	out := map[string][]map[string]any{}
+	errs := map[string]string{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for h, rooms := range want {
+		if !g.limitsAllow(b, h.cfg.ID) {
+			continue
+		}
+		wg.Add(1)
+		go func(h *hotel, rooms map[string]*room) {
+			defer wg.Done()
+			status, _, body, err := h.do(ctx, "GET", "/v1/sandboxes", pq, nil, 30*time.Second)
+			var doc struct {
+				Sandboxes []map[string]any `json:"sandboxes"`
+			}
+			if err != nil || status != 200 || json.Unmarshal(body, &doc) != nil {
+				mu.Lock()
+				errs[h.cfg.ID] = "unavailable"
+				mu.Unlock()
+				return
+			}
+			var list []map[string]any
+			for _, s := range doc.Sandboxes {
+				id, _ := s["id"].(string)
+				if rm := rooms[id]; rm != nil {
+					b.claimedView(s, rm)
+					list = append(list, s)
+				}
+			}
+			mu.Lock()
+			out[h.cfg.ID] = list
+			mu.Unlock()
+		}(h, rooms)
+	}
+	wg.Wait()
+	return out, errs
+}
+
+// addClaimedUsage adds g's claimed rooms to its usage parts, by hotel. The
+// hotel counts a room's hours from its own creation, which for a claimed room
+// is the pool room's, so the broker counts these from the win: a room still
+// in the room map up to now (or to when it was marked gone), an ended one
+// from its end record while that record is kept. It is a view, not the bill:
+// the usage meter is the bill. Groups follow the hotel's rule: group_by
+// label.<key> (default label.job), "unlabelled" without that label. A part
+// that is an error is left as it is. The caller does not hold b.mu.
+func (b *broker) addClaimedUsage(parts map[string]any, g *guestState, q url.Values) {
+	key := "job"
+	if gb := q.Get("group_by"); gb != "" {
+		if _, k, ok := strings.Cut(gb, "label."); ok {
+			key = k
+		} else {
+			key = gb
+		}
+	}
+	filters := customerFilters(g, q)
+	type use struct {
+		hotel        string
+		labels       map[string]string
+		vcpu, memGiB int64
+		seconds      float64
+	}
+	var uses []use
+	now := time.Now()
+	live := map[string]bool{}
+	b.mu.Lock()
+	for _, h := range b.hotelList() {
+		for _, rm := range h.rooms {
+			m := rm.mapping
+			if m == nil || rm.guest != g.cfg.ID {
+				continue
+			}
+			end := now
+			if !rm.vanished.IsZero() {
+				end = rm.vanished
+			}
+			live[rm.uuid] = true
+			uses = append(uses, use{h.cfg.ID, m.customerLabels, m.vcpu, m.memGiB, end.Sub(m.wonAt).Seconds()})
+		}
+	}
+	if ge := b.ended[g.cfg.ID]; ge != nil {
+		for _, rec := range ge.order {
+			if rec.Claim != nil && rec.CreatedAt != nil && !live[rec.UUID] {
+				uses = append(uses, use{rec.Hotel, rec.Claim.Labels, rec.Claim.VCPU, rec.Claim.MemoryGiB, rec.GoneAt.Sub(*rec.CreatedAt).Seconds()})
+			}
+		}
+	}
+	b.mu.Unlock()
+	for _, u := range uses {
+		part, _ := parts[u.hotel].(map[string]any)
+		groups, _ := part["groups"].(map[string]any)
+		if groups == nil || !labelsMatch(u.labels, filters) {
+			continue
+		}
+		name := u.labels[key]
+		if name == "" {
+			name = "unlabelled"
+		}
+		gr, _ := groups[name].(map[string]any)
+		if gr == nil {
+			gr = map[string]any{}
+			groups[name] = gr
+		}
+		hours := max(u.seconds, 0) / 3600
+		for k, add := range map[string]float64{"sandbox_hours": hours, "vcpu_hours": hours * float64(u.vcpu), "gib_hours": hours * float64(u.memGiB)} {
+			v, _ := gr[k].(float64)
+			gr[k] = v + add
+		}
+	}
 }

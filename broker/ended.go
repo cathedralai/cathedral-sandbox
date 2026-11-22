@@ -69,8 +69,11 @@ type endRecord struct {
 	GoneAt    time.Time  `json:"gone_at"`
 	Reason    string     `json:"reason"`
 	Detail    string     `json:"detail,omitempty"`
-	seq       uint64     // write order, for the live stream
-	written   time.Time  // when the broker wrote it (streamLog trim)
+	// Claim: a claimed room's customer labels and size, for the guest's
+	// usage view after the room is gone (claims_state.go); nil otherwise.
+	Claim   *endClaim `json:"claim,omitempty"`
+	seq     uint64    // write order, for the live stream
+	written time.Time // when the broker wrote it (streamLog trim)
 }
 
 // guestEnded is one guest's records. order is oldest first.
@@ -341,13 +344,17 @@ func (b *broker) newEndRecord(h *hotel, rm *room, gone time.Time, reason, detail
 		t := rm.born.UTC()
 		rec.CreatedAt = &t
 	}
+	if m := rm.mapping; m != nil {
+		rec.Claim = &endClaim{Labels: m.customerLabels, VCPU: m.vcpu, MemoryGiB: m.memGiB}
+	}
 	return rec
 }
 
 // bulkDeleted reports whether a delete by label of rm's guest, made while the
 // room existed, matches its listed labels. Caller holds b.mu.
 func (b *broker) bulkDeleted(rm *room) bool {
-	if rm.labels == nil {
+	labels := rm.viewLabels() // a claimed room: the labels its customer created it with
+	if labels == nil {
 		return false
 	}
 	for _, t := range b.tombs[rm.guest] {
@@ -356,7 +363,7 @@ func (b *broker) bulkDeleted(rm *room) bool {
 		}
 		match := true
 		for k, v := range t.want {
-			if got, ok := rm.labels[k]; !ok || got != v {
+			if got, ok := labels[k]; !ok || got != v {
 				match = false
 				break
 			}
