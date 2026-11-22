@@ -30,7 +30,8 @@ type mappedHotel struct {
 	mu      sync.Mutex
 	created map[string]time.Time // room id -> created_at; absent: the wrapper's start
 	frozen  map[string]bool
-	delFail map[string]int // room id -> the status its delete answers
+	delFail map[string]int  // room id -> the status its delete answers
+	hidden  map[string]bool // room ids the room list leaves out, as a list built before the room landed
 	start   time.Time
 }
 
@@ -71,12 +72,18 @@ func (m *mappedHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	id, tail, _ := strings.Cut(strings.TrimPrefix(p, "/v1/sandboxes/"), "/")
 	room := strings.HasPrefix(p, "/v1/sandboxes/") && id != ""
+	m.mu.Lock()
+	hiding := len(m.hidden) > 0
+	m.mu.Unlock()
 	switch {
-	case p == "/v1/sandboxes" && r.Method == "GET" && len(q["label"]) > 0:
+	case p == "/v1/sandboxes" && r.Method == "GET" && (len(q["label"]) > 0 || hiding):
 		m.f.mu.Lock()
 		list := []map[string]any{}
 		for _, rm := range m.f.rooms {
-			if labelsMatch(rm.labels, q["label"]) {
+			m.mu.Lock()
+			hide := m.hidden[rm.id]
+			m.mu.Unlock()
+			if !hide && labelsMatch(rm.labels, q["label"]) {
 				list = append(list, m.doc(rm))
 			}
 		}
@@ -166,7 +173,7 @@ func newMappedChain(t *testing.T, rooms int) (*poolChain, *mappedHotel) {
 		c.Guests = append(c.Guests, guestConfig{ID: "g2", KeySHA256: sha("key2")})
 		c.MeterKeySHA256 = sha("meter-key")
 	})
-	mh := &mappedHotel{f: pc.hotels["a"], created: map[string]time.Time{}, frozen: map[string]bool{}, delFail: map[string]int{}, start: time.Now()}
+	mh := &mappedHotel{f: pc.hotels["a"], created: map[string]time.Time{}, frozen: map[string]bool{}, delFail: map[string]int{}, hidden: map[string]bool{}, start: time.Now()}
 	srv := httptest.NewServer(mh)
 	t.Cleanup(srv.Close)
 	raw, err := os.ReadFile(pc.cfgPath)
@@ -361,11 +368,20 @@ func TestMappedRoomNeverSightedByPhysicalID(t *testing.T) {
 // Row "meter hotel pass": the customer's run stays present while its room
 // runs; the pass does not end it.
 func TestMappedRunStaysPresentInTheHotelPass(t *testing.T) {
-	pc, _ := newMappedChain(t, 1)
+	pc, mh := newMappedChain(t, 1)
 	run := pc.mapRoom("sbx-1", "g1", jobA, time.Now())
 	for i := 0; i < 3; i++ {
 		pc.sync("a")
 	}
+	// One list that misses the room (built before a change landed): the room
+	// map still holds it, so its run is present.
+	mh.mu.Lock()
+	mh.hidden["sbx-1"] = true
+	mh.mu.Unlock()
+	pc.sync("a")
+	mh.mu.Lock()
+	delete(mh.hidden, "sbx-1")
+	mh.mu.Unlock()
 	pc.b.usageMeter.mu.Lock()
 	open := pc.b.usageMeter.runs[run] != nil
 	pc.b.usageMeter.mu.Unlock()
@@ -918,11 +934,25 @@ func TestMappedRoomLeavesThePool(t *testing.T) {
 // hotel pass while the room is listed (the existing meter tests do not drive
 // usageMeterHotel with a room that stays, so this pins today's rule).
 func TestHotelPassKeepsAnUnmappedRoomsRunPresent(t *testing.T) {
-	pc, _ := newMappedChain(t, 1)
+	pc, mh := newMappedChain(t, 1)
 	pc.hotels["a"].addCustomerRooms(1)
 	for i := 0; i < 3; i++ {
 		pc.sync("a")
 	}
+	// One list that misses both rooms (built before they landed): the room
+	// map still holds them, so their runs are present.
+	f := pc.hotels["a"]
+	f.mu.Lock()
+	mh.mu.Lock()
+	for id := range f.rooms {
+		mh.hidden[id] = true
+	}
+	mh.mu.Unlock()
+	f.mu.Unlock()
+	pc.sync("a")
+	mh.mu.Lock()
+	mh.hidden = map[string]bool{}
+	mh.mu.Unlock()
 	h := pc.b.hotelByID("a")
 	pc.b.mu.Lock()
 	var runs []string
