@@ -175,10 +175,14 @@ type poolHotel struct {
 	level1   *poolAttest
 	level1At time.Time
 	reattest bool // a receipt named another binding: attest again now
-	alarm    string
-	alarmQ   int
-	alarmAt  time.Time
-	full     bool
+	// bindFailAt is when a receipt binding failure last counted in
+	// proofFails: a create that started before it was in flight under the
+	// same attestation and does not count again.
+	bindFailAt time.Time
+	alarm      string
+	alarmQ     int
+	alarmAt    time.Time
+	full       bool
 }
 
 type readyRooms struct {
@@ -1117,7 +1121,8 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	h.holdDisk(pl, 1)
 	h.place(rm)
 	ph.creating[k.name]++
-	ph.started[rm] = time.Now() // before the POST is sent: no listing of its room can come earlier
+	tStart := time.Now()
+	ph.started[rm] = tStart // before the POST is sent: no listing of its room can come earlier
 	b.mu.Unlock()
 
 	status, hdr, out, err := h.doHeaders(noConnWait(context.WithoutCancel(ctx)), h.cfg.API, "POST", "/v1/sandboxes", nil, body, poolCreateTimeout, nil)
@@ -1183,13 +1188,21 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 		}
 	}
 	ph.rooms[hid] = pr
-	if pr.state == poolStale {
+	// A binding failure counts once per attestation: the creates in flight
+	// when the front moves all started under the old one and fail alike.
+	// Creates that start after a counted failure count again, so a lasting
+	// mismatch still backs off and alarms.
+	bindFail := errors.Is(derr, errPoolReceiptBinding)
+	if pr.state == poolStale && !(bindFail && tStart.Before(ph.bindFailAt)) {
 		// A front that never proves pool rooms would otherwise see a create
 		// and a delete at the full refill rate, forever: back off 5 s,
 		// doubling to 1 min, and tell ops once the failures run on. A
 		// binding failure counts too (a receipt signer that lastingly
 		// disagrees with the attestation would churn the same way); it is
 		// still attested again at once, so a real move costs one 5 s pause.
+		if bindFail {
+			ph.bindFailAt = tDone
+		}
 		ph.proofFails++
 		ph.backoff = tDone.Add(poolRetry(ph.proofFails))
 		if ph.proofFails == poolProofAlarmAfter {

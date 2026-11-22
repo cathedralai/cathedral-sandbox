@@ -217,6 +217,63 @@ func TestPoolRoomsTurnStaleOnBindingChange(t *testing.T) {
 			t.Fatalf("%d deletes, want 3: the new rooms are ready under the new binding\n%s", n, pc.debug("a"))
 		}
 	})
+	// The front moves while 4 creates are in flight under the old
+	// attestation: all 4 fail the binding, but they count once (one 5 s
+	// pause, no alarm), and the next create under the new binding is ready
+	// (Reviewbot HOLD at 23f208d).
+	t.Run("move with 4 creates in flight", func(t *testing.T) {
+		pc := newPoolChain(t, []string{"a"}, nil)
+		f := pc.hotels["a"]
+		h := pc.b.hotelByID("a")
+		pc.up("a")
+		pc.target(2)
+		pc.fill("a", 2)
+		gate := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-gate:
+			default:
+				close(gate)
+			}
+		})
+		f.set(func(f *fakePoolHotel) { f.createGate = gate })
+		pc.target(6)
+		for i := 0; i < poolCreatesInFlight; i++ {
+			pc.b.poolStep(context.Background(), h)
+		}
+		waitFor(t, "4 creates held at the hotel", func() bool { return f.roomCount() == 2+poolCreatesInFlight })
+		pc.b.mu.Lock()
+		ph := pc.b.pool.hotel("a")
+		inFlight := ph.creating["node-22"]
+		pc.b.mu.Unlock()
+		if inFlight != poolCreatesInFlight {
+			t.Fatalf("%d creates in flight, want %d", inFlight, poolCreatesInFlight)
+		}
+		f.set(func(f *fakePoolHotel) { f.newBinding(); f.createGate = nil })
+		close(gate)
+		ph.inflight.Wait()
+		pc.b.mu.Lock()
+		fails, wait, alarm := ph.proofFails, time.Until(ph.backoff), ph.alarm
+		pc.b.mu.Unlock()
+		if fails != 1 || wait > poolRetryFirst || alarm != "" {
+			t.Fatalf("after a move with %d creates in flight: proof failures %d, backoff left %s, alarm %q; want 1, at most %s, none",
+				poolCreatesInFlight, fails, wait, alarm, poolRetryFirst)
+		}
+		if n := len(f.roomDeletes()); n != poolCreatesInFlight {
+			t.Fatalf("%d deletes, want the %d rooms made under the old attestation\n%s", n, poolCreatesInFlight, pc.debug("a"))
+		}
+		pc.b.mu.Lock()
+		ph.backoff = time.Time{} // past the one 5 s pause
+		pc.b.mu.Unlock()
+		pc.sync("a") // attests: the new binding
+		pc.step("a")
+		pc.b.mu.Lock()
+		fails, alarm = ph.proofFails, ph.alarm
+		pc.b.mu.Unlock()
+		if c := pc.counts("a"); c.ready != 1 || fails != 0 || alarm != "" {
+			t.Fatalf("after the new attestation: %+v, proof failures %d, alarm %q; want 1 ready, 0, none\n%s", c, fails, alarm, pc.debug("a"))
+		}
+	})
 }
 
 // A guest reboot wipes every room: the sync loop ends their runs (not
