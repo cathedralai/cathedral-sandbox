@@ -1951,7 +1951,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 			rm.state, rm.vanished = stDeleting, time.Now()
 		}
 		rm.deleteSent = true
-		b.usageMeter.end(rm.id, time.Now(), status == 204 && live) // the run's ended reading (usage_meter.go)
+		b.usageMeter.end(rm.runID(), time.Now(), status == 204 && live) // the run's ended reading (usage_meter.go); a claimed room's: its customer's
 		b.mu.Unlock()
 	}
 	for _, k := range []string{"Content-Type", "Content-Range", "Content-Length", "Retry-After", "Accept-Ranges"} {
