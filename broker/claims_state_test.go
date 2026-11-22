@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -637,9 +638,11 @@ func TestMappedRoomReceiptsStayTheCustomersAfterRelease(t *testing.T) {
 }
 
 // mappedRestart maps sbx-1 to g1 with its won record, meters it, and
-// restarts the broker over the same state; broken: the journal loses a
-// segment first. It returns the run and the room's readings before.
-func mappedRestart(t *testing.T, pc *poolChain, wonAt time.Time, broken bool) (string, []usageReading) {
+// restarts the broker over the same state; broken: the journal is made
+// incomplete first ("segment": a segment removed, nothing readable; "tail":
+// the active segment's last line lost, so the won before it stays readable).
+// It returns the run and the room's readings before.
+func mappedRestart(t *testing.T, pc *poolChain, wonAt time.Time, broken string) (string, []usageReading) {
 	t.Helper()
 	run := pc.mapRoom("sbx-1", "g1", jobA, wonAt)
 	pc.writeWon("g1", "sbx-1", run, jobA, wonAt)
@@ -650,8 +653,24 @@ func mappedRestart(t *testing.T, pc *poolChain, wonAt time.Time, broken bool) (s
 	if err := pc.b.saveCompat(); err != nil { // client-state.json as the one-second save leaves it
 		t.Fatal(err)
 	}
-	if broken {
+	switch broken {
+	case "segment":
 		pc.breakJournal()
+	case "tail":
+		pc.writeRecord("abandoned", map[string]any{"attempt_id": newUUID(), "why": "test"})
+		pc.b.pool.close()
+		segs, _ := filepath.Glob(filepath.Join(pc.stateDir, claimJournalDirName, "gen-*", "*.jsonl"))
+		if len(segs) != 1 {
+			t.Fatalf("%d journal segments, want 1", len(segs))
+		}
+		raw, err := os.ReadFile(segs[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.SplitAfter(strings.TrimSuffix(string(raw), "\n"), "\n")
+		if err := os.WriteFile(segs[0], []byte(strings.Join(lines[:len(lines)-1], "")), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	pc.start()
 	return run, before
@@ -663,7 +682,7 @@ func mappedRestart(t *testing.T, pc *poolChain, wonAt time.Time, broken bool) (s
 func TestMappedRunContinuesAcrossRestart(t *testing.T) {
 	pc, _ := newMappedChain(t, 1)
 	wonAt := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
-	run, before := mappedRestart(t, pc, wonAt, false)
+	run, before := mappedRestart(t, pc, wonAt, "")
 	if len(before) == 0 {
 		t.Fatalf("no reading of the customer's run %s before the restart", run)
 	}
@@ -700,7 +719,7 @@ func TestMappedRunContinuesAcrossRestart(t *testing.T) {
 // read, not in the pool's counts or bound, not quarantined, no alarm.
 func TestMappedRoomNeverAdoptedAsPool(t *testing.T) {
 	pc, _ := newMappedChain(t, 1)
-	mappedRestart(t, pc, time.Now().Add(-time.Minute), false)
+	mappedRestart(t, pc, time.Now().Add(-time.Minute), "")
 	f := pc.hotels["a"]
 	reads := len(f.callsOf("GET", "/v1/sandboxes/sbx-1/receipts"))
 	pc.up("a")
@@ -724,8 +743,16 @@ func TestMappedRoomNeverAdoptedAsPool(t *testing.T) {
 // any more: not found on GET, exec and list; its run ended by the meter as
 // an absent room; nothing of its later time charged.
 func TestIncompleteJournalLeavesClaimedRoomUnreachableAndEnded(t *testing.T) {
+	for _, broken := range []string{"segment", "tail"} {
+		t.Run(broken, func(t *testing.T) { incompleteJournalCase(t, broken) })
+	}
+}
+
+// incompleteJournalCase is one way of losing part of the journal; in "tail"
+// the won itself is still readable and must still not map.
+func incompleteJournalCase(t *testing.T, broken string) {
 	pc, _ := newMappedChain(t, 1)
-	run, before := mappedRestart(t, pc, time.Now().Add(-time.Minute), true)
+	run, before := mappedRestart(t, pc, time.Now().Add(-time.Minute), broken)
 	if pc.b.pool.journalState != "incomplete" {
 		t.Fatalf("journal %s, want incomplete", pc.b.pool.journalState)
 	}
@@ -864,5 +891,54 @@ func TestEndedRunIsNotMappedAtRestart(t *testing.T) {
 	}
 	if after := pc.readingsOfRun(run); len(after) != len(before) || endedCount(after) != 1 {
 		t.Fatalf("readings of the ended run: before %d, after %d (%+v); want no new reading, ended once", len(before), len(after), after)
+	}
+}
+
+// A claimed room leaves the pool's records at its win: the pool does not
+// count it as a ready room, and no pool rule (over target, retirement) ever
+// deletes it.
+func TestMappedRoomLeavesThePool(t *testing.T) {
+	pc, _ := newMappedChain(t, 3)
+	pc.mapRoom("sbx-1", "g1", jobA, time.Now())
+	if c := pc.counts("a"); c.ready != 2 {
+		t.Fatalf("pool counts after a win %+v, want 2 ready (the claimed room is not the pool's)", c)
+	}
+	pc.target(0) // every ready room is over target now
+	pc.steps("a", 3)
+	f := pc.hotels["a"]
+	if n := len(f.callsOf("DELETE", "/v1/sandboxes/sbx-1")); n != 0 {
+		t.Fatalf("the pool deleted the claimed room %d times", n)
+	}
+	if n := len(f.roomDeletes()); n != 2 {
+		t.Fatalf("%d pool deletes at target 0, want the 2 ready rooms", n)
+	}
+}
+
+// No mapping, nothing changes: an unmapped room's run stays present in the
+// hotel pass while the room is listed (the existing meter tests do not drive
+// usageMeterHotel with a room that stays, so this pins today's rule).
+func TestHotelPassKeepsAnUnmappedRoomsRunPresent(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	pc.hotels["a"].addCustomerRooms(1)
+	for i := 0; i < 3; i++ {
+		pc.sync("a")
+	}
+	h := pc.b.hotelByID("a")
+	pc.b.mu.Lock()
+	var runs []string
+	for _, rm := range h.rooms {
+		runs = append(runs, rm.id)
+	}
+	pc.b.mu.Unlock()
+	if len(runs) != 2 {
+		t.Fatalf("%d rooms in the room map, want the pool room and the customer room", len(runs))
+	}
+	for _, run := range runs {
+		pc.b.usageMeter.mu.Lock()
+		open := pc.b.usageMeter.runs[run] != nil
+		pc.b.usageMeter.mu.Unlock()
+		if !open || endedCount(pc.readingsOfRun(run)) != 0 {
+			t.Fatalf("run %s of a listed room: open %v, readings %+v; want open, never ended", run, open, pc.readingsOfRun(run))
+		}
 	}
 }
