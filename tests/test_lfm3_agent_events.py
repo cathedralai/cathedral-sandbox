@@ -708,3 +708,78 @@ def test_request_batch_keeps_escaped_text_and_media_separate(model: StreamModel,
     else:
         assert content == text
         assert saved == {"role": "user", "content": text}
+
+
+# AB#732: in a sealed room (2 vCPU) each process start costs about 5 to 30 ms
+# (jq 28 ms, curl 32 ms, measured 22 Nov 2026), and every one before the model
+# request delays the first word. A warm events turn through liquid starts jq
+# only to build the request (user message, body) and to read the stream, and
+# curl only for the stream.
+SHIMMED = ("jq", "curl", "dirname", "mkdir", "rm", "env")
+
+
+def shim_path(tmp_path: Path) -> tuple[str, Path]:
+    bin_dir = tmp_path / "shim"
+    bin_dir.mkdir()
+    log = tmp_path / "starts.log"
+    for name in SHIMMED:
+        real = shutil.which(name)
+        assert real, name
+        shim = bin_dir / name
+        shim.write_text(f'#!/bin/sh\necho {name} >>"{log}"\nexec "{real}" "$@"\n')
+        shim.chmod(0o755)
+    return f"{bin_dir}:{os.environ['PATH']}", log
+
+
+class Starts(list):
+    """model.requests that also keeps which processes had started when each request arrived."""
+
+    def __init__(self, log: Path) -> None:
+        super().__init__()
+        self.log = log
+        self.seen: list[list[str]] = []
+
+    def append(self, body: Any) -> None:
+        self.seen.append(self.log.read_text().split() if self.log.exists() else [])
+        super().append(body)
+
+
+def test_a_warm_events_turn_starts_no_extra_process_before_the_model_request(model: StreamModel, room: Any, tmp_path: Path) -> None:
+    path, log = shim_path(tmp_path)
+    model.replies = [{"pieces": ["One."]}, {"pieces": ["Two."]}]
+    done = room("--events", "--turn", TURN, "first", script=LIQUID, PATH=path, MODEL="lfm3-audio-2b")
+    assert done.returncode == 0, done.stderr
+    log.unlink()
+    model.requests = Starts(log)
+    done = room("--events", "--turn", TURN, "second", script=LIQUID, PATH=path, MODEL="lfm3-audio-2b")
+    assert done.returncode == 0, done.stderr
+    events = events_of(done)
+    check_envelope(events)
+    assert types(events) == ["start", "thinking", "delta", "answer"]
+    before = model.requests.seen[0]
+    # The stream's own jq may or may not have started by the time the request lands.
+    assert before.count("jq") in (2, 3), before
+    assert before.count("curl") == 1, before
+    assert not {"dirname", "mkdir", "rm", "env"} & set(before), before
+
+
+def test_the_start_line_escapes_and_cuts_a_model_name_as_before(model: StreamModel, room: Any) -> None:
+    name = 'my "model" ' + "x" * 70
+    model.replies = [{"pieces": ["Hi."]}]
+    done, events = turn(room, "hello", MODEL=name)
+    assert done.returncode == 0
+    check_envelope(events)
+    assert events[0]["model"] == name[:64]
+    done.stdout.decode("ascii")
+
+
+def test_a_model_server_not_on_loopback_is_still_checked_with_curl(model: StreamModel, room: Any, tmp_path: Path) -> None:
+    path, log = shim_path(tmp_path)
+    model.replies = [{"pieces": ["Hi."]}]
+    # 0.0.0.0 reaches the loopback server on Linux but is not the room's own address form.
+    base = model.base_url.replace("127.0.0.1", "0.0.0.0")
+    done, events = turn(room, "hello", PATH=path, MODEL_BASE_URL=base)
+    assert done.returncode == 0, done.stderr
+    assert types(events) == ["start", "thinking", "delta", "answer"]
+    # One curl for /health (no /dev/tcp fast path for this URL) and one for the stream.
+    assert log.read_text().split().count("curl") == 2
