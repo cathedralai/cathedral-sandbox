@@ -23,10 +23,13 @@ _spec.loader.exec_module(rr)
 KEY = b"k" * 32
 NONCE = "control-plane-nonce-1"
 IMAGE = "ghcr.io/cathedral/escape-room:1"
+# The guest's SNP REPORT_ID (ATTESTATION_REPORT 0x140): the launch every fresh create here must name.
+LAUNCH = "5e" * 32
+OTHER_LAUNCH = "6f" * 32
 FRESH = {
     "schema": "cathedral.escape.fresh_evidence/v1",
     "attempt_id": "attempt-1",
-    "report_id": "launch-1",
+    "report_id": LAUNCH,
     "request_sha256": "a" * 64,
 }
 
@@ -37,6 +40,7 @@ def _fake_report() -> bytes:
     report[0x08:0x10] = (0x30000).to_bytes(8, "little")
     report[0x90:0xC0] = bytes.fromhex("ab" * 48)
     report[0xC0:0xE0] = bytes.fromhex("cd" * 32)
+    report[0x140:0x160] = bytes.fromhex(LAUNCH)
     report[0x180:0x188] = bytes.fromhex("01" * 8)
     report[0x1A0:0x1E0] = bytes.fromhex("ef" * 64)
     return bytes(report)
@@ -124,8 +128,18 @@ class Front:
         finally:
             c.close()
 
-    def create(self, fresh=FRESH, headers=None, body=None):
+    def expected(self, fresh=FRESH, **change) -> dict:
+        """The expected launch the API would send for *fresh*: this guest's launch and binding by default."""
+        out = {"schema": "cathedral.escape.expected_launch/v1", "binding_sha256": self.ledger.binding_sha256,
+               **{k: fresh[k] for k in ("attempt_id", "report_id", "request_sha256")}}
+        return {**out, **change}
+
+    def create(self, fresh=FRESH, headers=None, body=None, expected="auto"):
         extra = {} if fresh is None else {"X-Escape-Fresh": fresh if isinstance(fresh, str) else json.dumps(fresh)}
+        if expected == "auto":
+            expected = self.expected(fresh) if isinstance(fresh, dict) else None
+        if expected is not None:
+            extra["X-Escape-Expected-Launch"] = expected if isinstance(expected, str) else json.dumps(expected)
         return self.request("POST", "/v1/sandboxes", json.dumps(body or {"image": IMAGE}).encode(),
                             {**extra, **(headers or {})})
 
@@ -198,7 +212,6 @@ def test_create_and_plant_sign_the_assignment(tmp_path, monkeypatch) -> None:
 
 @pytest.mark.parametrize("second", [
     FRESH,
-    {**FRESH, "report_id": "launch-2"},
     {**FRESH, "attempt_id": "attempt-2"},
 ])
 def test_attempt_and_launch_are_single_use(tmp_path, monkeypatch, second) -> None:
@@ -240,7 +253,7 @@ def test_a_failed_create_still_consumes_and_never_plants(tmp_path, monkeypatch) 
 ])
 def test_malformed_assignment_is_refused_unsent(tmp_path, monkeypatch, header) -> None:
     front = Front(tmp_path, monkeypatch)
-    status, headers, out = front.create(header)
+    status, headers, out = front.create(header, expected=front.expected())
     assert status == 400 and b"escape_fresh_invalid" in out
     assert "X-Room-Receipt" not in headers
     assert front.creates() == 0 and front.ledger.chain == [] and front.ledger.fresh_used == set()
@@ -447,3 +460,180 @@ def test_plant_write_failure_signs_nothing(tmp_path, monkeypatch) -> None:
     assert status == 500 and b"plant_failed" in out
     assert "X-Room-Receipt" not in headers
     assert len(front.ledger.chain) == chain
+
+
+# ---- AB#683 durable launch reservation and expected launch (SpockChaser producer-contract observations) ----
+
+def _reservations(tmp_path) -> list[str]:
+    d = tmp_path / "store" / getattr(rr, "ESCAPE_FRESH_RESERVATION_DIR", "escape-fresh")
+    return sorted(p.name for p in d.iterdir()) if d.exists() else []
+
+
+def test_observation1_idempotency_key_is_still_refused_and_reserves_nothing(tmp_path, monkeypatch) -> None:
+    # Chaser observation 1: a fresh create never carries an Idempotency-Key, with or without the expected
+    # launch, and the refusal leaves the launch unreserved, so the one correct create still runs.
+    front = Front(tmp_path, monkeypatch)
+    status, headers, out = front.create(headers={"Idempotency-Key": "escape-fresh-attempt-1"})
+    assert status == 400 and b"escape_fresh_idempotency_refused" in out
+    assert "X-Room-Receipt" not in headers and front.creates() == 0
+    assert _reservations(tmp_path) == []
+    assert front.create()[0] == 202
+    assert front.creates() == 1
+    assert len(_reservations(tmp_path)) == 2
+
+
+def test_observation2_consumption_survives_a_new_front_on_the_same_store(tmp_path, monkeypatch) -> None:
+    # Chaser observation 2: on main a second front on the same store accepted the consumed attempt (202).
+    first = Front(tmp_path, monkeypatch)
+    assert first.create()[0] == 202
+    assert first.create()[0] == 409
+    first.ledger.store.close()
+    second = Front(tmp_path, monkeypatch)
+    # A receipt-front restart is a new key and binding on the same launch.
+    assert second.ledger.binding_sha256 != first.ledger.binding_sha256
+    for fresh in (FRESH, {**FRESH, "attempt_id": "attempt-2"}, {**FRESH, "request_sha256": "b" * 64}):
+        status, headers, out = second.create(fresh)
+        assert status == 409 and b"escape_fresh_consumed" in out, out
+        assert "X-Room-Receipt" not in headers
+    assert second.creates() == 0 and second.ledger.chain == []
+    assert second.ledger.launch_report_id() == LAUNCH
+
+
+def test_observation3_report_id_other_than_this_launch_is_refused_unsent(tmp_path, monkeypatch) -> None:
+    # Chaser observation 3: on main a well formed arbitrary report_id was sent and signed (202).
+    front = Front(tmp_path, monkeypatch)
+    for report_id in ("not-the-admitted-launch", OTHER_LAUNCH):
+        supplied = {**FRESH, "report_id": report_id}
+        status, headers, out = front.create(supplied)
+        assert status == 409 and b"escape_expected_launch_mismatch" in out, out
+        assert "X-Room-Receipt" not in headers
+    assert front.creates() == 0 and front.ledger.chain == [] and _reservations(tmp_path) == []
+    # The guest's own launch was not used up by the refusals.
+    status, headers, _out = front.create()
+    assert status == 202 and _receipt(headers)["statement"]["escape_fresh"] == FRESH
+
+
+@pytest.mark.parametrize("change", [
+    {"binding_sha256": "0" * 64},  # an earlier receipt key on this launch, or another guest
+    {"attempt_id": "attempt-2"},
+    {"report_id": OTHER_LAUNCH},
+    {"request_sha256": "b" * 64},
+])
+def test_expected_launch_must_match_the_assignment_and_this_guest(tmp_path, monkeypatch, change) -> None:
+    front = Front(tmp_path, monkeypatch)
+    status, headers, out = front.create(expected=front.expected(**change))
+    assert status == 409 and b"escape_expected_launch_mismatch" in out
+    assert "X-Room-Receipt" not in headers
+    assert front.creates() == 0 and front.ledger.fresh_used == set() and _reservations(tmp_path) == []
+
+
+def test_expected_launch_from_before_a_key_restart_is_refused(tmp_path, monkeypatch) -> None:
+    first = Front(tmp_path, monkeypatch)
+    old_binding = first.ledger.binding_sha256
+    first.ledger.store.close()
+    second = Front(tmp_path, monkeypatch)
+    status, _h, out = second.create(expected=second.expected(binding_sha256=old_binding))
+    assert status == 409 and b"escape_expected_launch_mismatch" in out
+    assert second.creates() == 0
+
+
+@pytest.mark.parametrize("expected", [
+    None,
+    "not json",
+    json.dumps({"schema": "cathedral.escape.expected_launch/v0"}),
+    "extra",
+    "drop",
+    "short_binding",
+])
+def test_fresh_create_without_a_well_formed_expected_launch_is_refused(tmp_path, monkeypatch, expected) -> None:
+    front = Front(tmp_path, monkeypatch)
+    if expected == "extra":
+        expected = {**front.expected(), "owner": "o"}
+    elif expected == "drop":
+        expected = {k: v for k, v in front.expected().items() if k != "binding_sha256"}
+    elif expected == "short_binding":
+        expected = front.expected(binding_sha256="a" * 63)
+    status, headers, out = front.create(expected=expected)
+    assert status == 400 and b"escape_expected_launch_invalid" in out
+    assert "X-Room-Receipt" not in headers
+    assert front.creates() == 0 and front.ledger.fresh_used == set()
+
+
+def test_expected_launch_without_the_assignment_is_refused(tmp_path, monkeypatch) -> None:
+    front = Front(tmp_path, monkeypatch)
+    status, _h, out = front.create(fresh=None, expected=front.expected())
+    assert status == 400 and b"escape_fresh_refused" in out
+    status, _h, out = front.request("POST", "/v1/sandboxes/room-1/exec", b'{"cmd":["true"]}',
+                                    {"X-Escape-Expected-Launch": json.dumps(front.expected())})
+    assert status == 400 and b"escape_fresh_refused" in out
+    assert front.calls == []
+
+
+def test_guest_without_a_launch_report_id_refuses(tmp_path, monkeypatch) -> None:
+    front = Front(tmp_path, monkeypatch)
+    front.ledger.report = front.ledger.report[:0x140] + bytes(32) + front.ledger.report[0x160:]
+    assert front.ledger.launch_report_id() is None
+    status, _h, out = front.create()
+    assert status == 409 and b"escape_expected_launch_mismatch" in out
+    assert front.creates() == 0
+
+
+def test_expected_launch_is_not_sent_on_to_the_room_api(tmp_path, monkeypatch) -> None:
+    front = Front(tmp_path, monkeypatch)
+    assert front.create()[0] == 202
+    assert all("x-escape-expected-launch" not in {k.lower() for k in h} for _m, _p, h in front.calls)
+
+
+def test_reservation_that_cannot_be_saved_sends_nothing(tmp_path, monkeypatch) -> None:
+    front = Front(tmp_path, monkeypatch)
+    real_link, broken = rr.os.link, [True]
+
+    def failing_link(*args, **kwargs):
+        if broken[0]:
+            raise OSError("disk full")
+        return real_link(*args, **kwargs)
+
+    monkeypatch.setattr(rr.os, "link", failing_link)
+    status, headers, out = front.create()
+    assert status == 503 and b"escape_fresh_reservation_failed" in out
+    assert "X-Room-Receipt" not in headers and front.creates() == 0
+    broken[0] = False
+    # Unknown save outcome: the attempt and launch stay used in this process.
+    status, _h, out = front.create()
+    assert status == 409 and b"escape_fresh_consumed" in out
+    assert front.creates() == 0
+    # No temporary file is left behind.
+    assert _reservations(tmp_path) == []
+
+
+def test_reservation_is_written_before_the_create_is_sent(tmp_path, monkeypatch) -> None:
+    front = Front(tmp_path, monkeypatch)
+    seen = []
+    real = front.ledger.consume_fresh
+
+    def watching(fresh):
+        assert front.creates() == 0
+        ok = real(fresh)
+        seen.append(len(_reservations(tmp_path)))
+        return ok
+
+    monkeypatch.setattr(front.ledger, "consume_fresh", watching)
+    assert front.create()[0] == 202
+    assert seen == [2]
+    for name in _reservations(tmp_path):
+        record = json.loads((tmp_path / "store" / rr.ESCAPE_FRESH_RESERVATION_DIR / name).read_bytes())
+        assert record == {"attempt_id": "attempt-1", "report_id": LAUNCH, "request_sha256": "a" * 64,
+                          "binding_sha256": front.ledger.binding_sha256}
+
+
+def test_attempt_stays_reserved_when_its_launch_was_taken(tmp_path, monkeypatch) -> None:
+    first = Front(tmp_path, monkeypatch)
+    assert first.create()[0] == 202
+    first.ledger.store.close()
+    second = Front(tmp_path, monkeypatch)
+    late = {**FRESH, "attempt_id": "attempt-9"}
+    assert second.create(late)[0] == 409
+    assert len(_reservations(tmp_path)) == 3
+    third = Front(tmp_path, monkeypatch)
+    assert third.create(late)[0] == 409
+    assert third.creates() == 0

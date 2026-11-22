@@ -35,11 +35,15 @@ Routes it adds:
                                    path, not the value). AB#683: with "sandbox_id" and
                                    "escape_fresh", admitted once, only for the room, live
                                    incarnation and create receipt of that fresh create
-  POST /v1/sandboxes + X-Escape-Fresh
+  POST /v1/sandboxes + X-Escape-Fresh + X-Escape-Expected-Launch
                                    sealed Escape hotels only (AB#683): the API's assignment
-                                   (schema, attempt_id, report_id, request_sha256), consumed
-                                   once per boot before the create runs and signed into its
-                                   receipt as "escape_fresh"; not sent on to the room API
+                                   (schema, attempt_id, report_id, request_sha256) and its
+                                   expected launch (the same three plus binding_sha256). The
+                                   expected report_id and binding must be this guest's own;
+                                   then attempt and launch are reserved on disk before the
+                                   create runs, for good (a front or key restart keeps them),
+                                   and the assignment is signed into the receipt as
+                                   "escape_fresh". Neither header is sent on to the room API
   GET /room/hotel-key-install-key  miner hotels only: the guest X25519 install key, signed
                                    by the attested receipt key
   POST /room/hotel-key             miner hotels only: install the per-hotel API key, sealed
@@ -202,6 +206,15 @@ SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 ESCAPE_FRESH_HEADER_MAX = 1024
 # Attempts and launches this boot consumed. Never evicted: once full, fresh creates are refused until restart.
 ESCAPE_FRESH_MAX = 4096
+# The expected launch: the API's committed assignment as the guest must find it before the create runs. report_id
+# and binding_sha256 must be this guest's own (its SNP REPORT_ID and current binding), so an assignment made for
+# another launch, or for this launch under an earlier receipt key, is refused unsent.
+ESCAPE_EXPECTED_SCHEMA = "cathedral.escape.expected_launch/v1"
+ESCAPE_EXPECTED_HEADER = "X-Escape-Expected-Launch"
+ESCAPE_EXPECTED_KEYS = frozenset({"schema", "attempt_id", "report_id", "request_sha256", "binding_sha256"})
+# Durable single-use reservations (AB#683), under the receipt store: one file per attempt and per launch, never
+# removed by the front. A later front process or receipt key on the same store finds them and refuses.
+ESCAPE_FRESH_RESERVATION_DIR = "escape-fresh"
 # Miner hotel key install (the control plane side is polariscomputer
 # cathedral_hotel_reconciler.RoomKitKeyInstaller; keep the two in step).
 INSTALL_ALGORITHM = PLANT_ALGORITHM  # the plant construction, with its own HKDF info and AAD
@@ -2699,14 +2712,68 @@ class Ledger:
         with self.lock:
             return self._sign_locked(fields, create)
 
+    def launch_report_id(self) -> str | None:
+        """REPORT_ID of this guest's SNP launch (64 hex), or None when unsealed or all zero (fail closed).
+
+        Same field and offset as the broker's snpReportID (admission.go): ATTESTATION_REPORT 0x140, 32 bytes.
+        The firmware sets it at launch, so a receipt front or key restart keeps it and a new launch changes it."""
+        if not self.sealed or len(self.report) < 0x160:
+            return None
+        raw = self.report[0x140:0x160]
+        return raw.hex() if any(raw) else None
+
+    def _reserve_fresh_id(self, directory: str, key: str, record: bytes) -> bool:
+        """Create the reservation file for *key*, durably and without replacing one. False: it exists.
+
+        Written to a temporary name and fsynced, then linked to its final name (an atomic rename that refuses to
+        replace) and the directory fsynced. Any OSError other than an existing name propagates: no dispatch."""
+        target = os.path.join(directory, sha(key.encode()))
+        temporary = os.path.join(directory, f".{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                os.write(fd, record)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                return False
+        finally:
+            os.unlink(temporary)
+        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+        return True
+
     def consume_fresh(self, fresh: dict) -> bool:
-        """Take one fresh attempt and launch for this boot, before its create is sent. False: already used."""
+        """Take one fresh attempt and launch for good, before its create is sent. False: already used.
+
+        Reserved on disk under the receipt store, so a later front process or receipt key on this store refuses
+        it too. The attempt is reserved before the launch; when the launch is already taken the attempt stays
+        reserved (fail closed). OSError (the reservation could not be saved) propagates: the caller must not
+        send the create."""
         with self.lock:
             ids = (f"attempt:{fresh['attempt_id']}", f"report:{fresh['report_id']}")
             if any(i in self.fresh_used for i in ids) or len(self.fresh_used) + 2 > ESCAPE_FRESH_MAX:
                 return False
+            # Marked before the disk is touched: a failed or partial save leaves the ids used in this process.
             self.fresh_used.update(ids)
-            return True
+            directory = os.path.join(self.store_dir, ESCAPE_FRESH_RESERVATION_DIR)
+            if not os.path.isdir(directory):
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                # The new directory's entry lives in the store dir: fsync it so a crash cannot drop every reservation.
+                storefd = os.open(self.store_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(storefd)
+                finally:
+                    os.close(storefd)
+            record = canonical({k: fresh[k] for k in ("attempt_id", "report_id", "request_sha256")}
+                               | {"binding_sha256": self.binding_sha256})
+            return all(self._reserve_fresh_id(directory, i, record) for i in ids)
 
     def retain_fresh(self, receipt: dict) -> None:
         """Keep a signed 2xx fresh create's assignment for its plant. Only what this front signed."""
@@ -3232,7 +3299,8 @@ def escape_claims_bind(report_data: bytes, claims: bytes | None) -> bool:
         and hashlib.sha256(ESCAPE_CLAIMS_DOMAIN + claims).digest() == report_data[:32]
     )
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
-       "proxy-authenticate", "content-length", "host", "x-room-exec-handle", "x-escape-fresh"}
+       "proxy-authenticate", "content-length", "host", "x-room-exec-handle", "x-escape-fresh",
+       "x-escape-expected-launch"}
 
 # Exec result memory (AB#756). The broker's background exec path sends its own exec handle in
 # EXEC_HANDLE_HEADER; for those execs only, the front keeps the answer it signed, so a broker that
@@ -3916,6 +3984,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(problem[0], canonical({"error": {"code": problem[1], "message": problem[2]}}))
         elif ESCAPE_FRESH_HEADER in self.headers:
             return self.reply(400, b'{"error":{"code":"escape_fresh_refused","message":"X-Escape-Fresh is for a create only"}}')
+        elif ESCAPE_EXPECTED_HEADER in self.headers:
+            # Both or neither: an expected launch alone is not a fresh create and must not reach the API.
+            return self.reply(400, b'{"error":{"code":"escape_fresh_refused","message":"X-Escape-Expected-Launch goes with X-Escape-Fresh on a create"}}')
         fork = None
         if refusal is None and action == "snapshot" and self.authorized():
             if self.snapshot_name_is_id_shaped(body):
@@ -4223,11 +4294,46 @@ class Handler(BaseHTTPRequestHandler):
             return bad(401, "unauthorized", "unauthorized")
         if refusal is not None or not escape_plant_open(ledger):
             return bad(403, "escape_fresh_disabled", "this hotel does not take a fresh Escape create")
-        values = self.headers.get_all(ESCAPE_FRESH_HEADER)
         invalid = (400, "escape_fresh_invalid", "X-Escape-Fresh must be one JSON object of schema, attempt_id, "
                                                "report_id and request_sha256")
-        if len(values) != 1 or len(values[0]) > ESCAPE_FRESH_HEADER_MAX:
+        fresh = self.fresh_header_object(ESCAPE_FRESH_HEADER, ESCAPE_FRESH_KEYS, ESCAPE_FRESH_SCHEMA)
+        if fresh is None:
             return None, invalid
+        # The expected launch goes with every fresh create: without it the guest would sign whatever launch the
+        # caller named.
+        expected = self.fresh_header_object(ESCAPE_EXPECTED_HEADER, ESCAPE_EXPECTED_KEYS, ESCAPE_EXPECTED_SCHEMA)
+        if expected is None or not SHA256_HEX_RE.fullmatch(expected["binding_sha256"]):
+            return bad(400, "escape_expected_launch_invalid", "a fresh create carries one X-Escape-Expected-Launch "
+                                                              "object of schema, attempt_id, report_id, "
+                                                              "request_sha256 and binding_sha256")
+        if self.headers.get_all("Idempotency-Key") is not None:
+            # A replayed create answers an old room: one attempt, one create actually performed.
+            return bad(400, "escape_fresh_idempotency_refused", "a fresh create is made without an Idempotency-Key")
+        if create_ask is not None or self.fork_snapshot_id(body) is not None:
+            return bad(400, "escape_fresh_plain_create_required", "a fresh create is not a serial, pool or fork create")
+        own_report = ledger.launch_report_id()
+        if any(expected[k] != fresh[k] for k in ("attempt_id", "report_id", "request_sha256")) \
+                or own_report is None or expected["report_id"] != own_report \
+                or expected["binding_sha256"] != ledger.binding_sha256:
+            # Checked before anything is reserved: a mismatch leaves this guest's launch unused.
+            return bad(409, "escape_expected_launch_mismatch", "the expected launch is not this guest's launch "
+                                                               "and binding")
+        try:
+            consumed = ledger.consume_fresh(fresh)
+        except OSError:
+            traceback.print_exc()
+            return bad(503, "escape_fresh_reservation_failed", "the launch reservation could not be saved")
+        if not consumed:
+            return bad(409, "escape_fresh_consumed", "this attempt or launch was already used on this hotel")
+        return fresh, None
+
+    def fresh_header_object(self, header: str, keys: frozenset, schema: str) -> dict | None:
+        """The one JSON object in *header*: exactly *keys*, *schema*, id fields and request_sha256 well formed.
+
+        None for anything else (absent, repeated, oversize, duplicate keys, wrong shape)."""
+        values = self.headers.get_all(header)
+        if values is None or len(values) != 1 or len(values[0]) > ESCAPE_FRESH_HEADER_MAX:
+            return None
 
         def unique(pairs):
             out = {}
@@ -4237,23 +4343,16 @@ class Handler(BaseHTTPRequestHandler):
                 out[k] = v
             return out
         try:
-            fresh = json.loads(values[0], object_pairs_hook=unique)
+            doc = json.loads(values[0], object_pairs_hook=unique)
         except (ValueError, RecursionError):
-            return None, invalid
-        if not isinstance(fresh, dict) or set(fresh) != ESCAPE_FRESH_KEYS \
-                or fresh["schema"] != ESCAPE_FRESH_SCHEMA \
-                or not all(isinstance(fresh[k], str) and ESCAPE_FRESH_ID_RE.fullmatch(fresh[k])
+            return None
+        if not isinstance(doc, dict) or set(doc) != keys or doc["schema"] != schema \
+                or not all(isinstance(doc[k], str) and ESCAPE_FRESH_ID_RE.fullmatch(doc[k])
                            for k in ("attempt_id", "report_id")) \
-                or not isinstance(fresh["request_sha256"], str) or not SHA256_HEX_RE.fullmatch(fresh["request_sha256"]):
-            return None, invalid
-        if self.headers.get_all("Idempotency-Key") is not None:
-            # A replayed create answers an old room: one attempt, one create actually performed.
-            return bad(400, "escape_fresh_idempotency_refused", "a fresh create is made without an Idempotency-Key")
-        if create_ask is not None or self.fork_snapshot_id(body) is not None:
-            return bad(400, "escape_fresh_plain_create_required", "a fresh create is not a serial, pool or fork create")
-        if not ledger.consume_fresh(fresh):
-            return bad(409, "escape_fresh_consumed", "this attempt or launch was already used on this hotel")
-        return fresh, None
+                or not all(isinstance(doc[k], str) and SHA256_HEX_RE.fullmatch(doc[k])
+                           for k in keys - {"schema", "attempt_id", "report_id"}):
+            return None
+        return doc
 
     def reserved_label_check(self, body: bytes | None) -> tuple[tuple[str, str] | None, dict | None]:
         """(refusal, ask) for a create. The ask says what the create requested, for the signing step.
