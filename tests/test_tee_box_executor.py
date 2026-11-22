@@ -1239,7 +1239,11 @@ def test_the_exec_wrapper_and_kill_script_really_end_a_process_tree(tmp_path):
         if process.poll() is None:
             process.kill()
         for pid in _alive(tree_pids):
-            os.kill(pid, 9)
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                # A process can exit after the cleanup's /proc snapshot.
+                pass
 
 
 def _parent(pid: int) -> int | None:

@@ -260,11 +260,14 @@ Callers: _reconcile_locked.
 
 ### pause, unpause (757-773)
 Purpose: `docker pause|unpause` (30 s); nonzero -> 502.
-Callers: freeze, thaw.
+Callers: freeze, thaw, snapshot (which always attempts the unpause after a pause).
 
 ### commit (775-787)
 Purpose: `docker commit <cid> <image>` (300 s) then `image inspect {{.Id}}`;
-nonzero commit -> 502 snapshot_failed. The room is not paused during commit.
+nonzero commit -> 502 snapshot_failed. Since AB#604 the snapshot caller pauses a
+running room for the tar and the commit, and the room runs again after, on every
+exit path. A room that was already paused stays paused. Uploads to the room
+(file and tar PUT) are refused with 409 snapshot_in_progress while the capture runs.
 Callers: snapshot.
 
 ### wait_dind_ready (789-810)
@@ -487,26 +490,56 @@ Purpose: _in_work then the inner host-side implementation (O_NOFOLLOW chain,
 B38 fixed). API writes count against disk_gib; room writes do not (B40).
 Callers: server routes.
 
-### snapshot (1557-1592)
-Purpose: inner snapshot first (tar of host /work into <base>/<snap>.tar.gz
-under the inner lock, store cap 1000 per hotel, named get-or-create); if the
-snapshot is new and the guest is live, `docker commit` to
-cathedral-snap-<snap>:latest (not paused: tar and commit are two instants);
-on commit failure delete the inner record; record sizes (image, layer,
-archive) into the record and the operation.
-Trusts: /work fits on the volume twice (B40 class); the 1000 store is shared
-by every tenant of a shared hotel.
-Side effects: tar file, docker image (kept until delete_snapshot or forever,
-H6).
+### snapshot (line numbers are of the 22e7824 read; the entry describes AB#604)
+Purpose: one capture taken at one moment. Overlay rooms (tunables with a runsc
+overlay) are refused 422 snapshot_overlay_unsupported. The inner provider
+reserves the snapshot id and name under its lock (second capture of the room or
+of the name: 409 snapshot_in_progress; the name from another room after the
+capture is done: 409 snapshot_name_taken; store full by count or bytes: 429
+snapshot_store_sold_out), and from then on file and tar PUT, freeze and thaw of
+that room are refused 409 snapshot_in_progress. The capture waits, up to 30 s,
+for writes, freezes and thaws already in flight (503 snapshot_writes_pending).
+A running room is then paused, /work is tarred (outside the lock, stopped at
+the byte cap and at a 900 s deadline), the room is committed to
+cathedral-snap-<snap>:latest, and the room is unpaused on every exit path. A
+room that was already paused stays paused. The engine, not the record, decides
+whether to pause: the capture reads the container first. The customer's freeze
+and thaw set the desired run state; a capture never changes it. After a pause or
+unpause whose result is not certain (a timeout, an error) the room is marked
+"reconcile needed": the sweep reads the container and pauses or unpauses it to
+match the desired state, through the same per-room admission as freeze and thaw
+(never during a capture, and a capture waits for it, or reconciles the room
+first inside its own admission). A marked room reports what the engine last said.
+The hash of the tar is
+taken after the unpause. The record (id, source room, tar digest, size, image
+id) is written once, in one step with the guest's image map. A capture with no
+guest or no committed image is an error (409 snapshot_image_missing).
+Trusts: /work and the layer fit on the volume; the store caps are per machine.
+Side effects: tar file, docker image (kept until delete_snapshot or expiry).
 Callers: server snapshot route.
+
+### fork (create with snapshot_id; AB#604)
+What a fork gets: A fork gets a copy of the files. It does not get the first room's sealed env, secret mounts or the values of variables given at create. A secret that was written into a file is a file.
+Purpose: the fork starts from the record's committed image id and from /work as the stored tar held it. It is
+refused 404 snapshot_not_found after the snapshot's lifetime, even before the sweep runs. The stored tar is
+opened once; the bytes that are unpacked are the bytes that are hashed, into a staging folder inside the new
+room. The files become /work only if the digest equals the record's. A digest mismatch, a short or damaged
+tar, a missing image, or an image with another id is 409 snapshot_corrupt, and the new room is removed before
+any start (no container, no record, no folder, no image tag). The commit blanked each create-time variable with
+`--change "ENV NAME="`, which leaves the name with an empty value; the fork's own request env wins. A plain
+create of a snapshot's image, by id, name, tag, digest, template or another tag on it, is 400
+snapshot_image_fork_only for a caller who holds the image; another caller keeps image_not_owned. A fork is a new
+room: terminals, PTY sessions and kept exec results are keyed by room id in memory, and the fork has a new id.
 
 ### _snapshot_sizes, list_snapshots (1594-1618)
 Purpose: byte accounting; list from the inner store plus sizes.
 
-### delete_snapshot (1620-1626)
-Purpose: inner delete (False when the record is gone), drop meta, `docker
-image rm` when this process knows the image. The server answers 404 when the
-inner record was gone even though the image was just removed.
+### delete_snapshot (AB#604)
+Purpose: inner delete (False when the record is gone), drop meta, `docker image rm`. A removal that fails while
+the image is still there (a fork still runs from it) is kept in _pending_image_rm and retried by every sweep
+until it is gone; the delete answers 200 {"deleted": true, "image_removal": "pending"} (a clean delete answers
+{"deleted": true}). An expired snapshot's image goes the same way. A delete is a delete request; it does not
+say the bytes are erased.
 Callers: server route.
 
 ### push_snapshot (1628-1639)

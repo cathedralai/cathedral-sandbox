@@ -60,7 +60,7 @@ added `GET /v1/images` and `DELETE /v1/images/pins/{ref}` (71 rows).
 | POST | `/v1/sandboxes/{id}/terminals/{tid}/resize` | `terminal_resize` | 3 |
 | POST | `/v1/sandboxes/{id}/publish` | `publish` | 3 |
 | DELETE | `/v1/snapshots/{id}` | `snapshot_delete` (carries `snapshot_id`) | 3 |
-| POST | `/v1/snapshots/{id}/push` | `snapshot_push` | 3 |
+| POST | `/v1/snapshots/{id}/push` | none: refused 403 `snapshot_push_refused` at the front, unsent (AB#604) | 3 |
 | POST | `/v1/workspaces` | `workspace_create` | 3 |
 | DELETE | `/v1/workspaces/{name}` | `workspace_delete` | 3 |
 | POST | `/v1/workspaces/{name}/versions` | `workspace_version` | 3 |

@@ -2419,3 +2419,32 @@ func TestMeteredGuestWithoutOwnHostsOnlyWaitsForAJoinedMinerHotel(t *testing.T) 
 	tc.syncAll("miner-d")
 	tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
 }
+
+// A postpaid guest can never be metered: the config is refused, so a
+// typo cannot put const behind the allowance gate.
+func TestPostpaidGuestCannotBeMetered(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	raw, _ := os.ReadFile(tc.cfgPath)
+	var cfg config
+	_ = json.Unmarshal(raw, &cfg)
+	cfg.Guests[0].Metered = true
+	cfg.Guests[0].Postpaid = true
+	out, _ := json.Marshal(cfg)
+	_ = os.WriteFile(tc.cfgPath, out, 0o600)
+	if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "postpaid") {
+		t.Fatalf("metered and postpaid guest: %v", err)
+	}
+}
+
+// A postpaid guest is admitted with no allowance at all, and the ledger
+// cannot close it: PUT cap 0 answers 409 guest_not_metered.
+func TestPostpaidGuestIsNeverRefusedForAllowance(t *testing.T) {
+	tc, _ := meteredChain(t, func(c *config) { c.Guests[1].Postpaid = true }) // g1 metered, g2 postpaid
+	if status, doc := tc.call(t, "operator-key", "PUT", "/v1/broker/guests/g2/allowance", allowanceBody(1, 0)); status != 409 || errCode(doc) != "guest_not_metered" {
+		t.Fatalf("PUT cap 0 on a postpaid guest: %d %v", status, doc)
+	}
+	tc.room(t, "key2", map[string]any{"image": "alpine:3.20"})
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"image": "alpine:3.20"}); status != 402 {
+		t.Fatalf("metered guest with no allowance: %d %v", status, doc)
+	}
+}

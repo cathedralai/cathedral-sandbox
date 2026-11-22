@@ -72,6 +72,7 @@ from cathedral.sandbox_provider import (
     SandboxOpError,
     _parse_label_filters,
     _render_cmd,
+    looks_like_snapshot_id,
     provider_from_environment,
     read_log_page,
     validated_log_page,
@@ -142,6 +143,10 @@ DIND_DOCKERD_ARGS_DEFAULT = (
     "--default-address-pool",
     "base=172.28.0.0/16,size=24",
 )
+
+
+# AB#920: the liveness docker ps answers within this or is skipped for one window.
+LIVENESS_PS_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -1192,7 +1197,7 @@ class DockerClient:
         """
         return [(cid, sid) for cid, _state, sid in self.list_labeled_states(owner)]
 
-    def list_labeled_states(self, owner: str) -> list[tuple[str, str, str]]:
+    def list_labeled_states(self, owner: str, *, timeout: float = 60.0) -> list[tuple[str, str, str]]:
         """(container_id, docker State, sandbox_id) for all containers with our owner label.
 
         State is docker's word (running, exited, paused, created, dead). Raises
@@ -1209,7 +1214,7 @@ class DockerClient:
                 "--format",
                 "{{.ID}} {{.State}} {{.Label \"" + LABEL_SANDBOX_ID + "\"}}",
             ],
-            timeout=60.0,
+            timeout=timeout,
         )
         if result.returncode != 0:
             raise SandboxOpError(
@@ -1243,8 +1248,23 @@ class DockerClient:
                 f"docker unpause failed: {(result.stderr or result.stdout or '')[:200]}",
             )
 
-    def commit(self, container_id: str, image_name: str) -> str:
-        result = self.run(["docker", "commit", container_id, image_name], timeout=300.0)
+    def engine_status(self, container_id: str) -> str:
+        """The container's engine status ("running", "paused", "exited", ...), or "gone" when it does not exist.
+        Raises 502 when the engine cannot be read."""
+        result = self.run(["docker", "inspect", "--format", "{{.State.Status}}", container_id], timeout=15.0)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        if "no such" in (result.stderr or "").lower():
+            return "gone"
+        raise SandboxOpError("docker_inspect_failed", 502, f"docker inspect failed: {(result.stderr or '')[:200]}")
+
+    def commit(self, container_id: str, image_name: str, *, blank_env: Iterable[str] = ()) -> str:
+        # `--change "ENV NAME="` leaves the name in the image with an empty value. It does not remove it.
+        names = list(blank_env)
+        if not all(_ENV_NAME_OK.fullmatch(n) for n in names):
+            raise SandboxOpError("snapshot_env_name_unsupported", 422, "a variable name cannot be written into a --change")
+        changes = [arg for name in names for arg in ("--change", f"ENV {name}=")]
+        result = self.run(["docker", "commit", *changes, container_id, image_name], timeout=300.0)
         if result.returncode != 0:
             raise SandboxOpError(
                 "snapshot_failed",
@@ -1677,6 +1697,28 @@ def _sweep_stale_bases(own: Path) -> None:
         return
 
 
+def _runs_on_overlay(guest: GuestRecord) -> bool:
+    """True when the room's tunables set a runsc overlay (root:self or all:self), whose root file
+    system writes a snapshot does not see. A room without tunables runs the hotel's own default."""
+    if guest.tunables is None:
+        return False
+    overlay = ((guest.tunables.get("values") or {}).get("runsc") or {}).get("overlay2")
+    return overlay is not None and str(overlay) != "none"
+
+
+_ENV_NAME_OK = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+
+@dataclass(frozen=True)
+class _ForkPin:
+    """A snapshot resolved once for a fork: id, the stored entry it was admitted against, the verified image."""
+
+    snap_id: str
+    image_name: str
+    image_id: str
+    entry: tuple
+
+
 class DockerGuestProvider:
     """SandboxProvider that runs each sandbox as a real Linux Docker (or Kata) guest."""
 
@@ -1695,6 +1737,20 @@ class DockerGuestProvider:
         self._default_image = default_image
         self._guests: dict[str, GuestRecord] = {}
         self._snapshot_images: dict[str, str] = {}
+        # Reconcile state, all under self._inner._lock (see _converge): room id -> what the engine last said.
+        self._reconcile_pending: dict[str, str | None] = {}
+        self._reconcile_failures: dict[str, int] = {}
+        self._reconciling: set[str] = set()
+        # Rooms whose container a reconcile, a thaw or the liveness read (AB#920) found exited, dead or
+        # gone, with why when known: GET, wait and list say "failed" from then on, never what the
+        # customer last asked for.
+        self._ended_rooms: dict[str, str | None] = {}
+        self._lifecycle_locks: dict[str, threading.Lock] = {}
+        self._fork_pins: dict[str, _ForkPin] = {}  # new room id -> the pin its fork starts from
+        self._pending_image_rm: dict[str, int] = {}  # snapshot image -> failed removals, retried each sweep
+        # Snapshot image -> committed id, from the record's drop until the image is gone (under the provider
+        # lock). D7 keeps refusing a plain create from it: a room started from it would keep the image in use.
+        self._doomed_image_ids: dict[str, str] = {}
         self._snapshot_meta: dict[str, dict[str, Any]] = {}  # snapshot id -> sizes and image
         self._snapshot_owners: dict[str, str] = {}  # snapshot id -> owner_id (AB#650)
         self._built_images: dict[str, str] = {}  # content_hash -> tag
@@ -1747,6 +1803,11 @@ class DockerGuestProvider:
         self._kill_timeout = _env_float("CATHEDRAL_SANDBOX_KILL_TIMEOUT", 10.0, minimum=0.1)
         self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
         self._last_reconcile: float | None = None
+        # AB#920: GET, wait and list read every room's engine state from one docker ps, at most once
+        # per this many seconds; concurrent callers share the read in flight.
+        self._liveness_max_age = _env_float("CATHEDRAL_SANDBOX_LIVENESS_SECONDS", 3.0)
+        self._liveness_at: float | None = None
+        self._liveness_lock = threading.Lock()
         # AB#864: docker State per room id from the last reconcile, and why a
         # stopped room's container ended (oom_killed / container_exited). A dead
         # room stays listed until TTL or idle; these only say why it is dead.
@@ -1849,8 +1910,9 @@ class DockerGuestProvider:
         return normalize_image_id(str(inspected.get("Id") or ""))
 
     def _require_snapshot_owner(self, snapshot_ref: str, owner: str) -> None:
-        """Refuse a fork of another guest's snapshot on the same hotel key."""
-        snap_id = self._resolve_snapshot(snapshot_ref)
+        """Refuse a fork of another guest's snapshot on the same hotel key. *snapshot_ref* is a snapshot id,
+        resolved once by the caller; it is looked up by id only."""
+        snap_id = self._snapshot_by_id(snapshot_ref)
         if snap_id is None:
             # Inner visibility (per api_key) still answers snapshot_not_found.
             return
@@ -2068,34 +2130,133 @@ class DockerGuestProvider:
         return self._default_image
 
     def _resolve_snapshot(self, ref: str) -> str | None:
-        """Return the snapshot id for *ref* (an id or a name), or None when unknown."""
+        """Return the snapshot id for *ref* (an id or a name), or None when unknown or expired.
+
+        An expired snapshot is not found, before anything else about it is looked at."""
         with self._inner._lock:  # noqa: SLF001
             snapshots = self._inner._snapshots  # noqa: SLF001
             visible = self._inner._snapshot_visible  # noqa: SLF001
-            if ref in snapshots and visible(ref):
+            expired = self._inner._snapshot_expired  # noqa: SLF001
+            if ref in snapshots and visible(ref) and not expired(snapshots[ref][1]):
                 return ref
+            if looks_like_snapshot_id(ref):
+                # An id-shaped reference is an id only: a name equal to a gone or expired id is not followed.
+                return None
             for sid, (_, rec) in snapshots.items():
-                if rec.name == ref and visible(sid):
+                if rec.name == ref and visible(sid) and not expired(rec):
                     return sid
         return None
 
-    def _snapshot_image(self, ref: str) -> str:
-        """Return the committed image of snapshot *ref*. Never fall back to another image.
+    def _snapshot_by_id(self, snap_id: str) -> str | None:
+        """*snap_id* when it names a visible, unexpired snapshot by id; never matched against names, so a name
+        can not redirect a lookup that already resolved to an id."""
+        with self._inner._lock:  # noqa: SLF001
+            snapshots = self._inner._snapshots  # noqa: SLF001
+            if snap_id in snapshots and self._inner._snapshot_visible(snap_id) \
+                    and not self._inner._snapshot_expired(snapshots[snap_id][1]):  # noqa: SLF001
+                return snap_id
+        return None
 
-        Unknown snapshot: 404 snapshot_not_found. A known snapshot record with no
-        committed image on this host: 409 snapshot_image_missing.
-        """
-        snap_id = self._resolve_snapshot(ref)
+    def _pin_snapshot(self, ref: str) -> "_ForkPin":
+        """Look up snapshot id *ref* (by id only; the caller resolved any name once) and verify its image.
+        The pin carries the snapshot id, the stored entry and the verified image id; a fork starts from the
+        pin, never from a name or a tag.
+
+        Unknown or expired: 404 snapshot_not_found. A record whose committed image is gone from this host,
+        or has another id than the record's committed_image_id: 409 snapshot_corrupt."""
+        snap_id = self._snapshot_by_id(ref)
         if snap_id is None:
             raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {ref} on this host")
-        image = self._snapshot_images.get(snap_id)
-        if not image or not self._client.image_exists(image):
-            raise SandboxOpError(
-                "snapshot_image_missing",
-                409,
-                f"snapshot {snap_id} has no committed image on this host",
+        with self._inner._lock:  # noqa: SLF001
+            entry = self._inner._snapshots.get(snap_id)  # noqa: SLF001
+            image = self._snapshot_images.get(snap_id)
+            expected = self._snapshot_meta.get(snap_id, {}).get("committed_image_id")
+        if entry is None:
+            raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {ref} on this host")
+        if not image or not expected or not self._client.image_exists(image):
+            raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {snap_id} has no committed image on this host")
+        if self._image_id_of(image) != expected:
+            raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {snap_id}: its image is not the one that was captured")
+        return _ForkPin(snap_id, image, expected, entry)
+
+    def _snapshot_changed_during_start(
+        self, request: CreateSandboxRequest, pin: "_ForkPin | None", run_image: str
+    ) -> SandboxOpError | None:
+        """The refusal for a container that started from a snapshot whose standing changed meanwhile, or None."""
+        if pin is not None:
+            if not self._pin_still_holds(pin):
+                return SandboxOpError("snapshot_corrupt", 409, f"snapshot {pin.snap_id} changed during the fork")
+            return None
+        if request.snapshot_id is None and run_image.removeprefix("sha256:") in self._snapshot_image_keys()[0]:
+            return SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
+        return None
+
+    def _pin_still_holds(self, pin: "_ForkPin") -> bool:
+        with self._inner._lock:  # noqa: SLF001
+            return (
+                self._inner._snapshots.get(pin.snap_id) is pin.entry  # noqa: SLF001
+                and self._snapshot_meta.get(pin.snap_id, {}).get("committed_image_id") == pin.image_id
             )
-        return image
+
+    def _snapshot_image(self, ref: str) -> str:
+        """The committed image name of snapshot *ref*, verified (see _pin_snapshot)."""
+        return self._pin_snapshot(ref).image_name
+
+    # ---- D7: only the fork call may start a snapshot's image
+    _HEX_ID = re.compile(r"(?:sha256:)?([0-9a-f]{64})")
+    _NAME_ONLY = "name-only"  # a reserved snapshot image name whose id this provider does not hold
+
+    def _snapshot_image_keys(self) -> tuple[set[str], dict[str, str]]:
+        """(committed image ids as 64 hex, image name -> id) of every snapshot this provider holds."""
+        with self._inner._lock:  # noqa: SLF001
+            metas = list(self._snapshot_meta.values())
+            metas += [{"image": image, "committed_image_id": iid} for image, iid in self._doomed_image_ids.items()]
+        ids = {m["committed_image_id"].removeprefix("sha256:") for m in metas if m.get("committed_image_id")}
+        names = {m["image"]: m.get("committed_image_id", "") for m in metas if m.get("image")}
+        return ids, names
+
+    def _names_snapshot_image(self, ref: str | None, digest: str | None = None) -> str | None:
+        """The snapshot image *ref* (id, name, tag, name@digest, a template that resolves to one, or
+        another tag on the same image) or *digest* names: its id, _NAME_ONLY for a name in the reserved
+        cathedral-snap- space whose id is not known here, or None. Taken under the provider lock."""
+        ids, names = self._snapshot_image_keys()
+        seen: set[str] = set()
+        candidates = [ref or "", digest or ""]
+        if ref:
+            with self._inner._lock:  # noqa: SLF001
+                tmpl = self._inner._templates.get(ref)  # noqa: SLF001
+            if tmpl is not None:
+                candidates.append(tmpl.image_ref)
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            base = cand.split("@", 1)[0]
+            for key in (cand, base):
+                if key in names:
+                    return names[key] or self._NAME_ONLY
+            if base.startswith("cathedral-snap-"):
+                return self._NAME_ONLY
+            for part in (cand, cand.split("@", 1)[-1]):
+                m = self._HEX_ID.fullmatch(part.strip().lower())
+                if m and m.group(1) in ids:
+                    return "sha256:" + m.group(1)
+        # Another tag on the same image: the engine's own id decides (no snapshot, nothing to compare).
+        if not ids:
+            return None
+        for cand in candidates[:1] + candidates[2:]:
+            if cand and self._client.image_exists(cand):
+                inspected = normalize_image_id(str(self._client.image_inspect(cand).get("Id") or ""))
+                if inspected is not None and inspected.removeprefix("sha256:") in self._snapshot_image_keys()[0]:
+                    return inspected
+        return None
+
+    def _owner_holds_image(self, image_id: str, owner: str) -> bool:
+        try:
+            self._image_owners.require(image_id, owner)
+        except SandboxOpError:
+            return False
+        return True
 
     def create(
         self,
@@ -2112,10 +2273,26 @@ class DockerGuestProvider:
             owner = owner_id(api_key, None)
         if request.build is not None:
             refuse_shared_hotel_build()
+        replay = self._replay_of_started_create(api_key, owner, idempotency, body_digest)
+        if replay is not None:
+            # A retry of a create that already started its rooms answers as it did, even if its snapshot
+            # has since expired or gone: nothing new starts, so there is nothing to resolve.
+            return replay
+        pin: _ForkPin | None = None
         if request.snapshot_id is not None:
-            # Fail before any record exists. A fork never starts another image.
-            self._require_snapshot_owner(request.snapshot_id, owner)
-            self._snapshot_image(request.snapshot_id)
+            # Fail before any record exists. A fork never starts another image. The snapshot is resolved
+            # ONCE here; from now on the fork carries its id, not the name or a tag.
+            snap_id = self._resolve_snapshot(request.snapshot_id)
+            if snap_id is None:
+                raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {request.snapshot_id} on this host")
+            self._require_snapshot_owner(snap_id, owner)
+            pin = self._pin_snapshot(snap_id)
+            request = replace(request, snapshot_id=snap_id)
+        elif request.image is not None:
+            match = self._names_snapshot_image(request.image.image, request.image.digest)
+            # A caller who does not hold the image gets the ownership refusal as before; the owner gets this one.
+            if match and (match == self._NAME_ONLY or self._owner_holds_image(match, owner)):
+                raise SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
         if request.workspace is not None:
             # Fail before any record exists: 404 for a workspace of another owner.
             if self._workspaces is None:
@@ -2132,6 +2309,12 @@ class DockerGuestProvider:
         batch = docs["sandboxes"] if "sandboxes" in docs else [docs]
         started: list[dict[str, Any]] = []
         try:
+            if pin is not None:
+                for doc in batch:
+                    self._fork_pins[doc["id"]] = pin
+                if not self._pin_still_holds(pin):
+                    # The record or its image changed while the files were unpacked: nothing starts.
+                    raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {pin.snap_id} changed during the fork")
             for doc in batch:
                 existing = self._guests.get(doc["id"])
                 if existing is not None:
@@ -2143,6 +2326,7 @@ class DockerGuestProvider:
             # guest of this batch, so no ghost holds quota, and forget the
             # Idempotency-Key so a retry creates again.
             for doc in batch:
+                self._fork_pins.pop(doc["id"], None)
                 self.delete(doc["id"])
             if scoped_idem is not None:
                 with self._inner._lock:  # noqa: SLF001
@@ -2150,6 +2334,29 @@ class DockerGuestProvider:
                     if seen is not None and seen[1] is docs:
                         del self._inner._idempotency[(api_key, scoped_idem)]  # noqa: SLF001
             raise
+        if "sandboxes" in docs:
+            return {"sandboxes": started, "count": len(started)}
+        return started[0]
+
+    def _replay_of_started_create(
+        self, api_key: str | None, owner: str, idempotency: str | None, body_digest: str
+    ) -> dict[str, Any] | None:
+        """The stored answer of an Idempotency-Key create with the same body whose rooms all have a guest, or None.
+
+        None sends the request down the full create path, which checks the snapshot and answers any conflict.
+        """
+        if idempotency is None:
+            return None
+        with self._inner._lock:  # noqa: SLF001
+            seen = self._inner._idempotency.get((api_key, f"{owner_hash(owner)}:{idempotency}"))  # noqa: SLF001
+        if seen is None or seen[0] != body_digest:
+            return None
+        docs = seen[1]
+        batch = docs["sandboxes"] if "sandboxes" in docs else [docs]
+        guests = [self._guests.get(doc["id"]) for doc in batch]
+        if any(guest is None for guest in guests):
+            return None
+        started = [self._enrich_doc(doc, guest) for doc, guest in zip(batch, guests)]
         if "sandboxes" in docs:
             return {"sandboxes": started, "count": len(started)}
         return started[0]
@@ -2390,17 +2597,19 @@ class DockerGuestProvider:
                 # An Idempotency-Key replay of a sandbox that is gone or going.
                 raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
         effective_owner = owner if owner is not None else owner_id(None, None)
-        image = self._image_for(request)
+        pin: _ForkPin | None = None
         if request.snapshot_id is not None:
-            # Snapshot image must already be granted to the source room's owner.
-            image_id = self._image_id_of(image)
-            if image_id is None:
-                raise SandboxOpError(
-                    "snapshot_image_missing",
-                    409,
-                    f"snapshot {request.snapshot_id} has no committed image on this host",
-                )
-            self._image_owners.require(image_id, effective_owner)
+            # A fork starts from the pin made when the create began: the image ID that was verified, never a
+            # name or a tag that may name something else now.
+            pin = self._fork_pins.pop(sandbox_id, None)
+            if pin is None or not self._pin_still_holds(pin):
+                raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {request.snapshot_id} changed during the fork")
+            image = pin.image_name
+            self._image_owners.require(pin.image_id, effective_owner)
+        else:
+            image = self._image_for(request)
+        if pin is not None:
+            pass
         elif request.image is not None:
             # Authorize pulls (or rechecks credentials) to earn the grant; one
             # inspect afterwards fills the create receipt. Do not call
@@ -2425,8 +2634,13 @@ class DockerGuestProvider:
                 "digest": request.build.content_hash,
             }
         dind = is_dind_image(image)
-        auth = request.image.registry_auth if request.image is not None else None
-        inspected = self._inspect_pulled_image(image, registry_auth=auth)
+        if pin is not None:
+            inspected = self._client.image_inspect(pin.image_id)
+            if normalize_image_id(str(inspected.get("Id") or "")) != pin.image_id:
+                raise SandboxOpError("snapshot_corrupt", 409, f"snapshot {pin.snap_id}: its image is not the one that was captured")
+        else:
+            auth = request.image.registry_auth if request.image is not None else None
+            inspected = self._inspect_pulled_image(image, registry_auth=auth)
         # Pin docker run to the inspected Id. Allowlist / start:image decisions
         # were made against this inspect; running the mutable tag would race a
         # retag between inspect and create (AB#709 HOLD).
@@ -2442,6 +2656,10 @@ class DockerGuestProvider:
             # The grant above was made against an earlier inspect; the tag may
             # have moved to another owner's Id since. Re-check the Id that runs.
             self._image_owners.require(run_image, effective_owner)
+        if request.snapshot_id is None and run_image.removeprefix("sha256:") in self._snapshot_image_keys()[0]:
+            # D7 again, on the Id that will run, after every step that pulled, built or waited:
+            # whatever name got here (image, template, build, default), a snapshot's image starts only by fork.
+            raise SandboxOpError("snapshot_image_fork_only", 400, "a snapshot's image starts only through a fork of that snapshot")
         room_tunables = self._tunables_for(request, image, dind)
         work = Path(self._inner._sandboxes[sandbox_id].root) / "work"  # noqa: SLF001
         self._limit_work(sandbox_id, work.parent, request.resources.disk_gib)
@@ -2495,6 +2713,16 @@ class DockerGuestProvider:
             self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
             self._release_pending(sandbox_id)
             raise SandboxOpError("sandbox_not_found", 404, f"no sandbox {sandbox_id}")
+        late = self._snapshot_changed_during_start(request, pin, run_image)
+        if late is not None:
+            # docker run ran outside the provider lock, so a check before it leaves a window: a snapshot deleted
+            # or replaced (fork), or published for this image (ordinary create), while the container started.
+            # Checked again now that it runs, before it is registered; cleaned up as an egress failure is.
+            self._client.remove_confirmed(container_id, timeout=self._rm_timeout)
+            if attach and self._egress is not None:
+                self._egress.forget(container_id)
+            self._release_pending(sandbox_id)
+            raise late
         with self._doomed_lock:
             self._net_pending.pop(sandbox_id, None)
         self._guests[sandbox_id] = GuestRecord(
@@ -2792,6 +3020,14 @@ class DockerGuestProvider:
             cancelled=cancelled,
         )
 
+    @staticmethod
+    def _refuse_probe_on_paused(code: int, err: str) -> None:
+        """A probe the engine refused because the room is paused or stopped says nothing about the image:
+        it must not be cached as "no bash" or "no timeout tool". The caller retries when the room runs."""
+        low = (err or "").lower()
+        if code != 0 and ("is paused" in low or "is not running" in low):
+            raise SandboxOpError("sandbox_paused", 409, "the room is paused or stopped; try again when it runs", retry_after=5)
+
     def cancel_exec(self, sandbox_id: str, token: str) -> str:
         """Stop the exec that started with ``token``. The answer is a word, see AB#406 spec 3.1."""
         with self._inner._lock:  # noqa: SLF001
@@ -2900,9 +3136,10 @@ class DockerGuestProvider:
     def _has_bash(self, guest: GuestRecord) -> bool:
         """True when the guest image can run ``bash``. Probe once; the probe has no side effect."""
         if guest.has_bash is None:
-            code, _, _, _ = self._client.exec(
+            code, _, err, _ = self._client.exec(
                 guest.container_id, ["bash", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
             )
+            self._refuse_probe_on_paused(code, err)
             guest.has_bash = code == 0
         return guest.has_bash
 
@@ -2915,9 +3152,10 @@ class DockerGuestProvider:
             return guest.timeout_form
         form = "none"
         for name, probe in (("gnu", ["timeout", "5", "true"]), ("busybox", ["timeout", "-t", "5", "true"])):
-            code, _, _, _ = self._client.exec(
+            code, _, err, _ = self._client.exec(
                 guest.container_id, probe, cwd=None, env={}, timeout_seconds=20, stdin=None
             )
+            self._refuse_probe_on_paused(code, err)
             if code == 0:
                 form = name
                 break
@@ -3101,48 +3339,281 @@ class DockerGuestProvider:
         name: str | None = None,
         labels: dict[str, str] | None = None,
     ) -> str:
-        op_id = self._inner.snapshot(
-            sandbox_id, ttl_seconds=ttl_seconds, name=name, labels=labels
-        )
-        result = self._inner.get_operation(op_id)["result"]
-        snap_id = result["snapshot_id"]
-        if snap_id in self._snapshot_images:
-            # A named snapshot is get-or-create: keep the first commit unchanged.
-            return op_id
+        """Capture one moment of a room (AB#604): pause, tar /work, commit, unpause.
+
+        Lock order: only self._inner._lock, taken for short steps inside the inner provider's
+        begin / finish / abort calls; docker, the tar and the hash run with no lock held.
+        A running room is paused for the tar and the commit only and runs again on every exit path;
+        a room that was already paused stays paused. Nothing is recorded until the capture is whole.
+        """
         guest = self._guests.get(sandbox_id)
-        if guest is None:
-            return op_id
+        if guest is not None and _runs_on_overlay(guest):
+            raise SandboxOpError(
+                "snapshot_overlay_unsupported", 422,
+                "this room runs with a runsc overlay, which keeps root file system writes out of a snapshot",
+            )
+        done, capture = self._inner.begin_snapshot(sandbox_id, ttl_seconds=ttl_seconds, name=name, labels=labels)
+        if capture is None:
+            return done  # type: ignore[return-value]  # a repeat from the same room: the stored record
+        snap_id = capture.snapshot_id
         image_name = f"cathedral-snap-{snap_id}:latest"
+        commit_attempted = False  # once a commit was attempted an image may exist, whatever the call answered
+        granted: tuple[str, str] | None = None
         try:
-            self._client.commit(guest.container_id, image_name)
-        except SandboxOpError:
-            # Drop the record, so no fork can find a snapshot without an image.
-            self._inner.delete_snapshot(snap_id)
-            raise
-        # Ownership comes from the source room, not the snapshot request labels.
-        snap_owner = guest.owner if guest.owner is not None else owner_id(None, None)
-        image_id = self._image_id_of(image_name)
-        if image_id is None:
-            self._inner.delete_snapshot(snap_id)
-            self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
-            raise SandboxOpError("snapshot_image_missing", 409, f"snapshot {snap_id} has no docker id after commit")
-        try:
+            unsafe = [n for n in capture.env_names if not _ENV_NAME_OK.fullmatch(n)]
+            if unsafe:
+                # A name that is not plain cannot go into `docker commit --change` (Docker reads it as Dockerfile
+                # text). Blanking cannot be skipped, so the snapshot is refused, before anything is paused.
+                raise SandboxOpError(
+                    "snapshot_env_name_unsupported", 422,
+                    f"{len(unsafe)} create-time variable name(s) of this room cannot be blanked safely; "
+                    "names must match [A-Za-z_][A-Za-z0-9_]{0,127}",
+                )
+            if guest is None:
+                # No guest, no image: a tar alone is not a snapshot a fork could start.
+                raise SandboxOpError("snapshot_image_missing", 409, f"sandbox {sandbox_id} has no guest to commit")
+            self._inner.wait_for_api_writes(capture)  # also waits for freezes, thaws and reconciles in flight
+            # Nothing else can touch the room's run state now. A marked room is reconciled first, inside
+            # this capture's admission (the other choice, refusing, would leave a marked room uncapturable
+            # until a sweep came by); if it cannot be, the capture is refused, retryable.
+            if sandbox_id in self.pending_reconciles():
+                try:
+                    self._converge(sandbox_id, guest)
+                except SandboxOpError as exc:
+                    raise SandboxOpError(
+                        "snapshot_reconcile_failed", 503, f"room {sandbox_id} could not be brought to its run state: {exc}",
+                        retry_after=5,
+                    ) from exc
+            engine_state = self._read_state(guest)  # the engine decides whether to pause, not the record
+            if engine_state not in ("running", "paused"):
+                raise SandboxOpError(
+                    "snapshot_room_state_unknown", 503, f"room {sandbox_id} is {engine_state or 'unreadable'}; try again", retry_after=5
+                )
+            was_frozen = engine_state == "paused"
+            pause_attempted = False
+            try:
+                if not was_frozen:
+                    pause_attempted = True  # from here the unpause is always attempted, even if the pause timed out
+                    self._client.pause(guest.container_id)
+                size = self._inner.write_snapshot_archive(capture)
+                commit_attempted = True
+                self._client.commit(
+                    guest.container_id, image_name, **({"blank_env": capture.env_names} if capture.env_names else {})
+                )
+                image_id = self._image_id_of(image_name)
+                if image_id is None:
+                    raise SandboxOpError("snapshot_image_missing", 409, f"snapshot {snap_id} has no docker id after commit")
+            except BaseException:
+                if pause_attempted:
+                    self._unpause_after_capture(guest, sandbox_id, strict=False)
+                raise
+            if pause_attempted:
+                self._unpause_after_capture(guest, sandbox_id, strict=True)
+            sha = self._inner.hash_snapshot_archive(capture)
+            # Ownership comes from the source room, not the snapshot request labels.
+            snap_owner = guest.owner if guest.owner is not None else owner_id(None, None)
             self._image_owners.grant(image_id, snap_owner, provenance="snapshot", ref=image_name)
-        except SandboxOpError:
-            self._inner.delete_snapshot(snap_id)
-            self._client.run(["docker", "image", "rm", image_name], timeout=60.0)
+            granted = (image_id, snap_owner)
+            meta = {**self._snapshot_sizes(snap_id, image_name, guest.image, size), "committed_image_id": image_id,
+                    "work_archive_sha256": sha}
+            extra = {k: v for k, v in meta.items() if k not in ("size_bytes", "work_archive_bytes", "work_archive_sha256")}
+
+            def publish() -> None:
+                # Runs under the provider lock, in the same hold that inserts the record.
+                self._snapshot_images[snap_id] = image_name
+                self._snapshot_owners[snap_id] = snap_owner
+                self._snapshot_meta[snap_id] = meta
+
+            return self._inner.finish_snapshot(
+                capture, size_bytes=meta["size_bytes"], work_archive_bytes=size, work_archive_sha256=sha, extra=extra,
+                publish=publish,
+            )
+        except BaseException:
+            with self._inner._lock:  # noqa: SLF001
+                self._snapshot_images.pop(snap_id, None)
+                self._snapshot_owners.pop(snap_id, None)
+                self._snapshot_meta.pop(snap_id, None)
+            if granted is not None:
+                try:
+                    self._image_owners.drop_owner(*granted)
+                except Exception:  # noqa: BLE001  cleanup must not hide the first error
+                    pass
+            if commit_attempted:
+                self._remove_snapshot_image(image_name)
             raise
-        self._snapshot_images[snap_id] = image_name
-        self._snapshot_owners[snap_id] = snap_owner
-        sizes = self._snapshot_sizes(snap_id, image_name, guest.image, int(result.get("size_bytes") or 0))
-        self._snapshot_meta[snap_id] = sizes
+        finally:
+            self._inner.abort_snapshot(capture)
+
+    # ---- reconcile: read the engine, converge to what the customer asked for (AB#604)
+    # The customer's freeze and thaw set the desired run state (the record's "frozen" or "running").
+    # A capture never changes it. After an engine pause or unpause whose result is not certain, the room
+    # is marked "reconcile needed" (_reconcile_pending, room id -> the engine status last read, None
+    # unread). Nothing is assumed. A reconcile reads the container, then pauses or
+    # unpauses to match the desired state. It is a lifecycle operation: it takes the same per-room admission
+    # as freeze, thaw and writes (never during a capture; a capture waits for it) and the per-room lifecycle
+    # lock (never crossing a customer freeze or thaw). All of this state is read and written under the
+    # provider lock; no engine call is made under it.
+    _BENIGN_UNPAUSE = ("is not paused", "is not running", "no such container")
+    _BENIGN_PAUSE = ("is already paused",)
+
+    def _lifecycle_lock(self, sandbox_id: str) -> threading.Lock:
         with self._inner._lock:  # noqa: SLF001
-            entry = self._inner._snapshots.get(snap_id)  # noqa: SLF001
-            if entry is not None:
-                path, rec = entry
-                self._inner._snapshots[snap_id] = (path, replace(rec, size_bytes=sizes["size_bytes"]))  # noqa: SLF001
-            self._inner._operations[op_id]["result"].update(sizes)  # noqa: SLF001
-        return op_id
+            return self._lifecycle_locks.setdefault(sandbox_id, threading.Lock())
+
+    def _read_state(self, guest: GuestRecord) -> str | None:
+        """The container's engine status ("running", "paused", "exited", "gone"), None when unreadable."""
+        try:
+            return self._client.engine_status(guest.container_id)
+        except SandboxOpError:
+            return None
+
+    def _set_mark(self, sandbox_id: str, engine_state: str | None) -> int:
+        with self._inner._lock:  # noqa: SLF001
+            self._reconcile_pending[sandbox_id] = engine_state
+            self._reconcile_failures[sandbox_id] = self._reconcile_failures.get(sandbox_id, 0) + 1
+            return self._reconcile_failures[sandbox_id]
+
+    _ENDED = ("gone", "exited", "dead")
+
+    def _note_ended(self, sandbox_id: str, reason: str | None = None) -> None:
+        """The engine says the room's container is not there to run: no reconcile is owed, and GET says failed."""
+        with self._inner._lock:  # noqa: SLF001
+            self._reconcile_pending.pop(sandbox_id, None)
+            self._reconcile_failures.pop(sandbox_id, None)
+            if reason is not None or sandbox_id not in self._ended_rooms:
+                self._ended_rooms[sandbox_id] = reason
+
+    def _clear_mark(self, sandbox_id: str) -> None:
+        with self._inner._lock:  # noqa: SLF001
+            self._reconcile_pending.pop(sandbox_id, None)
+            self._reconcile_failures.pop(sandbox_id, None)
+
+    def _note_uncertain(self, sandbox_id: str, guest: GuestRecord, action: str, exc: Exception) -> None:
+        """An engine pause or unpause whose result is not certain: mark the room, read what the engine says."""
+        state = self._read_state(guest)
+        count = self._set_mark(sandbox_id, state)
+        print(
+            f"cathedral-sandbox: {action} of room {sandbox_id} failed ({count}, reconcile needed, engine says "
+            f"{state or 'unreadable'}): {exc}",
+            file=sys.stderr, flush=True,
+        )
+
+    def _converge(self, sandbox_id: str, guest: GuestRecord) -> None:
+        """Read the container and make it match the desired run state. The caller holds the room's
+        admission (so no capture or customer call runs) and its lifecycle lock."""
+        state = self._read_state(guest)
+        if state is None:
+            raise SandboxOpError("reconcile_unreadable", 503, f"cannot read the state of room {sandbox_id}", retry_after=5)
+        if state in self._ENDED:
+            self._note_ended(sandbox_id)  # nothing left to pause or unpause
+            return
+        paused = state == "paused"
+        desired_frozen = self._inner.is_frozen(sandbox_id)
+        try:
+            if paused and not desired_frozen:
+                self._client.unpause(guest.container_id)
+            elif not paused and desired_frozen:
+                self._client.pause(guest.container_id)
+        except SandboxOpError as exc:
+            action = "unpause" if paused else "pause"
+            benign = self._BENIGN_UNPAUSE if paused else self._BENIGN_PAUSE
+            if not any(m in str(exc).lower() for m in benign):
+                self._note_uncertain(sandbox_id, guest, action, exc)
+                raise
+            # Docker says "is not paused" for a container that stopped since the read: read it again.
+            after = self._read_state(guest)
+            if after is None:
+                self._note_uncertain(sandbox_id, guest, action, exc)
+                raise
+            if after in self._ENDED:
+                self._note_ended(sandbox_id)
+                return
+        self._clear_mark(sandbox_id)
+
+    def _reconcile_room(self, sandbox_id: str) -> bool:
+        """Reconcile one room if it is marked. True when it converged. A room in a capture, or already
+        being reconciled, is left for the next sweep."""
+        with self._inner._lock:  # noqa: SLF001
+            if sandbox_id not in self._reconcile_pending or sandbox_id in self._reconciling:
+                return False
+            self._reconciling.add(sandbox_id)
+        try:
+            guest = self._guests.get(sandbox_id)
+            if guest is None:
+                self._clear_mark(sandbox_id)  # the room is gone: nothing to reconcile
+                return False
+            try:
+                with self._inner.room_op(sandbox_id):
+                    with self._lifecycle_lock(sandbox_id):
+                        self._converge(sandbox_id, guest)
+            except SandboxOpError as exc:
+                if exc.code in ("sandbox_not_found", "sandbox_deleting"):
+                    self._clear_mark(sandbox_id)
+                return False
+            return True
+        finally:
+            with self._inner._lock:  # noqa: SLF001
+                self._reconciling.discard(sandbox_id)
+
+    def pending_reconciles(self) -> dict[str, str | None]:
+        """Room id -> the engine status last read (None unread), for marked rooms."""
+        with self._inner._lock:  # noqa: SLF001
+            return dict(self._reconcile_pending)
+
+    def _reconcile_pending_rooms(self) -> None:
+        for sandbox_id in list(self.pending_reconciles()):
+            self._reconcile_room(sandbox_id)
+
+    def _remove_snapshot_image(self, image: str) -> bool:
+        """Remove a snapshot's image. A removal that fails while the image is still there (a fork
+        still runs from it) is kept in _pending_image_rm and retried by every sweep until it is gone."""
+        try:
+            result = self._client.run(["docker", "image", "rm", image], timeout=60.0)
+            failed = result.returncode != 0 and self._client.image_exists(image)
+        except SandboxOpError:  # a timeout: the image may still be there, so it is queued like any failure
+            failed = True
+        if failed:
+            self._pending_image_rm[image] = self._pending_image_rm.get(image, 0) + 1
+            return False
+        self._pending_image_rm.pop(image, None)
+        with self._inner._lock:  # noqa: SLF001
+            self._doomed_image_ids.pop(image, None)
+        return True
+
+    def _doom_image_locked(self, snap_id: str) -> None:
+        """Provider lock held, before the snapshot's meta goes: keep its image id refused until it is removed."""
+        meta = self._snapshot_meta.get(snap_id) or {}
+        if meta.get("image") and meta.get("committed_image_id"):
+            self._doomed_image_ids[meta["image"]] = meta["committed_image_id"]
+
+    def pending_image_removals(self) -> dict[str, int]:
+        """Image name -> failed removal attempts, for images a sweep still has to remove."""
+        return dict(self._pending_image_rm)
+
+    def _retry_image_removals(self) -> None:
+        for image in list(self._pending_image_rm):
+            self._remove_snapshot_image(image)
+
+    def _unpause_after_capture(self, guest: GuestRecord, sandbox_id: str, *, strict: bool) -> None:
+        """Run the room again after the capture's pause. An unpause of a container that is not paused, not
+        running or gone has nothing left to do. Any other failure leaves the result unknown: the room is
+        marked for reconcile (and the error goes out when the capture has no other error to report)."""
+        try:
+            self._client.unpause(guest.container_id)
+        except SandboxOpError as exc:
+            if self._guests.get(sandbox_id) is None:
+                return
+            if any(m in str(exc).lower() for m in self._BENIGN_UNPAUSE):
+                # Nothing left to unpause, but the room may have stopped during the capture: say so.
+                state = self._read_state(guest)
+                if state in self._ENDED:
+                    self._note_ended(sandbox_id)
+                    return
+                if state is not None:
+                    return
+            self._note_uncertain(sandbox_id, guest, "unpause", exc)
+            if strict:
+                raise
 
     def _snapshot_sizes(self, snap_id: str, image_name: str, base_image: str, work_archive_bytes: int) -> dict[str, Any]:
         """Sizes of one snapshot, in bytes.
@@ -3182,26 +3653,34 @@ class DockerGuestProvider:
         return filtered
 
     def delete_snapshot(self, snapshot_id: str, *, owner: str | None = None) -> bool:
+        return self.delete_snapshot_ex(snapshot_id, owner=owner)[0]
+
+    def delete_snapshot_ex(self, snapshot_id: str, *, owner: str | None = None) -> tuple[bool, bool]:
+        """(deleted, image_removal_pending). The record goes at once; an image that could not be
+        removed is retried by the sweep and reported here."""
         snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
         if owner is not None:
             recorded = self._snapshot_owners.get(snap_id)
             if recorded is None or recorded != owner:
-                return False
+                return False, False
         existed = self._inner.delete_snapshot(snapshot_id)
         if not existed:
             # Unknown to the caller, or another key's: the image stays with
             # its record. One whose record expired meanwhile loses its image
             # in the next sweep.
-            return False
+            return False, False
+        with self._inner._lock:  # noqa: SLF001
+            self._doom_image_locked(snap_id)
         self._snapshot_meta.pop(snap_id, None)
         self._snapshot_owners.pop(snap_id, None)
         image = self._snapshot_images.pop(snap_id, None)
+        removed = True
         if image:
             image_id = self._image_id_of(image)
             if image_id is not None and owner is not None:
                 self._image_owners.drop_owner(image_id, owner)
-            self._client.run(["docker", "image", "rm", image], timeout=60.0)
-        return existed
+            removed = self._remove_snapshot_image(image)
+        return True, not removed
 
     def push_snapshot(
         self,
@@ -3216,10 +3695,13 @@ class DockerGuestProvider:
         Any host can then start rooms from *image*. The image holds the root
         file system only. /work is a bind mount and is not in the image.
         """
+        # Resolved once (an id or a name); every later lookup is by that id.
+        snap_id = self._resolve_snapshot(snapshot_id)
+        if snap_id is None:
+            raise SandboxOpError("snapshot_not_found", 404, f"no snapshot {snapshot_id} on this host")
         if owner is not None:
-            self._require_snapshot_owner(snapshot_id, owner)
-        local = self._snapshot_image(snapshot_id)
-        snap_id = self._resolve_snapshot(snapshot_id) or snapshot_id
+            self._require_snapshot_owner(snap_id, owner)
+        local = self._snapshot_image(snap_id)
         digest = self._client.push(local, image, registry_auth=registry_auth)
         if image != local:
             # Untag: a local copy under the registry name would start for any
@@ -3293,17 +3775,46 @@ class DockerGuestProvider:
         return doc
 
     def freeze(self, sandbox_id: str) -> dict[str, Any]:
-        guest = self._guests.get(sandbox_id)
-        if guest is not None:
-            self._client.pause(guest.container_id)
-        return self._inner.freeze(sandbox_id)
+        # Counted as in flight for the length of the call: a capture waits for it, and a new one is
+        # refused while a capture runs. The lifecycle lock keeps it from crossing a reconcile.
+        with self._inner.room_op(sandbox_id), self._lifecycle_lock(sandbox_id):
+            guest = self._guests.get(sandbox_id)
+            if guest is not None:
+                try:
+                    self._client.pause(guest.container_id)
+                except SandboxOpError as exc:
+                    if not any(m in str(exc).lower() for m in self._BENIGN_PAUSE):  # already paused is the wish
+                        self._note_uncertain(sandbox_id, guest, "pause", exc)
+                        raise
+            doc = self._inner.freeze(sandbox_id, admitted=True)
+            self._clear_mark(sandbox_id)  # the container is paused and the customer wants it so
+            return doc
 
     def thaw(self, sandbox_id: str) -> dict[str, Any]:
-        guest = self._guests.get(sandbox_id)
-        doc = self._inner.thaw(sandbox_id)
-        if guest is not None:
-            self._client.unpause(guest.container_id)
-        return doc
+        with self._inner.room_op(sandbox_id), self._lifecycle_lock(sandbox_id):
+            guest = self._guests.get(sandbox_id)
+            if guest is not None:
+                try:
+                    self._client.unpause(guest.container_id)
+                except SandboxOpError as exc:
+                    if not any(m in str(exc).lower() for m in self._BENIGN_UNPAUSE):
+                        # Not certain, so the record keeps saying what the customer last asked for.
+                        self._note_uncertain(sandbox_id, guest, "unpause", exc)
+                        raise
+                    # Docker says "is not paused" for a stopped container too: read the engine before
+                    # calling the room running.
+                    state = self._read_state(guest)
+                    if state is None:
+                        self._note_uncertain(sandbox_id, guest, "unpause", exc)
+                        raise
+                    if state in self._ENDED:
+                        self._note_ended(sandbox_id)
+                        raise SandboxOpError(
+                            "sandbox_not_running", 409, f"sandbox {sandbox_id} has stopped and cannot be thawed"
+                        ) from exc
+            doc = self._inner.thaw(sandbox_id, admitted=True)
+            self._clear_mark(sandbox_id)
+            return doc
 
     def delete(self, sandbox_id: str) -> None:
         """DELETE is idempotent (204). The record only goes when the container is gone.
@@ -3316,6 +3827,8 @@ class DockerGuestProvider:
         provider alone when a labeled container may still be running.
         """
         guest = self._guests.get(sandbox_id)
+        with self._inner._lock:  # noqa: SLF001
+            self._ended_rooms.pop(sandbox_id, None)
         if guest is not None:
             for process_id in list(guest.guest_processes):
                 try:
@@ -3539,6 +4052,8 @@ class DockerGuestProvider:
         Caller holds _drain_lock. A record is created before its container, so
         a container whose sandbox id has no record is an orphan.
         """
+        read_at = time.monotonic()
+        live = self._live_rooms()
         try:
             labeled = self._client.list_labeled_states(self._owner)
         except SandboxOpError as exc:
@@ -3551,7 +4066,9 @@ class DockerGuestProvider:
             for cid, _state, sid in labeled
             if sid not in queued and not (sid and self._inner.has_record(sid))
         ]
-        self._note_container_states(labeled, queued)
+        with self._liveness_lock:
+            self._note_container_states(labeled, queued, live=live)
+            self._liveness_at = read_at
         removed = sum(1 for gone in self._remove_many(orphans) if gone)
         self._sweep_secrets_dirs()
         self._reconcile_snapshot_images()
@@ -3563,15 +4080,25 @@ class DockerGuestProvider:
             self._net_pool.recount(held)
         return removed
 
-    def _note_container_states(self, labeled: list[tuple[str, str, str]], queued: set[str]) -> None:
-        """Keep each room's docker State from the reconcile list (AB#864).
+    def _note_container_states(
+        self, labeled: list[tuple[str, str, str]], queued: set[str], *, live: Mapping[str, str] | None = None
+    ) -> None:
+        """Keep each room's docker State from the reconcile or liveness list (AB#864, AB#920).
 
         A room whose container stopped gets one inspect, once, for OOM vs exit
         (the same reading as an exec that saw the room die). No events stream.
+        *live* is room id -> container id of the rooms that were running or
+        frozen before the list was read: of those, one whose container is
+        exited, dead or not listed at all has ended (GET, wait and list say
+        failed). A room created while the list was read is not in *live*, so it
+        is never taken for gone.
         """
+        live = live or {}
         states: dict[str, str] = {}
         ends: dict[str, str] = {}
+        listed: set[str] = set()
         for cid, state, sid in labeled:
+            listed.add(cid)
             if not sid or sid in queued or not self._inner.has_record(sid):
                 continue
             states[sid] = state
@@ -3581,11 +4108,82 @@ class DockerGuestProvider:
             if reason is None:
                 death = self._client.container_death(cid)
                 if death is None:
-                    continue  # unreadable now; the next reconcile asks again
+                    if live.get(sid) == cid:
+                        self._note_ended(sid, None)  # it has ended; only the reason is unread, asked again next time
+                    continue
                 reason = "oom_killed" if death[0] or death[1] == 137 else "container_exited"
             ends[sid] = reason
+            if live.get(sid) == cid:
+                self._note_ended(sid, reason)
+        for sid, cid in live.items():
+            if cid in listed or sid in queued or self._ended_rooms.get(sid) is not None:
+                continue  # an ended room keeps its first known reason (oom_killed is not overwritten)
+            guest = self._guests.get(sid)
+            if guest is not None and guest.container_id == cid and self._inner.state_of(sid) in ("running", "frozen"):
+                ends[sid] = "container_exited"  # removed behind our back: it cannot run again
+                self._note_ended(sid, "container_exited")
+        with self._inner._lock:  # noqa: SLF001
+            for sid in [s for s in self._ended_rooms if not self._inner.has_record(s)]:
+                del self._ended_rooms[sid]
         self._container_states = states
         self._container_ends = ends
+
+    def _live_rooms(self) -> dict[str, str]:
+        """Room id -> container id of every room whose record is running or frozen."""
+        out: dict[str, str] = {}
+        for sid, guest in list(self._guests.items()):
+            if guest.container_id and self._inner.state_of(sid) in ("running", "frozen"):
+                out[sid] = guest.container_id
+        return out
+
+    def _liveness_fresh(self) -> bool:
+        at = self._liveness_at
+        return at is not None and time.monotonic() - at < self._liveness_max_age
+
+    def _refresh_liveness(self) -> None:
+        """Read every room's engine state in one docker ps, at most once per
+        CATHEDRAL_SANDBOX_LIVENESS_SECONDS (AB#920). A caller that finds a read
+        in flight answers from the last known states. An unreadable engine keeps the last known
+        states and is asked again only after the same window."""
+        if self._liveness_fresh():
+            return
+        # A read already in flight: answer from the last known states instead of queueing behind a
+        # slow engine (GET, wait and the broker's 10 s sync list must not block on docker ps).
+        if not self._liveness_lock.acquire(blocking=False):
+            return
+        try:
+            if self._liveness_fresh():
+                return
+            live = self._live_rooms()
+            try:
+                labeled = self._client.list_labeled_states(self._owner, timeout=LIVENESS_PS_TIMEOUT_SECONDS)
+            except SandboxOpError as exc:
+                print(f"cathedral-sandbox: liveness read skipped: {exc}", file=sys.stderr, flush=True)
+                self._liveness_at = time.monotonic()  # back off a full window after a slow or failed read
+                return
+            with self._doomed_lock:
+                queued = set(self._doomed)
+            self._note_container_states(labeled, queued, live=live)
+            self._liveness_at = time.monotonic()  # when the read finished: a slow read is not re-run at once
+        finally:
+            self._liveness_lock.release()
+
+    def _ended_reason(self, sandbox_id: str) -> tuple[bool, str | None]:
+        with self._inner._lock:  # noqa: SLF001
+            if sandbox_id not in self._ended_rooms:
+                return False, None
+            return True, self._ended_rooms[sandbox_id]
+
+    def _with_liveness(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """*doc* with its docker State; a running or frozen room whose container ended says failed and why."""
+        doc = self._with_container(doc)
+        sid = doc.get("id") if isinstance(doc, dict) else None
+        if not sid or doc.get("state") not in ("running", "frozen", "failed"):
+            return doc
+        ended, reason = self._ended_reason(sid)
+        if not ended:
+            return doc
+        return {**doc, "state": "failed", "end_reason": reason or doc.get("end_reason") or "container_exited"}
 
     def _with_container(self, doc: dict[str, Any]) -> dict[str, Any]:
         """A room's docker State, and why its container ended when it is not running."""
@@ -3600,7 +4198,11 @@ class DockerGuestProvider:
         return doc
 
     def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]:
-        return [self._with_container(d) for d in self._inner.list(labels=labels, state=state)]
+        self._refresh_liveness()
+        # No record is "failed" in the inner provider: an ended room is running or frozen there.
+        inner_state = None if state == "failed" else state
+        docs = [self._with_liveness(d) for d in self._inner.list(labels=labels, state=inner_state)]
+        return [d for d in docs if d.get("state") == state] if state else docs
 
     def room_networks(self) -> dict[str, Any] | None:
         """Port use per room network, or None when the pool is off."""
@@ -3638,6 +4240,8 @@ class DockerGuestProvider:
         # sweep; collecting it here left its container and policy behind.
         self._inner.sweep_tombstones()
         self._gc_snapshot_images()
+        self._reconcile_pending_rooms()
+        self._retry_image_removals()
         return marked
 
     def _gc_snapshot_images(self) -> None:
@@ -3645,22 +4249,32 @@ class DockerGuestProvider:
         with self._inner._lock:  # noqa: SLF001
             self._inner._sweep_snapshots_locked()  # noqa: SLF001
             live = set(self._inner._snapshots)  # noqa: SLF001
-        for sid, image in list(self._snapshot_images.items()):
-            if sid not in live:
-                self._client.run(["docker", "image", "rm", image], timeout=60.0)
-                self._snapshot_images.pop(sid, None)
-                self._snapshot_meta.pop(sid, None)
-                self._snapshot_owners.pop(sid, None)
+            # Chosen under the same hold as `live`: a snapshot published a moment later is not in the list.
+            doomed = [(sid, image) for sid, image in self._snapshot_images.items() if sid not in live]
+            for sid, _ in doomed:
+                self._doom_image_locked(sid)
+        for sid, image in doomed:
+            self._remove_snapshot_image(image)  # a failure stays in _pending_image_rm
+            with self._inner._lock:  # noqa: SLF001
+                if sid not in self._inner._snapshots:  # noqa: SLF001
+                    self._snapshot_images.pop(sid, None)
+                    self._snapshot_meta.pop(sid, None)
+                    self._snapshot_owners.pop(sid, None)
 
     def _reconcile_snapshot_images(self) -> None:
-        """Remove cathedral-snap-* images no snapshot record names (left by a restart)."""
+        """Remove cathedral-snap-* images no snapshot record names (left by a restart).
+
+        An image of a capture in flight is not left over: it is committed, not yet recorded."""
         listed = self._client.run(
             ["docker", "images", "--filter", "reference=cathedral-snap-*", "--format", "{{.Repository}}:{{.Tag}}"],
             timeout=60.0,
         )
         if listed.returncode != 0:
             return
-        known = set(self._snapshot_images.values())
+        # Read after the listing, so a capture that finished meanwhile is in `known`.
+        with self._inner._lock:  # noqa: SLF001
+            known = set(self._snapshot_images.values())
+            known |= {f"cathedral-snap-{sid}:latest" for sid in self._inner.capture_snapshot_ids()}
         for image in listed.stdout.split():
             if image not in known:
                 self._client.run(["docker", "image", "rm", image], timeout=60.0)
@@ -3828,10 +4442,30 @@ class DockerGuestProvider:
         return argv, overlay
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
-        return self._with_container(self._with_tunables(self._inner.get(sandbox_id)))
+        doc = self._with_tunables(self._inner.get(sandbox_id))
+        self._refresh_liveness()
+        doc = self._with_liveness(doc)
+        with self._inner._lock:  # noqa: SLF001
+            marked = sandbox_id in self._reconcile_pending
+        if doc.get("state") == "failed":
+            return doc
+        if marked:
+            # A room marked for reconcile reports what the engine says now, not what was asked for and
+            # not a status read earlier. Unreadable is an error, never a guess; a container that is not
+            # running or paused (exited, dead, gone) is reported failed, never running.
+            guest = self._guests.get(sandbox_id)
+            state = "gone" if guest is None else self._read_state(guest)
+            if state is None:
+                raise SandboxOpError(
+                    "reconcile_unreadable", 503, f"cannot read the run state of room {sandbox_id}", retry_after=5
+                )
+            doc = {**doc, "state": {"paused": "frozen", "running": "running"}.get(state, "failed")}
+        return doc
 
     def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
-        return self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
+        doc = self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
+        self._refresh_liveness()
+        return self._with_liveness(doc)
 
     def guest_port_http(
         self,

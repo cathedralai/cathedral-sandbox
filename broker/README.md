@@ -159,6 +159,7 @@ Each guest in the config can have limits (`guests.go`):
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 | `metered` | `true`: the guest is admitted only on the ledger's allowance, and it starts closed. Needs `state_dir`. See "Metered guests". |
 | `escape_fresh_guest` | `{"slots": ["<hotel id>", ...]}`: opts the guest into the AB#683 fresh guest capability on `GET /v1/quota` (`fresh_guest.go`). Absent: off. Needs an explicit `hotels` list holding every slot (no `policy`). Even when set, nothing is advertised until the broker build implements durable single-use dispatch, expected-binding refusal at the guest, attempt-bound plant and exact recovery (`freshGuestEnforcement`); today it implements none. A slot is advertised only while it is in the guest's hotels and is a sealed hotel labelled `escape=true`. `GET /v1/quota` is `Cache-Control: no-store`. |
+| `postpaid` | `true`: the guest is billed after the fact and never gated on balance. It cannot also be `metered` (the config is refused), and the meter's `freeze-all` answers 409 `guest_postpaid` and freezes nothing. For const (Fred, 22 Nov 2026: bill him, never block him). |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
 routes. `GET /v1/quota` shows the guest its limits.

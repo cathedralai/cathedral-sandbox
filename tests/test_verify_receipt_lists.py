@@ -2165,7 +2165,7 @@ def test_rule_9_a_good_snapshot_list_names_its_fork_in_file_and_header_mode(mode
 
 # ---- the pair test: the receipts front's own fixture (copied byte for byte from AB#604 CS-3) through this checker
 SHARED = ROOT / "tests" / "fixtures" / "snapshot_fork_v1" / "snapshot_fork_v1.json"
-SHARED_SHA256 = "4b57e2329e5a7588f9869e9e63a4ccd58e35c13e4dc4b15b1746f9ed542483b0"
+SHARED_SHA256 = "2e57d7f4fc7f87f667829ee33ae2a478e722f30edcbfb51e3ba731f28d6aebce"
 
 
 def _shared_run(tmp_path: Path, receipts=None, head=True) -> tuple[int, dict, str]:
