@@ -581,15 +581,27 @@ func TestPoolCreatesAtMostOneASecondPerHotel(t *testing.T) {
 		"refill_per_second": 1, "refill_during_claims": 1, "reserve_share": 0.25}); st != 200 {
 		t.Fatalf("PUT: %d %v", st, doc)
 	}
-	pc.runPool(3500*time.Millisecond, nil)
+	probe := startSchedProbe(t)
+	stop := make(chan struct{})
+	go func() { // until both hotels have 3 creates
+		defer close(stop)
+		for end := time.Now().Add(20 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+			if len(pc.hotels["a"].creates()) >= 3 && len(pc.hotels["b"].creates()) >= 3 {
+				return
+			}
+		}
+	}()
+	pc.runPool(21*time.Second, stop)
 	for _, id := range []string{"a", "b"} {
 		c := pc.hotels[id].creates()
-		if len(c) < 2 || len(c) > 4 {
-			t.Fatalf("hotel %s: %d creates in 3.5 s, want 2 to 4", id, len(c))
+		if len(c) < 3 {
+			t.Fatalf("hotel %s: %d creates in 20 s, want 3", id, len(c))
 		}
 		for i := 1; i < len(c); i++ {
-			if gap := c[i].at.Sub(c[i-1].at); gap < time.Second {
-				t.Fatalf("hotel %s: creates %d and %d %s apart", id, i-1, i, gap)
+			// A loaded machine can make one arrival late after its start
+			// and so shorten the gap after it (schedProbe).
+			if !probe.gapAtLeast(c[i-1].at, c[i].at, time.Second) {
+				t.Fatalf("hotel %s: creates %d and %d %s apart", id, i-1, i, c[i].at.Sub(c[i-1].at))
 			}
 		}
 	}

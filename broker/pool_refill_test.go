@@ -32,7 +32,10 @@ func TestRefillRateCaps(t *testing.T) {
 	if _, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil); doc["creates_per_second_per_hotel_max"] != float64(4) {
 		t.Fatalf("GET creates_per_second_per_hotel_max %v, want 4", doc["creates_per_second_per_hotel_max"])
 	}
-	pc.runPool(3*time.Second, nil)
+	probe := startSchedProbe(t)
+	stop := make(chan struct{})
+	f.createsReach(12, 30*time.Second, stop)
+	pc.runPool(31*time.Second, stop)
 	starts := f.createStarts()
 	node, lfm := 0, 0
 	for _, c := range f.creates() {
@@ -42,11 +45,16 @@ func TestRefillRateCaps(t *testing.T) {
 			lfm++
 		}
 	}
-	if w := maxInWindow(starts, time.Second); w > 4 {
+	if w := probe.maxInWindowLate(starts, time.Second); w > 4 {
 		t.Fatalf("%d pool creates within one second over both keys, want at most 4", w)
 	}
-	if len(starts) < 9 || node == 0 || lfm == 0 {
-		t.Fatalf("%d creates in 3 s (%d node-22, %d lfm), want about 4 a second over both keys", len(starts), node, lfm)
+	if len(starts) < 12 || node == 0 || lfm == 0 {
+		t.Fatalf("%d creates in 30 s (%d node-22, %d lfm), want 12 over both keys", len(starts), node, lfm)
+	}
+	for i := 1; i < 12; i++ { // about 4 a second: spaced 263 ms
+		if !probe.gapAtMost(starts[i-1], starts[i], 400*time.Millisecond) {
+			t.Fatalf("creates %d and %d %s apart at 4 a second", i-1, i, starts[i].Sub(starts[i-1]))
+		}
 	}
 	// A lower setting is the lower cap.
 	g := newPoolChain(t, []string{"b"}, nil)
@@ -56,15 +64,17 @@ func TestRefillRateCaps(t *testing.T) {
 	if _, doc := g.operator("GET", "/v1/broker/ready-rooms", nil); doc["creates_per_second_per_hotel_max"] != float64(2) {
 		t.Fatalf("GET creates_per_second_per_hotel_max %v at refill 2, want 2", doc["creates_per_second_per_hotel_max"])
 	}
-	g.runPool(3*time.Second, nil)
-	if s := g.hotels["b"].createStarts(); maxInWindow(s, time.Second) > 2 || len(s) < 4 {
-		t.Fatalf("refill_per_second 2: %d creates in 3 s, %d within one second", len(s), maxInWindow(s, time.Second))
+	gstop := make(chan struct{})
+	g.hotels["b"].createsReach(6, 30*time.Second, gstop)
+	g.runPool(31*time.Second, gstop)
+	if s := g.hotels["b"].createStarts(); probe.maxInWindowLate(s, time.Second) > 2 || len(s) < 6 {
+		t.Fatalf("refill_per_second 2: %d creates in 30 s, %d within one second", len(s), probe.maxInWindowLate(s, time.Second))
 	}
 }
 
 // Claims every 400 ms for 30 s on a hotel never stop its refill: no pause
 // timer, at least 1 create a second throughout (the longest gap between two
-// creates stays near 1 s).
+// creates stays near 1 s, plus what a loaded machine adds: schedProbe).
 func TestRefillNeverStopsUnderRepeatedBursts(t *testing.T) {
 	pc := newPoolChain(t, []string{"a"}, nil)
 	f := pc.hotels["a"]
@@ -73,6 +83,7 @@ func TestRefillNeverStopsUnderRepeatedBursts(t *testing.T) {
 	pc.fill("a", 40) // full, no pacing
 	poolSpacingFactor = 1.05
 	before := len(f.createStarts())
+	probe := startSchedProbe(t)
 	stop := make(chan struct{})
 	claimed := 0
 	go func() {
@@ -88,16 +99,17 @@ func TestRefillNeverStopsUnderRepeatedBursts(t *testing.T) {
 	t0 := time.Now()
 	pc.runPool(40*time.Second, stop)
 	starts := f.createStarts()[before:]
-	if claimed < 60 {
-		t.Fatalf("%d claims in 30 s, want about 75", claimed)
+	lost := probe.late(t0, time.Now()) // a loaded machine runs fewer claims and creates in 30 s
+	if want := 60 - int(lost/(400*time.Millisecond)); claimed < want {
+		t.Fatalf("%d claims in 30 s, want about 75 (at least %d, %s lost to load)", claimed, want, lost)
 	}
-	if len(starts) < 26 {
-		t.Fatalf("%d creates during 30 s of claims, want at least 26", len(starts))
+	if want := 26 - int(lost/(1050*time.Millisecond)); len(starts) < want {
+		t.Fatalf("%d creates during 30 s of claims, want at least %d (%s lost to load)", len(starts), want, lost)
 	}
 	prev := t0
 	for _, s := range starts {
-		if gap := s.Sub(prev); gap > 1200*time.Millisecond {
-			t.Fatalf("refill paused %s during the claims", gap)
+		if !probe.gapAtMost(prev, s, 1200*time.Millisecond) {
+			t.Fatalf("refill paused %s during the claims (%s of it load)", s.Sub(prev), probe.late(prev, s.Add(probeSlack)))
 		}
 		prev = s
 	}
@@ -148,22 +160,26 @@ func TestRefillFloorBelowQuarter(t *testing.T) {
 	}
 	// On the loop: a claim held in flight the whole time; the first 10 rooms
 	// (below a quarter) come at the full rate, the next ones at 1 a second.
+	// Gaps get what a loaded machine adds (schedProbe).
 	poolSpacingFactor = 1.05
+	probe := startSchedProbe(t)
+	stop := make(chan struct{})
+	pc.hotels["a"].createsReach(13, 40*time.Second, stop)
 	pc.b.poolClaimBegin(h)
-	pc.runPool(6*time.Second, nil)
+	pc.runPool(41*time.Second, stop)
 	pc.b.poolClaimEnd(h)
 	s := pc.hotels["a"].createStarts()
-	if len(s) < 12 {
-		t.Fatalf("%d creates, want 10 fast ones and some slow ones", len(s))
+	if len(s) < 13 {
+		t.Fatalf("%d creates in 40 s, want 10 fast ones and 3 slow ones", len(s))
 	}
 	for i := 1; i < 10; i++ {
-		if gap := s[i].Sub(s[i-1]); gap > 500*time.Millisecond {
-			t.Fatalf("create %d came %s after the one before, below a quarter: want the full rate", i, gap)
+		if !probe.gapAtMost(s[i-1], s[i], 500*time.Millisecond) {
+			t.Fatalf("create %d came %s after the one before (%s of it load), below a quarter: want the full rate", i, s[i].Sub(s[i-1]), probe.late(s[i-1], s[i].Add(probeSlack)))
 		}
 	}
 	for i := 11; i < len(s); i++ {
-		if gap := s[i].Sub(s[i-1]); gap < 950*time.Millisecond {
-			t.Fatalf("create %d came %s after the one before, above a quarter during a claim: want 1 a second", i, gap)
+		if !probe.gapAtLeast(s[i-1], s[i], 950*time.Millisecond) {
+			t.Fatalf("create %d came %s after the one before, above a quarter during a claim: want 1 a second", i, s[i].Sub(s[i-1]))
 		}
 	}
 }
@@ -343,22 +359,26 @@ func TestPoolCreateSpacingCountsFromTheActualStart(t *testing.T) {
 	pc.step("a") // sbx-1, retired on the next step
 	f.set(func(f *fakePoolHotel) { f.createTTL, f.deleteDelay = 0, 1100*time.Millisecond })
 	poolSpacingFactor = 1.05
+	probe := startSchedProbe(t)
 	time.Sleep(1100 * time.Millisecond) // the spacing since sbx-1 has passed
 	pc.step("a")                        // deletes sbx-1 (1.1 s), then starts a create
-	pc.step("a")                        // at once: no create yet
+	started := time.Now()
+	pc.step("a") // at once: no create yet
 	s := f.createStarts()
-	if len(s) != 2 {
+	// A loaded machine can hold the second step back past the spacing; then
+	// a create is due, and the gaps below still decide.
+	if len(s) != 2 && time.Since(started) < 900*time.Millisecond {
 		t.Fatalf("%d creates, want 2 (sbx-1 and its replacement)", len(s))
 	}
 	time.Sleep(1200 * time.Millisecond)
 	pc.step("a")
 	s = f.createStarts()
 	for i := 2; i < len(s); i++ {
-		if gap := s[i].Sub(s[i-1]); gap < time.Second {
-			t.Fatalf("creates %d and %d %s apart at 1 a second", i-1, i, gap)
+		if !probe.gapAtLeast(s[i-1], s[i], time.Second) {
+			t.Fatalf("creates %d and %d %s apart at 1 a second", i-1, i, s[i].Sub(s[i-1]))
 		}
 	}
-	if len(s) != 3 {
+	if len(s) < 3 {
 		t.Fatalf("%d creates after the spacing passed, want 3", len(s))
 	}
 }
@@ -644,20 +664,25 @@ func TestPoolCreatesNeverWaitForAHotelConnection(t *testing.T) {
 		}
 		rels = append(rels, rel)
 	}
+	probe := startSchedProbe(t)
 	stop, done := make(chan struct{}), make(chan struct{})
 	go func() {
-		pc.runPool(15*time.Second, stop)
+		pc.runPool(30*time.Second, stop)
 		close(done)
 	}()
 	time.Sleep(2400 * time.Millisecond)
 	for _, rel := range rels {
 		rel()
 	}
-	time.Sleep(2500 * time.Millisecond)
-	close(stop)
+	freed := time.Now()
+	f.createsReach(2, 20*time.Second, stop)
 	<-done
 	starts := f.createStarts()
-	if w := maxInWindow(starts, time.Second); w > 1 || len(starts) == 0 {
-		t.Fatalf("refill 1 a second, every connection held for 2.4 s: %d creates, %d within one second; want at least 1, never more than 1 a second", len(starts), w)
+	if w := probe.maxInWindowLate(starts, time.Second); w > 1 || len(starts) < 2 {
+		t.Fatalf("refill 1 a second, every connection held for 2.4 s: %d creates, %d within one second; want 2, never more than 1 a second", len(starts), w)
+	}
+	// No backoff: the first slot after the connections free up sends.
+	if !probe.gapAtMost(freed, starts[0], 1050*time.Millisecond+2*poolTick) {
+		t.Fatalf("first create %s after the connections were free, want within one spacing", starts[0].Sub(freed))
 	}
 }

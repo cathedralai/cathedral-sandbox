@@ -614,3 +614,107 @@ func maxInWindow(ts []time.Time, d time.Duration) int {
 	}
 	return best
 }
+
+// schedProbe measures how late this test binary runs: a probe goroutine
+// sleeps probeNap at a time and records how much later than asked each sleep
+// ended. On a loaded machine (other work, the race detector) every tick,
+// sleep and request of the pool runs late by about as much as the probe, so
+// a timing check adds the lateness measured over its own interval to its
+// allowance. On an idle machine that is a few milliseconds; a broken rule is
+// off by far more (a pause timer: 12 s; the slow rate below a quarter: a
+// second a create).
+type schedProbe struct {
+	mu    sync.Mutex
+	ends  []time.Time
+	lates []time.Duration
+	stop  chan struct{}
+	done  chan struct{}
+}
+
+const (
+	probeNap   = 20 * time.Millisecond
+	probeSlack = 50 * time.Millisecond // lateness that ends just after an arrival still made it late
+)
+
+func startSchedProbe(t *testing.T) *schedProbe {
+	p := &schedProbe{stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(p.done)
+		for {
+			select {
+			case <-p.stop:
+				return
+			default:
+			}
+			t0 := time.Now()
+			time.Sleep(probeNap)
+			end := time.Now()
+			p.mu.Lock()
+			p.ends, p.lates = append(p.ends, end), append(p.lates, max(end.Sub(t0)-probeNap, 0))
+			p.mu.Unlock()
+		}
+	}()
+	t.Cleanup(p.close)
+	return p
+}
+
+func (p *schedProbe) close() {
+	select {
+	case <-p.stop:
+	default:
+		close(p.stop)
+	}
+	<-p.done
+}
+
+// late is the probe's lateness summed over the sleeps that ended in (a, b].
+func (p *schedProbe) late(a, b time.Time) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var sum time.Duration
+	for i := sort.Search(len(p.ends), func(i int) bool { return p.ends[i].After(a) }); i < len(p.ends) && !p.ends[i].After(b); i++ {
+		sum += p.lates[i]
+	}
+	return sum
+}
+
+// gapAtMost reports whether arrival b came at most want after a, allowing the
+// lateness between them: what delays b's create happens after a.
+func (p *schedProbe) gapAtMost(a, b time.Time, want time.Duration) bool {
+	return b.Sub(a) <= want+p.late(a, b.Add(probeSlack))
+}
+
+// gapAtLeast reports whether arrival b came at least want after a, allowing
+// the lateness of a: creates are spaced when the broker starts them, so an
+// arrival that ran late after its start (in the second before it) shortens
+// the gap after it.
+func (p *schedProbe) gapAtLeast(a, b time.Time, want time.Duration) bool {
+	return b.Sub(a) >= want-p.late(a.Add(-time.Second), a.Add(probeSlack))
+}
+
+// maxInWindowLate is maxInWindow with the same allowance: arrivals j..i count
+// as within d only while their span is under d less the lateness of the
+// first of them.
+func (p *schedProbe) maxInWindowLate(ts []time.Time, d time.Duration) int {
+	best := 0
+	for i := range ts {
+		for j := 0; j <= i; j++ {
+			if !p.gapAtLeast(ts[j], ts[i], d) {
+				best = max(best, i-j+1)
+				break
+			}
+		}
+	}
+	return best
+}
+
+// createsReach closes stop once hotel f got n creates, or after d.
+func (f *fakePoolHotel) createsReach(n int, d time.Duration, stop chan struct{}) {
+	go func() {
+		defer close(stop)
+		end := time.Now().Add(d)
+		for time.Now().Before(end) && len(f.creates()) < n {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+}
