@@ -153,7 +153,7 @@ first and `SEALED_RESTART_WITH_ROOMS=1` (`room-kit/sealed/README.md:460-462`).
 
 | GAP | Owner |
 |---|---|
-| Testnet acceptance: a Polaris deployment with the reconciler on, bound to the testnet netuid, plus a testnet broker, then the staged run in polariscomputer `docs/SNP_ROSTER_BROKER_BOUNDARY.md` "Before the first live receipt" item 8 | Toby (decision: testnet or production equivalent), Fred (host, AB#349) |
+| Testnet acceptance: a Polaris deployment with the reconciler on, bound to the testnet netuid, plus a testnet broker, then the staged run in `polariscomputer/docs/SNP_ROSTER_BROKER_BOUNDARY.md` "Before the first live receipt" item 8 | Toby (decision: testnet or production equivalent), Fred (host, AB#349) |
 | Offer status for the miner without the roster token | Polaris (Toby to assign) |
 | Signed update channel for miner hotels, or a decision that the manual `install.sh --sealed` roll is the supported path | Toby |
 | Publish the miner hotel `sealed.env`, measurement and install public key | Fred (key custody), Mr Spock (doc) |
