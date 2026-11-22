@@ -331,3 +331,29 @@ func TestMeterKeyConfigRejectsReuse(t *testing.T) {
 		}
 	})
 }
+
+// A postpaid guest (const) is billed, never frozen: freeze-all answers 409
+// and no hotel gets a freeze. Another guest on the same hotels still freezes.
+func TestMeterFreezeAllRefusesPostpaidGuest(t *testing.T) {
+	tc := meterChain(t)
+	tc.b.mu.Lock()
+	tc.b.guests["g1"].limits.Postpaid = true
+	tc.b.mu.Unlock()
+	seedRoom(tc.hotels["b"], "sbx_1", "g1", "running", 1, 4)
+	seedRoom(tc.hotels["b"], "sbx_2", "g2", "running", 1, 4)
+	status, doc := tc.call(t, "meter-key", "POST", "/v1/broker/guests/g1/freeze-all", nil)
+	if status != 409 || errCode(doc) != "guest_postpaid" {
+		t.Fatalf("freeze-all on a postpaid guest: %d %v", status, doc)
+	}
+	if n := len(tc.hotels["b"].freezes); n != 0 || hotelRoomState(tc.hotels["b"], "sbx_1") != "running" {
+		t.Fatalf("a postpaid guest's room was frozen (%d freezes)", n)
+	}
+	// Its rooms can still be read for billing.
+	if status, doc := tc.call(t, "meter-key", "GET", "/v1/broker/guests/g1/rooms", nil); status != 200 || len(doc["rooms"].([]any)) != 1 {
+		t.Fatalf("rooms of a postpaid guest: %d %v", status, doc)
+	}
+	status, doc = tc.call(t, "meter-key", "POST", "/v1/broker/guests/g2/freeze-all", nil)
+	if status != 200 || !reflect.DeepEqual(doc["frozen"], []any{"b.sbx_2"}) {
+		t.Fatalf("freeze-all on a normal guest: %d %v", status, doc)
+	}
+}

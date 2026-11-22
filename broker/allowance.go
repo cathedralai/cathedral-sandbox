@@ -998,6 +998,9 @@ func (b *broker) loadAllowances() error {
 	}
 	startMs := time.Now().UnixMilli()
 	for id, g := range b.guests {
+		if g.limits.Metered && g.limits.Postpaid {
+			return fmt.Errorf("config: guest %q is both metered and postpaid; a postpaid guest is never gated on its allowance", id)
+		}
 		if g.limits.Metered && b.cfg.StateDir == "" {
 			return fmt.Errorf("config: guest %q is metered, which needs state_dir to keep its allowance", id)
 		}

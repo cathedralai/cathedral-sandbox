@@ -676,3 +676,35 @@ def test_the_plain_path_does_not_echo_the_key_or_request_headers(model: StreamMo
     done = room("hello", MODEL_API_KEY=short)
     assert short.encode() not in done.stdout and b"Authorization" not in done.stdout
     assert b"Authorization" not in done.stderr
+
+
+@pytest.mark.parametrize("media", [None, "image", "audio"])
+def test_request_batch_keeps_escaped_text_and_media_separate(model: StreamModel, room: Any, media: str | None) -> None:
+    text = 'first line\nsecond \"quoted\" \t snowman ☃ \\ end'
+    extra: tuple[str, ...] = ()
+    env: dict[str, str] = {}
+    if media:
+        name = 'clip\n"quoted".' + ("png" if media == "image" else "wav")
+        path = room.work / name
+        path.write_bytes(b"fixture media bytes")
+        extra = ("--" + media, str(path))
+        if media == "audio":
+            env["MODEL"] = "lfm3-audio-2b"
+    model.replies = [{"pieces": ["Fine."]}]
+    done, events = turn(room, text, extra=extra, **env)
+    assert done.returncode == 0, done.stderr
+    check_envelope(events)
+    body = model.requests[-1]
+    assert body["stream"] is True
+    content = body["messages"][-1]["content"]
+    saved = json.loads((room.state / "history.json").read_text())[0]
+    assert saved["role"] == "user"
+    if media:
+        assert content[-1] == {"type": "text", "text": text}
+        assert content[0]["type"] == ("image_url" if media == "image" else "input_audio")
+        assert saved["content"] == f"[{media}: {name}] {text}"
+        assert saved["media"] is True
+        assert "fixture media bytes" not in saved["content"]
+    else:
+        assert content == text
+        assert saved == {"role": "user", "content": text}

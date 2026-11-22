@@ -208,6 +208,22 @@ func TestHotelUpAfterABlipDoesNotPullAgain(t *testing.T) {
 	}
 }
 
+// AB#896: a hotel with no key installer replays at the come-up itself, as before.
+func TestPlainHotelComeUpReplaysGuestPrefetch(t *testing.T) {
+	tc := guestFixture(t)
+	prefetchDone(t, tc, "key1", map[string]any{"images": []string{guestImage}, "hotels": []string{"b"}})
+	setHotel(tc, "b", func(h *hotel) {
+		h.ok = false
+		tc.b.hotelWentDown(h) // a reboot wipes the scratch
+	})
+	syncNow(tc, "b")
+	waitFor(t, "the replay at the come-up", func() bool { return callsTo(tc.hotels["b"], prefetchCall) >= 2 })
+	time.Sleep(200 * time.Millisecond)
+	if n := callsTo(tc.hotels["b"], prefetchCall); n != 2 {
+		t.Fatalf("%d prefetch calls; want the first and one replay", n)
+	}
+}
+
 func TestPrefetchSkipsHotelAtItsDiskLine(t *testing.T) {
 	tc := guestFixture(t)
 	pct := func(v float64) *float64 { return &v }
