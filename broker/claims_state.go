@@ -380,3 +380,42 @@ func (b *broker) addClaimedUsage(parts map[string]any, g *guestState, q url.Valu
 		}
 	}
 }
+
+// deleteClaimedRooms deletes, one by one, g's claimed rooms whose customer
+// labels hold every filter: a bulk delete by label (handleBulkDelete) never
+// reaches them at the hotel, where they carry the pool's labels. Each goes
+// through the single delete's rule (roomDeleteAnswered); PR 7 makes it a
+// revoke. rooms: each one's hotel status, 502 when the hotel did not answer;
+// stillRun: how many were not confirmed deleted and so still run and bill.
+// The caller does not hold b.mu.
+func (b *broker) deleteClaimedRooms(ctx context.Context, g *guestState, filters []string) (rooms map[string]int, stillRun int) {
+	var targets []*room
+	b.mu.Lock()
+	for _, h := range b.hotelList() {
+		for _, rm := range h.rooms {
+			if rm.mapping != nil && rm.guest == g.cfg.ID && rm.state == stRunning && labelsMatch(rm.mapping.customerLabels, filters) {
+				targets = append(targets, rm)
+			}
+		}
+	}
+	b.mu.Unlock()
+	if len(targets) == 0 {
+		return nil, 0
+	}
+	rooms = map[string]int{}
+	for _, rm := range targets {
+		// As the single delete: a delete that gave up would leave the room
+		// running on a full hotel, so it waits for a connection.
+		status, _, _, err := rm.h.do(waitForConnUntilDeadline(ctx), "DELETE", "/v1/sandboxes/"+url.PathEscape(rm.hid), nil, nil, 2*time.Minute)
+		if err != nil {
+			status = 502
+		}
+		if status == 204 || status == 404 {
+			b.roomDeleteAnswered(rm, status)
+		} else {
+			stillRun++
+		}
+		rooms[rm.id] = status
+	}
+	return rooms, stillRun
+}

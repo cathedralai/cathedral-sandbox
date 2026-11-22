@@ -1945,14 +1945,7 @@ func (b *broker) handleRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		return
 	}
 	if r.Method == "DELETE" && tail == "" && (status == 204 || status == 404) {
-		b.mu.Lock()
-		live := rm.state == stRunning // not already marked gone by the sync loop
-		if live {
-			rm.state, rm.vanished = stDeleting, time.Now()
-		}
-		rm.deleteSent = true
-		b.usageMeter.end(rm.runID(), time.Now(), status == 204 && live) // the run's ended reading (usage_meter.go); a claimed room's: its customer's
-		b.mu.Unlock()
+		b.roomDeleteAnswered(rm, status)
 	}
 	for _, k := range []string{"Content-Type", "Content-Range", "Content-Length", "Retry-After", "Accept-Ranges"} {
 		if v := hdr.Get(k); v != "" {
@@ -2407,13 +2400,46 @@ func (b *broker) handleBulkDelete(w http.ResponseWriter, r *http.Request, g *gue
 		}(h)
 	}
 	wg.Wait()
-	if claimBusy {
+	// The guest's claimed rooms carry the pool's hotel labels, so the hotel
+	// bulk delete never reaches them: each one whose customer labels match is
+	// deleted on its own (claims_state.go). One not confirmed deleted still
+	// runs and bills, so the answer never says the deletion is done.
+	rooms, stillRun := b.deleteClaimedRooms(r.Context(), g, customerFilters(g, r.URL.Query()))
+	if stillRun > 0 {
 		writeJSON(w, 409, map[string]any{"error": map[string]string{
-			"code": "bulk_delete_claim_busy", "message": "bulk deletion may be incomplete after a room claim; retry it",
-		}, "hotels": res})
+			"code": "bulk_delete_incomplete", "message": fmt.Sprintf("bulk deletion incomplete: %d rooms still run; retry it", stillRun),
+		}, "hotels": res, "rooms": rooms})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"hotels": res})
+	if claimBusy {
+		doc := map[string]any{"error": map[string]string{
+			"code": "bulk_delete_claim_busy", "message": "bulk deletion may be incomplete after a room claim; retry it",
+		}, "hotels": res}
+		if len(rooms) > 0 {
+			doc["rooms"] = rooms
+		}
+		writeJSON(w, 409, doc)
+		return
+	}
+	doc := map[string]any{"hotels": res}
+	if len(rooms) > 0 {
+		doc["rooms"] = rooms
+	}
+	writeJSON(w, 200, doc)
+}
+
+// roomDeleteAnswered applies a room delete the hotel answered 204 or 404:
+// the room is on its way out and its run ends (usage_meter.go; a claimed
+// room's run is its customer's). The caller does not hold b.mu.
+func (b *broker) roomDeleteAnswered(rm *room, status int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	live := rm.state == stRunning // not already marked gone by the sync loop
+	if live {
+		rm.state, rm.vanished = stDeleting, time.Now()
+	}
+	rm.deleteSent = true
+	b.usageMeter.end(rm.runID(), time.Now(), status == 204 && live) // the run's ended reading (usage_meter.go)
 }
 
 // A claim's lifetime call is bounded at the hotel. Retry only its explicit
