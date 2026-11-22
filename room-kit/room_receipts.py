@@ -2763,7 +2763,14 @@ class Ledger:
             # Marked before the disk is touched: a failed or partial save leaves the ids used in this process.
             self.fresh_used.update(ids)
             directory = os.path.join(self.store_dir, ESCAPE_FRESH_RESERVATION_DIR)
-            os.makedirs(directory, mode=0o700, exist_ok=True)
+            if not os.path.isdir(directory):
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                # The new directory's entry lives in the store dir: fsync it so a crash cannot drop every reservation.
+                storefd = os.open(self.store_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(storefd)
+                finally:
+                    os.close(storefd)
             record = canonical({k: fresh[k] for k in ("attempt_id", "report_id", "request_sha256")}
                                | {"binding_sha256": self.binding_sha256})
             return all(self._reserve_fresh_id(directory, i, record) for i in ids)
