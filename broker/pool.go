@@ -1104,7 +1104,7 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	ph.started[rm] = time.Now() // before the POST is sent: no listing of its room can come earlier
 	b.mu.Unlock()
 
-	status, hdr, out, err := h.doHeaders(context.WithoutCancel(ctx), h.cfg.API, "POST", "/v1/sandboxes", nil, body, poolCreateTimeout, nil)
+	status, hdr, out, err := h.doHeaders(noConnWait(context.WithoutCancel(ctx)), h.cfg.API, "POST", "/v1/sandboxes", nil, body, poolCreateTimeout, nil)
 	<-h.sem
 	tDone := time.Now()
 
@@ -1113,6 +1113,13 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	h.holdDisk(pl, -1)
 	ph.creating[k.name]--
 	delete(ph.started, rm)
+	if errors.Is(err, errHotelBusy) {
+		// Not sent: customer calls hold every data connection. No backoff:
+		// the next create slot in the spacing tries again.
+		h.release(rm)
+		b.mu.Unlock()
+		return
+	}
 	var doc map[string]any
 	if err == nil {
 		_ = json.Unmarshal(out, &doc)

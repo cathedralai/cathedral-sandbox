@@ -14,7 +14,8 @@
 // (exec, create) is unchanged and still applies while it waits. -1 keeps the
 // old behaviour: wait until that deadline. Background cleanup (room reap,
 // orphan removal) always waits until its deadline: it retries, and a delete
-// that gave up would leave a room running.
+// that gave up would leave a room running. A ready-room pool create never
+// waits (noConnWait): with no free connection it is not sent.
 package main
 
 import (
@@ -92,6 +93,17 @@ func waitForConnUntilDeadline(ctx context.Context) context.Context {
 	return context.WithValue(ctx, connWaitKey{}, true)
 }
 
+type connNoWaitKey struct{}
+
+// noConnWait marks ctx so its hotel calls never wait for a data connection:
+// with none free at once they fail with errHotelBusy, nothing sent. Pool
+// creates (pool.go) use it: they are spaced when they start, and a create
+// that waited here would reach the hotel together with the next ones once
+// connections free up; and a customer call never waits behind the pool.
+func noConnWait(ctx context.Context) context.Context {
+	return context.WithValue(ctx, connNoWaitKey{}, true)
+}
+
 // acquire takes a data connection slot. release gives it back; call it once,
 // after the answer body is read and closed.
 func (g *connGate) acquire(ctx context.Context, hotelID string) (release func(), err error) {
@@ -100,6 +112,9 @@ func (g *connGate) acquire(ctx context.Context, hotelID string) (release func(),
 	case g.slots <- struct{}{}:
 		return release, nil
 	default:
+	}
+	if ctx.Value(connNoWaitKey{}) != nil {
+		return nil, errHotelBusy
 	}
 	g.waits.Add(1)
 	g.waiting.Add(1)
