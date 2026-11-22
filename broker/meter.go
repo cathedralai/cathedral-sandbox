@@ -75,7 +75,9 @@ func (b *broker) handleMeter(w http.ResponseWriter, r *http.Request, id, action 
 	b.mu.Lock()
 	g := b.guests[id]
 	b.mu.Unlock()
-	if g == nil {
+	// The ready-room pool guest (pool.go) is the broker's own: its rooms are
+	// never a customer's, so the meter neither lists nor freezes them.
+	if g == nil || id == poolGuestID {
 		writeErr(w, 404, "guest_not_found", "no guest "+id)
 		return
 	}

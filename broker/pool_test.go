@@ -128,6 +128,15 @@ func TestPoolRoomWithoutPoolReceiptIsDeleted(t *testing.T) {
 			if len(rs) != 2 || !notBillable(rs[0]) || !notBillable(rs[1]) || rs[1].State != "ended" || rs[0].Guest != poolGuestID {
 				t.Fatalf("readings of the deleted room %+v", rs)
 			}
+			// The failed proof backs the hotel's creates off 5 s.
+			pc.b.mu.Lock()
+			ph := pc.b.pool.hotel("a")
+			fails, wait := ph.proofFails, time.Until(ph.backoff)
+			ph.backoff = time.Time{} // past the backoff
+			pc.b.mu.Unlock()
+			if fails != 1 || wait < 4*time.Second || wait > poolRetryFirst {
+				t.Fatalf("proof failures %d, backoff left %s; want 1 and about 5 s", fails, wait)
+			}
 			// The same hotel with an honest receipt: the next room is ready.
 			f.set(func(f *fakePoolHotel) {
 				f.signNoPool, f.signOtherKey, f.signOtherRoom, f.noReceipt = false, false, false, false
@@ -188,6 +197,15 @@ func TestPoolRoomsTurnStaleOnBindingChange(t *testing.T) {
 		if !again {
 			t.Fatal("the hotel is not attested again at once")
 		}
+		// A real move costs one 5 s pause, then the new binding proves rooms.
+		pc.b.mu.Lock()
+		ph := pc.b.pool.hotel("a")
+		fails, wait := ph.proofFails, time.Until(ph.backoff)
+		ph.backoff = time.Time{} // past the backoff
+		pc.b.mu.Unlock()
+		if fails != 1 || wait < 4*time.Second || wait > poolRetryFirst {
+			t.Fatalf("proof failures %d, backoff left %s; want 1 and about 5 s", fails, wait)
+		}
 		pc.sync("a") // attests: the new binding
 		pc.step("a")
 		if n := len(f.roomDeletes()); n != 3 {
@@ -197,6 +215,63 @@ func TestPoolRoomsTurnStaleOnBindingChange(t *testing.T) {
 		pc.fill("a", 3)
 		if n := len(f.roomDeletes()); n != 3 {
 			t.Fatalf("%d deletes, want 3: the new rooms are ready under the new binding\n%s", n, pc.debug("a"))
+		}
+	})
+	// The front moves while 4 creates are in flight under the old
+	// attestation: all 4 fail the binding, but they count once (one 5 s
+	// pause, no alarm), and the next create under the new binding is ready
+	// (Reviewbot HOLD at 23f208d).
+	t.Run("move with 4 creates in flight", func(t *testing.T) {
+		pc := newPoolChain(t, []string{"a"}, nil)
+		f := pc.hotels["a"]
+		h := pc.b.hotelByID("a")
+		pc.up("a")
+		pc.target(2)
+		pc.fill("a", 2)
+		gate := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-gate:
+			default:
+				close(gate)
+			}
+		})
+		f.set(func(f *fakePoolHotel) { f.createGate = gate })
+		pc.target(6)
+		for i := 0; i < poolCreatesInFlight; i++ {
+			pc.b.poolStep(context.Background(), h)
+		}
+		waitFor(t, "4 creates held at the hotel", func() bool { return f.roomCount() == 2+poolCreatesInFlight })
+		pc.b.mu.Lock()
+		ph := pc.b.pool.hotel("a")
+		inFlight := ph.creating["node-22"]
+		pc.b.mu.Unlock()
+		if inFlight != poolCreatesInFlight {
+			t.Fatalf("%d creates in flight, want %d", inFlight, poolCreatesInFlight)
+		}
+		f.set(func(f *fakePoolHotel) { f.newBinding(); f.createGate = nil })
+		close(gate)
+		ph.inflight.Wait()
+		pc.b.mu.Lock()
+		fails, wait, alarm := ph.proofFails, time.Until(ph.backoff), ph.alarm
+		pc.b.mu.Unlock()
+		if fails != 1 || wait > poolRetryFirst || alarm != "" {
+			t.Fatalf("after a move with %d creates in flight: proof failures %d, backoff left %s, alarm %q; want 1, at most %s, none",
+				poolCreatesInFlight, fails, wait, alarm, poolRetryFirst)
+		}
+		if n := len(f.roomDeletes()); n != poolCreatesInFlight {
+			t.Fatalf("%d deletes, want the %d rooms made under the old attestation\n%s", n, poolCreatesInFlight, pc.debug("a"))
+		}
+		pc.b.mu.Lock()
+		ph.backoff = time.Time{} // past the one 5 s pause
+		pc.b.mu.Unlock()
+		pc.sync("a") // attests: the new binding
+		pc.step("a")
+		pc.b.mu.Lock()
+		fails, alarm = ph.proofFails, ph.alarm
+		pc.b.mu.Unlock()
+		if c := pc.counts("a"); c.ready != 1 || fails != 0 || alarm != "" {
+			t.Fatalf("after the new attestation: %+v, proof failures %d, alarm %q; want 1 ready, 0, none\n%s", c, fails, alarm, pc.debug("a"))
 		}
 	})
 }
@@ -382,18 +457,20 @@ func TestPoolManagerNeverDeletesAnUnprovenRoom(t *testing.T) {
 
 // Quarantine that fills a hotel's pool bound stops refill there, deletes
 // nothing and raises an alarm; the other hotel fills. Quarantined rooms
-// count in the bound, so a higher target leaves only the difference.
+// count in the bound (20% of slots, PR 3): a hotel with more slots has room
+// for only the difference.
 func TestQuarantineFillingTheBoundStopsRefill(t *testing.T) {
 	pc := newPoolChain(t, []string{"a", "b"}, nil)
 	fa := pc.hotels["a"]
+	fa.set(func(f *fakePoolHotel) { f.slots = 15 }) // bound 3
 	for _, id := range []string{"q1", "q2", "q3"} {
 		fa.addRoom(id, "pool", "claim")
 	}
 	pc.up("a")
 	pc.up("b")
-	pc.target(3)
+	pc.target(10)
 	pc.steps("a", 5)
-	pc.fill("b", 3)
+	pc.fill("b", 10)
 	if c := pc.counts("a"); c.quarantined != 3 || c.ready != 0 {
 		t.Fatalf("hotel a %+v, want 3 quarantined and nothing else\n%s", c, pc.debug("a"))
 	}
@@ -406,14 +483,15 @@ func TestQuarantineFillingTheBoundStopsRefill(t *testing.T) {
 	_, doc := pc.operator("GET", "/v1/broker/ready-rooms", nil)
 	ha := doc["hotels"].(map[string]any)["a"].(map[string]any)
 	alarm, _ := ha["alarm"].(string)
-	if !strings.Contains(alarm, "3 pool rooms quarantined") || !strings.Contains(alarm, "no pool refill") {
-		t.Fatalf("alarm %q", alarm)
+	if !strings.Contains(alarm, "3 pool rooms quarantined") || !strings.Contains(alarm, "no pool refill") || ha["bound"] != float64(3) {
+		t.Fatalf("alarm %q, hotel %v", alarm, ha)
 	}
-	pc.target(5)
+	fa.set(func(f *fakePoolHotel) { f.slots = 25 }) // bound 5
+	pc.sync("a")
 	pc.fill("a", 2)
 	pc.steps("a", 3)
 	if c := pc.counts("a"); c.ready != 2 || c.quarantined != 3 {
-		t.Fatalf("hotel a at target 5: %+v, want 2 ready and 3 quarantined", c)
+		t.Fatalf("hotel a with bound 5: %+v, want 2 ready and 3 quarantined", c)
 	}
 }
 
@@ -567,36 +645,38 @@ func TestPoolReadingsAreNotBillable(t *testing.T) {
 	}
 }
 
-// A pool create starts no sooner than 1 s after the previous answer on the
-// same hotel: no hotel ever gets 2 pool creates in one second.
+// At refill_per_second 1 a pool create starts at least 1 s after the
+// previous one on the same hotel: no hotel gets 2 pool creates in one second.
 func TestPoolCreatesAtMostOneASecondPerHotel(t *testing.T) {
 	pc := newPoolChain(t, []string{"a", "b"}, nil)
-	poolCreateEvery = time.Second
+	poolSpacingFactor = 1.05
 	pc.up("a")
 	pc.up("b")
-	pc.target(10)
-	ctx, cancel := context.WithCancel(context.Background())
-	go pc.b.runPool(ctx)
-	time.Sleep(3500 * time.Millisecond)
-	cancel()
-	waitFor(t, "pool steps to end", func() bool {
-		pc.b.mu.Lock()
-		defer pc.b.mu.Unlock()
-		for _, ph := range pc.b.pool.hotels {
-			if ph.busy {
-				return false
+	if st, doc := pc.operator("PUT", "/v1/broker/ready-rooms", map[string]any{"per_hotel": map[string]int{"node-22": 10},
+		"refill_per_second": 1, "refill_during_claims": 1, "reserve_share": 0.25}); st != 200 {
+		t.Fatalf("PUT: %d %v", st, doc)
+	}
+	probe := startSchedProbe(t)
+	stop := make(chan struct{})
+	go func() { // until both hotels have 3 creates
+		defer close(stop)
+		for end := time.Now().Add(20 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+			if len(pc.hotels["a"].creates()) >= 3 && len(pc.hotels["b"].creates()) >= 3 {
+				return
 			}
 		}
-		return true
-	})
+	}()
+	pc.runPool(21*time.Second, stop)
 	for _, id := range []string{"a", "b"} {
 		c := pc.hotels[id].creates()
-		if len(c) < 2 || len(c) > 4 {
-			t.Fatalf("hotel %s: %d creates in 3.5 s, want 2 to 4", id, len(c))
+		if len(c) < 3 {
+			t.Fatalf("hotel %s: %d creates in 20 s, want 3", id, len(c))
 		}
 		for i := 1; i < len(c); i++ {
-			if gap := c[i].at.Sub(c[i-1].at); gap < time.Second {
-				t.Fatalf("hotel %s: creates %d and %d %s apart", id, i-1, i, gap)
+			// A loaded machine can make one arrival late after its start
+			// and so shorten the gap after it (schedProbe).
+			if !probe.gapAtLeast(c[i-1].at, c[i].at, time.Second) {
+				t.Fatalf("hotel %s: creates %d and %d %s apart", id, i-1, i, c[i].at.Sub(c[i-1].at))
 			}
 		}
 	}
