@@ -882,6 +882,27 @@ def test_host_net_refuses_the_link_a_stopped_sibling_hotel_is_set_to(host: FakeH
     assert proc.returncode == 0, proc.stderr
 
 
+def test_host_net_refuses_the_tap_a_stopped_sibling_hotel_is_set_to(host: FakeHost) -> None:
+    # AB#432 link_clash: a stopped sibling unit with the same SEALED_TAP and another /30 used to pass,
+    # so this hotel's "up" would readdress the sibling's tap and its "down" would delete it.
+    _sibling_unit(host, "nc-sealed-3", SEALED_TAP="snp1", SEALED_HOST_IP="10.215.0.9", SEALED_GUEST_IP="10.215.0.10")
+    link = {"SEALED_TAP": "snp1", "SEALED_HOST_IP": "10.215.0.5", "SEALED_GUEST_IP": "10.215.0.6"}
+    # "check" on a stopped guest leaves its link down and never reaches the clash check.
+    for action in ("clash", "up"):
+        proc = _run_host_net(host, action, link)
+        assert proc.returncode == 1, action
+        assert "room-sealed-nc-sealed-3.service is set to tap snp1, the same SEALED_TAP" in proc.stderr
+        assert not [c for c in host.calls("iptables") if " -A " in c or " -I " in c], action
+        assert not [c for c in host.calls("ip") if "addr replace" in c or "tuntap" in c], action
+    # Another tap and another /30: no clash.
+    proc = _run_host_net(host, "clash", {**link, "SEALED_TAP": "snp2"})
+    assert proc.returncode == 0, proc.stderr
+    # A sibling that names no tap is compared by its /30 only, as before.
+    _sibling_unit(host, "old-sibling", SEALED_HOST_IP="10.215.0.13", SEALED_GUEST_IP="10.215.0.14")
+    proc = _run_host_net(host, "clash", {**link, "SEALED_TAP": "snp2"})
+    assert proc.returncode == 0, proc.stderr
+
+
 @pytest.mark.parametrize("link", [{"SEALED_HOST_IP": "10.215.0.4", "SEALED_GUEST_IP": "10.215.0.5"},
                                   {"SEALED_HOST_IP": "10.215.0.5"}, {"SEALED_GUEST_IP": "10.215.0.6"}])
 def test_host_net_down_still_removes_the_tap_with_a_bad_link(host: FakeHost, link: dict[str, str]) -> None:
