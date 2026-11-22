@@ -30,6 +30,9 @@ def fake(tmp_path, monkeypatch) -> FakeDocker:
     # No reconcile during a test: only the liveness read may notice an end.
     monkeypatch.setenv("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", "3600")
     monkeypatch.setenv("CATHEDRAL_SANDBOX_LIVENESS_SECONDS", "0")
+    # The fake docker is a Python process: on a loaded runner its ps can take over the 2 s production
+    # bound, which would skip the read under test. The slow-read test reads the same constant.
+    monkeypatch.setattr(sandbox_guest, "LIVENESS_PS_TIMEOUT_SECONDS", 30.0)
     return docker
 
 
