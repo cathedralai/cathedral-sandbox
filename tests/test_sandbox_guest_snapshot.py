@@ -708,8 +708,15 @@ def test_api_writes_to_a_room_are_409_while_its_capture_runs_and_other_rooms_are
         with pytest.raises(SandboxOpError) as err:
             provider.write_tar(a, "/work", _tiny_tar())
         assert err.value.code == "snapshot_in_progress"
+        with pytest.raises(SandboxOpError) as err:
+            provider.make_directory(a, "/work/newdir")
+        assert err.value.code == "snapshot_in_progress"
+        with pytest.raises(SandboxOpError) as err:
+            provider.remove_entry(a, "/work/x.txt")
+        assert err.value.code == "snapshot_in_progress"
         provider.write_file(other, "/work/x.txt", b"1", None)  # another room: untouched
         provider.write_tar(other, "/work", _tiny_tar())
+        assert provider.make_directory(other, "/work/newdir")
     finally:
         gate.set()
         worker.join(10)
