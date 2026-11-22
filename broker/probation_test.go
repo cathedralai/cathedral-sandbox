@@ -188,6 +188,7 @@ func TestProbationMinimumComesFromConfig(t *testing.T) {
 	t0 := time.Now().Add(time.Hour)
 	tc.b.mu.Lock()
 	h.prob.lastSample = time.Time{}
+	h.prob.observed, h.prob.up = 0, 0 // real-time ticks before stopLoops may have counted time (slow under -race)
 	tc.b.mu.Unlock()
 	steps(tc, h, t0, sample{0, true}, sample{477 * time.Millisecond, true}, sample{500 * time.Millisecond, false}) // 95.4%
 	if !h.inProbation() {
