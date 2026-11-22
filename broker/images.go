@@ -75,6 +75,9 @@ type placement struct {
 	// matches, whatever the guest policy says, so no retry, fallback or
 	// queue move can reach one either.
 	ownHostsOnly bool
+	// fresh: an AB#683 fresh create (escape_fresh_create.go). only is then
+	// its assigned hotel; the create is sent there once or not at all.
+	fresh *freshCreate
 	// diskGiB: the create's resources.disk_gib (0: the hotel default). Above
 	// the base disk it must fit a hotel's disk budget (disk.go).
 	diskGiB int
@@ -163,6 +166,9 @@ func (pl placement) apply(payload map[string]any) {
 // noRoom is the answer when pick finds no hotel and no hotel was tried.
 // Caller must NOT hold b.mu; noRoomReason locks.
 func (b *broker) noRoom(pl placement) createResult {
+	if pl.fresh != nil {
+		return freshUnavailable(pl.fresh)
+	}
 	if pl.only != nil && pl.hotelSnap == "" && pl.hotelWorkspace != "" {
 		return createResult{status: 503, header: http.Header{"Retry-After": {"5"}}, doc: errDoc("workspace_hotel_unavailable",
 			"the hotel that holds this workspace has no free room or does not answer; retry later")}
