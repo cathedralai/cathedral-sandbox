@@ -56,6 +56,7 @@ type fakePoolHotel struct {
 	signNoPool    bool          // sign creates without "pool": true (the front withholds it)
 	signOtherKey  bool          // sign creates with a key the binding does not name
 	signOtherRoom bool          // the receipt names another room id
+	signOtherBind bool          // the receipt names a binding unlike its /room/attestation
 	noReceipt     bool          // answer creates without X-Room-Receipt
 	createTTL     time.Duration // 0: the ttl_seconds sent
 	healthFail    bool
@@ -289,7 +290,11 @@ func (f *fakePoolHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.signOtherKey {
 			_, priv, _ = ed25519.GenerateKey(rand.Reader)
 		}
-		rc := f.receipt(priv, f.createStatement(named, doc.Image, !f.signNoPool))
+		st := f.createStatement(named, doc.Image, !f.signNoPool)
+		if f.signOtherBind {
+			st["binding_sha256"] = strings.Repeat("ab", 32)
+		}
+		rc := f.receipt(priv, st)
 		rm.receipts = append(rm.receipts, rc)
 		if f.createLost {
 			reply(503, map[string]any{"error": "answer lost"})

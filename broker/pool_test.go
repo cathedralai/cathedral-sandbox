@@ -197,6 +197,15 @@ func TestPoolRoomsTurnStaleOnBindingChange(t *testing.T) {
 		if !again {
 			t.Fatal("the hotel is not attested again at once")
 		}
+		// A real move costs one 5 s pause, then the new binding proves rooms.
+		pc.b.mu.Lock()
+		ph := pc.b.pool.hotel("a")
+		fails, wait := ph.proofFails, time.Until(ph.backoff)
+		ph.backoff = time.Time{} // past the backoff
+		pc.b.mu.Unlock()
+		if fails != 1 || wait < 4*time.Second || wait > poolRetryFirst {
+			t.Fatalf("proof failures %d, backoff left %s; want 1 and about 5 s", fails, wait)
+		}
 		pc.sync("a") // attests: the new binding
 		pc.step("a")
 		if n := len(f.roomDeletes()); n != 3 {

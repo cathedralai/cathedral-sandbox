@@ -687,16 +687,29 @@ func TestPoolCreatesNeverWaitForAHotelConnection(t *testing.T) {
 	}
 }
 
-// A front that signs creates without "pool": true fails every receipt-1
-// proof. The real refill loop backs off 5 s, doubling to 1 min, so creates
-// stay at or under the 1 a second the 1 s limit of #658 allowed (the bound
-// never trips: each stale room is deleted at once), and after
-// poolProofAlarmAfter failures in a row the ready_rooms alarm is set. A ready
-// create resets the count and the alarm.
+// A front that signs creates without "pool": true, or signs a binding unlike
+// its /room/attestation, fails every receipt-1 proof. The real refill loop
+// backs off 5 s, doubling to 1 min, so creates stay at or under the 1 a
+// second the 1 s limit of #658 allowed (the bound never trips: each stale
+// room is deleted at once), and after poolProofAlarmAfter failures in a row
+// the ready_rooms alarm is set. A binding failure still asks for a new
+// attestation at once. A ready create resets the count and the alarm.
 func TestPoolProofFailuresBackOffAndAlarm(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bad  func(f *fakePoolHotel, on bool)
+	}{
+		{"no pool true", func(f *fakePoolHotel, on bool) { f.signNoPool = on }},
+		{"binding unlike its attestation", func(f *fakePoolHotel, on bool) { f.signOtherBind = on }},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testPoolProofFailuresBackOffAndAlarm(t, tc.bad) })
+	}
+}
+
+func testPoolProofFailuresBackOffAndAlarm(t *testing.T, bad func(f *fakePoolHotel, on bool)) {
 	pc := newPoolChain(t, []string{"a"}, nil)
 	f := pc.hotels["a"]
-	f.set(func(f *fakePoolHotel) { f.signNoPool = true })
+	f.set(func(f *fakePoolHotel) { bad(f, true) })
 	pc.up("a")
 	pc.putRefill(10, 4, 4)
 	poolSpacingFactor = 1.05
@@ -730,6 +743,9 @@ func TestPoolProofFailuresBackOffAndAlarm(t *testing.T) {
 		t.Fatalf("%d creates, %d deletes: every unproven room is deleted", creates, deletes)
 	}
 	starts := f.createStarts()
+	if n := maxInWindow(starts, 5*time.Second); n > poolCreatesInFlight {
+		t.Fatalf("%d creates within 5 s, want at most %d (one backoff round)", n, poolCreatesInFlight)
+	}
 	if g := starts[len(starts)-1].Sub(starts[0]); g < 14*time.Second {
 		t.Fatalf("first to last of %d creates %s apart, want the 5 s then 10 s backoff (about 15 s)", creates, g)
 	}
@@ -742,7 +758,7 @@ func TestPoolProofFailuresBackOffAndAlarm(t *testing.T) {
 	}
 
 	// An honest front: past the backoff, the next ready create resets both.
-	f.set(func(f *fakePoolHotel) { f.signNoPool = false })
+	f.set(func(f *fakePoolHotel) { bad(f, false) })
 	pc.b.mu.Lock()
 	ph.backoff = time.Time{}
 	pc.b.mu.Unlock()

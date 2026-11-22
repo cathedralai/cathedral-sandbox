@@ -1183,11 +1183,13 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 		}
 	}
 	ph.rooms[hid] = pr
-	if pr.state == poolStale && !errors.Is(derr, errPoolReceiptBinding) {
+	if pr.state == poolStale {
 		// A front that never proves pool rooms would otherwise see a create
 		// and a delete at the full refill rate, forever: back off 5 s,
-		// doubling to 1 min, and tell ops once the failures run on. A moved
-		// binding is not counted: the hotel is attested again at once.
+		// doubling to 1 min, and tell ops once the failures run on. A
+		// binding failure counts too (a receipt signer that lastingly
+		// disagrees with the attestation would churn the same way); it is
+		// still attested again at once, so a real move costs one 5 s pause.
 		ph.proofFails++
 		ph.backoff = tDone.Add(poolRetry(ph.proofFails))
 		if ph.proofFails == poolProofAlarmAfter {
