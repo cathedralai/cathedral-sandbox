@@ -122,7 +122,7 @@ var catalogTemplates = []catalogTemplate{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
 		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:a921557db976002b91c5a48478831edf31a36578427bc63bb1bdc58b482e92c8"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:6deb0202dd65f56b4f77b55320b8cd6279105cbfc1cce2df5500309bec2b8a98"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-omni-2b", DisplayName: "d1 Omni 2B (CPU)",
