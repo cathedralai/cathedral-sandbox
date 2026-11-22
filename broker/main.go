@@ -270,6 +270,11 @@ type config struct {
 	// observed second records 0. Turning it on changes what customers pay:
 	// a pricing decision for a person.
 	UsageMeterMinSecond bool `json:"usage_meter_min_second,omitempty"`
+	// ReadyRooms turns on the ready-room pool (pool.go, AB#894). Absent: off.
+	// ReadyRoomsUnsealedForTests: the Mac rig's level-1 fronts only
+	// (pool_settings.go); refused unless everything is on 127.0.0.1.
+	ReadyRooms                 *readyRoomsConfig `json:"ready_rooms,omitempty"`
+	ReadyRoomsUnsealedForTests bool              `json:"ready_rooms_unsealed_for_tests,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -506,6 +511,9 @@ type broker struct {
 	// usageMeter writes the usage readings of every room (usage_meter.go). nil:
 	// no state_dir, metering is off.
 	usageMeter *usageMeter
+
+	// pool is the ready-room pool (pool.go). nil: no ready_rooms config.
+	pool *readyRooms
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -778,6 +786,9 @@ func loadBroker(path string) (*broker, error) {
 	}
 	if err := b.loadUsageMeter(); err != nil {
 		return nil, fmt.Errorf("usage meter: %w", err)
+	}
+	if err := b.loadReadyRooms(); err != nil {
+		return nil, err
 	}
 	return b, nil
 }
@@ -3090,6 +3101,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.handleUsageMeter(w, r) // operator key only
 		return
 	}
+	if p == "/v1/broker/ready-rooms" {
+		b.handleReadyRooms(w, r) // operator key only (pool_settings.go)
+		return
+	}
 	if id, action, ok := meterRoute(p); ok {
 		b.handleMeter(w, r, id, action) // meter key only (meter.go)
 		return
@@ -3279,6 +3294,7 @@ func main() {
 	for _, h := range b.hotelList() {
 		b.startSync(ctx, h)
 	}
+	go b.runPool(ctx) // after the sync loops: it waits for each hotel's first list (pool.go)
 	handler := b.handler()
 	// No WriteTimeout: an exec may run for hours. IdleTimeout closes kept-alive
 	// connections that send nothing, so they cannot pile up to the fd limit.
@@ -3302,6 +3318,7 @@ func main() {
 		if err := b.usageMeter.flush(); err != nil {
 			log.Printf("usage meter: readings not written at stop: %v", err)
 		}
+		b.pool.close()
 		os.Exit(0)
 	}()
 	log.Printf("central booking on %s: %d hotels, %d guests", b.cfg.Listen, len(b.hotelList()), len(b.guests))
