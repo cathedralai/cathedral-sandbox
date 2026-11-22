@@ -344,7 +344,9 @@ A dedicated machine's create receipts also carry `owner_request_sha256`,
 
 A founding-miner hotel (AB#57) runs on a host the miner controls. The host is
 not trusted with the hotel key or with room traffic. `SEALED_MINER=1` in
-`sealed.env` builds a guest that keeps both inside:
+`sealed.env` builds a guest that keeps both inside.
+Operator procedure (requirements, entry points, testnet and production steps,
+open gaps): [docs/MINER_HOTEL.md](../../docs/MINER_HOTEL.md). The settings:
 
 ```
 SEALED_MINER=1
