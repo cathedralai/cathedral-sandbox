@@ -792,3 +792,77 @@ func TestUsageClaimRunShapes(t *testing.T) {
 		t.Fatal("an empty id reads as a claim run")
 	}
 }
+
+// writeRecord appends a record of kind with body to the running broker's
+// claim journal.
+func (pc *poolChain) writeRecord(kind string, body map[string]any) {
+	pc.t.Helper()
+	raw, _ := json.Marshal(body)
+	if err := <-pc.b.pool.journal.append(claimRecord{Kind: kind, Body: raw}); err != nil {
+		pc.t.Fatal(err)
+	}
+}
+
+// The replay keeps a won's mapping only while no later cancel or removed
+// names its run: those rooms stay the pool's after a restart.
+func TestReplayDropsCancelledAndRemovedRuns(t *testing.T) {
+	pc, _ := newMappedChain(t, 3)
+	wonAt := time.Now().Add(-time.Minute)
+	runs := map[string]string{}
+	for _, hid := range []string{"sbx-1", "sbx-2", "sbx-3"} {
+		runs[hid] = pc.mapRoom(hid, "g1", jobA, wonAt)
+		pc.writeWon("g1", hid, runs[hid], jobA, wonAt)
+	}
+	pc.writeRecord("cancel", map[string]any{"run_id": runs["sbx-1"]})
+	pc.writeRecord("removed", map[string]any{"run_id": runs["sbx-2"]})
+	pc.sync("a")
+	mustFlush(t, pc.b.usageMeter) // the runs' first readings on disk, as PR 6 requires before a claim's answer
+	pc.start()
+	pc.up("a")
+	pc.sync("a")
+	h := pc.b.hotelByID("a")
+	pc.b.mu.Lock()
+	got := map[string]string{}
+	for _, hid := range []string{"sbx-1", "sbx-2", "sbx-3"} {
+		if rm := h.rooms[hid]; rm != nil {
+			got[hid] = rm.guest
+		}
+	}
+	pc.b.mu.Unlock()
+	if got["sbx-1"] != poolGuestID || got["sbx-2"] != poolGuestID || got["sbx-3"] != "g1" {
+		t.Fatalf("guests after the restart %v; want sbx-1 (cancelled) and sbx-2 (removed) the pool's, sbx-3 g1's", got)
+	}
+}
+
+// A run the usage meter has already ended is never mapped back at a restart:
+// the meter would write nothing more for it, so the room stays set aside.
+func TestEndedRunIsNotMappedAtRestart(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	wonAt := time.Now().Add(-time.Minute)
+	run := pc.mapRoom("sbx-1", "g1", jobA, wonAt)
+	pc.writeWon("g1", "sbx-1", run, jobA, wonAt)
+	pc.sync("a")
+	pc.b.usageMeter.end(run, time.Now(), false) // as a delete answered 204 while the hotel kept the room
+	before := pc.readingsOfRun(run)
+	pc.start()
+	pc.up("a")
+	for i := 0; i < 3; i++ {
+		pc.sync("a")
+	}
+	pc.b.mu.Lock()
+	rm := pc.b.hotelByID("a").rooms["sbx-1"]
+	guest := ""
+	if rm != nil {
+		guest = rm.guest
+	}
+	pc.b.mu.Unlock()
+	if guest != poolGuestID {
+		t.Fatalf("room of an ended run after the restart: guest %q, want the pool's (set aside)", guest)
+	}
+	if st, _ := pc.as("key1", "GET", "/v1/sandboxes/a.sbx-1", false); st != 404 {
+		t.Fatalf("g1 GET of the set-aside room: %d, want 404", st)
+	}
+	if after := pc.readingsOfRun(run); len(after) != len(before) || endedCount(after) != 1 {
+		t.Fatalf("readings of the ended run: before %d, after %d (%+v); want no new reading, ended once", len(before), len(after), after)
+	}
+}
