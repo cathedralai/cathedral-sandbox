@@ -565,6 +565,16 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) (turnedNotBillabl
 	return turned && !s.pool
 }
 
+// runOpen reports whether run is open: it has readings and no ended one.
+func (m *usageMeter) runOpen(run string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runs[run] != nil
+}
+
 // end writes the ended reading of a run. confirmed: the broker's own delete
 // removed the room at at, so the time since its last sighting counts, when
 // the gap is short and no answered list since that sighting left the room

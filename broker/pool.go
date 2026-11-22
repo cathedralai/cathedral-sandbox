@@ -187,8 +187,13 @@ type readyRooms struct {
 	journalTries             int       // opens tried
 	journalNextTry           time.Time // unavailable: when the open is tried again
 	journalLoggedAt          time.Time // last log line of a failed retry
-	settings                 readyRoomsSettings
-	hotels                   map[string]*poolHotel
+	// Claim mappings from the journal (claims_state.go), by broker room id,
+	// taken by the sync's adoption after a restart. replayed: the journal
+	// was read (complete: its mappings; incomplete: none, decision 1).
+	mappings map[string]claimMapping
+	replayed bool
+	settings readyRoomsSettings
+	hotels   map[string]*poolHotel
 	// The open retry's lifetime (retryJournal). Guarded by retryMu.
 	retryMu   sync.Mutex
 	retryStop chan struct{} // closed by close(): the retry ends
@@ -217,8 +222,10 @@ func (p *readyRooms) openJournal(stateDir string) {
 	switch {
 	case err == nil:
 		p.journalState = "complete"
+		p.replayClaims() // before any sync: this runs inside loadBroker
 	case errors.Is(err, errClaimJournalIncomplete):
 		p.journalState, p.journalWhy = "incomplete", err.Error()
+		p.replayed = true // no mapping from an incomplete journal: its claimed rooms are set aside (claims_state.go)
 		log.Printf("ready rooms: %v; the pool manager creates and deletes nothing until a person looks", err)
 	default:
 		p.journalState, p.journalWhy = "unavailable", err.Error()

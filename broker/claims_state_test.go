@@ -759,3 +759,33 @@ func TestIncompleteJournalLeavesClaimedRoomUnreachableAndEnded(t *testing.T) {
 		t.Fatalf("%d deletes of the set-aside room, want none", n)
 	}
 }
+
+// Rule 1 of the late open tells a claim run from a physical run by the shape
+// of its id. This pins both shapes: an attempt id as the claim path makes it
+// (newUUID) and a broker room id taken from a real sync's room map. If either
+// shape changes, this test fails first.
+func TestUsageClaimRunShapes(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		if id := newUUID(); !usageClaimRun(id) {
+			t.Fatalf("attempt id %q is not a claim run", id)
+		}
+	}
+	pc, _ := newMappedChain(t, 1)
+	pc.b.mu.Lock()
+	var ids []string
+	for _, rm := range pc.b.hotelByID("a").rooms {
+		ids = append(ids, rm.id, rm.runID())
+	}
+	pc.b.mu.Unlock()
+	if len(ids) == 0 {
+		t.Fatal("no room in the room map")
+	}
+	for _, id := range ids {
+		if usageClaimRun(id) {
+			t.Fatalf("broker room id %q reads as a claim run", id)
+		}
+	}
+	if usageClaimRun("") {
+		t.Fatal("an empty id reads as a claim run")
+	}
+}

@@ -2670,7 +2670,9 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		rm := &room{hid: s.ID, id: h.cfg.ID + "." + s.ID, h: h, guest: s.Labels[guestLabel], state: stRunning, since: now, born: now, diskGiB: diskGiBOf(s.Resources)}
 		rm.noteListed(s.Labels, s.ExpiresAt, s.EndReason)
 		h.rooms[s.ID] = rm
-		b.register(rm)
+		if !b.adoptMappedLocked(h, rm) { // a claimed room after a restart: the journal's customer (claims_state.go)
+			b.register(rm)
+		}
 		h.place(rm)
 		b.forgetEnded(rm.guest, rm.id) // a late list: the room is back
 	}
