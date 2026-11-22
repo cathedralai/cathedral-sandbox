@@ -11,6 +11,7 @@
 //	"pin_max_gib": 400             image bytes the guest may pin on each hotel (0 or absent: no pins, guest_images.go)
 //	"ops": true                    the guest may run the probe and reset the broker counters
 //	"metered": true                admitted only on the ledger's allowance; closed until one comes (allowance.go)
+//	"postpaid": true               never refused, frozen or closed for balance: not metered, no freeze-all (meter.go)
 //
 // Every hotel is sealed (AB#776), so every room is sealed and
 // "default_sealed" no longer changes where a create goes. The field stays
@@ -58,6 +59,11 @@ type guestLimits struct {
 	// (allowance.go). It starts closed: cap 0 and no lease. Only the config
 	// makes a guest metered.
 	Metered bool `json:"metered,omitempty"`
+	// Postpaid: the guest's usage is billed after the fact and never gated
+	// on balance (Fred 22 Nov 2026 for const: bill him, never block him).
+	// The config refuses a postpaid guest that is also metered, and the
+	// meter's freeze-all answers 409 guest_postpaid and freezes nothing.
+	Postpaid bool `json:"postpaid,omitempty"`
 	// PinMaxGiB caps the image bytes the guest may pin on each hotel
 	// (prefetch "pin": true, guest_images.go). 0: pins are off.
 	PinMaxGiB int `json:"pin_max_gib,omitempty"`

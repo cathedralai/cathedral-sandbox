@@ -158,6 +158,7 @@ Each guest in the config can have limits (`guests.go`):
 | `pin_max_gib` | Image bytes the guest may pin on each hotel (prefetch `"pin": true`). Absent or 0: no pins; a pin gets 403 `pins_not_enabled`. Config only. |
 | `ops` | `true`: the guest may run `POST /v1/broker/probe` and reset the counters with `POST /v1/broker/stats`. Other guests get 403. |
 | `metered` | `true`: the guest is admitted only on the ledger's allowance, and it starts closed. Needs `state_dir`. See "Metered guests". |
+| `postpaid` | `true`: the guest is billed after the fact and never gated on balance. It cannot also be `metered` (the config is refused), and the meter's `freeze-all` answers 409 `guest_postpaid` and freezes nothing. For const (Fred, 22 Nov 2026: bill him, never block him). |
 
 The limits apply to the native routes and to the client (Harbor, ctcli)
 routes. `GET /v1/quota` shows the guest its limits.
