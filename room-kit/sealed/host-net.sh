@@ -112,12 +112,13 @@ dnat() {
 # - a /30 another interface holds or overlaps (two guests on one connected
 #   route: the broker reaches the wrong one or none),
 # - a /30 another sealed hotel unit on this host is set to use (stopped or not),
+# - a tap name (SEALED_TAP) another sealed hotel unit on this host is set to use,
 # - a move of this hotel's own link while its guest runs (its tap holds another
 #   address): the running guest would lose its NAT. Drain, stop the unit (its
 #   stop removes the old link; "check" leaves a stopped guest's link down),
 #   retarget any broker tunnel, then install.
 link_clash() {
-  local net dev cidr a p unit env other
+  local net dev cidr a p unit env other other_tap
   net=$(( $(sealed_ip_int "$SEALED_HOST_IP") - 1 ))
   while read -r _ dev _ cidr _; do
     a=$(sealed_ip_int "${cidr%/*}") || continue
@@ -138,7 +139,13 @@ link_clash() {
     [ -f "$unit" ] && [ "$unit" != "${ROOM_DESTDIR:-}/etc/systemd/system/room-sealed-$SEALED_NAME.service" ] || continue
     env=$(sed -n 's/^ExecStart=[^ ]*\/launch-guest\.sh \([^ ]*\)$/\1/p' "$unit" | head -1)
     [ -n "$env" ] && [ -r "$env" ] && ! [ "$env" -ef "$ENV" ] || continue
-    other=$(bash -c 'set +eu; source "$1" >/dev/null 2>&1; echo "${SEALED_HOST_IP:-10.215.0.1}"' _ "$env")
+    read -r other other_tap < <(bash -c 'set +eu; source "$1" >/dev/null 2>&1; echo "${SEALED_HOST_IP:-10.215.0.1} ${SEALED_TAP:-}"' _ "$env")
+    # Same tap name, any /30 (AB#432): both guests would open one tap device, and this hotel's
+    # "up" would readdress the sibling's link or its "down" would delete it.
+    if [ -n "${other_tap:-}" ] && [ "$other_tap" = "$TAP" ]; then
+      echo "sealed-hotel: $(basename "$unit") is set to tap $other_tap, the same SEALED_TAP as this hotel; give $SEALED_NAME its own SEALED_TAP in sealed.env" >&2
+      return 1
+    fi
     a=$(sealed_ip_int "$other") || continue
     if sealed_cidr_overlap "$net" 30 "$(( a - 1 ))" 30; then
       echo "sealed-hotel: $(basename "$unit") is set to $other/30, which overlaps this hotel's link $SEALED_HOST_IP/30; give $SEALED_NAME its own SEALED_HOST_IP and SEALED_GUEST_IP in sealed.env" >&2
