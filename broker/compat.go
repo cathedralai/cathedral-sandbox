@@ -243,6 +243,12 @@ func (b *broker) serveCompat(w http.ResponseWriter, r *http.Request, g *guestSta
 		}
 		writeJSON(w, 200, b.imageView(img))
 	case p == "/v1/sandboxes" && r.Method == "POST":
+		if hasFreshHeader(r) {
+			// AB#683: a fresh create is the native create only; this path
+			// would start a room without the headers (a legacy create).
+			compatErr(w, 400, "escape_fresh_refused", "a fresh create (X-Escape-Fresh) is made on the native create, not the compat API", 0)
+			return
+		}
 		b.compatIdem(w, r, g, func(w http.ResponseWriter, body []byte) { b.compatCreate(w, r, g, body) })
 	case p == "/v1/sandboxes" && r.Method == "GET":
 		b.compatList(w, r, g)

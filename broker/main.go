@@ -457,6 +457,7 @@ type guestState struct {
 
 type broker struct {
 	cfg              config
+	freshReplays     freshReplays  // AB#683 fresh creates by attempt and launch (escape_fresh_create.go)
 	terminalWSIdle   time.Duration // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
@@ -1103,6 +1104,14 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	// size: read from body at the first retry of a metered create (allowance.go).
 	var size *createSize
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 && pl.fresh != nil {
+			// A fresh create goes to its one hotel once (AB#683): what that
+			// hotel answered, or that it was never sent, is the answer.
+			if last.status != 0 {
+				return finish(last)
+			}
+			return finish(freshUnavailable(pl.fresh))
+		}
 		if attempt > 0 && createDeadlinePassed(pl) {
 			// A retry (the first hotel refused or had no free connection)
 			// would wait for a slot again past the create's own deadline.
@@ -1199,7 +1208,19 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 
 		// The hotel does not stop a create when the guest goes away. Keep the
 		// call open, so the broker learns the room id and can delete the room.
-		status, hdr, out, err := h.doHeaders(withCreateDeadline(context.WithoutCancel(ctx), pl), h.cfg.API, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout, ownerHeadersFrom(ctx))
+		extra := ownerHeadersFrom(ctx)
+		if pl.fresh != nil {
+			// Both values byte for byte. pl.only is the hotel of the expected
+			// binding: pick and waitSlot reach no other.
+			extra = extra.Clone()
+			if extra == nil {
+				extra = http.Header{}
+			}
+			for k, v := range pl.fresh.headers() {
+				extra[k] = v
+			}
+		}
+		status, hdr, out, err := h.doHeaders(withCreateDeadline(context.WithoutCancel(ctx), pl), h.cfg.API, "POST", "/v1/sandboxes", nil, body, hotelCreateTimeout, extra)
 		<-h.sem
 		tDone := time.Now()
 
@@ -1651,6 +1672,27 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
+	// AB#683: both fresh headers or neither (escape_fresh_create.go).
+	fresh, ferr := parseFreshCreate(r, raw)
+	if ferr != nil {
+		writeAPIErr(w, ferr)
+		return
+	}
+	if fresh != nil {
+		// A repeat of a create already made answers its first answer, before
+		// any check that the room it made could now fail (the room limit).
+		rec, e := b.freshReplays.lookup(g.cfg.ID, fresh)
+		if e != nil {
+			writeAPIErr(w, e)
+			return
+		}
+		if rec != nil {
+			if res, ok := b.freshReplays.await(r.Context(), rec); ok {
+				b.finishCreate(w, res, tRecv)
+			}
+			return
+		}
+	}
 	// The object form {"image", "registry_auth"} names its reference inside:
 	// the same refusal applies to it (AB#817).
 	if ref := createImageRef(payload); ref != "" {
@@ -1702,10 +1744,22 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeLimitErr(w, e, retry)
 		return
 	}
+	if fresh != nil {
+		if e := freshPlainCreate(payload, count, wantBytes); e != nil {
+			writeAPIErr(w, e)
+			return
+		}
+	}
 	pl, perr := b.placementFor(r.Context(), g, payload)
 	if perr != nil {
 		writeAPIErr(w, perr)
 		return
+	}
+	if fresh != nil {
+		if e := b.pinFresh(fresh, &pl); e != nil {
+			writeAPIErr(w, e)
+			return
+		}
 	}
 	pl.apply(payload)
 	pl.image = createImageRef(payload)
@@ -1714,7 +1768,34 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeLimitErr(w, e, retry)
 		return
 	}
-	results := b.createMany(withOwnerHeaders(r.Context(), r), g, payload, count, tRecv, pl)
+	ctx := withOwnerHeaders(r.Context(), r)
+	var rec *freshRecord
+	if fresh != nil {
+		var isNew bool
+		var e *apiErr
+		rec, isNew, e = b.freshReplays.claim(g.cfg.ID, fresh)
+		if !isNew {
+			b.unreserve(g, 1) // admitCreate's reservation: no create runs here
+			if e != nil {
+				writeAPIErr(w, e)
+			} else if res, ok := b.freshReplays.await(r.Context(), rec); ok {
+				b.finishCreate(w, res, tRecv)
+			}
+			return
+		}
+		// The answer must not depend on whether the caller stayed: a lost
+		// reply is recovered by a repeat, so the create runs to its end.
+		ctx = context.WithoutCancel(ctx)
+		if pl.deadline.IsZero() {
+			// Bounded without the caller: wait for the pinned hotel's slot
+			// at most this long, then answer create_timeout (nothing sent).
+			pl.deadline = tRecv.Add(freshSlotWait)
+		}
+	}
+	results := b.createMany(ctx, g, payload, count, tRecv, pl)
+	if rec != nil {
+		b.freshReplays.finish(rec, results[0])
+	}
 	if count == 1 {
 		if wantBytes && results[0].status == 202 && results[0].doc != nil {
 			results[0].doc["create_request_b64"] = base64.StdEncoding.EncodeToString(results[0].sent)
