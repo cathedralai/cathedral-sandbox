@@ -35,7 +35,7 @@ cathedral-validator `deploy/validator-update/sn94-snp-policy.json:3-7`
 |---|---|---|
 | CPU | AMD EPYC Genoa family: 9004 Genoa, 97x4 Bergamo, 8004 Siena (family 0x19, models 0x10 to 0x1F or 0xA0 to 0xAF) | `sn94-snp-policy.json:4`; `room-kit/hotel_offer.py:101-112` |
 | Not admitted | Milan, Turin, EPYC 4004, Ryzen, Intel, cloud confidential VMs | `sn94-snp-policy.json` (Genoa only); `broker/amd_chain.go:41-42` (Turin report fails) |
-| TCB | At or above `0x581c00000000000c` (boot loader 12, TEE 0, SNP 28, microcode 88), committed | `sn94-snp-policy.json:6` |
+| TCB | Roster worker guest: every TCB value in the report (current, reported, committed and launch) at or above `0x581c00000000000c` per component (boot loader 12, TEE 0, SNP 28, microcode 88), not as one packed number. The broker also enforces its own configured hotel floor (`min_genoa_snp_spl`, `min_genoa_microcode_spl`). Polaris offer verification applies no TCB floor of its own | `sn94-snp-policy.json:6`; cathedral-validator `cathedral_thin/independent_runtime/snp_production.py:229-246, 410-420`; `broker/admission.go:321-327` |
 | Sockets | One populated socket | [AMD_SEV_SNP_FRIEND_TEST.md](AMD_SEV_SNP_FRIEND_TEST.md#socket-policy-and-hardware-identity) |
 | Host kernel | Bare metal, root, `kvm_amd sev_snp=Y`, `/dev/sev` | `room-kit/sealed/install-sealed.sh:27-28` |
 | Chip | One miner hotel per chip (`chip_in_use`) | `broker/admission.go:56` |
