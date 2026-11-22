@@ -32,7 +32,14 @@ Routes it adds:
   POST /room/escape-nonce          sealed Escape hotels only: plant the window nonce at
                                    /run/escape-room/<window_id>/nonce, one file per window
                                    (never echoed; the signed receipt and the answer carry that
-                                   path, not the value)
+                                   path, not the value). AB#683: with "sandbox_id" and
+                                   "escape_fresh", admitted once, only for the room, live
+                                   incarnation and create receipt of that fresh create
+  POST /v1/sandboxes + X-Escape-Fresh
+                                   sealed Escape hotels only (AB#683): the API's assignment
+                                   (schema, attempt_id, report_id, request_sha256), consumed
+                                   once per boot before the create runs and signed into its
+                                   receipt as "escape_fresh"; not sent on to the room API
   GET /room/hotel-key-install-key  miner hotels only: the guest X25519 install key, signed
                                    by the attested receipt key
   POST /room/hotel-key             miner hotels only: install the per-hotel API key, sealed
@@ -184,6 +191,17 @@ WINDOW_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 # A window id becomes a directory name: no ".", "..", or hidden names.
 WINDOW_DIR_RE = re.compile(r"^[A-Za-z0-9_:-][A-Za-z0-9._:-]{0,127}$")
 NONCE_RE = re.compile(r"^[A-Za-z0-9+/=_-]{16,512}$")
+# AB#683 fresh guest evidence: polariscomputer docs/AB683_FRESH_EVIDENCE.md. The API's assignment rides on a
+# create in this header and is signed into the create receipt; the plant must name the same assignment, room
+# incarnation and create receipt, or it is refused before the nonce is written.
+ESCAPE_FRESH_SCHEMA = "cathedral.escape.fresh_evidence/v1"
+ESCAPE_FRESH_HEADER = "X-Escape-Fresh"
+ESCAPE_FRESH_KEYS = frozenset({"schema", "attempt_id", "report_id", "request_sha256"})
+ESCAPE_FRESH_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+ESCAPE_FRESH_HEADER_MAX = 1024
+# Attempts and launches this boot consumed. Never evicted: once full, fresh creates are refused until restart.
+ESCAPE_FRESH_MAX = 4096
 # Miner hotel key install (the control plane side is polariscomputer
 # cathedral_hotel_reconciler.RoomKitKeyInstaller; keep the two in step).
 INSTALL_ALGORITHM = PLANT_ALGORITHM  # the plant construction, with its own HKDF info and AAD
@@ -2276,6 +2294,12 @@ class Ledger:
         self.forks_in_flight: dict[str, int] = {}
         self.snapshot_deletes_in_flight: dict[str, int] = {}
         self.lives: dict[str, str] = {}  # room id -> the create receipt that began its current life
+        # AB#683 (guarded by self.lock). fresh_used: every attempt_id and report_id a fresh create consumed this
+        # boot, whatever its outcome, so no second create runs for one. fresh_rooms: room id -> the assignment and
+        # create receipt_sha256 of its fresh create. fresh_planted: attempts whose one plant was admitted.
+        self.fresh_used: set[str] = set()
+        self.fresh_rooms: dict[str, tuple[dict, str]] = {}
+        self.fresh_planted: set[str] = set()
         # Serial rooms (all guarded by self.lock). in_flight counts the authorized requests between enter and
         # leave; busy is the per-room token (taken without waiting, so nothing queues and nothing can deadlock),
         # always a subset of the in_flight keys; serial holds the rooms whose create was signed serial; broken the
@@ -2533,6 +2557,7 @@ class Ledger:
         """A signed delete or room_end ends the room's incarnation and every mark kept for it. Caller holds self.lock."""
         self.incarnations.pop(room, None)
         self.lives.pop(room, None)
+        self.fresh_rooms.pop(room, None)
         self.serial.discard(room)
         self.broken.discard(room)
         self.pool.pop(room, None)
@@ -2673,6 +2698,44 @@ class Ledger:
     def sign(self, fields: dict, create: dict | None = None) -> dict:
         with self.lock:
             return self._sign_locked(fields, create)
+
+    def consume_fresh(self, fresh: dict) -> bool:
+        """Take one fresh attempt and launch for this boot, before its create is sent. False: already used."""
+        with self.lock:
+            ids = (f"attempt:{fresh['attempt_id']}", f"report:{fresh['report_id']}")
+            if any(i in self.fresh_used for i in ids) or len(self.fresh_used) + 2 > ESCAPE_FRESH_MAX:
+                return False
+            self.fresh_used.update(ids)
+            return True
+
+    def retain_fresh(self, receipt: dict) -> None:
+        """Keep a signed 2xx fresh create's assignment for its plant. Only what this front signed."""
+        st = receipt["statement"]
+        room, fresh, status = st.get("sandbox_id"), st.get("escape_fresh"), st.get("status")
+        if st.get("action") != "create" or not isinstance(fresh, dict) or not isinstance(status, int) \
+                or not 200 <= status < 300 or not isinstance(room, str) or not SECRETS_ROOM_RE.fullmatch(room):
+            return
+        with self.lock:
+            if self.incarnations.get(room) == receipt["receipt_sha256"]:
+                self.fresh_rooms[room] = (dict(fresh), receipt["receipt_sha256"])
+
+    def admit_fresh_plant(self, room, fresh) -> bool:
+        """The one plant of a fresh attempt: same assignment, live incarnation and create receipt. Consumed here."""
+        if not isinstance(room, str) or not SECRETS_ROOM_RE.fullmatch(room) or not isinstance(fresh, dict) \
+                or set(fresh) != ESCAPE_FRESH_KEYS | {"create_receipt_sha256"}:
+            return False
+        with self.lock:
+            held = self.fresh_rooms.get(room)
+            if held is None:
+                return False
+            assignment, create_sha = held
+            if {k: fresh[k] for k in ESCAPE_FRESH_KEYS} != assignment \
+                    or fresh["create_receipt_sha256"] != create_sha \
+                    or self.incarnations.get(room) != create_sha \
+                    or assignment["attempt_id"] in self.fresh_planted:
+                return False
+            self.fresh_planted.add(assignment["attempt_id"])
+            return True
 
     def snapshot_entry(self, snapshot_id: str) -> dict | None:
         """A copy of what this boot signed for *snapshot_id*, or None."""
@@ -3152,7 +3215,7 @@ def escape_claims_bind(report_data: bytes, claims: bytes | None) -> bool:
         and hashlib.sha256(ESCAPE_CLAIMS_DOMAIN + claims).digest() == report_data[:32]
     )
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
-       "proxy-authenticate", "content-length", "host", "x-room-exec-handle"}
+       "proxy-authenticate", "content-length", "host", "x-room-exec-handle", "x-escape-fresh"}
 
 # Exec result memory (AB#756). The broker's background exec path sends its own exec handle in
 # EXEC_HANDLE_HEADER; for those execs only, the front keeps the answer it signed, so a broker that
@@ -3828,6 +3891,14 @@ class Handler(BaseHTTPRequestHandler):
             problem, create_ask = self.reserved_label_check(body)
             if problem is not None:
                 return self.reply(400, canonical({"error": {"code": problem[0], "message": problem[1]}}))
+        fresh = None
+        if action == "create" and self.headers.get_all(ESCAPE_FRESH_HEADER) is not None:
+            # Checked and consumed before the API runs; any refusal is unsent and unsigned.
+            fresh, problem = self.fresh_create_check(ledger, body, refusal, create_ask)
+            if problem is not None:
+                return self.reply(problem[0], canonical({"error": {"code": problem[1], "message": problem[2]}}))
+        elif ESCAPE_FRESH_HEADER in self.headers:
+            return self.reply(400, b'{"error":{"code":"escape_fresh_refused","message":"X-Escape-Fresh is for a create only"}}')
         fork = None
         if refusal is None and action == "snapshot" and self.authorized():
             if self.snapshot_name_is_id_shaped(body):
@@ -3902,8 +3973,10 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         receipt = ledger.sign(
                             {**self.fields(action, path, body, status, out, target_path=forward_path, fork=fork),
-                             **owner_fields},
+                             **owner_fields, **({"escape_fresh": fresh} if fresh is not None else {})},
                             **({"create": create_ask} if create_ask else {}))
+                        if fresh is not None:
+                            ledger.retain_fresh(receipt)
                     extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
                 except Exception as exc:  # noqa: BLE001 the action ran: answer, and say the receipt is missing
                     traceback.print_exc()
@@ -4123,6 +4196,47 @@ class Handler(BaseHTTPRequestHandler):
         if not signed:
             status, headers, out = 502, [], SNAPSHOT_UNSIGNED_BODY
         return receipt, status, headers, out
+
+    def fresh_create_check(self, ledger: "Ledger", body: bytes | None, refusal, create_ask) -> tuple[dict | None, tuple | None]:
+        """(assignment, refusal) for a create that carries X-Escape-Fresh. Fail closed on anything unexpected."""
+        def bad(status: int, code: str, message: str) -> tuple[None, tuple]:
+            return None, (status, code, message)
+
+        if not self.authorized():
+            return bad(401, "unauthorized", "unauthorized")
+        if refusal is not None or not escape_plant_open(ledger):
+            return bad(403, "escape_fresh_disabled", "this hotel does not take a fresh Escape create")
+        values = self.headers.get_all(ESCAPE_FRESH_HEADER)
+        invalid = (400, "escape_fresh_invalid", "X-Escape-Fresh must be one JSON object of schema, attempt_id, "
+                                               "report_id and request_sha256")
+        if len(values) != 1 or len(values[0]) > ESCAPE_FRESH_HEADER_MAX:
+            return None, invalid
+
+        def unique(pairs):
+            out = {}
+            for k, v in pairs:
+                if k in out:
+                    raise ValueError("duplicate key")
+                out[k] = v
+            return out
+        try:
+            fresh = json.loads(values[0], object_pairs_hook=unique)
+        except (ValueError, RecursionError):
+            return None, invalid
+        if not isinstance(fresh, dict) or set(fresh) != ESCAPE_FRESH_KEYS \
+                or fresh["schema"] != ESCAPE_FRESH_SCHEMA \
+                or not all(isinstance(fresh[k], str) and ESCAPE_FRESH_ID_RE.fullmatch(fresh[k])
+                           for k in ("attempt_id", "report_id")) \
+                or not isinstance(fresh["request_sha256"], str) or not SHA256_HEX_RE.fullmatch(fresh["request_sha256"]):
+            return None, invalid
+        if self.headers.get_all("Idempotency-Key") is not None:
+            # A replayed create answers an old room: one attempt, one create actually performed.
+            return bad(400, "escape_fresh_idempotency_refused", "a fresh create is made without an Idempotency-Key")
+        if create_ask is not None or self.fork_snapshot_id(body) is not None:
+            return bad(400, "escape_fresh_plain_create_required", "a fresh create is not a serial, pool or fork create")
+        if not ledger.consume_fresh(fresh):
+            return bad(409, "escape_fresh_consumed", "this attempt or launch was already used on this hotel")
+        return fresh, None
 
     def reserved_label_check(self, body: bytes | None) -> tuple[tuple[str, str] | None, dict | None]:
         """(refusal, ask) for a create. The ask says what the create requested, for the signing step.
@@ -4677,6 +4791,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"ciphertext_b64 or nonce is required"}}')
         if not isinstance(nonce, str) or not NONCE_RE.fullmatch(nonce):
             return self.reply(400, b'{"error":{"code":"invalid_request","message":"nonce must be 16 to 512 of [A-Za-z0-9+/=_-]"}}')
+        fresh = None
+        if "escape_fresh" in doc or "sandbox_id" in doc:
+            # AB#683: the attempt's one plant, into the room its signed fresh create made. Consumed before the
+            # write, so a failure after this point leaves it used. Encrypted only, whatever the plaintext flag.
+            if not encrypted or not ledger.admit_fresh_plant(doc.get("sandbox_id"), doc.get("escape_fresh")):
+                return self.reply(409, b'{"error":{"code":"escape_fresh_mismatch","message":"the plant does not match a fresh create of this room, or was already made"}}')
+            fresh = doc["escape_fresh"]
         base_dir = escape_nonce_dir()
         # Reject a symlinked or non-directory base before prune: listdir/rmtree would otherwise
         # follow the link and delete matching directories in an outside target.
@@ -4700,12 +4821,13 @@ class Handler(BaseHTTPRequestHandler):
             receipt = ledger.sign({
                 "action": PLANT_ACTION,
                 "target": "POST /room/escape-nonce",
-                "sandbox_id": None,
+                "sandbox_id": doc["sandbox_id"] if fresh is not None else None,
                 "window_id": window_id,
                 "nonce_sha256": nonce_sha,
                 "path": path,
                 "encrypted": encrypted,
                 "status": 200,
+                **({"escape_fresh": dict(fresh)} if fresh is not None else {}),
             })
             extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(receipt)).decode()
         except Exception as exc:  # noqa: BLE001 the file is written: answer, and say the receipt is missing
