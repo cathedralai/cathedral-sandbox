@@ -1737,9 +1737,10 @@ class DockerGuestProvider:
         self._reconcile_pending: dict[str, str | None] = {}
         self._reconcile_failures: dict[str, int] = {}
         self._reconciling: set[str] = set()
-        # Rooms whose container a reconcile or a thaw found exited, dead or gone: GET says "failed" from
-        # then on, never what the customer last asked for.
-        self._ended_rooms: set[str] = set()
+        # Rooms whose container a reconcile, a thaw or the liveness read (AB#920) found exited, dead or
+        # gone, with why when known: GET, wait and list say "failed" from then on, never what the
+        # customer last asked for.
+        self._ended_rooms: dict[str, str | None] = {}
         self._lifecycle_locks: dict[str, threading.Lock] = {}
         self._fork_pins: dict[str, _ForkPin] = {}  # new room id -> the pin its fork starts from
         self._pending_image_rm: dict[str, int] = {}  # snapshot image -> failed removals, retried each sweep
@@ -1798,6 +1799,11 @@ class DockerGuestProvider:
         self._kill_timeout = _env_float("CATHEDRAL_SANDBOX_KILL_TIMEOUT", 10.0, minimum=0.1)
         self._reconcile_interval = _env_float("CATHEDRAL_SANDBOX_RECONCILE_SECONDS", 60.0)
         self._last_reconcile: float | None = None
+        # AB#920: GET, wait and list read every room's engine state from one docker ps, at most once
+        # per this many seconds; concurrent callers share the read in flight.
+        self._liveness_max_age = _env_float("CATHEDRAL_SANDBOX_LIVENESS_SECONDS", 3.0)
+        self._liveness_at: float | None = None
+        self._liveness_lock = threading.Lock()
         # AB#864: docker State per room id from the last reconcile, and why a
         # stopped room's container ended (oom_killed / container_exited). A dead
         # room stays listed until TTL or idle; these only say why it is dead.
@@ -3465,12 +3471,13 @@ class DockerGuestProvider:
 
     _ENDED = ("gone", "exited", "dead")
 
-    def _note_ended(self, sandbox_id: str) -> None:
+    def _note_ended(self, sandbox_id: str, reason: str | None = None) -> None:
         """The engine says the room's container is not there to run: no reconcile is owed, and GET says failed."""
         with self._inner._lock:  # noqa: SLF001
             self._reconcile_pending.pop(sandbox_id, None)
             self._reconcile_failures.pop(sandbox_id, None)
-            self._ended_rooms.add(sandbox_id)
+            if reason is not None or sandbox_id not in self._ended_rooms:
+                self._ended_rooms[sandbox_id] = reason
 
     def _clear_mark(self, sandbox_id: str) -> None:
         with self._inner._lock:  # noqa: SLF001
@@ -3817,7 +3824,7 @@ class DockerGuestProvider:
         """
         guest = self._guests.get(sandbox_id)
         with self._inner._lock:  # noqa: SLF001
-            self._ended_rooms.discard(sandbox_id)
+            self._ended_rooms.pop(sandbox_id, None)
         if guest is not None:
             for process_id in list(guest.guest_processes):
                 try:
@@ -4041,6 +4048,8 @@ class DockerGuestProvider:
         Caller holds _drain_lock. A record is created before its container, so
         a container whose sandbox id has no record is an orphan.
         """
+        read_at = time.monotonic()
+        live = self._live_rooms()
         try:
             labeled = self._client.list_labeled_states(self._owner)
         except SandboxOpError as exc:
@@ -4053,7 +4062,9 @@ class DockerGuestProvider:
             for cid, _state, sid in labeled
             if sid not in queued and not (sid and self._inner.has_record(sid))
         ]
-        self._note_container_states(labeled, queued)
+        with self._liveness_lock:
+            self._note_container_states(labeled, queued, live=live)
+            self._liveness_at = read_at
         removed = sum(1 for gone in self._remove_many(orphans) if gone)
         self._sweep_secrets_dirs()
         self._reconcile_snapshot_images()
@@ -4065,15 +4076,25 @@ class DockerGuestProvider:
             self._net_pool.recount(held)
         return removed
 
-    def _note_container_states(self, labeled: list[tuple[str, str, str]], queued: set[str]) -> None:
-        """Keep each room's docker State from the reconcile list (AB#864).
+    def _note_container_states(
+        self, labeled: list[tuple[str, str, str]], queued: set[str], *, live: Mapping[str, str] | None = None
+    ) -> None:
+        """Keep each room's docker State from the reconcile or liveness list (AB#864, AB#920).
 
         A room whose container stopped gets one inspect, once, for OOM vs exit
         (the same reading as an exec that saw the room die). No events stream.
+        *live* is room id -> container id of the rooms that were running or
+        frozen before the list was read: of those, one whose container is
+        exited, dead or not listed at all has ended (GET, wait and list say
+        failed). A room created while the list was read is not in *live*, so it
+        is never taken for gone.
         """
+        live = live or {}
         states: dict[str, str] = {}
         ends: dict[str, str] = {}
+        listed: set[str] = set()
         for cid, state, sid in labeled:
+            listed.add(cid)
             if not sid or sid in queued or not self._inner.has_record(sid):
                 continue
             states[sid] = state
@@ -4086,8 +4107,72 @@ class DockerGuestProvider:
                     continue  # unreadable now; the next reconcile asks again
                 reason = "oom_killed" if death[0] or death[1] == 137 else "container_exited"
             ends[sid] = reason
+            if live.get(sid) == cid:
+                self._note_ended(sid, reason)
+        for sid, cid in live.items():
+            if cid in listed or sid in queued:
+                continue
+            guest = self._guests.get(sid)
+            if guest is not None and guest.container_id == cid and self._inner.state_of(sid) in ("running", "frozen"):
+                ends[sid] = "container_exited"  # removed behind our back: it cannot run again
+                self._note_ended(sid, "container_exited")
+        with self._inner._lock:  # noqa: SLF001
+            for sid in [s for s in self._ended_rooms if not self._inner.has_record(s)]:
+                del self._ended_rooms[sid]
         self._container_states = states
         self._container_ends = ends
+
+    def _live_rooms(self) -> dict[str, str]:
+        """Room id -> container id of every room whose record is running or frozen."""
+        out: dict[str, str] = {}
+        for sid, guest in list(self._guests.items()):
+            if guest.container_id and self._inner.state_of(sid) in ("running", "frozen"):
+                out[sid] = guest.container_id
+        return out
+
+    def _liveness_fresh(self) -> bool:
+        at = self._liveness_at
+        return at is not None and time.monotonic() - at < self._liveness_max_age
+
+    def _refresh_liveness(self) -> None:
+        """Read every room's engine state in one docker ps, at most once per
+        CATHEDRAL_SANDBOX_LIVENESS_SECONDS (AB#920). A caller that waited on a
+        read in flight uses that read. An unreadable engine keeps the last known
+        states and is asked again only after the same window."""
+        if self._liveness_fresh():
+            return
+        with self._liveness_lock:
+            if self._liveness_fresh():
+                return
+            read_at = time.monotonic()
+            live = self._live_rooms()
+            try:
+                labeled = self._client.list_labeled_states(self._owner)
+            except SandboxOpError as exc:
+                print(f"cathedral-sandbox: liveness read skipped: {exc}", file=sys.stderr, flush=True)
+                self._liveness_at = read_at
+                return
+            with self._doomed_lock:
+                queued = set(self._doomed)
+            self._note_container_states(labeled, queued, live=live)
+            self._liveness_at = read_at
+
+    def _ended_reason(self, sandbox_id: str) -> tuple[bool, str | None]:
+        with self._inner._lock:  # noqa: SLF001
+            if sandbox_id not in self._ended_rooms:
+                return False, None
+            return True, self._ended_rooms[sandbox_id]
+
+    def _with_liveness(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """*doc* with its docker State; a running or frozen room whose container ended says failed and why."""
+        doc = self._with_container(doc)
+        sid = doc.get("id") if isinstance(doc, dict) else None
+        if not sid or doc.get("state") not in ("running", "frozen", "failed"):
+            return doc
+        ended, reason = self._ended_reason(sid)
+        if not ended:
+            return doc
+        return {**doc, "state": "failed", "end_reason": reason or doc.get("end_reason") or "container_exited"}
 
     def _with_container(self, doc: dict[str, Any]) -> dict[str, Any]:
         """A room's docker State, and why its container ended when it is not running."""
@@ -4102,7 +4187,11 @@ class DockerGuestProvider:
         return doc
 
     def list(self, *, labels: Iterable[str], state: str | None) -> list[dict[str, Any]]:
-        return [self._with_container(d) for d in self._inner.list(labels=labels, state=state)]
+        self._refresh_liveness()
+        # No record is "failed" in the inner provider: an ended room is running or frozen there.
+        inner_state = None if state == "failed" else state
+        docs = [self._with_liveness(d) for d in self._inner.list(labels=labels, state=inner_state)]
+        return [d for d in docs if d.get("state") == state] if state else docs
 
     def room_networks(self) -> dict[str, Any] | None:
         """Port use per room network, or None when the pool is off."""
@@ -4342,12 +4431,13 @@ class DockerGuestProvider:
         return argv, overlay
 
     def get(self, sandbox_id: str) -> dict[str, Any]:
-        doc = self._with_container(self._with_tunables(self._inner.get(sandbox_id)))
+        doc = self._with_tunables(self._inner.get(sandbox_id))
+        self._refresh_liveness()
+        doc = self._with_liveness(doc)
         with self._inner._lock:  # noqa: SLF001
             marked = sandbox_id in self._reconcile_pending
-            ended = sandbox_id in self._ended_rooms
-        if ended:
-            return {**doc, "state": "failed"}
+        if doc.get("state") == "failed":
+            return doc
         if marked:
             # A room marked for reconcile reports what the engine says now, not what was asked for and
             # not a status read earlier. Unreadable is an error, never a guess; a container that is not
@@ -4362,7 +4452,9 @@ class DockerGuestProvider:
         return doc
 
     def wait(self, sandbox_id: str, timeout_seconds: int) -> dict[str, Any]:
-        return self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
+        doc = self._with_tunables(self._inner.wait(sandbox_id, timeout_seconds))
+        self._refresh_liveness()
+        return self._with_liveness(doc)
 
     def guest_port_http(
         self,
