@@ -14,6 +14,7 @@ import pytest
 
 from cathedral.sandbox_api import CreateSandboxRequest, ImageSource, Resources
 from cathedral.sandbox_provider import SandboxOpError
+from cathedral import sandbox_guest
 from cathedral.sandbox_guest import DockerGuestProvider
 from cathedral.sandbox_server import SandboxApplication
 from tests.fake_docker_cli import FakeDocker, install
@@ -165,7 +166,7 @@ def test_an_unreadable_engine_keeps_the_last_states_and_is_asked_once_per_window
 
     calls = []
 
-    def broken(owner):
+    def broken(owner, **_kw):
         calls.append(owner)
         raise SandboxOpError("docker_list_failed", 502, "docker ps failed: daemon down")
 
@@ -185,7 +186,7 @@ def test_a_room_created_while_the_engine_is_read_is_not_taken_for_gone(fake, pro
     # The listing ran before the room's container existed, and the room was not
     # running when the read started: it must not be reported failed.
     monkeypatch.setattr(provider, "_live_rooms", lambda: {})
-    monkeypatch.setattr(provider._client, "list_labeled_states", lambda owner: [])  # noqa: SLF001
+    monkeypatch.setattr(provider._client, "list_labeled_states", lambda owner, **_kw: [])  # noqa: SLF001
     assert provider.get(room)["state"] == "running"
     assert _listed(provider)[room]["state"] == "running"
 
@@ -214,3 +215,51 @@ def test_negative_control_without_the_liveness_read_the_exit_is_missed(fake, pro
     assert provider.get(room)["state"] == "running"
     assert provider.wait(room, 5)["state"] == "running"
     assert _listed(provider)[room]["state"] == "running"
+
+
+def test_a_slow_engine_read_does_not_block_other_callers(fake, provider, monkeypatch) -> None:
+    """AB#920: one slow docker ps must not make every GET, wait and list wait on it."""
+    import threading
+    import time as _time
+
+    room = _room(provider)
+    started, release = threading.Event(), threading.Event()
+    seen_timeouts = []
+
+    def slow(owner, *, timeout=60.0):
+        seen_timeouts.append(timeout)
+        started.set()
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(provider._client, "list_labeled_states", slow)  # noqa: SLF001
+    provider._liveness_max_age = 60.0  # noqa: SLF001
+    provider._liveness_at = None  # noqa: SLF001
+    worker = threading.Thread(target=lambda: provider.get(room), daemon=True)
+    worker.start()
+    try:
+        assert started.wait(5)
+        began = _time.monotonic()
+        assert provider.get(room)["state"] == "running"  # answered from the last known states
+        provider.list(labels=[], state=None)
+        assert _time.monotonic() - began < 1.0
+    finally:
+        release.set()
+        worker.join(10)
+    assert seen_timeouts == [sandbox_guest.LIVENESS_PS_TIMEOUT_SECONDS]
+    # The window starts when the read finished: no second read straight after a slow one.
+    provider.get(room)
+    assert len(seen_timeouts) == 1
+
+
+def test_an_ended_room_keeps_oom_killed_when_its_container_is_later_removed(fake, provider) -> None:
+    room = _room(provider)
+    cid = _cid(fake, room)
+    fake.set_container(cid, status="exited", exit_code=137)
+    provider._liveness_at = None  # noqa: SLF001
+    assert provider.get(room)["state"] == "failed"
+    first = provider._ended_rooms.get(room)  # noqa: SLF001
+    fake.remove_container(cid) if hasattr(fake, "remove_container") else fake.containers.pop(cid, None)
+    provider._liveness_at = None  # noqa: SLF001
+    provider.get(room)
+    assert provider._ended_rooms.get(room) == first  # noqa: SLF001

@@ -145,6 +145,10 @@ DIND_DOCKERD_ARGS_DEFAULT = (
 )
 
 
+# AB#920: the liveness docker ps answers within this or is skipped for one window.
+LIVENESS_PS_TIMEOUT_SECONDS = 2.0
+
+
 @dataclass(frozen=True)
 class DindConfig:
     """Operator settings for Docker-in-Docker guests.
@@ -1193,7 +1197,7 @@ class DockerClient:
         """
         return [(cid, sid) for cid, _state, sid in self.list_labeled_states(owner)]
 
-    def list_labeled_states(self, owner: str) -> list[tuple[str, str, str]]:
+    def list_labeled_states(self, owner: str, *, timeout: float = 60.0) -> list[tuple[str, str, str]]:
         """(container_id, docker State, sandbox_id) for all containers with our owner label.
 
         State is docker's word (running, exited, paused, created, dead). Raises
@@ -1210,7 +1214,7 @@ class DockerClient:
                 "--format",
                 "{{.ID}} {{.State}} {{.Label \"" + LABEL_SANDBOX_ID + "\"}}",
             ],
-            timeout=60.0,
+            timeout=timeout,
         )
         if result.returncode != 0:
             raise SandboxOpError(
@@ -4104,14 +4108,16 @@ class DockerGuestProvider:
             if reason is None:
                 death = self._client.container_death(cid)
                 if death is None:
-                    continue  # unreadable now; the next reconcile asks again
+                    if live.get(sid) == cid:
+                        self._note_ended(sid, None)  # it has ended; only the reason is unread, asked again next time
+                    continue
                 reason = "oom_killed" if death[0] or death[1] == 137 else "container_exited"
             ends[sid] = reason
             if live.get(sid) == cid:
                 self._note_ended(sid, reason)
         for sid, cid in live.items():
-            if cid in listed or sid in queued:
-                continue
+            if cid in listed or sid in queued or self._ended_rooms.get(sid) is not None:
+                continue  # an ended room keeps its first known reason (oom_killed is not overwritten)
             guest = self._guests.get(sid)
             if guest is not None and guest.container_id == cid and self._inner.state_of(sid) in ("running", "frozen"):
                 ends[sid] = "container_exited"  # removed behind our back: it cannot run again
@@ -4136,26 +4142,31 @@ class DockerGuestProvider:
 
     def _refresh_liveness(self) -> None:
         """Read every room's engine state in one docker ps, at most once per
-        CATHEDRAL_SANDBOX_LIVENESS_SECONDS (AB#920). A caller that waited on a
-        read in flight uses that read. An unreadable engine keeps the last known
+        CATHEDRAL_SANDBOX_LIVENESS_SECONDS (AB#920). A caller that finds a read
+        in flight answers from the last known states. An unreadable engine keeps the last known
         states and is asked again only after the same window."""
         if self._liveness_fresh():
             return
-        with self._liveness_lock:
+        # A read already in flight: answer from the last known states instead of queueing behind a
+        # slow engine (GET, wait and the broker's 10 s sync list must not block on docker ps).
+        if not self._liveness_lock.acquire(blocking=False):
+            return
+        try:
             if self._liveness_fresh():
                 return
-            read_at = time.monotonic()
             live = self._live_rooms()
             try:
-                labeled = self._client.list_labeled_states(self._owner)
+                labeled = self._client.list_labeled_states(self._owner, timeout=LIVENESS_PS_TIMEOUT_SECONDS)
             except SandboxOpError as exc:
                 print(f"cathedral-sandbox: liveness read skipped: {exc}", file=sys.stderr, flush=True)
-                self._liveness_at = read_at
+                self._liveness_at = time.monotonic()  # back off a full window after a slow or failed read
                 return
             with self._doomed_lock:
                 queued = set(self._doomed)
             self._note_container_states(labeled, queued, live=live)
-            self._liveness_at = read_at
+            self._liveness_at = time.monotonic()  # when the read finished: a slow read is not re-run at once
+        finally:
+            self._liveness_lock.release()
 
     def _ended_reason(self, sandbox_id: str) -> tuple[bool, str | None]:
         with self._inner._lock:  # noqa: SLF001
