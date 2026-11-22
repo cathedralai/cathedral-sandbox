@@ -42,6 +42,20 @@ def _fake_report() -> bytes:
     return bytes(report)
 
 
+# Every Front starts two servers; each test must close them, or the listening sockets and
+# keep-alive threads leak into later tests (the full suite then passes select()'s 1024 fd limit).
+_SERVERS: list[ThreadingHTTPServer] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_servers():
+    yield
+    while _SERVERS:
+        srv = _SERVERS.pop()
+        srv.shutdown()
+        srv.server_close()
+
+
 class Front:
     def __init__(self, tmp_path, monkeypatch, *, escape="1", sealed=True, plaintext=None, create_status=202):
         if escape is None:
@@ -91,10 +105,11 @@ class Front:
                 return self._answer(200, {"ok": True})
 
         api = ThreadingHTTPServer(("127.0.0.1", 0), Api)
-        Thread(target=api.serve_forever, daemon=True).start()
+        Thread(target=api.serve_forever, args=(0.05,), daemon=True).start()
         server = rr.Server(("127.0.0.1", 0), self.ledger, api.server_address[1], 1, KEY, "/nonexistent.sock",
                            pool_scan=False)
-        Thread(target=server.serve_forever, daemon=True).start()
+        Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
+        _SERVERS.extend((api, server))
         self.port = server.server_address[1]
 
     def request(self, method, path, body=None, headers=None):
@@ -102,9 +117,12 @@ class Front:
         h = {"Authorization": "Bearer " + KEY.decode()}
         if body is not None:
             h["Content-Type"] = "application/json"
-        c.request(method, path, body=body, headers={**h, **(headers or {})})
-        r = c.getresponse()
-        return r.status, dict(r.getheaders()), r.read()
+        try:
+            c.request(method, path, body=body, headers={**h, **(headers or {})})
+            r = c.getresponse()
+            return r.status, dict(r.getheaders()), r.read()
+        finally:
+            c.close()
 
     def create(self, fresh=FRESH, headers=None, body=None):
         extra = {} if fresh is None else {"X-Escape-Fresh": fresh if isinstance(fresh, str) else json.dumps(fresh)}
