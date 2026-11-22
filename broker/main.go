@@ -323,6 +323,9 @@ type room struct {
 	hotelDeath     string
 	hotelEnd       string
 	hotelRestarted bool
+	// mapping: a claimed ready room's customer run (claims_state.go); nil
+	// for every other room, which then takes exactly the paths it always did.
+	mapping *roomMapping
 }
 
 type latencies struct{ hotel, queue, overhead []float64 }
