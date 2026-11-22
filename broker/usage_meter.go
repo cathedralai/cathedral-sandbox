@@ -305,7 +305,10 @@ type usageMeter struct {
 	dir       string
 	every     int64 // seconds
 	minSecond bool  // usage_meter_min_second: a billable run's ended reading rounds up (queueLocked)
-	maxLines  int   // lines per file (usageFileLines; tests lower it)
+	// holdClaimRuns: the claim journal is not read yet (claims_state.go), so
+	// a claim run may still be mapped back to its room: none ends by absence.
+	holdClaimRuns bool
+	maxLines      int // lines per file (usageFileLines; tests lower it)
 	// write appends p to f and makes it durable. Tests replace it to fail.
 	write func(f *os.File, p []byte) error
 	known func(hotelID string) bool // the hotel is in the broker now; nil: every hotel
@@ -565,6 +568,17 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) (turnedNotBillabl
 	return turned && !s.pool
 }
 
+// setHoldClaimRuns turns the claim-run hold on (the journal is not read
+// yet) or off (it was read).
+func (m *usageMeter) setHoldClaimRuns(on bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.holdClaimRuns = on
+	m.mu.Unlock()
+}
+
 // runOpen reports whether run is open: it has readings and no ended one.
 func (m *usageMeter) runOpen(run string) bool {
 	if m == nil {
@@ -663,7 +677,9 @@ func (m *usageMeter) hotelPass(hotelID string, listed []usageSighting, present m
 		}
 	}
 	for id, r := range m.runs {
-		if endAbsent && r.last.Hotel == hotelID && !present[id] {
+		// A claim run waits for the claim journal's replay: its room may be
+		// the pool's until then (claims_state.go, the late open).
+		if endAbsent && r.last.Hotel == hotelID && !present[id] && !(m.holdClaimRuns && usageClaimRun(id)) {
 			m.endLocked(id, at, false)
 		}
 	}

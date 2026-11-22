@@ -188,6 +188,11 @@ func (b *broker) loadReadyRooms() error {
 	b.pool = p
 	b.setPoolMaxRoomsLocked()
 	p.openJournal(b.cfg.StateDir)
+	if !p.replayed {
+		// Not read yet (unavailable; the retry reads it): until then no claim
+		// run ends by absence (claims_state.go).
+		b.usageMeter.setHoldClaimRuns(true)
+	}
 	return nil
 }
 

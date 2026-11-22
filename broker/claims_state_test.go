@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -970,5 +971,161 @@ func TestHotelPassKeepsAnUnmappedRoomsRunPresent(t *testing.T) {
 		if !open || endedCount(pc.readingsOfRun(run)) != 0 {
 			t.Fatalf("run %s of a listed room: open %v, readings %+v; want open, never ended", run, open, pc.readingsOfRun(run))
 		}
+	}
+}
+
+// lateOpen maps sbx-1 to g1 with its won record, meters it for a while, and
+// restarts with the journal not opening at first (decision 2, the late open).
+// endRun: the meter ends the customer's run before the restart, as a delete
+// answered 204 while the hotel kept the room. It returns the run and its
+// readings before the restart.
+func lateOpen(t *testing.T, pc *poolChain, endRun bool) (string, []usageReading) {
+	t.Helper()
+	wonAt := time.Now().Add(-time.Minute)
+	run := pc.mapRoom("sbx-1", "g1", jobA, wonAt)
+	pc.writeWon("g1", "sbx-1", run, jobA, wonAt)
+	pc.sync("a")
+	time.Sleep(1100 * time.Millisecond)
+	pc.sync("a")
+	pc.b.usageMeter.checkpoint(time.Now())
+	if endRun {
+		pc.b.usageMeter.end(run, time.Now(), false)
+	}
+	before := pc.readingsOfRun(run)
+	if err := pc.b.saveCompat(); err != nil {
+		t.Fatal(err)
+	}
+	failJournalOpens(t, 1, errors.New("disk busy"))
+	pc.start()
+	if pc.b.pool.journalState != "unavailable" {
+		t.Fatalf("journal %s at start, want unavailable", pc.b.pool.journalState)
+	}
+	pc.up("a")
+	return run, before
+}
+
+// openLate is the retry's open succeeding.
+func (pc *poolChain) openLate() {
+	pc.t.Helper()
+	j, _, err := poolOpenJournal(pc.stateDir)
+	if !pc.b.noteJournalOpen(j, err) || pc.b.pool.journalState != "complete" {
+		pc.t.Fatalf("late open: %v, journal %s", err, pc.b.pool.journalState)
+	}
+}
+
+// Decision 2: the journal opens late. In the gap the claimed room is the
+// pool's and the customer cannot reach it, but the meter ends no claim run by
+// absence (a cold room's run still ends as today). The late open maps the
+// room back in place and the customer's run goes on: one run, one first
+// reading, cumulative, no ended reading, and its seconds are the time before
+// the restart plus the time after the mapping, not a second more: the gap is
+// not charged.
+func TestLateJournalOpenResumesTheOpenRunOnce(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	f := pc.hotels["a"]
+	f.addCustomerRooms(1)
+	pc.sync("a")
+	cold := ""
+	f.mu.Lock()
+	for id := range f.rooms {
+		if strings.HasPrefix(id, "cust-") {
+			cold = "a." + id
+		}
+	}
+	f.mu.Unlock()
+	run, before := lateOpen(t, pc, false)
+	gapStart := time.Now()
+	f.mu.Lock()
+	delete(f.rooms, strings.TrimPrefix(cold, "a.")) // a cold room goes in the gap
+	f.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		pc.sync("a")
+		time.Sleep(700 * time.Millisecond)
+	}
+	pc.letGo("a")
+	if !pc.b.usageMeter.runOpen(run) || endedCount(pc.readingsOfRun(run)) != 0 {
+		t.Fatalf("customer's run in the gap: open %v, readings %+v; want held open", pc.b.usageMeter.runOpen(run), pc.readingsOfRun(run))
+	}
+	if n := endedCount(pc.readingsOfRun(cold)); n != 1 {
+		t.Fatalf("the cold room's run %s in the gap: %d ended readings, want 1 (it ends by absence as today)", cold, n)
+	}
+	if st, _ := pc.as("key1", "GET", "/v1/sandboxes/a.sbx-1", false); st != 404 {
+		t.Fatalf("customer GET in the gap: %d, want 404 (the room is the pool's until the journal is read)", st)
+	}
+	gap := time.Since(gapStart)
+	pc.openLate()
+	h := pc.b.hotelByID("a")
+	pc.b.mu.Lock()
+	rm := h.rooms["sbx-1"]
+	ok := rm != nil && rm.guest == "g1" && rm.runID() == run && pc.b.pool.hotel("a").rooms["sbx-1"] == nil
+	pc.b.mu.Unlock()
+	if !ok {
+		t.Fatalf("after the late open: %+v, want g1's room %s, out of the pool's records", rm, run)
+	}
+	if st, doc := pc.as("key1", "GET", "/v1/sandboxes/a.sbx-1", false); st != 200 || !sameLabels(labelsOf(doc), jobA) {
+		t.Fatalf("customer GET after the late open: %d %v", st, doc)
+	}
+	t1 := time.Now()
+	pc.sync("a")
+	t1e := time.Now()
+	time.Sleep(1500 * time.Millisecond)
+	t2 := time.Now()
+	pc.sync("a")
+	t2e := time.Now()
+	pc.b.usageMeter.checkpoint(time.Now())
+	after := pc.readingsOfRun(run)
+	last, was := after[len(after)-1], before[len(before)-1]
+	for i, r := range after {
+		if r.StartedAt != after[0].StartedAt || r.Guest != "g1" || r.Billable != nil || r.State != "running" || (i > 0 && r.Seconds < after[i-1].Seconds) {
+			t.Fatalf("customer's run is not one billable run going on: %+v", after)
+		}
+	}
+	lo, hi := int64(t2.Sub(t1e)/time.Second), int64(t2e.Sub(t1)/time.Second)
+	if got := last.Seconds - was.Seconds; got < lo || got > hi || float64(got) >= gap.Seconds() {
+		t.Fatalf("charged seconds after the late open: %d more than before the restart, want %d to %d (the time after the mapping), never the %.1f s gap", got, lo, hi, gap.Seconds())
+	}
+}
+
+// Decision 2, rule 2: a run the meter had already ended before the late open
+// is not mapped back: the room stays set aside, the customer cannot reach it,
+// and nothing more is written under that run.
+func TestLateJournalOpenLeavesAnEndedRunSetAside(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	run, before := lateOpen(t, pc, true)
+	for i := 0; i < 2; i++ {
+		pc.sync("a")
+		pc.step("a")
+	}
+	pc.openLate()
+	for i := 0; i < 2; i++ {
+		pc.sync("a")
+		pc.step("a")
+	}
+	pc.b.mu.Lock()
+	rm := pc.b.hotelByID("a").rooms["sbx-1"]
+	guest := ""
+	if rm != nil {
+		guest = rm.guest
+	}
+	pc.b.mu.Unlock()
+	if guest != poolGuestID {
+		t.Fatalf("room of an ended run after the late open: guest %q, want the pool's (set aside)", guest)
+	}
+	for _, c := range []struct {
+		method, path string
+		compat       bool
+	}{{"GET", "/v1/sandboxes/a.sbx-1", false}, {"POST", "/v1/sandboxes/a.sbx-1/exec", false}, {"GET", "/v1/sandboxes/" + run, true}} {
+		if st, doc := pc.as("key1", c.method, c.path, c.compat); st != 404 && !(c.compat && st == 200 && doc["state"] == "deleted") {
+			t.Fatalf("%s %s (compat %v) after the late open: %d %v, want not found", c.method, c.path, c.compat, st, doc)
+		}
+	}
+	if _, doc := pc.as("key1", "GET", "/v1/sandboxes", false); listIDs(doc)["a.sbx-1"] != nil {
+		t.Fatalf("g1 lists the set-aside room: %v", doc)
+	}
+	if after := pc.readingsOfRun(run); len(after) != len(before) {
+		t.Fatalf("readings of the ended run: %d before, %d after the late open; want none new", len(before), len(after))
+	}
+	if n := len(pc.hotels["a"].roomDeletes()); n != 0 {
+		t.Fatalf("%d deletes of the set-aside room, want none", n)
 	}
 }

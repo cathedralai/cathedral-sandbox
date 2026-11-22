@@ -299,10 +299,15 @@ func (b *broker) noteJournalOpen(j *claimJournal, err error) bool {
 	case err == nil:
 		p.journal, p.journalState, p.journalWhy, p.journalNextTry = j, "complete", "", time.Time{}
 		log.Printf("ready rooms: claim journal opened on try %d; the pool starts on each hotel after its receipts reads", p.journalTries)
+		p.replayClaims()
+		b.mapLateLocked() // claimed rooms the syncs took as the pool's since start (claims_state.go)
+		b.usageMeter.setHoldClaimRuns(false)
 		return true
 	case errors.Is(err, errClaimJournalIncomplete):
 		p.journal, p.journalState, p.journalWhy, p.journalNextTry = j, "incomplete", err.Error(), time.Time{}
 		log.Printf("ready rooms: %v; the pool manager creates and deletes nothing until a person looks", err)
+		p.replayed = true // no mapping from an incomplete journal: its claim runs end by absence now
+		b.usageMeter.setHoldClaimRuns(false)
 		return true
 	}
 	changed := err.Error() != p.journalWhy

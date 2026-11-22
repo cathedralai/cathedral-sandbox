@@ -419,3 +419,19 @@ func (b *broker) deleteClaimedRooms(ctx context.Context, g *guestState, filters 
 	}
 	return rooms, stillRun
 }
+
+// mapLateLocked maps, in place, the claimed rooms the syncs adopted as the
+// pool's while the claim journal could not be read (the late open): each
+// pool-labelled room in a room map that the replay names, under the same rule
+// as an adoption (adoptMappedLocked: only while the meter holds its run open;
+// a run held by the meter during the gap, usageMeter.holdClaimRuns, is still
+// open). Rooms not adopted yet are mapped when they are. Caller holds b.mu.
+func (b *broker) mapLateLocked() {
+	for _, h := range b.hotelList() {
+		for _, rm := range h.rooms {
+			if rm.guest == poolGuestID {
+				b.adoptMappedLocked(h, rm)
+			}
+		}
+	}
+}
