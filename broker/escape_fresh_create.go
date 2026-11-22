@@ -175,7 +175,12 @@ func freshPlainCreate(payload map[string]any, count int, wantBytes bool) *apiErr
 // binding, so the create can only be signed there. pl.only pins it: pick
 // returns that hotel or none, waitSlot never moves the create and fallbackFor
 // never widens it.
-func (b *broker) pinFresh(f *freshCreate, pl *placement) *apiErr {
+//
+// Only a guest holding the #659 fresh guest capability for that hotel may send
+// it (freshGuestSlotHeld): the guest trusts the broker's hotel key, so a fresh
+// create from any other guest would be signed and would consume the API
+// guest's launch.
+func (b *broker) pinFresh(g *guestState, f *freshCreate, pl *placement) *apiErr {
 	if pl.only != nil {
 		return &apiErr{400, "escape_fresh_plain_create_required", "a fresh create is one plain create (count 1, no snapshot or workspace)"}
 	}
@@ -191,6 +196,9 @@ func (b *broker) pinFresh(f *freshCreate, pl *placement) *apiErr {
 	}
 	if pinned == nil || !pinned.cfg.Sealed || !pinned.isEscape() || pinned.leaving || !b.admitted(pinned, now) {
 		return &apiErr{409, "escape_expected_launch_unplaced", "no admitted Escape hotel holds the expected binding"}
+	}
+	if !freshGuestSlotHeld(g, g.limits, pinned.cfg.ID) {
+		return &apiErr{403, "escape_fresh_not_enabled", "this guest does not hold the fresh guest capability for the hotel of the expected launch; the create was not sent"}
 	}
 	pl.only, pl.prefer = pinned, false
 	if !pl.allows(pinned) {

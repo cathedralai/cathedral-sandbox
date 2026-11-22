@@ -22,12 +22,37 @@ var (
 	freshReqSHA   = strings.Repeat("c3", 32)
 )
 
-// freshChain: hotels a and b are Escape hotels with their own bindings; c is
-// an ordinary hotel. Every create the hotels get is recorded with its headers.
-func freshChain(t *testing.T) (*testChain, *ownerSeen) {
+// freshCreateChain: hotels a and b are Escape hotels with their own bindings;
+// c is an ordinary hotel. Every create the hotels get is recorded with its
+// headers. g1 (the API guest) holds the #659 fresh guest capability on a and b,
+// with hotels a, b and c; so do the guests in alsoOptIn. g2 otherwise has none.
+func freshCreateChain(t *testing.T, alsoOptIn ...string) (*testChain, *ownerSeen) {
+	t.Helper()
+	return freshCreateChainWith(t, nil, alsoOptIn...)
+}
+
+// freshCreateChainWith is freshCreateChain with edit applied to the config
+// after the opt-ins.
+func freshCreateChainWith(t *testing.T, edit func(*config), alsoOptIn ...string) (*testChain, *ownerSeen) {
 	t.Helper()
 	seen := &ownerSeen{headers: map[string][]http.Header{}}
 	tc := r6Chain(t, "", seen.wrap(""))
+	optIn := map[string]bool{"g1": true}
+	for _, id := range alsoOptIn {
+		optIn[id] = true
+	}
+	rewriteConfig(t, tc, func(c *config) {
+		for i := range c.Guests {
+			if optIn[c.Guests[i].ID] {
+				c.Guests[i].Hotels = []string{"a", "b", "c"}
+				c.Guests[i].EscapeFreshGuest = &freshGuestConfig{Slots: []string{"a", "b"}}
+			}
+		}
+		if edit != nil {
+			edit(c)
+		}
+	})
+	tc.start(t)
 	tc.b.mu.Lock()
 	for id, binding := range map[string]string{"a": freshBindingA, "b": freshBindingB} {
 		h := tc.b.hotelByID(id)
@@ -109,7 +134,7 @@ func noHotelCreate(t *testing.T, seen *ownerSeen) {
 }
 
 func TestFreshCreateForwardsBothHeadersToTheHotelOfTheExpectedBinding(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t)
 	for i, attempt := range []string{"attempt-1", "attempt-2", "attempt-3", "attempt-4"} {
 		a := defaultAssign()
 		a.attempt, a.report = attempt, "launch-"+attempt
@@ -150,7 +175,7 @@ func TestFreshCreateForwardsBothHeadersToTheHotelOfTheExpectedBinding(t *testing
 func TestFreshCreateOneHeaderAloneIsRefusedUnsent(t *testing.T) {
 	for _, keep := range []string{escapeFreshHeader, escapeExpectedHeader} {
 		t.Run(keep, func(t *testing.T) {
-			tc, seen := freshChain(t)
+			tc, seen := freshCreateChain(t)
 			hdr := defaultAssign().headers()
 			ans := freshPost(t, tc, freshCreateBody(), map[string]string{keep: hdr[keep]}, nil)
 			if ans.status != 400 || errCode(ans.doc) != "escape_fresh_refused" {
@@ -205,7 +230,7 @@ func TestFreshCreateMalformedHeadersAreRefusedUnsent(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			tc, seen := freshChain(t)
+			tc, seen := freshCreateChain(t)
 			ans := freshPost(t, tc, freshCreateBody(), c.hdr, nil)
 			if ans.status != c.status || errCode(ans.doc) != c.code {
 				t.Fatalf("%d %v, want %d %s", ans.status, ans.doc, c.status, c.code)
@@ -231,7 +256,7 @@ func TestFreshCreateRefusesWhatTheGuestRefusesUnsent(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			tc, seen := freshChain(t)
+			tc, seen := freshCreateChain(t)
 			ans := freshPost(t, tc, c.body, hdr, c.extra)
 			if errCode(ans.doc) != c.code || ans.status < 400 || ans.status >= 500 {
 				t.Fatalf("%d %v, want %s", ans.status, ans.doc, c.code)
@@ -242,7 +267,7 @@ func TestFreshCreateRefusesWhatTheGuestRefusesUnsent(t *testing.T) {
 }
 
 func TestFreshCreateNeedsAnAdmittedEscapeHotel(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t)
 	tc.b.mu.Lock()
 	h := tc.b.hotelByID("c")
 	h.adm.bindingSHA = strings.Repeat("f6", 32) // attested, not an Escape hotel
@@ -259,7 +284,7 @@ func TestFreshCreateNeedsAnAdmittedEscapeHotel(t *testing.T) {
 func TestFreshCreateIsNeverRetriedOnAnotherHotel(t *testing.T) {
 	for _, status := range []int{503, 500, 429} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			tc, seen := freshChain(t)
+			tc, seen := freshCreateChain(t)
 			f := tc.hotels["b"]
 			f.mu.Lock()
 			f.createFail = status
@@ -285,7 +310,7 @@ func TestFreshCreateIsNeverRetriedOnAnotherHotel(t *testing.T) {
 // The pinned hotel with no free slot: the create is not moved to a free
 // hotel, it answers once its wait ends, and nothing was sent.
 func TestFreshCreateWaitsOnlyForItsOwnHotel(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t)
 	h := tc.b.hotelByID("b")
 	for i := 0; i < cap(h.sem); i++ {
 		h.sem <- struct{}{}
@@ -303,7 +328,7 @@ func TestFreshCreateWaitsOnlyForItsOwnHotel(t *testing.T) {
 }
 
 func TestFreshCreateSameRequestReplaysTheFirstAnswer(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t)
 	hdr := defaultAssign().headers()
 	first := freshPost(t, tc, freshCreateBody(), hdr, nil)
 	if first.status != 202 {
@@ -320,7 +345,7 @@ func TestFreshCreateSameRequestReplaysTheFirstAnswer(t *testing.T) {
 }
 
 func TestFreshCreateReplayOfAnotherRequestIsRefused(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t, "g2")
 	if first := freshPost(t, tc, freshCreateBody(), defaultAssign().headers(), nil); first.status != 202 {
 		t.Fatalf("first: %d %v", first.status, first.doc)
 	}
@@ -358,7 +383,7 @@ func TestFreshCreateReplayOfAnotherRequestIsRefused(t *testing.T) {
 // The caller goes away while the hotel creates the room: the room is kept
 // and the repeat gets it, with no second create.
 func TestFreshCreateLostReplyIsRecoveredByTheSameRequest(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t)
 	f := tc.hotels["b"]
 	f.mu.Lock()
 	f.createDelay = 400 * time.Millisecond
@@ -385,7 +410,7 @@ func TestFreshCreateLostReplyIsRecoveredByTheSameRequest(t *testing.T) {
 }
 
 func TestFreshCreateConcurrentSameRequestSendsOneCreate(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t)
 	f := tc.hotels["b"]
 	f.mu.Lock()
 	f.createDelay = 150 * time.Millisecond
@@ -416,7 +441,7 @@ func TestFreshCreateConcurrentSameRequestSendsOneCreate(t *testing.T) {
 }
 
 func TestFreshCreateOnTheCompatAPIIsRefused(t *testing.T) {
-	tc, seen := freshChain(t)
+	tc, seen := freshCreateChain(t)
 	ans := freshPost(t, tc, freshCreateBody(), defaultAssign().headers(), http.Header{"User-Agent": {"cathedral-harbor/1.0"}})
 	if ans.status != 400 || !strings.Contains(string(freshJSON(ans.doc)), "escape_fresh_refused") {
 		t.Fatalf("compat fresh create: %d %v", ans.status, ans.doc)
@@ -427,4 +452,77 @@ func TestFreshCreateOnTheCompatAPIIsRefused(t *testing.T) {
 func freshJSON(v any) []byte {
 	raw, _ := json.Marshal(v)
 	return raw
+}
+
+// Reviewbot HOLD on #677: a guest without the #659 fresh guest capability
+// (default off) is refused before any hotel call, so it cannot consume the API
+// guest's launch, and it learns nothing from the replay table.
+func TestFreshCreateWithoutTheCapabilityIsRefusedUnsent(t *testing.T) {
+	tc, seen := freshCreateChain(t)
+	hdr := defaultAssign().headers()
+	cases := map[string]map[string]string{
+		"both headers":  hdr,
+		"fresh only":    {escapeFreshHeader: hdr[escapeFreshHeader]},
+		"expected only": {escapeExpectedHeader: hdr[escapeExpectedHeader]},
+		"malformed":     {escapeFreshHeader: "not json", escapeExpectedHeader: "{}"},
+	}
+	for name, h := range cases {
+		a, err := freshPostCtx(context.Background(), tc, "key2", freshCreateBody(), h, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.status != 403 || errCode(a.doc) != "escape_fresh_not_enabled" {
+			t.Fatalf("g2 %s: %d %v", name, a.status, a.doc)
+		}
+	}
+	noHotelCreate(t, seen)
+	// The launch g2 named is still the API guest's to use.
+	if first := freshPost(t, tc, freshCreateBody(), hdr, nil); first.status != 202 || first.doc["hotel"] != "b" {
+		t.Fatalf("g1 after g2's refused attempts: %d %v", first.status, first.doc)
+	}
+	// A repeat by g2 now still gets 403, not the replay table's 409.
+	if a, _ := freshPostCtx(context.Background(), tc, "key2", freshCreateBody(), hdr, nil); a.status != 403 || errCode(a.doc) != "escape_fresh_not_enabled" {
+		t.Fatalf("g2 after g1's create: %d %v", a.status, a.doc)
+	}
+	if n := freshHotelCreates(seen); n["b"] != 1 || n["a"]+n["c"] != 0 {
+		t.Fatalf("hotel creates %v, want one on b", n)
+	}
+	// A plain create from g2 is unchanged.
+	if ok := tc.room(t, "key2", map[string]any{"image": "alpine:3.20", "hotels": []string{"c"}}); ok == "" {
+		t.Fatal("g2 plain create failed")
+	}
+}
+
+// The capability is per hotel: an opted-in guest whose slots do not hold the
+// hotel of the expected binding is refused unsent, with no fallback to a slot
+// it does hold.
+func TestFreshCreateOutsideTheGuestsSlotsIsRefusedUnsent(t *testing.T) {
+	tc, seen := freshCreateChainWith(t, func(c *config) {
+		c.Guests[0].EscapeFreshGuest = &freshGuestConfig{Slots: []string{"a"}}
+	})
+	ans := freshPost(t, tc, freshCreateBody(), defaultAssign().headers(), nil) // binding of b
+	if ans.status != 403 || errCode(ans.doc) != "escape_fresh_not_enabled" {
+		t.Fatalf("slot not held: %d %v", ans.status, ans.doc)
+	}
+	noHotelCreate(t, seen)
+	// The slot it holds still works.
+	a := defaultAssign()
+	a.binding = freshBindingA
+	if ok := freshPost(t, tc, freshCreateBody(), a.headers(), nil); ok.status != 202 || ok.doc["hotel"] != "a" {
+		t.Fatalf("held slot: %d %v", ok.status, ok.doc)
+	}
+}
+
+// A slot removed from the guest's hotels at runtime no longer carries the
+// capability on the next create.
+func TestFreshCreateSlotRemovedAtRuntimeIsRefusedUnsent(t *testing.T) {
+	tc, seen := freshCreateChain(t)
+	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"hotels": []string{"a", "c"}}); status != 200 {
+		t.Fatalf("patch: %d %v", status, doc)
+	}
+	ans := freshPost(t, tc, freshCreateBody(), defaultAssign().headers(), nil)
+	if ans.status != 403 || errCode(ans.doc) != "escape_fresh_not_enabled" {
+		t.Fatalf("slot left the guest's hotels: %d %v", ans.status, ans.doc)
+	}
+	noHotelCreate(t, seen)
 }

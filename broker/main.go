@@ -1679,7 +1679,14 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	// AB#683: both fresh headers or neither (escape_fresh_create.go).
+	// AB#683: either fresh header needs the #659 opt-in (default off). It is
+	// refused before the headers are read or the replay table is asked, so a
+	// guest without it learns nothing and nothing is sent.
+	if hasFreshHeader(r) && !freshGuestOptedIn(g) {
+		writeAPIErr(w, &apiErr{403, "escape_fresh_not_enabled", "this guest does not hold the fresh guest capability; the create was not sent"})
+		return
+	}
+	// Both fresh headers or neither (escape_fresh_create.go).
 	fresh, ferr := parseFreshCreate(r, raw)
 	if ferr != nil {
 		writeAPIErr(w, ferr)
@@ -1763,7 +1770,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		return
 	}
 	if fresh != nil {
-		if e := b.pinFresh(fresh, &pl); e != nil {
+		if e := b.pinFresh(g, fresh, &pl); e != nil {
 			writeAPIErr(w, e)
 			return
 		}

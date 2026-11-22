@@ -144,3 +144,34 @@ func (b *broker) freshGuestAdvertisement(g *guestState, lim guestLimits) map[str
 		"slots":               slots,
 	}
 }
+
+// freshGuestOptedIn: the guest's config opts it into fresh creates. The
+// broker refuses a fresh create from any other guest before reading further.
+func freshGuestOptedIn(g *guestState) bool {
+	return g.cfg.EscapeFreshGuest != nil
+}
+
+// freshGuestSlotHeld: hotelID is one of the guest's opted-in slots and is still
+// in its explicit hotels (a runtime PATCH can remove it). Caller holds b.mu.
+func freshGuestSlotHeld(g *guestState, lim guestLimits, hotelID string) bool {
+	fg := g.cfg.EscapeFreshGuest
+	if fg == nil || lim.Policy != nil {
+		return false
+	}
+	inHotels := false
+	for _, h := range lim.Hotels {
+		if h == hotelID {
+			inHotels = true
+			break
+		}
+	}
+	if !inHotels {
+		return false
+	}
+	for _, s := range fg.Slots {
+		if s == hotelID {
+			return true
+		}
+	}
+	return false
+}
