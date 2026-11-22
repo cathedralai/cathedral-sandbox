@@ -101,6 +101,11 @@ const (
 	poolReadsPerStep = 20
 	poolRetryFirst   = 5 * time.Second
 	poolRetryMax     = time.Minute
+	// poolProofAlarmAfter is the receipt-1 proof failures in a row on one
+	// hotel that raise the ready_rooms alert: its front does not prove pool
+	// rooms (an older room-kit, or a tag vs digest image), so refill there is
+	// churn until someone looks.
+	poolProofAlarmAfter = 3
 )
 
 // Refill and bounds (design 6.1, 6.3).
@@ -161,6 +166,7 @@ type poolHotel struct {
 	memMiB     float64              // the largest memory its health answers gave since start
 	lastCreate time.Time            // the last pool create's start
 	backoff    time.Time            // a create failed: none before this
+	proofFails int                  // creates in a row whose receipt 1 did not prove a ready room
 	claims     int                  // claims in flight (poolClaimBegin)
 	claimEnd   time.Time            // when the last claim ended
 	inflight   sync.WaitGroup       // creates started by steps, for tests
@@ -169,10 +175,14 @@ type poolHotel struct {
 	level1   *poolAttest
 	level1At time.Time
 	reattest bool // a receipt named another binding: attest again now
-	alarm    string
-	alarmQ   int
-	alarmAt  time.Time
-	full     bool
+	// bindFailAt is when a receipt binding failure last counted in
+	// proofFails: a create that started before it was in flight under the
+	// same attestation and does not count again.
+	bindFailAt time.Time
+	alarm      string
+	alarmQ     int
+	alarmAt    time.Time
+	full       bool
 }
 
 type readyRooms struct {
@@ -894,7 +904,7 @@ func (b *broker) poolAlarmLocked(h *hotel, ph *poolHotel, now time.Time) {
 	full := b.pool.anyTargetLocked() && c.quarantined >= bound
 	switch {
 	case c.quarantined == 0:
-		ph.alarm, ph.alarmQ, ph.full = "", 0, false
+		ph.alarm, ph.alarmQ, ph.full = poolProofAlarm(h, ph), 0, false
 		return
 	case full && !ph.full:
 	case c.quarantined > ph.alarmQ && now.Sub(ph.alarmAt) >= alertCooldown:
@@ -909,6 +919,16 @@ func (b *broker) poolAlarmLocked(h *hotel, ph *poolHotel, now time.Time) {
 		ph.alarm += "; quarantine fills the bound: no pool refill on this hotel"
 	}
 	b.alerts.send("ready_rooms", b.alerts.opsChat, ph.alarm, nil, nil)
+}
+
+// poolProofAlarm is the alarm text for a hotel whose last
+// poolProofAlarmAfter or more creates failed their receipt-1 proof, else "".
+// Caller holds b.mu.
+func poolProofAlarm(h *hotel, ph *poolHotel) string {
+	if ph.proofFails < poolProofAlarmAfter {
+		return ""
+	}
+	return fmt.Sprintf("%s: %d pool creates in a row failed their receipt 1 proof (each deleted); pool creates back off to one a minute", hotelAlertName(h), ph.proofFails)
 }
 
 // poolLevel1 reads the level-1 binding of a rig front
@@ -1113,7 +1133,8 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	h.holdDisk(pl, 1)
 	h.place(rm)
 	ph.creating[k.name]++
-	ph.started[rm] = time.Now() // before the POST is sent: no listing of its room can come earlier
+	tStart := time.Now()
+	ph.started[rm] = tStart // before the POST is sent: no listing of its room can come earlier
 	b.mu.Unlock()
 
 	status, hdr, out, err := h.doHeaders(noConnWait(context.WithoutCancel(ctx)), h.cfg.API, "POST", "/v1/sandboxes", nil, body, poolCreateTimeout, nil)
@@ -1169,6 +1190,7 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 	switch {
 	case derr == nil && image == k.image:
 		pr.state, pr.receipt1 = poolReady, sha
+		ph.proofFails = 0
 	case derr == nil:
 		pr.state, pr.why = poolStale, "its receipt 1 names image "+strconv.Quote(image)
 	default:
@@ -1178,6 +1200,28 @@ func (b *broker) poolCreate(ctx context.Context, h *hotel, k poolKey, att poolAt
 		}
 	}
 	ph.rooms[hid] = pr
+	// A binding failure counts once per attestation: the creates in flight
+	// when the front moves all started under the old one and fail alike.
+	// Creates that start after a counted failure count again, so a lasting
+	// mismatch still backs off and alarms.
+	bindFail := errors.Is(derr, errPoolReceiptBinding)
+	if pr.state == poolStale && !(bindFail && tStart.Before(ph.bindFailAt)) {
+		// A front that never proves pool rooms would otherwise see a create
+		// and a delete at the full refill rate, forever: back off 5 s,
+		// doubling to 1 min, and tell ops once the failures run on. A
+		// binding failure counts too (a receipt signer that lastingly
+		// disagrees with the attestation would churn the same way); it is
+		// still attested again at once, so a real move costs one 5 s pause.
+		if bindFail {
+			ph.bindFailAt = tDone
+		}
+		ph.proofFails++
+		ph.backoff = tDone.Add(poolRetry(ph.proofFails))
+		if ph.proofFails == poolProofAlarmAfter {
+			ph.alarm = poolProofAlarm(h, ph)
+			b.alerts.send("ready_rooms", b.alerts.opsChat, ph.alarm, nil, nil)
+		}
+	}
 	b.mu.Unlock()
 	if pr.state == poolStale {
 		log.Printf("ready rooms: hotel %s: pool room %s not ready (%s); deleted", h.cfg.ID, hid, pr.why)

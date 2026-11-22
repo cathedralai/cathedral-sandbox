@@ -63,7 +63,12 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # (quota freed at kill, AB#863) and #642 (owner-scoped image list, pins and GC keep file, AB#860).
 # Same make-dist.sh; the eedd025 tarball rebuilds to its pinned sha
 # dea3072a... with the same tool.
-CATHEDRAL_COMMIT=5b974b0
-CATHEDRAL_TARBALL=dist/cathedral-5b974b0.tar.gz
-CATHEDRAL_TARBALL_SHA256=fd8787357f48ed5d1713a9b30dde7dcea63099d95212fe7539af82d3400d4184
+# Pinned 2026-11-22 to cb80ac4: main after #556 (room snapshot captured at one moment, AB#604), #662
+# (guest port dial into gVisor rooms, AB#772) and #668 (a room whose container ended by itself reads
+# failed with an end reason on GET, wait and list, AB#920). #546 (signed snapshots and forks, AB#604)
+# is room-kit code and rides with the kit commit. Same make-dist.sh; the 5b974b0 tarball rebuilds to
+# its pinned sha fd878735... with the same tool.
+CATHEDRAL_COMMIT=cb80ac4
+CATHEDRAL_TARBALL=dist/cathedral-cb80ac4.tar.gz
+CATHEDRAL_TARBALL_SHA256=62cb22560da9cc6d1958c23d6954a95873619392c08643ea76a2f3d15dc2b305
 PROBE_IMAGE=alpine:3.20

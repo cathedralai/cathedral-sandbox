@@ -164,7 +164,7 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:d787ed7937cf0b1dad424bb614fd655ccd66ec635d21ac85f72d7a6f77c6583d"),
 		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:4fc6e0682a2f563c5e0fb862c7a4968cdfd509a4d7bc73fee860c3592d214b41"),
 		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:4aed662bc5292e6c8813fefb178a471630d6122994b0cb2e4371f2439e18895f"),
-		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:4f9ab1457d67d8fba8c9890a612c81ad4274e5f83ea1903becafc5c51a14d5f9"),
+		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:6deb0202dd65f56b4f77b55320b8cd6279105cbfc1cce2df5500309bec2b8a98"),
 		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:57f9038bf8198e6a9fa52e37260a48b56ddf6b6a89c83dbf84b9b74838168cfd"),
 		"lfm3-1.7b-base": pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:b48013ae60249c18cc756d6b449e3320ec63e5861dd0e3cb87c38be11e775e08"),
 	}

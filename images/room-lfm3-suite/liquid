@@ -21,11 +21,15 @@ set -euo pipefail
 
 # --events (AB#541): the chat stream for the console. lfm3-agent owns it, refusals
 # included: a model that does not chat gets one error line there, not text here.
+# Every process start costs about 5 to 30 ms in a sealed room (2 vCPU, AB#732),
+# so this path starts none of its own: the directory comes from the path this
+# script was run by, and the agent runs in this bash's binary without env.
 if [ "${1:-}" = --events ]; then
-  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-  agent=$here/lfm3-agent
-  [ -x "$agent" ] || agent=lfm3-agent
-  LFM3_AGENT_NAME=liquid exec "$agent" "$@"
+  case ${BASH_SOURCE[0]} in */*) here=${BASH_SOURCE[0]%/*} ;; *) here=. ;; esac
+  if [ -x "$here/lfm3-agent" ] && [ -x "${BASH:-}" ]; then
+    LFM3_AGENT_NAME=liquid exec "$BASH" "$here/lfm3-agent" "$@"
+  fi
+  LFM3_AGENT_NAME=liquid exec lfm3-agent "$@"
 fi
 
 if [ "${LFM3_KIND:-chat}" = decision ]; then

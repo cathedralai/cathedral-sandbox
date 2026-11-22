@@ -55,11 +55,55 @@ var (
 	plantHKDFInfo       = []byte("cathedral.escape-nonce-plant.v1")
 	windowIDRE          = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 	plantNonceRE        = regexp.MustCompile(`^[A-Za-z0-9+/=_-]{16,512}$`)
+	freshIDRE           = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+	freshRoomRE         = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 )
+
+// escapeFreshSchema is the AB#683 assignment the guest signs into the plant
+// receipt (polariscomputer docs/AB683_FRESH_EVIDENCE.md). The broker only
+// checks its shape and forwards it; the guest refuses a plant whose
+// assignment, room incarnation or create receipt is not its own.
+const escapeFreshSchema = "cathedral.escape.fresh_evidence/v1"
+
+type escapeFreshPlant struct {
+	Schema              string `json:"schema"`
+	AttemptID           string `json:"attempt_id"`
+	ReportID            string `json:"report_id"`
+	RequestSHA256       string `json:"request_sha256"`
+	CreateReceiptSHA256 string `json:"create_receipt_sha256"`
+}
 
 type escapePlantRequest struct {
 	WindowID string `json:"window_id"`
 	Nonce    string `json:"nonce"`
+	// AB#683: both or neither. SandboxID is the hotel-local room id the
+	// signed create receipt names.
+	SandboxID   string            `json:"sandbox_id,omitempty"`
+	EscapeFresh *escapeFreshPlant `json:"escape_fresh,omitempty"`
+}
+
+func (f *escapeFreshPlant) valid() bool {
+	return f.Schema == escapeFreshSchema && freshIDRE.MatchString(f.AttemptID) &&
+		freshIDRE.MatchString(f.ReportID) && sha256HexRE.MatchString(f.RequestSHA256) &&
+		sha256HexRE.MatchString(f.CreateReceiptSHA256)
+}
+
+// decodePlantRequest refuses unknown fields, so a mistyped or extra fresh
+// field is not silently dropped and the plant sent without it.
+func decodePlantRequest(raw []byte) (escapePlantRequest, string, bool) {
+	var req escapePlantRequest
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&req) != nil || dec.More() {
+		return req, "request body is not JSON", false
+	}
+	if (req.SandboxID == "") != (req.EscapeFresh == nil) {
+		return req, "sandbox_id and escape_fresh go together", false
+	}
+	if req.EscapeFresh != nil && (!freshRoomRE.MatchString(req.SandboxID) || !req.EscapeFresh.valid()) {
+		return req, "escape_fresh must be the fresh_evidence/v1 assignment and its create receipt", false
+	}
+	return req, "", true
 }
 
 type escapePlantKey struct {
@@ -91,9 +135,13 @@ func (b *broker) handleEscapeNoncePlant(w http.ResponseWriter, r *http.Request, 
 		writeErr(w, 413, "body_too_large", "plant body over 8192 bytes")
 		return
 	}
-	var req escapePlantRequest
-	if json.Unmarshal(raw, &req) != nil {
-		writeErr(w, 400, "invalid_json", "request body is not JSON")
+	req, why, ok := decodePlantRequest(raw)
+	if !ok {
+		code := "invalid_request"
+		if why == "request body is not JSON" {
+			code = "invalid_json"
+		}
+		writeErr(w, 400, code, why)
 		return
 	}
 	if !windowIDRE.MatchString(req.WindowID) {
@@ -168,8 +216,15 @@ func (b *broker) sealEscapePlant(ctx context.Context, h *hotel, req escapePlantR
 	if sealErr != nil {
 		return nil, fmt.Errorf("the hotel plant key could not be used")
 	}
-	env["window_id"] = req.WindowID
-	return json.Marshal(env)
+	body := map[string]any{"window_id": req.WindowID}
+	for k, v := range env {
+		body[k] = v
+	}
+	if req.EscapeFresh != nil {
+		body["sandbox_id"] = req.SandboxID
+		body["escape_fresh"] = req.EscapeFresh
+	}
+	return json.Marshal(body)
 }
 
 // escapeReceiptKey is the Ed25519 public key named by the attested binding.

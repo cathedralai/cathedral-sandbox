@@ -130,6 +130,15 @@ ev() { # jq options and program for one event: builds it and writes the line
   obj=$(jq -nc -a "$@") || return 1
   ev_emit "$obj" || return 1
 }
+ev_start() { # the start line; jq only for a model name that needs escaping or cutting
+  local t=false
+  [ -z "$tools" ] || t=true
+  if [[ $MODEL_NAME =~ ^[A-Za-z0-9._:+-]{0,64}$ ]]; then
+    ev_emit "{\"type\":\"start\",\"model\":\"$MODEL_NAME\",\"tools\":$t}"
+  else
+    ev --arg m "$MODEL_NAME" --argjson t "$t" '{type: "start", model: ($m | .[0:64]), tools: $t}'
+  fi
+}
 ev_clock() { # milliseconds
   if [ -n "${EPOCHREALTIME:-}" ]; then
     local t=${EPOCHREALTIME//[^0-9]/}
@@ -260,18 +269,20 @@ CMD_TIMEOUT=${LFM3_AGENT_CMD_TIMEOUT:-60}
 OUTPUT_CHARS=${LFM3_AGENT_OUTPUT_CHARS:-2000}
 CONTEXT_CHARS=${LFM3_AGENT_CONTEXT_CHARS:-4000}
 LOG=${LFM3_LOG_DIR:-/tmp/lfm3}/server.log
-if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$SAMPLING"; then
+# Only a value from the environment can be malformed; the defaults above are
+# fixed objects, and checking them would start jq on every turn.
+if [ -n "${LFM3_AGENT_SAMPLING:-}" ] && ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$SAMPLING"; then
   echo "lfm3-agent: LFM3_AGENT_SAMPLING must be a JSON object" >&2
   exit 2
 fi
-if [ -n "$ANSWER_SAMPLING" ] && ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$ANSWER_SAMPLING"; then
+if [ -n "${LFM3_AGENT_ANSWER_SAMPLING:-}" ] && ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$ANSWER_SAMPLING"; then
   echo "lfm3-agent: LFM3_AGENT_ANSWER_SAMPLING must be a JSON object or empty" >&2
   exit 2
 fi
 DIR=${LFM3_AGENT_DIR:-/tmp/lfm3/agent}
 # lfm3-serve makes /tmp/lfm3 as the image user; an exec as another user keeps
 # its conversation beside it instead.
-if ! mkdir -p "$DIR" 2>/dev/null || [ ! -w "$DIR" ]; then
+if ! { [ -d "$DIR" ] || mkdir -p "$DIR" 2>/dev/null; } || [ ! -w "$DIR" ]; then
   if [ -n "${LFM3_AGENT_DIR:-}" ]; then
     echo "lfm3-agent: cannot write $DIR" >&2
     exit 1
@@ -496,9 +507,26 @@ if [ -z "$warm" ]; then
   fi
 fi
 
+# The model server's /health answers 200. For the room's own server
+# (http://127.0.0.1:PORT/v1) bash asks it over /dev/tcp: curl costs about 30 ms
+# to start in a sealed room, and this check runs before every turn (AB#732).
+server_up() {
+  local fd code=""
+  if [[ $BASE_URL =~ ^http://(127\.0\.0\.1|localhost):([0-9]{1,5})/v1$ ]]; then
+    if exec {fd}<>"/dev/tcp/127.0.0.1/${BASH_REMATCH[2]}"; then
+      printf 'GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' >&"$fd" 2>/dev/null \
+        && IFS=' ' read -r -t 5 _ code _ <&"$fd" || code=""
+      exec {fd}>&-
+    fi 2>/dev/null
+    [ "$code" = 200 ]
+    return
+  fi
+  curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null
+}
+
 wait_for_server() {
   for _ in $(seq 1 "${LFM3_WAIT:-120}"); do
-    if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+    if server_up; then
       return 0
     fi
     sleep 1
@@ -581,7 +609,7 @@ run_tool() { # name arguments-json: prints the result the model reads
 # fit CONTEXT_CHARS (whole turns, oldest dropped first), this message with its
 # media, and the tool calls of this turn so far. Without new media, the last
 # picture or clip goes back on the message that brought it, if that is kept.
-build_body() { # with-tools [max-tokens] [sampling]
+build_body() { # with-tools [max-tokens] [sampling] [stream]
   local n=${2:-$MAX_TOKENS} sampling=${3:-$SAMPLING}
   local media=$MEDIA_FILE
   [ -s "$media" ] || media=$work/no_media
@@ -590,7 +618,7 @@ build_body() { # with-tools [max-tokens] [sampling]
     --slurpfile turn "$work/turn" --slurpfile media "$media" --slurpfile parts "$work/parts" \
     --argjson room "$CONTEXT_CHARS" --arg model "$MODEL_NAME" --argjson n "$n" \
     --argjson tools "$TOOLS" --arg with_tools "$1" --argjson sampling "$sampling" --argjson examples "$EXAMPLES" \
-    --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" --arg final_line "$FINAL_LINE" '
+    --argjson stream "${4:-false}" --arg json "$json" --argjson format "$JSON_FORMAT" --arg json_line "$JSON_LINE" --arg final_line "$FINAL_LINE" '
     def drop_turn: (.[1:] | map(.role == "user") | index(true)) as $i
       | if $i == null then [] else .[($i + 1):] end;
     def fit($room): if length == 0 or (tojson | length) <= $room then . else (drop_turn | fit($room)) end;
@@ -610,7 +638,8 @@ build_body() { # with-tools [max-tokens] [sampling]
       }
     + $sampling
     + (if $with_tools == "1" then {tools: $tools} else {} end)
-    + (if $json == "1" then {response_format: $format} else {} end)' >"$work/body"
+    + (if $json == "1" then {response_format: $format} else {} end)
+    + (if $stream then {stream: true} else {} end)' >"$work/body"
 }
 
 normalize_reply() { # $work/out holds a chat completion: the reply message goes to $work/msg
@@ -1031,12 +1060,12 @@ ev_answer() { # stop-reason: the terminal line, text cut to the contract's caps
 }
 
 wait_for_server_events() {
-  if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+  if server_up; then
     return 0
   fi
-  ev '{type: "thinking", round: 1, phase: "warming"}'
+  ev_emit '{"type":"thinking","round":1,"phase":"warming"}'
   for _ in $(seq 1 "${LFM3_WAIT:-120}"); do
-    if curl -fsS -o /dev/null "${BASE_URL%/v1}/health" 2>/dev/null; then
+    if server_up; then
       return 0
     fi
     sleep 1
@@ -1046,9 +1075,12 @@ wait_for_server_events() {
 
 ask_model_stream() { # with-tools [sampling]: the reply message goes to $work/msg, delta lines to stdout
   local line rc code
-  build_body "$1" "" "${2:-}"
-  jq '. + {stream: true}' "$work/body" >"$work/body.stream"
-  rm -f "$work/end" "$work/curl_rc" "$work/hdr" "$work/raw"
+  # Set streaming while constructing the body, avoiding a second jq startup.
+  build_body "$1" "" "${2:-}" true
+  # Only a later round has these; the first one skips starting rm.
+  if [ -e "$work/end" ] || [ -e "$work/curl_rc" ] || [ -e "$work/hdr" ] || [ -e "$work/raw" ]; then
+    rm -f "$work/end" "$work/curl_rc" "$work/hdr" "$work/raw"
+  fi
   while IFS= read -r line; do
     case "$line" in
       '{"_end":'*) printf '%s' "$line" >"$work/end" ;;
@@ -1056,7 +1088,7 @@ ask_model_stream() { # with-tools [sampling]: the reply message goes to $work/ms
     esac
   done < <({ curl -sS -N -D "$work/hdr" --max-time "${LFM3_TIMEOUT:-600}" \
       -H 'Content-Type: application/json' -H "Authorization: Bearer ${MODEL_API_KEY:-local}" \
-      --data-binary @"$work/body.stream" "$BASE_URL/chat/completions" 2>/dev/null
+      --data-binary @"$work/body" "$BASE_URL/chat/completions" 2>/dev/null
     echo "$?" >"$work/curl_rc"; } | tee "$work/raw" | jq -n -R -c -a --unbuffered --argjson round "$ev_round" "$SECRETS_JQ $STREAM_JQ")
   rc=$(cat "$work/curl_rc" 2>/dev/null || echo 1)
   code=$(grep -a '^HTTP/' "$work/hdr" 2>/dev/null | tail -n 1 | cut -d' ' -f2 | tr -d '\r' || true)
@@ -1083,20 +1115,24 @@ one_turn() { # message
   if [ -z "$text" ] && [ "$(jq length "$work/parts")" -eq 0 ]; then
     usage
   fi
-  jq -n --arg t "$text" --slurpfile names "$work/names" '
+  # Prepare stored metadata and sent media in one jq process. Compact JSON
+  # escapes embedded newlines, so each array occupies exactly one physical line.
+  jq -cn --arg t "$text" --slurpfile names "$work/names" --slurpfile parts "$work/parts" '
     ($names[0] | map("[" + . + "]") | join(" ")) as $n
-    | [{role: "user", content: ([$n, $t] | map(select(. != "")) | join(" "))}
-       + (if $n == "" then {} else {media: true} end)]' >"$work/user_stored"
-  jq -n --arg t "$text" --slurpfile parts "$work/parts" '
-    [{role: "user", content: (if ($parts[0] | length) == 0 then $t
-      else $parts[0] + (if $t == "" then [] else [{type: "text", text: $t}] end) end)}]' >"$work/user_sent"
+    | ([{role: "user", content: ([$n, $t] | map(select(. != "")) | join(" "))}
+        + (if $n == "" then {} else {media: true} end)]),
+      ([{role: "user", content: (if ($parts[0] | length) == 0 then $t
+        else $parts[0] + (if $t == "" then [] else [{type: "text", text: $t}] end) end)}])' >"$work/user_pair"
+  local stored sent
+  { IFS= read -r stored && IFS= read -r sent; } <"$work/user_pair"
+  printf '%s\n' "$stored" >"$work/user_stored"
+  printf '%s\n' "$sent" >"$work/user_sent"
   echo '[]' >"$work/turn"
 
   ask=ask_model
   if [ -n "$events" ]; then
     ask=ask_model_stream
-    ev --arg m "$MODEL_NAME" --argjson t "$([ -n "$tools" ] && echo true || echo false)" \
-      '{type: "start", model: ($m | .[0:64]), tools: $t}'
+    ev_start
     wait_for_server_events
   else
     wait_for_server
@@ -1109,7 +1145,7 @@ one_turn() { # message
     fi
     if [ -n "$events" ]; then
       ev_round=$((ev_round + 1))
-      ev --argjson r "$ev_round" '{type: "thinking", round: $r, phase: "working"}'
+      ev_emit "{\"type\":\"thinking\",\"round\":$ev_round,\"phase\":\"working\"}"
     fi
     if ! "$ask" "$with" "$(round_sampling "$with")"; then
       round=$STEPS
