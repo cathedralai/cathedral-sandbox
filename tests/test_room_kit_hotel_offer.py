@@ -204,6 +204,7 @@ def _serve(status, body):
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            server.user_agents.append(self.headers.get("User-Agent"))
             self.send_response(status)
             self.end_headers()
             self.wfile.write(body)
@@ -212,6 +213,7 @@ def _serve(status, body):
             pass
 
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    server.user_agents = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -233,6 +235,18 @@ def test_cli_post_exit_status_follows_the_api_answer(tmp_path, capsys, status, b
         assert f"HTTP {status} machine_not_on_roster" in captured.err and captured.out == ""
     else:
         assert f"HTTP {status}" in captured.out
+
+
+def test_post_sends_its_own_user_agent(tmp_path):
+    # Cloudflare in front of the Polaris API blocks urllib's default agent with
+    # 403 "error code: 1010", so the offer must name its own agent.
+    server = _serve(200, b'{"ok":true}')
+    try:
+        ho.post(f"http://127.0.0.1:{server.server_port}/v1/cathedral/snp/hotel-offers", {"schema": "x"})
+    finally:
+        server.shutdown()
+    assert server.user_agents == [ho.USER_AGENT]
+    assert not ho.USER_AGENT.lower().startswith("python-urllib")
 
 
 @pytest.mark.parametrize("url", ["https://10.200.0.2:18443", "https://[fd00::2]:18443"])

@@ -49,7 +49,21 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # #494 (guest-made ingress TLS key named in the binding, AB#422; off unless SEALED_*GUEST_INGRESS=1)
 # and #442 (background exec cancel inside the room, AB#406). Same make-dist.sh; the 400892e tarball
 # rebuilds to its pinned sha 88f93fee... with the same tool.
-CATHEDRAL_COMMIT=87f01a6
-CATHEDRAL_TARBALL=dist/cathedral-87f01a6.tar.gz
-CATHEDRAL_TARBALL_SHA256=2519214162c174745135d56daf2a2d910dbb0a4bccb735e76c517387e0d9ae4b
+# Pinned 2026-11-18 to bdfd6bf: main after #561 (guest process logs paged by offset and the entrypoint
+# log, AB#419), #523 (xfs project quota on each room's /work and each workspace, AB#396; the kit
+# already sets CATHEDRAL_SANDBOX_WORK_QUOTA=1 and the sealed data dir mounts with prjquota), #484
+# (volume head log, AB#398) and #580/#582 (cathedral.signer and sealed_hotels, AB#382). Same
+# make-dist.sh; the 87f01a6 tarball rebuilds to its pinned sha 25192141... with the same tool.
+# Pinned 2026-11-19 to eedd025: main after the AB#812 security fix, #599 (a room's anonymous volumes
+# go with the room, AB#815) and #595 (aws_kms signer method names, AB#382). Same make-dist.sh; the
+# bdfd6bf tarball rebuilds to its pinned sha 0b703817... with the same tool.
+# Pinned 2026-11-21 to 5b974b0: main after #619 (per-create registry login carried into the sealed
+# guest, AB#817), #617 (volume shred hardening, AB#825), #633 and #641 (image pull disk floor and a
+# Hub-login pull of a cached image is a refresh, AB#861), #636 (room end reasons, AB#864) and #638
+# (quota freed at kill, AB#863) and #642 (owner-scoped image list, pins and GC keep file, AB#860).
+# Same make-dist.sh; the eedd025 tarball rebuilds to its pinned sha
+# dea3072a... with the same tool.
+CATHEDRAL_COMMIT=5b974b0
+CATHEDRAL_TARBALL=dist/cathedral-5b974b0.tar.gz
+CATHEDRAL_TARBALL_SHA256=fd8787357f48ed5d1713a9b30dde7dcea63099d95212fe7539af82d3400d4184
 PROBE_IMAGE=alpine:3.20

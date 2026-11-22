@@ -359,6 +359,50 @@ def test_verifier_refuses_a_debug_sealed_build(tmp_path) -> None:
         vr.verify_attestation(_sealed_att("rdinit=/init cathedral.debug=1"), None, None, str(tmp_path), None, True)
 
 
+def test_genoa_firmware_floor_checks_all_four_tcb_fields_after_chain(tmp_path, monkeypatch) -> None:
+    # The AMD chain is a separate test; this isolates the policy applied to
+    # its verified product and a report committed to its binding.
+    monkeypatch.setattr(vr, "verify_amd", lambda *args: {"product": "Genoa"})
+
+    def attestation(old_field: int | None = None) -> dict:
+        att = _sealed_att("rdinit=/init")
+        report = bytearray(base64.b64decode(att["report_b64"]))
+        report[0x188:0x18A] = bytes((0x19, 0x11))  # Genoa
+        for offset in (0x38, 0x180, 0x1E0, 0x1F0):
+            report[offset + 6] = 0x1e
+        if old_field is not None:
+            report[old_field + 6] = 0x1c
+            report[old_field + 7] = 0xff  # cannot compensate for old SNP
+        att["binding"]["reported_tcb"] = report[0x180:0x188].hex()
+        bsha = rr.sha(rr.canonical(att["binding"]))
+        att["binding_sha256"] = bsha
+        report[0x50:0x90] = bytes.fromhex(bsha) + bytes(32)
+        att["report_b64"] = base64.b64encode(report).decode()
+        return att
+
+    checked = vr.verify_attestation(attestation(), None, None, str(tmp_path), None, False,
+                                    min_genoa_snp_spl=0x1e)
+    assert checked["amd"]["min_genoa_snp_spl_checked"] == 0x1e
+    milan_att = attestation()
+    milan_report = bytearray(base64.b64decode(milan_att["report_b64"]))
+    milan_report[0x188:0x18A] = bytes((0x19, 0x01))
+    milan_att["report_b64"] = base64.b64encode(milan_report).decode()
+    monkeypatch.setattr(vr, "verify_amd", lambda *args: {"product": "Milan"})
+    milan = vr.verify_attestation(milan_att, None, None, str(tmp_path), None, False,
+                                  min_genoa_snp_spl=0x1e)
+    assert milan["amd"]["min_genoa_snp_spl_not_applied"] == "Genoa floor not applied to Milan"
+    assert "min_genoa_snp_spl_checked" not in milan["amd"]
+    monkeypatch.setattr(vr, "verify_amd", lambda *args: {"product": "Genoa"})
+    for name, offset in (("current", 0x38), ("reported", 0x180),
+                         ("committed", 0x1E0), ("launch", 0x1F0)):
+        with pytest.raises(vr.Fail, match=name):
+            vr.verify_attestation(attestation(offset), None, None, str(tmp_path), None, False,
+                                  min_genoa_snp_spl=0x1e)
+    with pytest.raises(vr.Fail, match="verified AMD processor"):
+        vr.verify_attestation(attestation(), None, None, str(tmp_path), None, True,
+                              min_genoa_snp_spl=0x1e)
+
+
 def test_a_fresh_hotel_with_no_receipts_verifies(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(rr, "tsm_provider", lambda: None)
     fresh = rr.Ledger("room-b", str(tmp_path / "b"))
@@ -426,3 +470,25 @@ def test_a_repeated_receipt_fails_and_is_not_counted_twice(tmp_path, monkeypatch
         out = json.loads(proc.stdout)
         assert out["verdict"] == "FAIL"
         assert out["reason"] == "receipt 2: sequence appears more than once"
+
+
+def test_incomplete_broker_archive_is_not_called_the_whole_chain(tmp_path, monkeypatch) -> None:
+    # AB#386 HOLD: the broker archived the first page before a restart. It
+    # keeps the hotel's head and complete=false; the verifier checks each
+    # receipt and must not report a whole chain or a PASS.
+    ledger = _chain(tmp_path, monkeypatch)
+    prefix = {"binding_sha256": ledger.binding_sha256, "head": ledger.head, "complete": False,
+              "receipts": ledger.chain[:1]}
+    proc = _verify_cli(tmp_path / "prefix", ledger.attestation(), prefix)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["verdict"] == "NOT PROVEN"
+    assert "INCOMPLETE" in out["checked"] and "whole chain" not in out["checked"]
+    assert any("incomplete" in r for r in out["not_proven"])
+
+    # The same archive once complete: the whole chain to its head, PASS.
+    whole = {"binding_sha256": ledger.binding_sha256, "head": ledger.head, "complete": True,
+             "receipts": ledger.chain}
+    proc = _verify_cli(tmp_path / "whole", ledger.attestation(), whole)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert json.loads(proc.stdout)["checked"].startswith("whole chain to the head the server named")

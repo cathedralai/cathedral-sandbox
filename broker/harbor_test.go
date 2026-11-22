@@ -180,80 +180,59 @@ func buildForm(t *testing.T, dockerfile string, ctx []byte) ([]byte, string) {
 	return buf.Bytes(), mw.FormDataContentType()
 }
 
-func waitImage(t *testing.T, tc *testChain, id string) map[string]any {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, doc := tc.clientCall(t, "GET", "/v1/images/"+id, nil, nil)
-		if doc["state"] != "pending" || time.Now().After(deadline) {
-			return doc
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-func TestBuildThroughTheBrokerAndCreateOnlyWhereBuilt(t *testing.T) {
+// AB#650 and AB#776: every hotel is a shared sealed hotel and no hotel
+// builds. A build is refused at once, no hotel is asked, and nothing is kept.
+func TestBuildIsRefusedAndNoHotelBuilds(t *testing.T) {
 	tc := newChain(t)
-	tc.hotels["c"].failBuild = true
-	tc.b.hotelByID("b").cfg.Drain = true // a draining hotel does not build
 	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("gzip-bytes"))
 	status, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	if status != 200 || doc["image_id"] == nil {
-		t.Fatalf("build: %d %v", status, doc)
+	detail, _ := doc["detail"].(map[string]any)
+	if status != 409 || detail["error"] != "shared_hotel_build_refused" {
+		t.Fatalf("build: %d %v, want 409 shared_hotel_build_refused", status, doc)
 	}
-	// AB#650 Option A: sealed hotel a is skipped. With b draining and c failing,
-	// the build cannot become ready until an unsealed hotel can build.
-	view := waitImage(t, tc, doc["image_id"].(string))
-	if view["state"] == "ready" {
-		t.Fatalf("build ready with only sealed/draining/failed hotels: %v", view)
-	}
-	if len(tc.hotels["a"].builds) != 0 {
-		t.Fatalf("sealed hotel a must not build under Option A: %v", tc.hotels["a"].builds)
-	}
-	if len(tc.hotels["b"].builds) != 0 {
-		t.Fatalf("draining hotel built")
-	}
-	tc.b.hotelByID("b").cfg.Drain = false
-	_, _ = tc.clientCall(t, "GET", "/v1/images/"+doc["image_id"].(string), nil, nil)
-	view = waitImage(t, tc, doc["image_id"].(string))
-	if view["state"] != "ready" || view["image"] != "cathedral-build-0123456789abcdef:latest" {
-		t.Fatalf("view after unsealing b: %v", view)
-	}
-	got := tc.hotels["b"].builds[0]
-	if got["dockerfile"] != "FROM alpine:3.20\n" || got["context_tar_b64"] != "Z3ppcC1ieXRlcw==" {
-		t.Fatalf("hotel build body: %v", got)
-	}
-	before := createsOn(tc)
-	for i := 0; i < 4; i++ {
-		status, doc = tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": view["image_id"], "sealed": false}), nil)
-		if status != 201 {
-			t.Fatalf("create: %d %v", status, doc)
+	time.Sleep(50 * time.Millisecond)
+	for id, f := range tc.hotels {
+		f.mu.Lock()
+		n := len(f.builds)
+		f.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("hotel %s was asked to build", id)
 		}
 	}
-	after := createsOn(tc)
-	if after["b"]-before["b"] != 4 {
-		t.Fatalf("creates went to hotels without the image: %v -> %v", before, after)
-	}
-	last := tc.hotels["b"].creates[len(tc.hotels["b"].creates)-1]
-	if res := last["resources"].(map[string]any); res["vcpu"].(float64) != 2 || last["image"] != "cathedral-build-0123456789abcdef:latest" {
-		t.Fatalf("create body: %v", last)
+	tc.b.compat.mu.Lock()
+	n := len(tc.b.compat.images)
+	tc.b.compat.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("a refused build left %d image(s)", n)
 	}
 }
 
-func TestBuildFailureIsReported(t *testing.T) {
-	tc := newChain(t)
-	for _, f := range tc.hotels {
-		f.failBuild = true
+// A built image left in older state can never become ready: it reads as
+// failed with shared_hotel_build_refused, and a create from it gets the same
+// code with no retry hint, never the retrying image_not_ready.
+func TestBuiltImageFromOlderStateIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	tc := newChainState(t, dir)
+	const id = "0a1b2c3d-0000-0000-0000-000000000001"
+	tc.b.compat.mu.Lock()
+	tc.b.compat.images[id] = &compatImage{ID: id, CPU: 1, MemoryGiB: 4, DiskGiB: 10, Build: true, Dockerfile: "FROM alpine:3.20\n"}
+	tc.b.compat.mu.Unlock()
+	if err := tc.b.saveCompat(); err != nil {
+		t.Fatal(err)
 	}
-	body, ctype := buildForm(t, "FROM alpine:3.20\nRUN false\n", nil)
-	_, doc := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	view := waitImage(t, tc, doc["image_id"].(string))
-	if view["state"] != "failed" || view["error"] != "image_build_failed" || !strings.Contains(view["message"].(string), "docker build failed") {
-		t.Fatalf("view: %v", view)
+	tc.start(t) // restart over the same state_dir
+	status, view := tc.clientCall(t, "GET", "/v1/images/"+id, nil, nil)
+	if status != 200 || view["state"] != "failed" || view["error"] != "shared_hotel_build_refused" {
+		t.Fatalf("image view: %d %v", status, view)
 	}
-	status, _ := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": view["image_id"]}), nil)
-	if status != 409 {
-		t.Fatalf("create from failed build: %d", status)
+	before := totalCreates(tc)
+	status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"image_id": id}), nil)
+	detail, _ := doc["detail"].(map[string]any)
+	if status != 409 || detail["error"] != "shared_hotel_build_refused" {
+		t.Fatalf("create from a built image: %d %v", status, doc)
+	}
+	if totalCreates(tc) != before {
+		t.Fatalf("a refused create reached a hotel")
 	}
 }
 
@@ -266,9 +245,6 @@ func TestIdempotentCreateSurvivesABrokerRestart(t *testing.T) {
 		t.Fatalf("create: %d %v", status, first)
 	}
 	id := first["id"].(string)
-	body, ctype := buildForm(t, "FROM alpine:3.20\n", []byte("ctx"))
-	_, img := tc.clientCall(t, "POST", "/v1/images/build", body, map[string]string{"Content-Type": ctype})
-	waitImage(t, tc, img["image_id"].(string))
 	if err := tc.b.saveCompat(); err != nil {
 		t.Fatal(err)
 	}
@@ -291,11 +267,6 @@ func TestIdempotentCreateSurvivesABrokerRestart(t *testing.T) {
 	// The room keeps its client id after the restart.
 	if status, doc := tc.clientCall(t, "GET", "/v1/sandboxes/"+id, nil, nil); status != 200 || doc["id"] != id {
 		t.Fatalf("room after restart: %d %v", status, doc)
-	}
-	// A built image is known after the restart and builds again from the saved context.
-	view := waitImage(t, tc, img["image_id"].(string))
-	if view["state"] != "ready" {
-		t.Fatalf("image after restart: %v", view)
 	}
 }
 

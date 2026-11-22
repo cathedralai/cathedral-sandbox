@@ -104,7 +104,7 @@ python3 "$KIT/assess.py" --data-dir "$ROOM_DATA_DIR" --room-socket "$SOCK" --out
 log "assess: $ROOM_ETC/machine.json"
 
 # Resolved copy of the config (values only, no comments) for units and health.
-ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME ROOM_EGRESS ROOM_WORKSPACES ROOM_SECRETS_PERSIST ROOM_SECRETS_PER_OWNER ROOM_ESCAPE ROOM_ESCAPE_ALLOW_PLAINTEXT ROOM_SEALED_SECRETS ROOM_SEALED_EXEC ROOM_GUEST_INGRESS ROOM_WORKSPACES_SOURCE"
+ROOM_KEYS="ROOM_TLS ROOM_REGISTRY_MIRRORS ROOM_ID ROOM_HOSTNAME ROOM_ACME_EMAIL ROOM_CUSTOMER ROOM_REGION API_PROFILE ROOM_API_PORT ROOM_HEALTH_PORT ROOM_PUBLIC_PORT ROOM_DATA_DIR ROOM_DATA_DEVICE ROOM_DATA_IMG ROOM_DATA_SIZE_GB ROOM_IMAGE_GC ROOM_IMAGE_GC_HIGH_PCT ROOM_IMAGE_GC_LOW_PCT ROOM_IMAGE_GC_MIN_IDLE_MIN ROOM_IMAGE_PIN_MAX_PCT ROOM_BRIDGE ROOM_BRIDGE_CIDR ROOM_DNS ROOM_RUNSC_FLAGS ROOM_ALLOW_DIND ROOM_CREATES_PER_MINUTE ROOM_GC_PARALLELISM ROOM_DIND_DOCKERD_ARGS ROOM_DIND_ENV ROOM_BRIDGE_PORT_CAP ROOM_NETS ROOM_NETS_POOL ROOM_NET_SIZE ROOM_NET_BRIDGE_PREFIX SHAPE_VCPU SHAPE_MEM_GIB SHAPE_DISK_GIB RESERVE_RAM_PCT RESERVE_THREADS DISK_MAX_FILL_PCT CPU_OVERCOMMIT MEM_OVERCOMMIT DISK_OVERCOMMIT ROOM_MAX_SLOTS ROOM_QUOTA_VCPU ROOM_RECEIPTS ROOM_RECEIPTS_LISTEN ROOM_HOTEL_NAME ROOM_EGRESS ROOM_WORKSPACES ROOM_SECRETS_PERSIST ROOM_SECRETS_PER_OWNER ROOM_ESCAPE ROOM_ESCAPE_ALLOW_PLAINTEXT ROOM_SEALED_SECRETS ROOM_SEALED_EXEC ROOM_GUEST_INGRESS ROOM_WORKSPACES_SOURCE"
 write_room_env() {
   for k in $ROOM_KEYS; do printf '%s="%s"\n' "$k" "${!k:-}"; done > "$ROOM_ETC/room.env"
   chmod 0644 "$ROOM_ETC/room.env"
@@ -143,6 +143,26 @@ elif [ ! -f "$ROOM_DATA_IMG" ]; then
   truncate -s "${ROOM_DATA_SIZE_GB}G" "$ROOM_DATA_IMG"
   mkfs.xfs -f -q "$ROOM_DATA_IMG"
   mark "file:$ROOM_DATA_IMG"
+elif [ "${ROOM_DATA_SIZE_GB:-0}" -gt 0 ]; then
+  # A re-run with a larger ROOM_DATA_SIZE_GB grows the image store in place,
+  # rooms and images kept (AB#819: c46's 60 GB store was full). The file
+  # grows here; room-data.sh grows the file system once the volume is up
+  # (below). xfs cannot shrink, so a smaller size keeps the file as it is.
+  DATA_WANT=$((ROOM_DATA_SIZE_GB * 1024 * 1024 * 1024))
+  DATA_HAVE=$(stat -c %s "$ROOM_DATA_IMG")
+  if [ "$DATA_WANT" -gt "$DATA_HAVE" ]; then
+    # The file is sparse: a host disk without room for the growth would fill
+    # later, under the rooms, and shut the volume down. Refuse it now.
+    HOST_FREE=$(df -B1 --output=avail "$(dirname "$ROOM_DATA_IMG")" | tail -1 | tr -d ' ')
+    if [ "$HOST_FREE" -lt "$((DATA_WANT - DATA_HAVE))" ]; then
+      echo "ROOM_DATA_SIZE_GB=$ROOM_DATA_SIZE_GB needs $(((DATA_WANT - DATA_HAVE) / 1024 / 1024 / 1024)) GiB more on the disk of $ROOM_DATA_IMG; only $((HOST_FREE / 1024 / 1024 / 1024)) GiB is free" >&2
+      exit 1
+    fi
+    truncate -s "${ROOM_DATA_SIZE_GB}G" "$ROOM_DATA_IMG"
+    log "data volume: $ROOM_DATA_IMG grown from $((DATA_HAVE / 1024 / 1024 / 1024)) to $ROOM_DATA_SIZE_GB GiB"
+  elif [ "$DATA_WANT" -lt "$DATA_HAVE" ]; then
+    echo "warning: ROOM_DATA_SIZE_GB=$ROOM_DATA_SIZE_GB is below the $((DATA_HAVE / 1024 / 1024 / 1024)) GiB of $ROOM_DATA_IMG; xfs cannot shrink, the size stays" >&2
+  fi
 fi
 cat > "$UNIT_DIR/$DATA_UNIT" <<EOF
 [Unit]
@@ -187,7 +207,10 @@ install -m 0755 "$KIT/room_api.py" "$ROOM_OPT/bin/room_api.py"
 install -m 0755 "$KIT/assess.py" "$ROOM_OPT/bin/assess.py"
 install -m 0755 "$KIT/size.py" "$ROOM_OPT/bin/size.py"
 install -m 0755 "$KIT/room_receipts.py" "$ROOM_OPT/bin/room_receipts.py"
+install -m 0644 "$KIT/room_ingress.py" "$ROOM_OPT/bin/room_ingress.py"
+install -m 0644 "$KIT/room_acme.py" "$ROOM_OPT/bin/room_acme.py"
 install -m 0755 "$KIT/room_egress.py" "$ROOM_OPT/bin/room_egress.py"
+install -m 0755 "$KIT/room_image_gc.py" "$ROOM_OPT/bin/room_image_gc.py"
 
 # ---------------------------------------------------------------- 5. Caddy (pinned, sha512)
 fetch "$CADDY_URL" sha512 "$CADDY_SHA512" "$ROOM_OPT/cache/caddy-$CADDY_VERSION.tar.gz"
@@ -270,6 +293,9 @@ mark "unit:$ROOM_ID-docker.service"
 # ---------------------------------------------------------------- 8. size (after the volume exists)
 systemctl daemon-reload
 systemctl enable --now "$DATA_UNIT"
+# On a re-run the data unit is already active: grow the file system to the
+# file now (idempotent), so the sizing below sees the new size.
+"$ROOM_OPT/bin/room-data.sh" grow "$ROOM_ETC/room.env"
 mountpoint -q "$ROOM_DATA_DIR" || { echo "data volume did not mount" >&2; exit 1; }
 xfs_info "$ROOM_DATA_DIR" >/dev/null
 grep -E " $ROOM_DATA_DIR " /proc/mounts | grep -q prjquota || { echo "prjquota missing on $ROOM_DATA_DIR" >&2; exit 1; }
@@ -306,7 +332,7 @@ size_room() { # size_room <bridge addresses (0 = no bridge limit)> <out>
   python3 "$KIT/size.py" "$ROOM_ETC/machine.json" --vcpu "$SHAPE_VCPU" --mem-gib "$SHAPE_MEM_GIB" --disk-gib "$SHAPE_DISK_GIB" \
     --cpu-overcommit "$CPU_OVERCOMMIT" --mem-overcommit "$MEM_OVERCOMMIT" --disk-overcommit "$DISK_OVERCOMMIT" \
     --reserve-ram-pct "$RESERVE_RAM_PCT" --reserve-threads "$RESERVE_THREADS" --disk-max-fill-pct "$DISK_MAX_FILL_PCT" \
-    --room-disk-bytes "$ROOM_DISK_BYTES" --max-slots "${ROOM_MAX_SLOTS:-0}" --bridge-addresses "$1" --out "$2"
+    --room-disk-bytes "$ROOM_DISK_BYTES" --max-slots "${ROOM_MAX_SLOTS:-0}" --quota-vcpu "${ROOM_QUOTA_VCPU:-slots}" --bridge-addresses "$1" --out "$2"
 }
 if [ "$ROOM_NETS_AUTO" = 1 ]; then
   # One room network for each ROOM_NET_SIZE rooms that CPU, memory and disk
@@ -361,6 +387,7 @@ eval "$XTRACE"
   echo "DOCKER_HOST=unix://$SOCK"
   echo "HOME=/var/lib/pool-room"
   echo "TMPDIR=$ROOM_DATA_DIR/work"
+  echo "CATHEDRAL_PULL_DATA_DIR=$ROOM_DATA_DIR" # pull disk floor (AB#861)
   profile_env
 } > "$ROOM_ETC/api.env"
 cat > "$UNIT_DIR/$ROOM_ID.service" <<EOF
@@ -371,7 +398,9 @@ After=$ROOM_ID-docker.service
 [Service]
 User=poolroom
 Group=poolroom
-StateDirectory=pool-room
+# The image GC's state directory too: the API writes the pins file there
+# (AB#860), and the GC first runs 5 minutes after boot.
+StateDirectory=pool-room pool-room-$ROOM_ID-image-gc
 EnvironmentFile=$ROOM_ETC/api.env
 EnvironmentFile=$ROOM_ETC/secret.env
 ExecStart=$(profile_exec)
@@ -417,7 +446,9 @@ EOF
 mark "unit:$ROOM_ID-health.service"
 
 # The API collects past-TTL sandboxes only when it handles a list/get.
-# This timer makes collection happen even when no client is calling.
+# This timer makes collection happen even when no client is calling. With
+# ROOM_RECEIPTS=1 the receipts front deletes due rooms first, with a signed
+# receipt (ROOM_REAP_SECONDS, AB#385); this stays as the backstop.
 cat > "$UNIT_DIR/$ROOM_ID-reaper.service" <<EOF
 [Unit]
 Description=Pool room $ROOM_ID TTL reaper tick
@@ -436,6 +467,41 @@ AccuracySec=5
 WantedBy=timers.target
 EOF
 mark "unit:$ROOM_ID-reaper.timer"; mark "unit:$ROOM_ID-reaper.service"
+
+# Image cleanup (AB#819): above ROOM_IMAGE_GC_HIGH_PCT of the data volume, the
+# least recently used images no container uses go until it is below the low
+# mark (room_image_gc.py has the rules). ROOM_IMAGE_GC=0 keeps the timer but
+# makes each run do nothing. Images owners pinned (AB#860, the API's pins file
+# in the same state directory) are kept like the probe image.
+IMAGE_GC_ARGS="--sock $SOCK --data-dir $ROOM_DATA_DIR --state /var/lib/pool-room-$ROOM_ID-image-gc/state.json --keep $PROBE_IMAGE"
+IMAGE_GC_ARGS="$IMAGE_GC_ARGS --keep-file /var/lib/pool-room-$ROOM_ID-image-gc/pins.json"
+IMAGE_GC_ARGS="$IMAGE_GC_ARGS --high-pct ${ROOM_IMAGE_GC_HIGH_PCT:-85} --low-pct ${ROOM_IMAGE_GC_LOW_PCT:-70} --min-idle-minutes ${ROOM_IMAGE_GC_MIN_IDLE_MIN:-60}"
+[ "${ROOM_IMAGE_GC:-1}" = 1 ] || IMAGE_GC_ARGS="$IMAGE_GC_ARGS --off"
+cat > "$UNIT_DIR/$ROOM_ID-image-gc.service" <<EOF
+[Unit]
+Description=Pool room $ROOM_ID image cleanup (least recently used, above the fill mark)
+Requires=$ROOM_ID-docker.service
+After=$ROOM_ID-docker.service
+[Service]
+Type=oneshot
+User=poolroom
+Group=poolroom
+StateDirectory=pool-room-$ROOM_ID-image-gc
+ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_image_gc.py $IMAGE_GC_ARGS
+Nice=10
+NoNewPrivileges=yes
+EOF
+cat > "$UNIT_DIR/$ROOM_ID-image-gc.timer" <<EOF
+[Unit]
+Description=Pool room $ROOM_ID image cleanup (every 5 min)
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=300
+AccuracySec=30
+[Install]
+WantedBy=timers.target
+EOF
+mark "unit:$ROOM_ID-image-gc.timer"; mark "unit:$ROOM_ID-image-gc.service"
 
 # Egress policy per room (ROOM_EGRESS=1, the default): room_egress.py runs as
 # root outside the rooms. It owns the nftables rules per room, the hotel DNS
@@ -505,6 +571,15 @@ if [ "${ROOM_GUEST_INGRESS:-0}" = 1 ]; then
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 Environment=ROOM_GUEST_INGRESS=1
 EOF
+if [ -n "${ROOM_INGRESS_ZONE:-}" ]; then
+# Preview URL ingress served by the front (room_ingress.py): HTTPS on the guest
+# ingress port with that key, a Let's Encrypt certificate over DNS-01 through
+# the broker. No zone: the key only, as before.
+cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
+Environment=ROOM_INGRESS_ZONE=$ROOM_INGRESS_ZONE ROOM_INGRESS_BROKER_URL=$ROOM_INGRESS_BROKER_URL ROOM_INGRESS_TLS_LISTEN=$ROOM_INGRESS_TLS_LISTEN ROOM_INGRESS_PUBLIC_PORT=${ROOM_INGRESS_PUBLIC_PORT:-443}
+Environment=ROOM_ACME_DIRECTORY=${ROOM_ACME_DIRECTORY:-https://acme-v02.api.letsencrypt.org/directory} ROOM_ACME_DNS_WAIT=${ROOM_ACME_DNS_WAIT:-20}${ROOM_ACME_EMAIL:+ ROOM_ACME_EMAIL=$ROOM_ACME_EMAIL}
+EOF
+fi
 fi
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 ExecStart=$ROOM_OPT/venv/bin/python $ROOM_OPT/bin/room_receipts.py
@@ -594,11 +669,11 @@ fi
 refuse_restart_with_rooms  # the guard at the top is minutes old by now
 systemctl daemon-reload
 if [ "${ROOM_EGRESS:-1}" = 1 ]; then systemctl enable -q "$ROOM_ID-egress.service"; systemctl restart "$ROOM_ID-egress.service"; fi
-systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reaper.timer"
+systemctl enable -q "$ROOM_ID.service" "$ROOM_ID-health.service" "$ROOM_ID-reaper.timer" "$ROOM_ID-image-gc.timer"
 systemctl restart "$ROOM_ID.service" "$ROOM_ID-health.service"
 if [ "$ROOM_RECEIPTS" = 1 ]; then systemctl enable -q "$ROOM_ID-receipts.service"; systemctl restart "$ROOM_ID-receipts.service"; fi
 if [ "${ROOM_TLS:-on}" = on ]; then systemctl enable -q "$ROOM_ID-caddy.service"; systemctl restart "$ROOM_ID-caddy.service"; fi
-systemctl start "$ROOM_ID-reaper.timer"
+systemctl start "$ROOM_ID-reaper.timer" "$ROOM_ID-image-gc.timer"
 # With the key: 200 means the API is up and the key store took this key. A
 # bare 401 or 000 used to print "done" over a hotel that answered nobody.
 API_CODE=000

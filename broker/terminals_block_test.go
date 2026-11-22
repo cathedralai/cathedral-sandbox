@@ -157,11 +157,11 @@ func TestTerminalHotelsOpenOnlyListedOperatorHotels(t *testing.T) {
 func TestTerminalHotelsNeverOpenMinerHotels(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	withTerminalHotels(t, tc, "miner-1", "op-join")
-	joinMiner(t, tc, "miner-1", true, 4, nil)
+	joinMiner(t, tc, "miner-1", 4, nil)
 	if a := admissionOf(t, tc, "miner-1"); a["state"] != "admitted" {
 		t.Fatalf("miner-1 admission: %v", a)
 	}
-	joinMiner(t, tc, "op-join", false, 4, nil) // unsealed operator hotel, no hotkey
+	joinOperatorSealed(t, tc, "op-join", 4) // operator hotel, no hotkey
 	if status, doc := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{
 		"policy": map[string]any{"prefer": []any{
 			map[string]any{"label": map[string]string{"sealed": "true", "miner": "true"}},

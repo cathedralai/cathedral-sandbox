@@ -4,6 +4,7 @@
 //   - finished Idempotency-Key answers, so a repeated create after a restart
 //     returns the first answer and starts no new room;
 //   - deleted-room tombstones;
+//   - room end records (ended.go);
 //   - imported and built images. A build context is a separate file in
 //     state_dir/build-contexts.
 //
@@ -22,7 +23,6 @@ import (
 
 const (
 	stateFile      = "client-state.json"
-	contextsDir    = "build-contexts"
 	stateKeep      = 48 * time.Hour // idempotency answers and tombstones
 	stateSaveEvery = time.Second
 )
@@ -45,6 +45,7 @@ type savedState struct {
 	Images     map[string]*compatImage               `json:"images"`
 	GuestRooms map[string]map[string]map[string]bool `json:"guest_rooms"` // guest -> hotel -> room id
 	MinerExits []minerExit                           `json:"miner_exits"` // miner_exits.go
+	EndedRooms []endRecord                           `json:"ended_rooms"` // ended.go
 }
 
 func (b *broker) markDirty() { b.dirty.Store(true) }
@@ -118,6 +119,7 @@ func (b *broker) saveCompat() error {
 		}
 	}
 	st.MinerExits = b.minerExitsSnapshot()
+	st.EndedRooms = b.endedSnapshot(time.Now())
 	b.mu.Unlock()
 	now := time.Now()
 	b.compat.mu.Lock()
@@ -164,27 +166,6 @@ func (b *broker) saveCompat() error {
 // it to hold one save there while another starts.
 var afterStateSnapshot = func() {}
 
-// saveBuildContext writes a build context file. Caller holds b.compat.mu.
-func (b *broker) saveBuildContext(img *compatImage) {
-	if b.cfg.StateDir == "" || len(img.buildCtx) == 0 {
-		return
-	}
-	dir := filepath.Join(b.cfg.StateDir, contextsDir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		log.Printf("build context not saved: %v", err)
-		return
-	}
-	// Write and rename, so a crash leaves the old file or the whole new one.
-	final := filepath.Join(dir, img.ID+".tar.gz")
-	if err := os.WriteFile(final+".tmp", img.buildCtx, 0o600); err != nil {
-		log.Printf("build context not saved: %v", err)
-		return
-	}
-	if err := os.Rename(final+".tmp", final); err != nil {
-		log.Printf("build context not saved: %v", err)
-	}
-}
-
 // keepCorruptState copies a state file that did not parse next to itself,
 // so an operator can recover from it after the next save replaces it.
 func (b *broker) keepCorruptState(raw []byte) {
@@ -219,7 +200,7 @@ func (b *broker) loadCompat() error {
 	var st savedState
 	var bad []string
 	for name, into := range map[string]any{"uuids": &st.UUIDs, "idempotency": &st.Idem, "tombstones": &st.Tombs,
-		"images": &st.Images, "guest_rooms": &st.GuestRooms, "miner_exits": &st.MinerExits} {
+		"images": &st.Images, "guest_rooms": &st.GuestRooms, "miner_exits": &st.MinerExits, "ended_rooms": &st.EndedRooms} {
 		if v, ok := sections[name]; ok && len(v) > 0 {
 			if err := json.Unmarshal(v, into); err != nil {
 				bad = append(bad, name)
@@ -232,6 +213,7 @@ func (b *broker) loadCompat() error {
 	}
 	b.mu.Lock()
 	b.restoreMinerExits(st.MinerExits, time.Now())
+	b.restoreEnded(st.EndedRooms, time.Now())
 	b.savedUUIDs = map[string]string{}
 	for u, bid := range st.UUIDs {
 		b.savedUUIDs[bid] = u
@@ -272,18 +254,6 @@ func (b *broker) loadCompat() error {
 			continue
 		}
 		img.ID = id
-		if img.Build {
-			ctx, err := os.ReadFile(filepath.Join(b.cfg.StateDir, contextsDir, id+".tar.gz"))
-			switch {
-			case err == nil:
-				img.buildCtx = ctx
-			case os.IsNotExist(err):
-				// A build with no context file had an empty context.
-			default:
-				img.ctxMissing = true
-			}
-			img.builds = map[string]*buildHotel{} // the hotels are asked again
-		}
 		b.compat.images[id] = img
 	}
 	return nil

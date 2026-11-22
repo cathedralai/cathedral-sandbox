@@ -91,7 +91,7 @@ func newSecretChain(t *testing.T, g1Hotels []string) *secretChain {
 		t.Cleanup(hs.Close)
 		sc.hotels[id] = f
 		sc.sh[id] = h
-		cfg.Hotels = append(cfg.Hotels, hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4})
+		cfg.Hotels = append(cfg.Hotels, hotelConfig{ID: id, Name: id, API: hs.URL, Health: hs.URL, KeyFile: key, Concurrency: 4, Sealed: true, SealedAdmission: sealedAdmissionOff}) // AB#776, see newChainState
 	}
 	raw, _ := json.Marshal(cfg)
 	sc.cfgPath = filepath.Join(dir, "config.json")

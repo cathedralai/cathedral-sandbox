@@ -79,7 +79,7 @@ def test_base_image_pins_safetensors() -> None:
 def test_prefetch_script_targets_sealed_only() -> None:
     script = (ROOT / "scripts" / "prepull-sealed-lfm3.sh").read_text(encoding="utf-8")
     assert "sealed" in script
-    assert "7d0aa94f7bf7d0356a02c65adfc2f3d08f6a26bf750d6d3127780ff8f68d54cb" in script
+    assert "0c5757f472f61228e66e34555cda07f7ac5e2eb8a4edf1707b3a6810242398d2" in script
     assert "/v1/images/prefetch" in script
 
 

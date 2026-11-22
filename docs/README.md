@@ -36,8 +36,8 @@ order.
 
 ## Founding miners
 
-Compute mining is closed to new miners and there is no application right now.
-Cathedral will post an announcement when mining opens.
+Miner compute is open: bring an AMD SEV-SNP bare-metal box. Check it and
+apply with [Bring your compute](BRING_YOUR_COMPUTE.md).
 See [Founding miners](MINING.md#founding-miners). Registration alone does
 not admit a machine to the sealed customer pool or place customer jobs.
 
@@ -78,6 +78,9 @@ not open.
   customer sandboxes under gVisor. This page is a design proposal, not a
   mining path and not a self-serve install. Cathedral's leased sealed product
   is separate and is not sold from this repository.
+- [Measured memory](MEASURED_MEMORY.md): a design and threat model for paying
+  miners for memory proven inside a measured SEV-SNP guest and checked by timed
+  random-page probes. Not implemented and not paid.
 - [Room memory checkpoint spike](ROOM_MEMORY_CHECKPOINT_SPIKE.md): measured
   gVisor checkpoint and restore of a room's memory under the sealed runsc
   flags, on a development machine.

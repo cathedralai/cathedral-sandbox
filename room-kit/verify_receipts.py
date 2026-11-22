@@ -22,6 +22,9 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      equal the report; the report's ECDSA P-384 signature verifies with the VCEK.
      Optional --ark-sha256 pins the ARK certificate; repeat it to accept
      any of several roots (one per product: Milan, Genoa, ...).
+     Optional --min-genoa-snp-spl checks the current, reported, committed and
+     launch SNP TCB components after the AMD chain; it cannot prove the OEM
+     PI, mitigation bit or full microcode patch in AMD-SB-3059/3061.
   4. receipts: each statement names this binding and the sealed hotel receipt
      schema, receipt_sha256 = sha256(canonical(statement)), the Ed25519
      signature verifies with the binding's receipt key, and the chain links
@@ -72,8 +75,13 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      unknown, not retired. The output's pool_rooms gives each state.
  12. guest ingress (AB#422): a sealed binding that names guest_ingress must
      name a cathedral_guest_ingress_v1 object with a well-formed
-     tls_spki_sha256: the key Preview URLs will be served with, made in the
-     guest. The output reports it; nothing serves on it yet.
+     tls_spki_sha256: the key Preview URLs are served with, made in the
+     guest, and the zone when it names one. --ingress-spki-sha256 (the SPKI
+     sha256 of the TLS peer that served a Preview URL) must equal it. Each
+     successful expose receipt that names an expose URL must name the
+     binding's ingress key, a port 1 to 65535, and a host
+     <room>-<port>.<hotel>.<zone> of this binding's hotel and zone, with the
+     URL https://<host>[:port]/. The output's exposes lists them.
  13. snapshots and forks, inside one binding. A successful snapshot receipt
      names snapshot_id, snapshot_image_id (sha256: and 64 hex),
      snapshot_work_archive_sha256, snapshot_size_bytes and
@@ -100,7 +108,8 @@ Run mode (--oneshot FILE, a cathedral_oneshot_bundle_v1) checks one run's file o
 caller expects, in eight checks. The AMD certificates come from the file (amd_certs) and must match
 --ark-sha256, which run mode requires. Any missing input is a FAIL, never a guess.
 Run mode takes --oneshot, --recipe, --context or --no-context, --run-id, --input-sha256, --input-file,
---output-file, --expected-measurement, --allowed-measurements, --ark-sha256, --product and --require-sealed (which
+--output-file, --expected-measurement, --allowed-measurements, --ark-sha256, --product,
+--min-genoa-snp-spl and --require-sealed (which
 changes nothing: run mode always requires an SEV-SNP attestation). These flags are usage errors with exit 2:
 --receipts, --attestation, --broker, --origin, --key-file, --operator-key-file, --hotel, --sandbox,
 --receipt-header, --cathedral-sandbox, --save, --owner-pubkey, --tls-spki-sha256, --require-tls and --kds-cache,
@@ -453,7 +462,8 @@ def verify_hotel_attestation(att: dict) -> dict:
 
 
 def verify_attestation(att: dict, expected_measurement: str | list[str] | None, prod: str | None, cache: str,
-                       ark_sha256: str | list[str] | None, skip_amd: bool, certs: dict | None = None) -> dict:
+                       ark_sha256: str | list[str] | None, skip_amd: bool, certs: dict | None = None,
+                       min_genoa_snp_spl: int = 0) -> dict:
     binding = att["binding"]
     bsha = sha(canonical(binding))
     need(bsha == att["binding_sha256"], "binding_sha256 does not match the binding")
@@ -482,6 +492,17 @@ def verify_attestation(att: dict, expected_measurement: str | list[str] | None, 
            "kernel_cmdline": cmdline}
     if not skip_amd:
         out["amd"] = verify_amd(report, rep, product(rep, prod), cache, ark_sha256, certs)
+    if min_genoa_snp_spl:
+        need(not skip_amd and out["amd"]["product"] in ("Genoa", "Milan"),
+             "Genoa SNP floor requires a verified AMD processor generation")
+        if out["amd"]["product"] == "Genoa":
+            for name, offset in (("current", 0x38), ("reported", 0x180),
+                                 ("committed", 0x1E0), ("launch", 0x1F0)):
+                need(report[offset + 6] >= min_genoa_snp_spl,
+                     f"{name} TCB SNP component is below Genoa floor 0x{min_genoa_snp_spl:02x}")
+            out["amd"]["min_genoa_snp_spl_checked"] = min_genoa_snp_spl
+        else:
+            out["amd"]["min_genoa_snp_spl_not_applied"] = "Genoa floor not applied to Milan"
     return out
 
 
@@ -549,6 +570,49 @@ def verify_guest_ingress(att: dict, peer_spki_sha256: str | None = None, require
     if peer_spki_sha256 is not None:
         need(peer_spki_sha256.lower() == tls, "the Preview URL peer is not the key the binding names (the host answered?)")
     return {"schema": INGRESS_SCHEMA, "tls_spki_sha256": tls, "peer_checked": peer_spki_sha256 is not None}
+
+
+EXPOSE_FIELDS = ("expose_port", "expose_url", "expose_host", "ingress_tls_spki_sha256")
+
+
+def check_exposes(att: dict, receipts: list[dict]) -> list[dict]:
+    """Expose receipts signed by a guest that serves Preview URLs (AB#422), checked against the binding.
+
+    The receipt is signed by the binding's receipt key (verify_receipts checks that); here its
+    expose fields must name the ingress key the binding names and a host under this binding's
+    hotel and zone. A receipt with none of the fields (the API's own 501, or a failed expose)
+    is not listed.
+    """
+    binding = att["binding"]
+    ingress = binding.get("guest_ingress") if isinstance(binding.get("guest_ingress"), dict) else None
+    out = []
+    for rc in receipts:
+        st = rc["statement"]
+        if st.get("action") != "expose":
+            continue
+        present = [k for k in EXPOSE_FIELDS if k in st]
+        if not present:
+            continue
+        where = f"expose receipt {st['sequence']}"
+        need(len(present) == len(EXPOSE_FIELDS), f"{where} names only some of the expose fields")
+        need(_is_int(st.get("status")) and 200 <= st["status"] < 300, f"{where} names a URL but did not succeed")
+        need(ingress is not None and isinstance(ingress.get("zone"), str),
+             f"{where}: the binding names no guest ingress zone, so no URL is attested")
+        need(st["ingress_tls_spki_sha256"] == ingress.get("tls_spki_sha256"),
+             f"{where} names another ingress key than the binding")
+        port = st["expose_port"]
+        need(_is_int(port) and 1 <= port <= 65535, f"{where}: expose_port is not a TCP port")
+        room = st.get("sandbox_id")
+        need(isinstance(room, str), f"{where} names no room")
+        base = f"{binding.get('hotel')}.{ingress['zone']}"
+        want_host = f"{room.replace('_', '-')}-{port}.{base}"
+        need(st["expose_host"] == want_host, f"{where}: host is not {want_host}")
+        url = st["expose_url"]
+        need(isinstance(url, str) and re.fullmatch(r"https://" + re.escape(want_host) + r"(:[1-9][0-9]{0,4})?/", url)
+             is not None, f"{where}: URL is not https://{want_host}/")
+        out.append({"sequence": st["sequence"], "sandbox_id": room, "port": port, "url": url,
+                    "tls_spki_sha256": st["ingress_tls_spki_sha256"]})
+    return out
 
 
 def verify_install_key(doc: dict, att: dict) -> str:
@@ -1993,7 +2057,7 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
          "check 1: the file holds no AMD certificates (amd_certs)")
     try:
         attestation_out = verify_attestation(att, trust["measurements"], trust.get("product"), "", trust["ark_sha256"],
-                                             False, certs)
+                                             False, certs, trust.get("min_genoa_snp_spl", 0))
         chain_out = verify_receipts(att, receipts, None)
         edges = check_snapshot_edges(receipts)
         if edges is not None:
@@ -2307,7 +2371,8 @@ def run_mode(a) -> int:
             held[path] = read_file(value, "the output file")
         caller = {"context": context, "run_id": a.run_id, "input_hashes": hashes, "output_bytes": held}
         out = verify_oneshot(bundle, recipe, {"measurements": list(dict.fromkeys(measurements)),
-                                              "ark_sha256": a.ark_sha256, "product": a.product}, caller)
+                                              "ark_sha256": a.ark_sha256, "product": a.product,
+                                              "min_genoa_snp_spl": a.min_genoa_snp_spl or 0}, caller)
         print(json.dumps(out, indent=1))
         return 0
     except (KeyError, TypeError, AttributeError, IndexError, ValueError, OverflowError, RecursionError):
@@ -2347,6 +2412,8 @@ def main() -> int:
                     help="run mode: an output file you hold, to check against the receipts; repeat per output")
     ap.add_argument("--ark-sha256", action="append",
                     help="pin the AMD ARK certificate (sha256 of its DER); repeat to accept any of several")
+    ap.add_argument("--min-genoa-snp-spl", type=int, metavar="N",
+                    help="require Genoa current/reported/committed/launch SNP TCB components >= N (e.g. 30 for AMD-SB-3059); requires AMD chain")
     ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
     ap.add_argument("--kds-cache", help="list mode: where fetched AMD certificates are cached "
                                         "(default ~/.cache/amd-kds)")
@@ -2358,11 +2425,15 @@ def main() -> int:
     ap.add_argument("--tls-spki-sha256", help="SPKI sha256 of the TLS peer that served the attestation; "
                                               "fails unless the binding names this key")
     ap.add_argument("--require-tls", action="store_true", help="fail unless the binding names a guest TLS key")
+    ap.add_argument("--ingress-spki-sha256", help="SPKI sha256 of the TLS peer that served a Preview URL; "
+                    "must equal the binding's guest_ingress key (AB#422)")
     ap.add_argument("--origin", help="a miner hotel's https://<ip>:<port>: fetch the attestation from the guest "
                                      "and check the TLS peer and the install key")
     ap.add_argument("--cathedral-sandbox", help="a Cathedral sandbox id (UUID): fail unless a successful create "
                                                 "receipt names it")
     a = ap.parse_args()
+    if a.min_genoa_snp_spl is not None and not 1 <= a.min_genoa_snp_spl <= 255:
+        ap.error("--min-genoa-snp-spl must be an integer from 1 to 255")
     if a.oneshot:
         # Every flag run mode does not act on is refused, so no caller believes a check ran that did not.
         # --require-sealed is accepted: run mode always requires an SEV-SNP attestation.
@@ -2374,7 +2445,8 @@ def main() -> int:
             ("--require-tls", a.require_tls), ("--kds-cache", a.kds_cache), ("--sandbox", a.sandbox),
             ("--hotel", a.hotel), ("--operator-key-file", a.operator_key_file), ("--save", a.save),
             ("--receipt-header", a.receipt_header), ("--cathedral-sandbox", a.cathedral_sandbox),
-            ("--key-file", a.key_file)) if value is not None and value is not False and value != []]
+            ("--key-file", a.key_file), ("--ingress-spki-sha256", a.ingress_spki_sha256))
+            if value is not None and value is not False and value != []]
         if clash:
             ap.error(f"--oneshot checks one file; it takes no {', '.join(clash)}")
         return run_mode(a)
@@ -2423,7 +2495,12 @@ def main() -> int:
         receipts = doc["receipts"] if isinstance(doc, dict) else doc
         # A guest's chain from the broker is filtered to its own rooms, so it
         # has gaps by design: check each receipt, not a whole chain to the head.
-        whole = isinstance(doc, dict) and not doc.get("filtered") and not a.sandbox and not a.receipt_header
+        # The broker's chain archive (GET /v1/broker/bindings/<sha>/receipts)
+        # says complete=false when it holds only a prefix of the chain it saw
+        # (AB#386): check each receipt, and never call that the whole chain.
+        incomplete = isinstance(doc, dict) and doc.get("complete") is False
+        whole = (isinstance(doc, dict) and not doc.get("filtered") and not incomplete
+                 and not a.sandbox and not a.receipt_header)
         head = doc.get("head") if whole else None
         need(isinstance(receipts, list), "the receipts are not a list")
         for h in a.receipt_header:
@@ -2438,7 +2515,8 @@ def main() -> int:
                 raise Fail("--receipt-header is not base64url JSON") from exc
         check_receipt_shapes(receipts)
         owner = owner_key_bytes(a.owner_pubkey) if a.owner_pubkey else None
-        sealed_asked = a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product or owner
+        sealed_asked = (a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product
+                        or a.min_genoa_snp_spl or owner)
         if is_hotel_level(att) and sealed_asked:
             # A sealed guest whose TSM is missing runs level 1 under the same
             # hotel name. Asking for a measurement means asking for SNP.
@@ -2459,19 +2537,23 @@ def main() -> int:
         unproven_archives: list[str] = []
         if is_hotel_level(att):
             need(not (a.require_tls or a.origin or peer_spki), "a level 1 binding has no attested guest TLS")
+            need(not a.ingress_spki_sha256, "a level 1 binding has no attested guest ingress key")
             attestation_out = verify_hotel_attestation(att)
             chain_out = verify_receipts(att, live_receipts, chain_head)
         else:
             attestation_out = verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
-                                                 a.ark_sha256, a.skip_amd)
+                                                 a.ark_sha256, a.skip_amd,
+                                                 min_genoa_snp_spl=a.min_genoa_snp_spl or 0)
             guest_tls = verify_guest_tls(att, peer_spki, require=bool(a.require_tls or a.origin))
             if guest_tls is not None:
                 if a.origin:
                     need(install_doc is not None, "the hotel did not answer GET /room/hotel-key-install-key")
                     guest_tls["install_key_checked"] = verify_install_key(install_doc, att) is not None
                 attestation_out["guest_tls"] = guest_tls
-            guest_ingress = verify_guest_ingress(att)
+            guest_ingress = verify_guest_ingress(att, a.ingress_spki_sha256)
             if guest_ingress is not None:
+                if isinstance(att["binding"]["guest_ingress"].get("zone"), str):
+                    guest_ingress["zone"] = att["binding"]["guest_ingress"]["zone"]
                 attestation_out["guest_ingress"] = guest_ingress
             if owner is not None:
                 attestation_out["owner"] = verify_owner(att, owner)
@@ -2496,6 +2578,9 @@ def main() -> int:
         edges = check_snapshot_edges(receipts)
         if edges is not None:
             chain_out["forks"] = edges["forks"]
+        exposes = check_exposes(att, live_receipts) if not is_hotel_level(att) else []
+        if exposes:
+            chain_out["exposes"] = exposes
         checked = ("whole chain to the head the server named" if chain_head is not None
                    else "each receipt; not that none are missing")
         if edges is not None:
@@ -2523,15 +2608,22 @@ def main() -> int:
             if archive_chains:
                 checked += "; archived bindings verify signatures only"
             verdict = "PASS"
+        if incomplete:
+            checked += "; INCOMPLETE archive: a prefix of the chain, not shown to reach the hotel's head"
+            verdict = "NOT PROVEN"
         out = {"attestation": attestation_out,
                "chain": chain_out,
                "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts),
                "room_links": room_links(receipts), "verdict": verdict,
                "checked": checked}
+        not_proven = []
         if sealed_archive:
-            out["not_proven"] = [
-                "archived sealed bindings have no SNP report; receipt signatures checked, attestation not proven"
-            ]
+            not_proven.append(
+                "archived sealed bindings have no SNP report; receipt signatures checked, attestation not proven")
+        if incomplete:
+            not_proven.append("the archived chain is incomplete; receipts after the last one archived are missing")
+        if not_proven:
+            out["not_proven"] = not_proven
         if pools:
             out["pool_rooms"] = pools
         if a.cathedral_sandbox:

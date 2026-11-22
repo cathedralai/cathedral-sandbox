@@ -222,7 +222,7 @@ class AwsKmsSigner:
 
     def public_key_raw(self) -> bytes:
         if self._public is None:
-            response = self._kms().GetPublicKey(KeyId=self._key_arn)
+            response = self._kms().get_public_key(KeyId=self._key_arn)
             if response.get("KeySpec") != "ECC_NIST_EDWARDS25519":
                 raise SignerError("the KMS key spec is not ECC_NIST_EDWARDS25519")
             if response.get("KeyUsage") != "SIGN_VERIFY":
@@ -243,7 +243,7 @@ class AwsKmsSigner:
         if self._pinned is None:
             raise SignerError("the aws_kms backend needs a pinned public key before it signs")
         public = self.public_key_raw()
-        response = self._kms().Sign(
+        response = self._kms().sign(
             KeyId=self._key_arn,
             Message=message,
             MessageType="RAW",

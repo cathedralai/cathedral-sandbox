@@ -28,6 +28,47 @@ func TestCatalogListsRoomSizesThenLFM3(t *testing.T) {
 	}
 }
 
+// AB#894: node-22 is the ComputeSDK benchmark's template. It is listed live,
+// sealed ready and sealed only, pinned by digest, and every create of it lands
+// on the sealed hotel.
+func TestCatalogListsNode22(t *testing.T) {
+	tc := newChain(t)
+	// Old unsealed runtime entries must never receive a node-22 create.
+	for _, id := range []string{"b", "c"} {
+		setHotel(tc, id, func(h *hotel) { h.cfg.Sealed = false })
+	}
+	_, cat := tc.clientCall(t, "GET", "/v1/sandboxes/catalog", nil, nil)
+	node, ok := catalogByName(t, cat)["node-22"]
+	if !ok {
+		t.Fatalf("catalog has no node-22: %v", cat)
+	}
+	if node["live"] != true || node["sealed"] != "ready" || node["sealed_only"] != true {
+		t.Fatalf("node-22 catalog: %v", node)
+	}
+	want := pinnedImage("node", nodeDigest)
+	if node["image"] != want {
+		t.Fatalf("node-22 image %v want %s", node["image"], want)
+	}
+	if e := imageRefRefusal(want, false); e != nil {
+		t.Fatalf("node-22 image is not a valid hotel reference: %+v", e)
+	}
+	for _, body := range []map[string]any{{"template": "node-22"}, {"template": "node-22", "sealed": true}} {
+		if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", body); status >= 300 {
+			t.Fatalf("native %v: %d %v", body, status, doc)
+		}
+		if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(body), nil); status != 201 {
+			t.Fatalf("compat %v: %d %v", body, status, doc)
+		}
+	}
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": "node-22", "sealed": false})
+	if status != 409 || errCode(doc) != "template_sealed_only" {
+		t.Fatalf("node-22 sealed false: %d %v", status, doc)
+	}
+	if n := createsOn(tc); n["a"] != 4 || n["b"]+n["c"] != 0 {
+		t.Fatalf("node-22 creates must land on the sealed hotel only: %v", n)
+	}
+}
+
 func TestPinnedImageIsDigestOnly(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("ab", 32)
 	got := pinnedImage(lfm31_7bRepo, digest)
@@ -73,15 +114,15 @@ func TestLFM3CreateHasNoUnsealedPath(t *testing.T) {
 	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 0 {
 		t.Fatalf("refused LFM create reached a hotel: %v", n)
 	}
-	// Ready and sealed only: with or without sealed: true it lands on the sealed hotel, never elsewhere.
+	// Ready and sealed only: with or without sealed: true it is placed (every hotel is sealed, AB#776).
 	for _, body := range []map[string]any{{"template": "lfm3-1.7b"}, {"template": "lfm3-1.7b", "sealed": true}} {
 		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", body)
 		if status >= 300 {
 			t.Fatalf("native %v: %d %v", body, status, doc)
 		}
 	}
-	if n := createsOn(tc); n["a"] != 2 || n["b"]+n["c"] != 0 {
-		t.Fatalf("LFM creates must land on the sealed hotel only: %v", n)
+	if n := createsOn(tc); n["a"]+n["b"]+n["c"] != 2 {
+		t.Fatalf("LFM creates: %v, want 2", n)
 	}
 }
 
@@ -100,7 +141,7 @@ func TestLFM3PendingErrorDoesNotOfferUnsealed(t *testing.T) {
 	}
 }
 
-func TestLFM3SuiteCreatesLandOnTheSealedHotelOnly(t *testing.T) {
+func TestLFM3SuiteCreatesAreSealedOnly(t *testing.T) {
 	tc := newChain(t)
 	for _, name := range []string{"lfm3-1.7b-base", "lfm3-vl-2b", "lfm3-audio-2b", "lfm3-omni-2b", "d1-2b", "d1-omni-2b"} {
 		status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes", map[string]any{"template": name})
@@ -112,20 +153,20 @@ func TestLFM3SuiteCreatesLandOnTheSealedHotelOnly(t *testing.T) {
 			t.Fatalf("%s sealed false: %d %v", name, status, doc)
 		}
 	}
-	if n := createsOn(tc); n["a"] != 6 || n["b"]+n["c"] != 0 {
-		t.Fatalf("suite creates must land on the sealed hotel only: %v", n)
+	if n := totalCreates(tc); n != 6 {
+		t.Fatalf("suite creates: %d, want 6 (every hotel is sealed, AB#776)", n)
 	}
 }
 
 func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 	wantImages := map[string]string{
 		"lfm3-1.7b":      pinnedImage(lfm31_7bRepo, lfm31_7bDigest),
-		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1"),
-		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:df5cea815abd5ba5be781c07558dc72dc45a1334c5b97d0b5a93a907bc9911d6"),
-		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6"),
-		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:4f9ab1457d67d8fba8c9890a612c81ad4274e5f83ea1903becafc5c51a14d5f9"),
-		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd"),
-		"lfm3-1.7b-base": pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8"),
+		"lfm3-vl-2b":     pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:d787ed7937cf0b1dad424bb614fd655ccd66ec635d21ac85f72d7a6f77c6583d"),
+		"lfm3-omni-2b":   pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:4fc6e0682a2f563c5e0fb862c7a4968cdfd509a4d7bc73fee860c3592d214b41"),
+		"d1-2b":          pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:4aed662bc5292e6c8813fefb178a471630d6122994b0cb2e4371f2439e18895f"),
+		"lfm3-audio-2b":  pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:a921557db976002b91c5a48478831edf31a36578427bc63bb1bdc58b482e92c8"),
+		"d1-omni-2b":     pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:57f9038bf8198e6a9fa52e37260a48b56ddf6b6a89c83dbf84b9b74838168cfd"),
+		"lfm3-1.7b-base": pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:b48013ae60249c18cc756d6b449e3320ec63e5861dd0e3cb87c38be11e775e08"),
 	}
 	for name, image := range wantImages {
 		tpl, ok := templateByName(name)
@@ -136,7 +177,7 @@ func TestLFM3SuiteCatalogIsSealedOnlyAndGHCR(t *testing.T) {
 		if !tpl.SealedOnly || tpl.Sealed != wantSealed || !tpl.Live {
 			t.Fatalf("%s: sealed_only=%v sealed=%s live=%v", name, tpl.SealedOnly, tpl.Sealed, tpl.Live)
 		}
-		if name != "lfm3-1.7b" && (tpl.CPU != 2 || tpl.MemoryGiB != 4) {
+		if tpl.CPU != 2 || tpl.MemoryGiB != 4 {
 			t.Fatalf("%s must use the sealed 2 vCPU / 4 GiB shape: %+v", name, tpl)
 		}
 		if tpl.Image != image {
@@ -181,7 +222,7 @@ func TestCatalogAdvertisesLFM3LiveAndSealedPending(t *testing.T) {
 	}
 }
 
-func TestLFM3ReadyCreateForcesSealedAndStaysOnSealedHotels(t *testing.T) {
+func TestLFM3ReadyCreateForcesSealed(t *testing.T) {
 	idx := lfm31_7bIndex(t)
 	old := catalogTemplates[idx]
 	catalogTemplates[idx].Sealed = sealedReady
@@ -200,14 +241,11 @@ func TestLFM3ReadyCreateForcesSealedAndStaysOnSealedHotels(t *testing.T) {
 		t.Fatalf("hotel must not see template: %v", created)
 	}
 	res := created["resources"].(map[string]any)
-	if res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 8 {
+	if res["vcpu"].(float64) != 2 || res["memory_gib"].(float64) != 4 {
 		t.Fatalf("lfm3 resources: %v", res)
 	}
-	if len(tc.hotels["a"].creates) == 0 {
-		t.Fatal("ready LFM did not land on the sealed hotel")
-	}
-	if len(tc.hotels["b"].creates)+len(tc.hotels["c"].creates) != 0 {
-		t.Fatalf("ready LFM leaked to an unsealed hotel: b=%v c=%v", tc.hotels["b"].creates, tc.hotels["c"].creates)
+	if n := totalCreates(tc); n != 1 {
+		t.Fatalf("ready LFM: %d hotel creates, want 1 (every hotel is sealed, AB#776)", n)
 	}
 }
 

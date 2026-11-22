@@ -30,7 +30,7 @@ _probe: dict = {}
 _lock = threading.Lock()
 # Live numbers sampled in the background, so a busy room daemon never makes
 # the health call slow: host CPU busy % (1 s window), load, room containers.
-_live: dict = {"cpu_pct": None, "containers": None, "containers_at": None}
+_live: dict = {"cpu_pct": None, "containers": None, "containers_at": None, "images_count": None, "images_bytes": None}
 # The health document, built in the background once a second. A request only
 # sends these bytes, so the answer stays fast when the host CPU is full.
 _doc: dict = {"body": None, "at": 0.0}
@@ -98,6 +98,31 @@ def containers_loop() -> None:
             _live["containers"] = len(out.split()) if rc == 0 else None
             _live["containers_at"] = time.time()
         time.sleep(2)
+
+
+def images_once() -> None:
+    """Count the room daemon's images and their bytes (AB#860). Totals only, no refs.
+
+    Shared layers count once per image, as docker image ls shows sizes.
+    """
+    count = total = None
+    rc, out = run(DOCKER + ["image", "ls", "-a", "-q", "--no-trunc"], timeout=60)
+    if rc == 0:
+        ids = sorted(set(out.split()))
+        count, total = len(ids), 0
+        if ids:
+            rc, sizes = run(DOCKER + ["image", "inspect", "--format", "{{.Size}}", *ids], timeout=60)
+            total = sum(int(s) for s in sizes.split() if s.isdigit()) if rc == 0 else None
+            if total is None:
+                count = None
+    with _lock:
+        _live["images_count"], _live["images_bytes"] = count, total
+
+
+def images_loop() -> None:
+    while True:
+        images_once()
+        time.sleep(60)
 
 
 def meminfo() -> dict[str, int]:
@@ -182,6 +207,8 @@ def document() -> dict:
             "load1": round(os.getloadavg()[0], 1),
             "room_data_used_pct": round(100 * du.used / du.total, 1),
             "host_root_used_pct": round(100 * root.used / root.total, 1),
+            "images_count": live["images_count"],
+            "images_bytes": live["images_bytes"],
         },
         "workspaces_storage": workspaces_storage(env),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -253,6 +280,7 @@ def main() -> int:
     threading.Thread(target=refresh_probe_loop, daemon=True).start()
     threading.Thread(target=cpu_loop, daemon=True).start()
     threading.Thread(target=containers_loop, daemon=True).start()
+    threading.Thread(target=images_loop, daemon=True).start()
     threading.Thread(target=doc_loop, daemon=True).start()
     port = int(os.environ.get("ROOM_HEALTH_PORT", "18091"))
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

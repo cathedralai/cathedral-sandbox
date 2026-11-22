@@ -4,16 +4,18 @@
 // "template": "<name>" maps to the template's image and size, the same
 // path Harbor and ctcli already use for room-1x4 / room-2x8 / room-4x16.
 //
-// LFM3 names and images match cathedralai/cathedral sandbox_models/catalog.py. Suite digests
-// from cathedral-sandbox #361 (each proven sealed on prod at 2 vCPU / 4 GiB, 29 Oct 2026);
-// Base, VL, d1 and d1-Omni are the #392 builds (per-model sampling, loop guard, tool-call
-// markup parsed; ADO 523); Audio and Omni are their #407 builds (main f9f9a19): liquid --speak,
-// one sentence per /tts request (ADO 552), and the warm cache saved in the image (#403, #405),
-// on top of liquid --json for Audio (ADO 547) and --swa-full with sampled answers for Omni (ADO
-// 549, 550).
-// Prefetched on c46-sealed-2, nc-sealed-2 and nc-sealed-3 before each pin (5 Nov 2026).
-// A suite model is sealed ready only once its image is prefetched on every shared sealed hotel
-// (all six: c46-sealed-2, nc-sealed-2, nc-sealed-3, 6 of 6 each, 29 Oct 2026 11:40Z).
+// LFM3 names and images match the API's SEALED_SUITE catalog (polaris
+// cathedral_lfm3_standard.py). Base, VL, Omni, d1 and d1-Omni are the main 3339b9f builds
+// (publish run 43467170286, 13 Nov 2026); Audio is the main 62686dd build (run 43862309556,
+// 16 Nov 2026) with example turns so it stops calling a tool for every message (#506, AB#545).
+// All six carry lfm3-agent --events streaming chat events (#440, ADO 541) and the static Go
+// chat gateway (#478, ADO 539) on top of per-model sampling and the loop guard (#392, ADO 523),
+// liquid --speak one sentence per /tts request (#407, ADO 552), the warm cache saved in the
+// image (#403, #405), liquid --json for Audio (ADO 547) and --swa-full with sampled answers
+// for Omni (ADO 549, 550).
+// A suite model is sealed ready only once its image is prefetched on every shared sealed hotel.
+// All six exact digests: prefetched and read back on c46-sealed-2, nc-sealed-2 and nc-sealed-3
+// (prefetch pf_1dab9af0e8857ebb as guest cathedral-customer-sealed, 18 Nov 2026, AB#732).
 // LFM templates are sealed-only (AMD SEV-SNP). A pending sealed offer refuses
 // every create. There is no unsealed path and no Standard path.
 package main
@@ -54,12 +56,13 @@ type catalogTemplate struct {
 	SealedOnly bool
 }
 
-// LFM3-1.7B image. llama.cpp b11960, Q4_K_M GGUF. Published from #574
-// (dd39ce17, AB#763): llama-server, llama-bench, python and curl ship next to
-// llama-cli for the sealed benchmark.
+// LFM3-1.7B image. llama.cpp b11960, Q4_K_M GGUF. Published from #488
+// (9bb0f1cc, AB#589, publish run 44324981481): #574's image (dd39ce17, AB#763:
+// llama-server, llama-bench, python and curl next to llama-cli) plus lfm3-ask
+// printing only the answer for long prompts.
 const (
 	lfm31_7bRepo   = "ghcr.io/cathedralai/room-lfm3-1.7b"
-	lfm31_7bDigest = "sha256:7d0aa94f7bf7d0356a02c65adfc2f3d08f6a26bf750d6d3127780ff8f68d54cb"
+	lfm31_7bDigest = "sha256:0c5757f472f61228e66e34555cda07f7ac5e2eb8a4edf1707b3a6810242398d2"
 )
 
 var digestPin = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -94,46 +97,59 @@ var catalogTemplates = []catalogTemplate{
 	{
 		Name: "lfm3-1.7b", DisplayName: "LFM3 1.7B (CPU)",
 		Description: "LFM3 1.73B on CPU via llama.cpp (LFM3-1.7B-Q4_K_M.gguf). Sandbox inputs: text. Sandbox outputs: text. GPU is not required. Sealed AMD SEV-SNP only.",
-		CPU:         2, MemoryGiB: 8, DiskGiB: 10,
+		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
 		Image: pinnedImage(lfm31_7bRepo, lfm31_7bDigest), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-vl-2b", DisplayName: "LFM3 VL 2B (CPU)",
 		Description: "LFM3 1.92B on CPU via llama.cpp b11960 (LFM3-VL-2B-Q4_K_M.gguf). Sandbox inputs: text, image. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:ef5c553961e5a6d9eba616fe4f5b2d68d46ec996f651e2011e5a09ae67f9cdc1"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-vl-2b", "sha256:d787ed7937cf0b1dad424bb614fd655ccd66ec635d21ac85f72d7a6f77c6583d"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-omni-2b", DisplayName: "LFM3 Omni 2B (CPU)",
 		Description: "LFM3 2.17B on CPU via llama.cpp b11960 (LFM3-Omni-2B-Q4_K_M.gguf). Sandbox inputs: text, image, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:df5cea815abd5ba5be781c07558dc72dc45a1334c5b97d0b5a93a907bc9911d6"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-omni-2b", "sha256:4fc6e0682a2f563c5e0fb862c7a4968cdfd509a4d7bc73fee860c3592d214b41"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-2b", DisplayName: "d1 2B (CPU)",
 		Description: "d1 1.92B on CPU via llama.cpp b11960 (d1-2B-Q8_0.gguf). Sandbox outputs: decision (yes/no, choice, score). Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:f95d88c7144642328fe85bd7f52e95e434979e64a220550fac3d0e965aca35c6"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-d1-2b", "sha256:4aed662bc5292e6c8813fefb178a471630d6122994b0cb2e4371f2439e18895f"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-audio-2b", DisplayName: "LFM3 Audio 2B (CPU)",
 		Description: "LFM3 2B on CPU via llama.cpp b11960 (LFM3-Audio-2B-Q4_K_M.gguf). Sandbox inputs: text, audio. Sandbox outputs: text. Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:4f9ab1457d67d8fba8c9890a612c81ad4274e5f83ea1903becafc5c51a14d5f9"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-audio-2b", "sha256:a921557db976002b91c5a48478831edf31a36578427bc63bb1bdc58b482e92c8"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "d1-omni-2b", DisplayName: "d1 Omni 2B (CPU)",
 		Description: "d1 2.17B on CPU via llama.cpp b11960 (d1-Omni-2B-Q8_0.gguf). Sandbox outputs: decision (yes/no, choice, score). Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:3cb800de3d2f9bfcc69d24ab2fc659fc51eb7ed3aae2abe46d46a23f10b57abd"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-d1-omni-2b", "sha256:57f9038bf8198e6a9fa52e37260a48b56ddf6b6a89c83dbf84b9b74838168cfd"), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 	{
 		Name: "lfm3-1.7b-base", DisplayName: "LFM3 1.7B Base (CPU)",
 		Description: "LFM3 1.73B on CPU via llama.cpp b11960 (converted from LiquidAI/LFM3-1.7B-Base safetensors to Q4_K_M). Sealed AMD SEV-SNP only.",
 		CPU:         2, MemoryGiB: 4, DiskGiB: 10,
-		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:810911016ac6ea1ddeba1bba4dc157e0c3d4252201e64d3279876e57dce344a8"), Live: true, Sealed: sealedReady, SealedOnly: true,
+		Image: pinnedImage("ghcr.io/cathedralai/room-lfm3-1.7b-base", "sha256:b48013ae60249c18cc756d6b449e3320ec63e5861dd0e3cb87c38be11e775e08"), Live: true, Sealed: sealedReady, SealedOnly: true,
+	},
+	// node-22 is the ComputeSDK benchmark's template (AB#894). The digest is
+	// the node:22-slim manifest list (holds linux/amd64) that the benchmark
+	// participant names. Sealed-only keeps the pre-pull off unsealed hotels
+	// (prewarmsTemplate) and forces every create onto the sealed pool.
+	{
+		Name: "node-22", DisplayName: "node-22",
+		Description: "1 vCPU, 4 GiB room with Node.js 22 (node:22-slim)",
+		CPU:         1, MemoryGiB: 4, DiskGiB: 10,
+		Image: pinnedImage("node", nodeDigest), Live: true, Sealed: sealedReady, SealedOnly: true,
 	},
 }
+
+// nodeDigest is node:22-slim (22-bookworm-slim).
+const nodeDigest = "sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee"
 
 // pinnedImage is repository@sha256:hex. The hotel image grammar is a tag or a
 // digest, not both. Live model templates use this for the published digest.
@@ -233,7 +249,7 @@ func applyCatalogTemplate(req map[string]any) *apiErr {
 	if id, _ := req["image_id"].(string); id != "" {
 		return nil
 	}
-	if ref, _ := req["image"].(string); ref != "" {
+	if createImageRef(req) != "" {
 		return nil
 	}
 	name, _ := req["template"].(string)

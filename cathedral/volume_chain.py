@@ -64,6 +64,11 @@ LABELS = {
 DEFAULT_LEASE_SECONDS = 900
 MAX_ID_LENGTH = 128
 
+# AB#825: how long shred waits for the key service before answering key_service_timeout.
+DESTROY_KEY_TIMEOUT_SECONDS = 10.0
+MIN_DESTROY_KEY_TIMEOUT_SECONDS = 0.1
+MAX_DESTROY_KEY_TIMEOUT_SECONDS = 60.0
+
 
 class VolumeRefused(Exception):
     """A volume statement refused. The code is short and stable."""
@@ -175,6 +180,7 @@ class _Volume:
     shred_pending: bool = False
     shred_pending_key_id: str | None = None
     shred_receipt: dict | None = None
+    shred_in_flight: bool = False
 
 
 class VolumeRegistry:
@@ -188,8 +194,12 @@ class VolumeRegistry:
         self.lease_seconds = lease_seconds
         self.lock = threading.Lock()
         self.volumes: dict[str, _Volume] = {}
+        # AB#825: key id to the one volume it was ever bound to. Never freed, not even
+        # after a shred, so a receipt's key_id names one volume forever. Safe only
+        # because key ids come from the key service, never from a customer request.
+        self.key_volumes: dict[str, str] = {}
         # AB#398: every accepted head and every shred, in order (volume_log format).
-        # In memory like the rest of this contract; where it is published is open.
+        # In memory like the rest of this contract; the log is not published.
         self.log: list[dict] = []
         self.log_signing_key_id = "registry:" + sha(self.key.public_key().public_bytes(
             Encoding.Raw, PublicFormat.Raw))[:16]
@@ -214,7 +224,8 @@ class VolumeRegistry:
     def create(self, volume_id: str, owner: str, *, key_id: str | None = None) -> dict:
         """Create a volume. Returns the signed volume statement; its digest is the parent of generation 1.
 
-        key_id, when known at create, is the volume's key; shred refuses any other.
+        key_id, when known at create, is the volume's key; shred refuses any other. A key
+        id already bound to another volume is refused (key_bound_elsewhere).
         """
         _ident(volume_id, "bad_volume_id")
         if not volume_log.VOLUME_ID_RE.fullmatch(volume_id):
@@ -225,21 +236,32 @@ class VolumeRegistry:
         with self.lock:
             if volume_id in self.volumes:
                 raise VolumeRefused("volume_exists")
+            if key_id is not None and key_id in self.key_volumes:
+                raise VolumeRefused("key_bound_elsewhere")
             doc = sign_statement(self.key, {"schema": VOLUME_SCHEMA, "volume_id": volume_id, "owner": owner,
                                             "created_at": self._t()})
             genesis = statement_sha256(doc)
             self.volumes[volume_id] = _Volume(doc=doc, genesis_sha256=genesis, generation=0, head_sha256=genesis,
                                               head_doc=self._head(volume_id, 0, genesis, None), key_id=key_id)
+            if key_id is not None:
+                self.key_volumes[key_id] = volume_id
             return doc
 
     def bind_key(self, volume_id: str, key_id: str) -> None:
-        """Record the volume's key id once (when the key is released after create). shred refuses any other."""
+        """Record the volume's key id once (when the key is released after create). shred refuses any other.
+
+        A key id bound to another volume, live or shredded, is refused (key_bound_elsewhere).
+        """
         _key_id(key_id)
         with self.lock:
             volume = self._volume(volume_id)
             if volume.key_id is not None and volume.key_id != key_id:
                 raise VolumeRefused("key_already_bound")
+            bound_to = self.key_volumes.get(key_id)
+            if bound_to is not None and bound_to != volume_id:
+                raise VolumeRefused("key_bound_elsewhere")
             volume.key_id = key_id
+            self.key_volumes[key_id] = volume_id
 
     def _volume(self, volume_id) -> _Volume:
         volume = self.volumes.get(volume_id) if isinstance(volume_id, str) else None
@@ -379,31 +401,51 @@ class VolumeRegistry:
             volume.head_doc = self._head(commit["volume_id"], generation, digest, current.statement)
             return volume.head_doc
 
-    def shred(self, volume_id: str, *, key_id: str, destroy_key: Callable[[str, str], object]) -> dict:
+    def shred(self, volume_id: str, *, owner: str, key_id: str, destroy_key: Callable[[str, str], object],
+              timeout_seconds: float = DESTROY_KEY_TIMEOUT_SECONDS) -> dict:
         """Crypto-shred a volume: destroy its key, log a terminal shred entry, return a signed receipt.
+
+        owner is the authenticated caller, compared with the owner given to create. The
+        registry does not authenticate; the host passes who it authenticated. A caller
+        that is not the owner gets not_owner before anything else about the volume is
+        read, including the resend of a finished shred.
 
         destroy_key(volume_id, key_id) is the key service's call (AB#392). It must raise
         on an unknown key or a key that is not this volume's, be idempotent (a key it
-        already destroyed counts as destroyed) and return True only once the key is
-        gone; any other return is a refusal. The registry also refuses (before the key
-        is touched) a key_id other than the one recorded for the volume at create or
-        bind_key, and a retry of a pending shred with a key_id other than the pending
-        one (shred_key_mismatch). The receipt attests that the key service confirmed
+        already destroyed counts as destroyed), carry its own bounded network timeout,
+        and return True only once the key is gone; any other return is a refusal. A
+        call that never returns pins the volume in shred_in_progress (one thread per
+        such volume). The registry also refuses (before the key is touched) a key_id
+        other than the one recorded for the volume at create or bind_key, and a retry
+        of a pending shred with a key_id other than the pending one
+        (shred_key_mismatch). The receipt attests that the key service confirmed
         destroying key_id.
 
-        Everything is checked and the log entry built before the key is touched. The
-        lease ends and the volume freezes (shred_pending: no grant, accept or head)
-        before destroy_key runs, and stays frozen if the key service refuses or the
-        answer is lost, so no commit can land on a key that may be gone. Retrying shred
-        finishes it. A resend after success, with the same key_id, returns the same
-        receipt. Held under the lock throughout.
+        Everything is checked before the key is touched. The lease ends and the
+        volume freezes (shred_pending: no grant, accept or head) before destroy_key
+        runs, and stays frozen if the key service refuses, times out or the answer is
+        lost, so no commit can land on a key that may be gone. Retrying shred finishes
+        it. A resend after success, with the same key_id, returns the same receipt.
+
+        The registry lock is not held while destroy_key runs: it runs on a worker
+        thread and shred waits at most timeout_seconds (key_service_timeout), so a
+        hung key service cannot block other volumes. Only one worker runs per volume
+        (shred_in_progress). The shred entry is therefore built after the key is
+        destroyed, against the log as it is then. log_refused at that point is
+        practically unreachable (this volume is frozen, only other volumes append)
+        and leaves the volume shred_pending.
         """
+        if (not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool)
+                or not MIN_DESTROY_KEY_TIMEOUT_SECONDS <= timeout_seconds <= MAX_DESTROY_KEY_TIMEOUT_SECONDS):
+            raise VolumeRefused("bad_timeout")
         with self.lock:
             volume = self._volume(volume_id)
+            if volume.doc["statement"]["owner"] != owner:
+                raise VolumeRefused("not_owner")
             if volume.shredded:
-                if volume.shred_receipt is not None and volume.shred_receipt["key_id"] == key_id:
-                    return volume.shred_receipt
-                raise VolumeRefused("volume_shredded")
+                return _shredded_answer(volume, key_id)
+            if volume.shred_in_flight:
+                raise VolumeRefused("shred_in_progress")
             if volume.generation < 1 or volume.head_commit_sha256 is None:
                 raise VolumeRefused("nothing_to_shred")
             _key_id(key_id)
@@ -413,6 +455,46 @@ class VolumeRegistry:
                 raise VolumeRefused("key_not_bound")
             if volume.key_id != key_id:
                 raise VolumeRefused("shred_key_mismatch")
+            if volume.lease is not None:
+                volume.lease.released = True
+            volume.shred_pending = True
+            volume.shred_pending_key_id = key_id
+            volume.shred_in_flight = True
+
+        outcome: dict[str, object] = {}
+        done = threading.Event()
+
+        def run_destroy_key() -> None:
+            try:
+                outcome["destroyed"] = destroy_key(volume_id, key_id)
+            except Exception:
+                outcome["destroyed"] = False
+            finally:
+                # Clear before set: a caller woken by done may retry at once and must
+                # not see its own finished worker as shred_in_progress.
+                with self.lock:
+                    volume.shred_in_flight = False
+                done.set()
+
+        try:
+            threading.Thread(target=run_destroy_key, name=f"volume-shred-{volume_id}", daemon=True).start()
+        except Exception:
+            with self.lock:
+                volume.shred_in_flight = False
+            raise VolumeRefused("key_not_destroyed") from None
+        if not done.wait(timeout_seconds):
+            raise VolumeRefused("key_service_timeout")
+        if outcome.get("destroyed") is not True:
+            raise VolumeRefused("key_not_destroyed")
+
+        with self.lock:
+            # Another caller's worker may have finished this shred while the lock was free.
+            if volume.shredded:
+                return _shredded_answer(volume, key_id)
+            if not volume.shred_pending or volume.shred_pending_key_id != key_id:
+                raise VolumeRefused("shred_key_mismatch")
+            # Built now, not before the wait: other volumes may have appended meanwhile,
+            # and append_entry needs the current seq and prev hash.
             shredded_at = self._iso()
             try:
                 extended = volume_log.append_entry(
@@ -421,16 +503,6 @@ class VolumeRegistry:
                     commit_receipt_sha256=volume.head_commit_sha256, logged_at=shredded_at)
             except (volume_log.VolumeLogError, KeyError):
                 raise VolumeRefused("log_refused") from None
-            if volume.lease is not None:
-                volume.lease.released = True
-            volume.shred_pending = True
-            volume.shred_pending_key_id = key_id
-            try:
-                destroyed = destroy_key(volume_id, key_id)
-            except Exception:
-                destroyed = False
-            if destroyed is not True:
-                raise VolumeRefused("key_not_destroyed")
             receipt = volume_log.sign_shred_receipt(
                 extended, volume_id=volume_id, key_id=key_id, shredded_at=shredded_at,
                 signing_key_id=self.log_signing_key_id,
@@ -440,6 +512,13 @@ class VolumeRegistry:
             volume.shred_pending = False
             volume.shred_receipt = receipt
             return receipt
+
+
+def _shredded_answer(volume: _Volume, key_id) -> dict:
+    """A shredded volume answers the same receipt to its own key id and volume_shredded to any other."""
+    if volume.shred_receipt is not None and volume.shred_receipt["key_id"] == key_id:
+        return volume.shred_receipt
+    raise VolumeRefused("volume_shredded")
 
 
 def _key_id(key_id) -> str:

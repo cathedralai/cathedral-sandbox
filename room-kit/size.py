@@ -5,7 +5,7 @@ Usage: size.py machine.json [--vcpu 1] [--mem-gib 4] [--disk-gib 10]
        [--cpu-overcommit 1.0] [--mem-overcommit 1.0] [--disk-overcommit 1.0]
        [--reserve-ram-pct 12]
        [--reserve-threads 2] [--disk-max-fill-pct 70] [--room-disk-bytes N]
-       [--max-slots N] [--out size.json]
+       [--max-slots N] [--quota-vcpu slots|pool|N] [--out size.json]
 
 Rules:
 * A sealed hotel guest on the same host (room kit --sealed, a QEMU guest named
@@ -19,6 +19,11 @@ Rules:
 * The room's own Docker daemon is not subtracted (those are our slots).
 * Disk: the room may grow the host filesystem to disk-max-fill-pct, no more.
   If the room has its own data volume (room-disk-bytes), the smaller wins.
+* Quota vCPU (the hotel's running:vcpu:memory cap) is slots x shape vCPU by
+  default. --quota-vcpu pool sets it to the overcommitted CPU pool, so rooms
+  larger than the shape fill the pool instead of the slot count (AB#857: 2 vCPU
+  rooms stopped at half the slots). An integer sets it directly. Either way it
+  is never below slots x shape vCPU.
 * Overcommit multiplies the pool. Use 1.0 until real per-sandbox use is
   measured. The per-sandbox disk size is a ceiling (xfs project quota), and
   blocks are allocated only when written, so disk overcommit is safe to raise
@@ -48,9 +53,12 @@ def main() -> int:
     ap.add_argument("--disk-max-fill-pct", type=float, default=70)
     ap.add_argument("--room-disk-bytes", type=int, default=0)
     ap.add_argument("--max-slots", type=int, default=0)
+    ap.add_argument("--quota-vcpu", default="slots", help="slots, pool, or a whole number of vCPUs")
     ap.add_argument("--bridge-addresses", type=int, default=0, help="usable guest IPs on the room bridge")
     ap.add_argument("--out", default="-")
     a = ap.parse_args()
+    if a.quota_vcpu not in ("slots", "pool") and not a.quota_vcpu.isdecimal():
+        ap.error("--quota-vcpu must be slots, pool or a whole number")
     m = json.loads(Path(a.machine).read_text())
 
     threads = m["cpu"]["threads"]
@@ -85,6 +93,11 @@ def main() -> int:
         by["bridge_ips"] = a.bridge_addresses
     limiting = min(by, key=by.get)
     slots = by[limiting]
+    quota_vcpu = math.floor(slots * a.vcpu)
+    if a.quota_vcpu == "pool":
+        quota_vcpu = max(quota_vcpu, math.floor(cpu_pool))
+    elif a.quota_vcpu != "slots":
+        quota_vcpu = max(quota_vcpu, int(a.quota_vcpu))
     out = {
         "shape": {"vcpu": a.vcpu, "mem_gib": a.mem_gib, "disk_gib": a.disk_gib},
         "inputs": {k: getattr(a, k) for k in ["cpu_overcommit", "mem_overcommit", "disk_overcommit", "reserve_ram_pct", "reserve_threads", "disk_max_fill_pct", "room_disk_bytes", "max_slots"]},
@@ -99,7 +112,8 @@ def main() -> int:
         "slots": slots,
         "limiting": limiting,
         # CATHEDRAL_SANDBOX_QUOTA format is running:vcpu:memory_gib.
-        "quota": f"{slots}:{math.floor(slots * a.vcpu)}:{math.floor(slots * a.mem_gib)}",
+        "quota": f"{slots}:{quota_vcpu}:{math.floor(slots * a.mem_gib)}",
+        "quota_vcpu_source": a.quota_vcpu,
     }
     text = json.dumps(out, indent=2, sort_keys=True)
     if a.out == "-":

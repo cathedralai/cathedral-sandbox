@@ -98,6 +98,113 @@ func TestPrewarmMarksCatalogImagesWarmAndDownClearsThem(t *testing.T) {
 	}
 }
 
+// 20 Nov 2026 broker swap smoke: prewarm pulled the sealed-only LFM images onto
+// the unsealed hotel c46 and filled its room volume. Since AB#776 every hotel
+// is sealed, so every hotel gets the sealed-only images and the warm image.
+func TestPrewarmSendsSealedOnlyImagesToEverySealedHotel(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true)
+	sealedOnly := map[string]bool{}
+	for _, tp := range catalogTemplates {
+		if tp.Live && tp.SealedOnly && tp.Image != "" {
+			sealedOnly[tp.Image] = true
+		}
+	}
+	if len(sealedOnly) == 0 {
+		t.Fatal("fixture: the catalog has no live sealed-only image")
+	}
+	pulled := func(id string) map[string]bool {
+		tc.b.prewarmHotel(tc.b.hotelByID(id))
+		got := map[string]bool{}
+		for _, req := range tc.hotels[id].prefetch {
+			for _, im := range req["images"].([]any) {
+				got[im.(string)] = true
+			}
+		}
+		return got
+	}
+	for _, id := range []string{"a", "b"} {
+		got := pulled(id)
+		for im := range sealedOnly {
+			if !got[im] {
+				t.Fatalf("sealed hotel %s did not pull sealed-only image %s", id, im)
+			}
+		}
+		if !got[warmImage] {
+			t.Fatalf("sealed hotel %s did not pull %s: %v", id, warmImage, got)
+		}
+	}
+}
+
+// AB#894 plus AB#776: every configured hotel is sealed and pre-pulls node-22 once.
+func TestPrewarmPullsNode22OnEverySealedHotel(t *testing.T) {
+	tc := newChain(t)
+	warmUp(tc, true)
+	node := pinnedImage("node", nodeDigest)
+	pulls := func(id string) int {
+		tc.b.prewarmHotel(tc.b.hotelByID(id))
+		n := 0
+		for _, req := range tc.hotels[id].prefetch {
+			for _, im := range req["images"].([]any) {
+				if im.(string) == node {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	if n := pulls("a"); n != 1 {
+		t.Fatalf("sealed hotel a pulled %s %d times, want once", node, n)
+	}
+	if n := pulls("b"); n != 1 {
+		t.Fatalf("sealed hotel b pulled %s %d times, want once", node, n)
+	}
+}
+
+// AB#894 (Astra r2 finding 4): a hotel whose scratch is at or over the guest
+// prefetch line pulls no catalog image, logs the skip once per image, and
+// still takes creates; a hotel under the line pulls.
+func TestPrewarmSkipsCatalogPullOnAFullScratchAndStaysPlaceable(t *testing.T) {
+	tc := newChain(t)
+	setHotelOK(tc, "b", false) // only a is eligible; all fixture hotels are sealed now
+	setHotelOK(tc, "c", false)
+	warmUp(tc, true)
+	logs := captureLog(t)
+	node := pinnedImage("node", nodeDigest)
+	full, roomy := diskFullPct, diskFullPct-30
+	setHotel(tc, "a", func(h *hotel) { h.ok, h.roomDataPct = true, &full })
+	tc.b.prewarmHotel(tc.b.hotelByID("a"))
+	tc.b.prewarmHotel(tc.b.hotelByID("a")) // a second come-up does not log again
+	if n := len(tc.hotels["a"].prefetch); n != 0 {
+		t.Fatalf("hotel a at %.0f%% scratch got %d prefetch calls, want none", full, n)
+	}
+	if n := strings.Count(logs.String(), "catalog pre-pull of "+node+" skipped"); n != 1 {
+		t.Fatalf("skip of %s logged %d times, want once: %s", node, n, logs.String())
+	}
+	tc.b.mu.Lock()
+	ok, warm := tc.b.hotelByID("a").ok, tc.b.hotelByID("a").warm[node]
+	tc.b.mu.Unlock()
+	if !ok || warm {
+		t.Fatalf("hotel a after the skip: ok=%v warm=%v, want placeable and cold", ok, warm)
+	}
+	if status, doc := tc.clientCall(t, "POST", "/v1/sandboxes", mustMarshal(map[string]any{"template": "node-22"}),
+		map[string]string{"User-Agent": computeSDKAgent}); status != 201 || creates(tc, "a") != 1 {
+		t.Fatalf("node-22 create on the full-scratch sealed hotel: %d %v, creates on a %d", status, doc, creates(tc, "a"))
+	}
+
+	setHotel(tc, "a", func(h *hotel) { h.roomDataPct = &roomy })
+	tc.b.prewarmHotel(tc.b.hotelByID("a"))
+	pulled := false
+	for _, req := range tc.hotels["a"].prefetch {
+		for _, im := range req["images"].([]any) {
+			pulled = pulled || im.(string) == node
+		}
+	}
+	if !pulled {
+		t.Fatalf("hotel a at %.0f%% scratch did not pull %s", roomy, node)
+	}
+}
+
 func compatWarmCreates(t *testing.T, tc *testChain, n int) map[string]int {
 	t.Helper()
 	got := map[string]int{}

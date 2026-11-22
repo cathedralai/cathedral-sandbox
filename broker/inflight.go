@@ -98,15 +98,21 @@ func clientGone() createResult {
 func (b *broker) reapRoom(h *hotel, rm *room) {
 	b.mu.Lock()
 	rm.state, rm.since, rm.vanished = stDeleting, time.Now(), time.Now()
+	// The guest never had this room: it gets no end record (ended.go).
+	rm.reaped = true
 	if old := h.rooms[rm.hid]; old != nil && old != rm { // the sync loop saw it first
 		b.release(h, old)
 	}
 	h.rooms[rm.hid] = rm
 	b.rememberGuestRoom(rm.guest, h.cfg.ID, rm.hid)
+	turned := b.usageMeter.seen(usageSightingOf(h, rm, nil), time.Now()) // metered, not billable: no client id (usage_meter.go)
 	b.mu.Unlock()
+	if turned { // durable before the delete, outside b.mu, bounded
+		b.usageMeter.awaitDurable(usageTurnWait)
+	}
 	path := "/v1/sandboxes/" + url.PathEscape(rm.hid)
 	for attempt := 0; attempt < 3; attempt++ {
-		status, _, _, err := h.do(context.Background(), "DELETE", path, nil, nil, 2*time.Minute)
+		status, _, _, err := h.do(waitForConnUntilDeadline(context.Background()), "DELETE", path, nil, nil, 2*time.Minute)
 		if err == nil && (status == 204 || status == 200 || status == 404) {
 			return
 		}

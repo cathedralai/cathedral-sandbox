@@ -28,7 +28,7 @@ func TestRuntimeMinerHotelsSurviveTightenedCaps(t *testing.T) {
 	stateDir := t.TempDir()
 	tc := newChainState(t, stateDir)
 	for _, id := range []string{"m1", "m2", "m3"} {
-		joinMiner(t, tc, id, true, 1, nil)
+		joinMiner(t, tc, id, 1, nil)
 	}
 
 	setCaps := func(perHotkey, global int) {
@@ -170,8 +170,8 @@ func TestOperatorAddsChangesAndRemovesAHotelAtRuntime(t *testing.T) {
 func TestRuntimeHotelMutationsRefuseFailedStateSave(t *testing.T) {
 	newHotelToJoin := func(t *testing.T) map[string]any {
 		t.Helper()
-		_, origin := newOperatorHotel(t, 1, nil)
-		return map[string]any{"id": "durable", "api": origin, "key": joinKey}
+		_, origin := newOperatorHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("durable")}))
+		return map[string]any{"id": "durable", "api": origin, "key": joinKey, "sealed": true}
 	}
 	blockSave := func(t *testing.T, dir string) {
 		t.Helper()
@@ -229,7 +229,7 @@ func TestRuntimeHotelMutationsRefuseFailedStateSave(t *testing.T) {
 
 func TestMinerEnrollmentKeyCannotOperateOutsideMinerScope(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
-	joinMiner(t, tc, "m1", true, 1, nil)
+	joinMiner(t, tc, "m1", 1, nil)
 	for _, path := range []string{"/v1/broker/hotels/a", "/v1/broker/hotels/b"} {
 		if status, doc := tc.call(t, "enroller-key", "GET", path, nil); status != 403 || errCode(doc) != "enroller_scope" {
 			t.Fatalf("read operator hotel %s: %d %v", path, status, doc)
@@ -495,7 +495,8 @@ func TestJoinChecksTheHotelAndTheInput(t *testing.T) {
 		want int
 		code string
 	}{
-		{map[string]any{"id": "x", "api": dead.URL, "key": joinKey}, 502, "hotel_unreachable"},
+		{map[string]any{"id": "x", "api": dead.URL, "key": joinKey, "sealed": true}, 502, "hotel_unreachable"},
+		{map[string]any{"id": "x", "api": dead.URL, "key": joinKey}, 400, "invalid_hotel"}, // AB#776: not sealed
 		{map[string]any{"id": "x.y", "api": dead.URL, "key": joinKey}, 400, "invalid_hotel"},
 		{map[string]any{"id": "x", "api": "file:///etc/passwd", "key": joinKey}, 400, "invalid_hotel"},
 		{map[string]any{"id": "x", "api": dead.URL, "key": "short"}, 400, "invalid_hotel"},
@@ -513,26 +514,8 @@ func TestJoinChecksTheHotelAndTheInput(t *testing.T) {
 	}
 }
 
-func TestRuntimeUnsealedHotelCannotGainSealedLabel(t *testing.T) {
-	tc := newChainState(t, t.TempDir())
-	_, url := newMinerHotel(t, 5, nil)
-	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
-		"id": "plain", "api": url, "key": joinKey, "verify": false,
-	})
-	if status != 201 {
-		t.Fatalf("join unsealed operator hotel: %d %v", status, doc)
-	}
-	status, doc = tc.call(t, "operator-key", "PATCH", "/v1/broker/hotels/plain", map[string]any{
-		"labels": map[string]string{"sealed": "true"},
-	})
-	if status != 400 || errCode(doc) != "invalid_hotel" {
-		t.Fatalf("unsealed hotel gained sealed label: %d %v", status, doc)
-	}
-	if tc.b.hotelByID("plain").labels()["sealed"] == "true" {
-		t.Fatal("unsealed hotel kept sealed label")
-	}
-}
-
+// A runtime hotel that joined unsealed before AB#776 (state from an older
+// broker) never takes a room, whatever its labels say.
 func TestLegacyRuntimeSealedLabelCannotTakeRooms(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	h := newHotel(hotelConfig{ID: "old-label", Labels: map[string]string{"sealed": "true"}}, joinKey)

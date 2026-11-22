@@ -148,11 +148,20 @@ def read_log_page(fh: Any, size: int, offset: int, limit: int) -> dict[str, Any]
 class SandboxOpError(Exception):
     """A provider refusal with an HTTP status the server can map directly."""
 
-    def __init__(self, code: str, http_status: int, message: str, retry_after: int | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        http_status: int,
+        message: str,
+        retry_after: int | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.http_status = http_status
         self.retry_after = retry_after
+        # Extra fields for the error object (AB#864 end_reason); old clients ignore them.
+        self.detail = dict(detail or {})
 
 
 # AB#604: per-machine cap on stored snapshot bytes (/work archives plus committed layers).
@@ -318,6 +327,16 @@ def _disk_full_is_413(sandbox: "_Sandbox"):
 
 # AB#534: how stale a room's disk_bytes may be in a list answer.
 _DISK_LIST_MAX_AGE = 10.0
+# States of a record on its way out (AB#863). "deleting": the container may
+# still run. "stopped_deleting": killed, docker rm not yet confirmed. Both are
+# hidden from the API and keep the record (AB#815 leak guard).
+_LEAVING = ("deleting", "stopped_deleting")
+# The disk every hotel slot assumes (the default resources.disk_gib); the
+# broker counts only the disk above it against a hotel budget (broker/disk.go).
+_BASE_ROOM_DISK_GIB = api.Resources().disk_gib
+
+# AB#864: how long a room that left is named, with why, in list "ended" and a GET 404.
+ENDED_RETENTION = timedelta(minutes=10)
 
 
 @dataclass
@@ -356,6 +375,9 @@ class _Sandbox:
     # A fork room whose files are being unpacked outside the lock (AB#604): nothing may run in it or
     # write to its folder until the unpack is published.
     unpacking: bool = False
+    # AB#864: why and when the room left (deleted, ttl_expired, idle_timeout, key_revoked).
+    end_reason: str | None = None
+    ended_at: datetime | None = None
 
 
 class SandboxProvider(Protocol):
@@ -468,6 +490,11 @@ class InMemorySandboxProvider:
         self._idempotency: dict[tuple[str | None, str], tuple[str, Any]] = {}
         # §3.13/§3.18: logs kept 24 h after delete (stdout, stderr, exec history).
         self._log_tombstones: dict[str, dict[str, Any]] = {}
+        # AB#864: rooms that left in the last ENDED_RETENTION, oldest first:
+        # id -> {api_key, end_reason, ended_at}.
+        self._ended: dict[str, dict[str, Any]] = {}
+        # Fixed per process, so a caller can tell this API restarted (and forgot its rooms).
+        self._api_started_at = _now()
         self._limits = limits or QuotaLimits(
             running_sandboxes=api.MIN_RUNNING_SANDBOXES, vcpu=api.MIN_VCPU, memory_gib=api.MIN_MEMORY_GIB
         )
@@ -564,7 +591,7 @@ class InMemorySandboxProvider:
         # still counts it. Answer 409 (not 404) so callers that treat GET 404 as
         # "container gone" (broker cleanup_state, Polaris stop) keep waiting
         # while docker rm may still be running — Spock soak 2026-10-26 c46 ghost.
-        if sandbox is not None and sandbox.state == "deleting":
+        if sandbox is not None and sandbox.state in _LEAVING:
             raise SandboxOpError(
                 "sandbox_deleting",
                 409,
@@ -912,7 +939,13 @@ class InMemorySandboxProvider:
     # ------------------------------------------------------------------ §3.1 read / wait
     def get(self, sandbox_id: str) -> dict[str, Any]:
         with self._lock:
-            sandbox = self._require_active(sandbox_id)
+            try:
+                sandbox = self._require_active(sandbox_id)
+            except SandboxOpError as exc:
+                ended = self._ended_visible_locked(sandbox_id) if exc.code == "sandbox_not_found" else None
+                if ended is None:
+                    raise
+                raise SandboxOpError(exc.code, exc.http_status, str(exc), detail=ended) from None
         self._refresh_disk([sandbox], max_age=0.0)
         with self._lock:
             return self._get_doc(self._require_active(sandbox_id))
@@ -1639,7 +1672,7 @@ class InMemorySandboxProvider:
         """
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
-            if sandbox is None or sandbox.state in ("deleted", "deleting"):
+            if sandbox is None or sandbox.state == "deleted" or sandbox.state in _LEAVING:
                 return
             for handle, _ in sandbox.processes.values():
                 if handle is None:
@@ -1648,6 +1681,7 @@ class InMemorySandboxProvider:
                     handle.terminate()
             sandbox.state = "deleted"
             sandbox.deleted_at = _now()
+            self._record_end_locked(sandbox, "deleted", sandbox.deleted_at)
             self._retain_logs(sandbox)
             shutil.rmtree(sandbox.root, ignore_errors=True)
             del self._sandboxes[sandbox_id]
@@ -1727,9 +1761,11 @@ class InMemorySandboxProvider:
         removed = 0
         with self._lock:
             for sid, sandbox in list(self._sandboxes.items()):
-                if self._is_collectable_locked(sandbox, now):
+                reason = self._collect_reason_locked(sandbox, now)
+                if reason is not None:
                     sandbox.state = "deleted"
                     sandbox.deleted_at = now
+                    self._record_end_locked(sandbox, reason, now)
                     self._retain_logs(sandbox)
                     shutil.rmtree(sandbox.root, ignore_errors=True)
                     del self._sandboxes[sid]
@@ -1748,26 +1784,75 @@ class InMemorySandboxProvider:
                     del self._log_tombstones[sid]
 
     def _is_collectable_locked(self, sandbox: _Sandbox, now: datetime) -> bool:
-        """True when GC must collect *sandbox* (TTL, idle window or revoked key).
+        """True when GC must collect *sandbox* (TTL, idle window or revoked key)."""
+        return self._collect_reason_locked(sandbox, now) is not None
+
+    def _collect_reason_locked(self, sandbox: _Sandbox, now: datetime) -> str | None:
+        """Why GC must collect *sandbox* (ttl_expired, idle_timeout, key_revoked), else None.
 
         Callers must already hold ``self._lock``. A record that is already
         "deleting" is not collectable again; its owner finishes the removal.
         """
-        if sandbox.state in ("deleted", "deleting"):
-            return False
-        past_ttl = api.is_collectable(now, deadline_at=api.gc_deadline(sandbox.expires_at), last_heartbeat_at=None)
+        if sandbox.state == "deleted" or sandbox.state in _LEAVING:
+            return None
+        if api.is_collectable(now, deadline_at=api.gc_deadline(sandbox.expires_at), last_heartbeat_at=None):
+            return "ttl_expired"
         # A room still "creating" (a fork unpacking with no lock held) is not idle; its idle window
         # starts when it runs.
-        idle_expired = (
+        if (
             sandbox.state != "creating"
             and sandbox.idle_timeout_seconds is not None
             and sandbox.last_activity_at is not None
             and (now - sandbox.last_activity_at) >= timedelta(seconds=sandbox.idle_timeout_seconds)
-        )
+        ):
+            return "idle_timeout"
         # §3.4: a sandbox whose owning project key has been revoked is collected too.
         key = self._keys.get(sandbox.api_key) if sandbox.api_key is not None else None
-        revoked = key is not None and key.revoked
-        return past_ttl or idle_expired or revoked
+        if key is not None and key.revoked:
+            return "key_revoked"
+        return None
+
+    # ------------------------------------------------------------------ AB#864 end records
+    def _record_end_locked(self, sandbox: _Sandbox, reason: str, at: datetime) -> None:
+        """Remember why *sandbox* left, for ENDED_RETENTION. Caller holds ``self._lock``."""
+        sandbox.end_reason = reason
+        sandbox.ended_at = at
+        self._prune_ended_locked(at)
+        self._ended.pop(sandbox.id, None)
+        self._ended[sandbox.id] = {"api_key": sandbox.api_key, "end_reason": reason, "ended_at": at}
+
+    def _prune_ended_locked(self, now: datetime) -> None:
+        # Oldest first, so stop at the first record still inside the window.
+        for sid, rec in list(self._ended.items()):
+            if now - rec["ended_at"] < ENDED_RETENTION:
+                break
+            del self._ended[sid]
+
+    def _ended_visible(self, rec: Mapping[str, Any], caller: str | None) -> bool:
+        # The same scope as list(): a keyed caller sees its own and keyless rooms.
+        return caller is None or rec["api_key"] is None or rec["api_key"] == caller
+
+    def _ended_visible_locked(self, sandbox_id: str) -> dict[str, Any] | None:
+        """{end_reason, ended_at} of a recently ended room the caller may see, else None."""
+        self._prune_ended_locked(_now())
+        rec = self._ended.get(sandbox_id)
+        if rec is None or not self._ended_visible(rec, self._caller_key()):
+            return None
+        return {"end_reason": rec["end_reason"], "ended_at": rec["ended_at"].isoformat()}
+
+    def ended(self) -> list[dict[str, Any]]:
+        """Rooms that left in the last ENDED_RETENTION, scoped to the caller key like list()."""
+        caller = self._caller_key()
+        with self._lock:
+            self._prune_ended_locked(_now())
+            return [
+                {"id": sid, "end_reason": rec["end_reason"], "ended_at": rec["ended_at"].isoformat()}
+                for sid, rec in self._ended.items()
+                if self._ended_visible(rec, caller)
+            ]
+
+    def api_started_at(self) -> str:
+        return self._api_started_at.isoformat()
 
     # ------------------------------------------------------------------ two-phase delete
     # A provider that owns an outside guest (a Docker container) must not drop the
@@ -1776,25 +1861,54 @@ class InMemorySandboxProvider:
     # in a "deleting" state: hidden from the API, still counted in quota.
     def collectable_ids(self) -> list[str]:
         """Ids that GC must collect now. Does not change any state."""
+        return list(self.collectable_reasons())
+
+    def collectable_reasons(self) -> dict[str, str]:
+        """Id -> GC reason for each record GC must collect now. Does not change any state."""
         now = _now()
         with self._lock:
-            return [sid for sid, s in self._sandboxes.items() if self._is_collectable_locked(s, now)]
+            reasons = {sid: self._collect_reason_locked(s, now) for sid, s in self._sandboxes.items()}
+        return {sid: r for sid, r in reasons.items() if r is not None}
 
-    def begin_delete(self, sandbox_id: str) -> bool:
-        """Mark a record "deleting". Return False when it is already gone or deleting."""
+    def begin_delete(self, sandbox_id: str, reason: str = "deleted") -> bool:
+        """Mark a record "deleting". Return False when it is already gone or deleting.
+
+        The room leaves the API here, so this is when its end *reason* is recorded.
+        """
         with self._lock:
             sandbox = self._sandboxes.get(sandbox_id)
-            if sandbox is None or sandbox.state in ("deleted", "deleting"):
+            # A stopped_deleting record is still leaving: a second retire with
+            # no guest would finish_delete while its container exists (AB#815).
+            if sandbox is None or sandbox.state == "deleted" or sandbox.state in _LEAVING:
                 return False
             for handle, _ in sandbox.processes.values():
                 if handle is not None and handle.poll() is None:
                     handle.terminate()
             sandbox.state = "deleting"
             sandbox.deleted_at = _now()
+            self._record_end_locked(sandbox, reason, sandbox.deleted_at)
             self._retain_logs(sandbox)
             terms = self._pop_terminals_locked(sandbox_id)
         self._close_ptys(terms)
         return True
+
+    def mark_stopped(self, sandbox_id: str) -> bool:
+        """Move a "deleting" record whose container is confirmed killed to "stopped_deleting".
+
+        It then leaves resident quota: its CPU and memory are free, only docker
+        rm (disk) is left. At most limits.running_sandboxes (the slots) records
+        stop counting, so a docker rm that never ends cannot grow usage without
+        bound; past that the record stays "deleting" and counted.
+        """
+        with self._lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+            if sandbox is None or sandbox.state != "deleting":
+                return False
+            stopped = sum(1 for s in self._sandboxes.values() if s.state == "stopped_deleting")
+            if stopped >= self._limits.running_sandboxes:
+                return False
+            sandbox.state = "stopped_deleting"
+            return True
 
     def finish_delete(self, sandbox_id: str) -> None:
         """Drop a record after its guest is confirmed gone. Idempotent."""
@@ -1802,13 +1916,19 @@ class InMemorySandboxProvider:
             sandbox = self._sandboxes.pop(sandbox_id, None)
             if sandbox is None:
                 return
-            if sandbox.state != "deleting":
+            if sandbox.state not in _LEAVING:
                 self._retain_logs(sandbox)
             sandbox.state = "deleted"
             shutil.rmtree(sandbox.root, ignore_errors=True)
 
+    def state_of(self, sandbox_id: str) -> str | None:
+        """The state of a record, None when there is none."""
+        with self._lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+            return None if sandbox is None else sandbox.state
+
     def has_record(self, sandbox_id: str) -> bool:
-        """True while any record (live or "deleting") exists for *sandbox_id*."""
+        """True while any record (live or leaving) exists for *sandbox_id*."""
         with self._lock:
             return sandbox_id in self._sandboxes
 
@@ -1820,7 +1940,7 @@ class InMemorySandboxProvider:
         def matches(sandbox: _Sandbox) -> bool:
             if caller is not None and sandbox.api_key is not None and sandbox.api_key != caller:
                 return False
-            if sandbox.state == "deleting":
+            if sandbox.state in _LEAVING:
                 return False
             if state and sandbox.state != state:
                 return False
@@ -1849,7 +1969,7 @@ class InMemorySandboxProvider:
             targets = [
                 sid
                 for sid, s in self._sandboxes.items()
-                if s.state != "deleting"
+                if s.state not in _LEAVING
                 and all(s.labels.get(k) == v for k, v in want.items())
                 and (caller is None or s.api_key is None or s.api_key == caller)
             ]
@@ -2378,7 +2498,8 @@ class InMemorySandboxProvider:
         """Resident capacity: running + creating + frozen + deleting.
 
         Freeze does not free host slots. A "deleting" record still holds its guest
-        until removal is confirmed, so it still counts.
+        until it is killed, so it still counts. A "stopped_deleting" record
+        (killed, docker rm pending) does not (AB#863, capped in mark_stopped).
         """
         resident = [
             s
@@ -2397,6 +2518,7 @@ class InMemorySandboxProvider:
         running = [s for s in self._sandboxes.values() if s.state in ("running", "creating")]
         frozen = [s for s in self._sandboxes.values() if s.state == "frozen"]
         deleting = [s for s in self._sandboxes.values() if s.state == "deleting"]
+        removing = [s for s in self._sandboxes.values() if s.state == "stopped_deleting"]
         return {
             "limits": {
                 "running_sandboxes": self._limits.running_sandboxes,
@@ -2407,6 +2529,14 @@ class InMemorySandboxProvider:
                 "running_sandboxes": len(running),
                 "frozen_sandboxes": len(frozen),
                 "deleting_sandboxes": len(deleting),
+                # Killed rooms whose docker rm is pending (AB#863): out of resident
+                # quota, but their disk is still in use. removing_disk_gib is the
+                # disk above the default each slot already assumes, the part a
+                # broker disk budget counts.
+                "removing_sandboxes": len(removing),
+                "removing_disk_gib": sum(
+                    max(s.resources.disk_gib - _BASE_ROOM_DISK_GIB, 0) for s in removing
+                ),
                 "resident_sandboxes": usage.running_sandboxes,
                 "vcpu": usage.vcpu,
                 "memory_gib": usage.memory_gib,
@@ -2447,7 +2577,7 @@ class InMemorySandboxProvider:
         with self._lock:
             # A "deleting" record already has a tombstone; do not bill it twice.
             # Each key sees its own sandboxes, tombstones and snapshots only.
-            actives = [s for s in self._sandboxes.values() if s.state != "deleting" and mine(s.api_key)]
+            actives = [s for s in self._sandboxes.values() if s.state not in _LEAVING and mine(s.api_key)]
             tombs = [t for t in self._log_tombstones.values()
                      if t.get("resources") is not None and mine(t.get("api_key"))]
 

@@ -23,6 +23,8 @@ Routes it adds:
   GET /room/attestation            binding, binding_sha256, report (base64)
   POST /room/attest                a fresh SNP report over caller REPORT_DATA (sealed only);
                                    with "sandbox_id", also that room's signed create receipt
+  POST /room/release-proof         sealed-secrets guests only: a receipt over a release
+                                   challenge and the current live room incarnation
   GET /room/receipts?after=&limit= the chain of this boot, in order
   GET /v1/sandboxes/<id>/receipts  the receipts of one room
   GET /room/escape-plant-key       sealed Escape hotels only: the guest X25519 public
@@ -102,9 +104,13 @@ Guest ingress key (ROOM_GUEST_INGRESS=1, sealed only; AB#422). The front
 makes, at start and in memory, a P-256 TLS key for customer Preview URLs and
 names its SPKI sha256 in the binding (guest_ingress.tls_spki_sha256), so the
 boot's REPORT_DATA commits to it. It is not the miner hotel's control-plane
-TLS key (tls_spki_sha256). Nothing serves on it yet: the certificate (AB#423),
-the host DNAT to the guest and the signed expose come next. Flag off: the
-binding is byte for byte what it was.
+TLS key (tls_spki_sha256). With ROOM_INGRESS_ZONE set the binding also names
+the zone, and room_ingress.py serves HTTPS on ROOM_INGRESS_TLS_LISTEN with that
+key: a Let's Encrypt certificate for <hotel>.<zone> and *.<hotel>.<zone>
+(DNS-01 through the broker, signed with the receipt key; room_acme.py), and a
+signed POST /v1/sandboxes/<id>/expose answers https://<room>-<port>.<hotel>.<zone>/
+with a receipt that names the port, the URL and the ingress key. Flag off: the
+binding is byte for byte what it was and expose goes to the API (501).
 
 Dedicated sealed machine (one owner). The host launches the guest with the
 owner's Ed25519 public key and the manifest digest in fw_cfg, and with
@@ -196,6 +202,20 @@ INSTALL_MAX_SIGNERS = 4
 HOTEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")  # the broker's hotel key rule, bounded
 BROKER_HOTEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 KEY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# AB#392: receipt-key liveness proof for a future separate release service.
+# This route never authenticates the service's HMAC or releases a secret.
+RELEASE_CHALLENGE_SCHEMA = "cathedral_vault_release_challenge_v1"
+RELEASE_PROOF_PURPOSE = "cathedral.vault-release.v1"
+RELEASE_PROOF_MAX_BYTES = 4096
+RELEASE_PROOF_MAX_AGE = 60
+# Cross-host allowance only. The RS still authenticates and expires its MAC
+# against its own clock before decrypting; the guest has no MAC key.
+RELEASE_PROOF_CLOCK_SKEW = 5
+RELEASE_PROOF_LOOKUP_SECONDS = 3
+RELEASE_CHALLENGE_FIELDS = frozenset({
+    "schema", "nonce_b64", "issued_at", "secret_id", "sandbox_id",
+    "binding_sha256", "room_create_receipt_sha256", "hmac_b64",
+})
 # Dedicated sealed machines (one owner). fw_cfg files are host-given and not
 # measured; HOST_DATA (chip-signed, fixed at launch) is what makes them count.
 OWNER_FW_CFG = "/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral"
@@ -236,6 +256,7 @@ SECRET_VERSION_MAX = 2**53 - 1  # an integer a browser can hold exactly
 SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")  # a file name: no slash, no leading dot
 SECRETS_ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 SECRETS_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-secrets$")
+EXPOSE_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/expose$")  # answered by the front with guest ingress (AB#422)
 # AB#389: the Cathedral API names the sandbox a create is for in this label
 # (the id its customer holds, a UUID) and refuses it from customers. The create
 # receipt signs it, so the customer can tie that id to this room without the
@@ -259,7 +280,7 @@ EXEC_HEADER = ("schema", "algorithm", "binding_sha256", "sandbox_id", "room_crea
 EXEC_FIELDS = frozenset(EXEC_HEADER + SECRETS_ENVELOPE)
 EXEC_STRING_FIELDS = ("response_public_b64",) + SECRETS_ENVELOPE  # hashed or decoded before any other check
 # What the envelope opens to: the exec request the room API takes, less the timeout (in the header).
-EXEC_REQUEST_KEYS = frozenset({"cmd", "env", "stdin", "cwd", "user"})
+EXEC_REQUEST_KEYS = frozenset({"cmd", "env", "stdin", "cwd", "user", "required_secrets"})
 EXEC_PLAINTEXT_MAX_BYTES = 6 * 1024 * 1024  # 1 MiB of stdin and the env, with JSON escapes
 EXEC_MAX_BYTES = 9 * 1024 * 1024  # one request: base64 of the largest envelope plus the header
 # A sealed exec's answer exists only in the front's one reply (it is kept out of the room API's
@@ -344,6 +365,59 @@ def sha(data: bytes) -> str:
 
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
+
+
+class ReleaseProofRefused(Exception):
+    def __init__(self, status: int, code: str):
+        self.status, self.code = status, code
+        super().__init__(code)
+
+
+def release_proof_request(body: bytes) -> tuple[str, dict]:
+    """Strict, bounded challenge framing. The guest cannot authenticate the RS HMAC.
+
+    The separate release service must authenticate it and enforce expiry again
+    when consuming the proof. No caller field becomes a receipt field directly.
+    """
+    def unique(pairs):
+        doc = {}
+        for key, value in pairs:
+            if key in doc:
+                raise ValueError("duplicate member")
+            doc[key] = value
+        return doc
+
+    try:
+        if not body or len(body) > RELEASE_PROOF_MAX_BYTES:
+            raise ValueError
+        doc = json.loads(body, object_pairs_hook=unique)
+        if not isinstance(doc, dict) or set(doc) != {"sandbox_id", "challenge"}:
+            raise ValueError
+        room, challenge = doc["sandbox_id"], doc["challenge"]
+        if not isinstance(room, str) or not SECRETS_ROOM_RE.fullmatch(room):
+            raise ValueError
+        if not isinstance(challenge, dict) or set(challenge) != RELEASE_CHALLENGE_FIELDS:
+            raise ValueError
+        if challenge["schema"] != RELEASE_CHALLENGE_SCHEMA:
+            raise ValueError
+        for name in ("secret_id", "sandbox_id"):
+            if not isinstance(challenge[name], str) or not SANDBOX_LINK_RE.fullmatch(challenge[name]):
+                raise ValueError
+        for name in ("binding_sha256", "room_create_receipt_sha256"):
+            if not isinstance(challenge[name], str) or not KEY_SHA256_RE.fullmatch(challenge[name]):
+                raise ValueError
+        for name in ("nonce_b64", "hmac_b64"):
+            raw = challenge[name]
+            if not isinstance(raw, str) or len(raw) != 44:
+                raise ValueError
+            decoded = base64.b64decode(raw, validate=True)
+            if len(decoded) != 32 or b64(decoded) != raw:
+                raise ValueError
+        if type(challenge["issued_at"]) is not int or not 0 <= challenge["issued_at"] < 2**53:
+            raise ValueError
+        return room, challenge
+    except (ValueError, TypeError, RecursionError):
+        raise ReleaseProofRefused(400, "release_proof_request_invalid") from None
 
 
 # ---------------------------------------------------------------- attestation
@@ -753,11 +827,13 @@ def open_secret(doc: dict, private: X25519PrivateKey) -> bytes:
 class AcceptedSecret:
     """What this boot accepted for one name in one room incarnation."""
 
-    __slots__ = ("version", "envelope_sha256", "ephemeral_public_b64", "receipt")
+    __slots__ = ("version", "envelope_sha256", "ephemeral_public_b64", "receipt", "file_identity", "exec_holds")
 
-    def __init__(self, version: int, envelope_sha256: str, ephemeral_public_b64: str, receipt: dict | None):
+    def __init__(self, version: int, envelope_sha256: str, ephemeral_public_b64: str, receipt: dict | None,
+                 file_identity: tuple | None = None):
         self.version, self.envelope_sha256 = version, envelope_sha256
         self.ephemeral_public_b64, self.receipt = ephemeral_public_b64, receipt
+        self.file_identity, self.exec_holds = file_identity, 0
 
 
 class SealedSecrets:
@@ -875,6 +951,23 @@ def _secret_file_present(dir_fd: int, name: str) -> bool:
         return stat.S_ISREG(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
     except OSError:
         return False
+
+
+def _secret_file_identity(dir_fd: int, name: str) -> tuple | None:
+    """Guest-local identity only; never hash or publish a guessable secret value."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        try:
+            st = os.fstat(fd)
+            if (not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o444
+                    or st.st_nlink != 1 or st.st_uid != os.geteuid()
+                    or not 0 <= st.st_size <= SECRET_VALUE_MAX_BYTES):
+                return None
+            return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
 
 
 def _secret_file_count(dir_fd: int) -> int:
@@ -1170,6 +1263,20 @@ def _exec_request_problem(request) -> str | None:
             return "cmd"
     elif not (isinstance(cmd, list) and cmd and all(isinstance(p, str) and p for p in cmd)):
         return "cmd"
+    if "required_secrets" in request:
+        required = request["required_secrets"]
+        if not isinstance(required, list) or not 1 <= len(required) <= SECRETS_MAX_PER_ROOM:
+            return "required_secrets"
+        names = set()
+        for item in required:
+            if (not isinstance(item, dict) or set(item) != {"name", "version", "envelope_sha256"}
+                    or not isinstance(item["name"], str) or not SECRET_NAME_RE.fullmatch(item["name"])
+                    or item["name"] in names or type(item["version"]) is not int
+                    or not 1 <= item["version"] <= SECRET_VERSION_MAX
+                    or not isinstance(item["envelope_sha256"], str)
+                    or not KEY_SHA256_RE.fullmatch(item["envelope_sha256"])):
+                return "required_secrets"
+            names.add(item["name"])
     env = request.get("env")
     if env is not None and not (isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str)
                                                               for k, v in env.items())):
@@ -1355,19 +1462,30 @@ class GuestIngress:
     Made here, inside the guest, so the host never holds it. The binding names
     its SPKI sha256 (binding_fields), so the boot's SNP report commits to it,
     and a client that pins that value knows the TLS session ends in this guest.
-    The certificate is self-issued for now; a publicly trusted one for the same
-    key waits on AB#423. Kept apart from MinerHotel's key: that one is the
-    control plane's channel, this one faces customers.
+    The certificate is self-issued until room_ingress gets a Let's Encrypt one
+    for the same key (ROOM_INGRESS_ZONE set). Kept apart from MinerHotel's key:
+    that one is the control plane's channel, this one faces customers.
     """
 
-    def __init__(self, hotel: str):
+    def __init__(self, hotel: str, zone: str | None = None):
         self.cert_pem, self._key_pem, self.tls_spki_sha256 = make_tls_identity(hotel)
+        # ROOM_INGRESS_ZONE: named in the binding so a verifier can check an expose URL's host.
+        self.zone = zone or None
+        # room_ingress.IngressState once the front serves on this key (main), else None.
+        self.serving = None
 
     def __repr__(self) -> str:
         return f"GuestIngress(tls_spki_sha256={self.tls_spki_sha256})"
 
+    def key_pem(self) -> bytes:
+        """The private key, for the TLS context and the certificate request. Memory only."""
+        return self._key_pem
+
     def binding_fields(self) -> dict:
-        return {"guest_ingress": {"schema": INGRESS_SCHEMA, "tls_spki_sha256": self.tls_spki_sha256}}
+        fields = {"schema": INGRESS_SCHEMA, "tls_spki_sha256": self.tls_spki_sha256}
+        if self.zone:
+            fields["zone"] = self.zone
+        return {"guest_ingress": fields}
 
 
 class InstallRefused(Exception):
@@ -1773,6 +1891,8 @@ class Ledger:
                 if (held.version, held.envelope_sha256) == (version, envelope_sha256) \
                         and _secret_file_present(dir_fd, name):
                     return held
+                if held.exec_holds:
+                    raise SecretRefused(409, "sealed_secret_in_use")
                 if version <= held.version:
                     raise SecretRefused(409, "sealed_secret_replayed")
             if any(e.ephemeral_public_b64 == doc["ephemeral_public_b64"] for e in accepted.values()):
@@ -1827,7 +1947,8 @@ class Ledger:
                     traceback.print_exc()
                     receipt = None
                 secrets.record(room, incarnation, name,
-                               AcceptedSecret(version, envelope_sha256, doc["ephemeral_public_b64"], receipt))
+                               AcceptedSecret(version, envelope_sha256, doc["ephemeral_public_b64"], receipt,
+                                              _secret_file_identity(dir_fd, name)))
         finally:
             os.close(dir_fd)
         return answer("written"), receipt
@@ -1988,6 +2109,47 @@ class Ledger:
                 if not 200 <= status < 300 and status != 404:
                     print(f"room-receipts: sealed env clear of {room} answered {status}", file=sys.stderr, flush=True)
 
+    def hold_exec_secrets(self, room: str, incarnation: str, required: list[dict]) -> tuple:
+        """Check and hold exact accepted files until confirmed command completion.
+
+        The caller has validated required inside the sealed request. No network call
+        happens under the short secrets lock. Uncertain commands retain their holds
+        until the room incarnation ends; a timeout is not proof its children ended.
+        """
+        secrets = self.secrets
+        if secrets is None:
+            raise ExecRefused(409, "sealed_exec_secret_unconfirmed")
+        with secrets.lock:
+            if self.room_incarnation(room) != incarnation:
+                raise ExecRefused(409, "sealed_exec_secret_unconfirmed")
+            try:
+                fd = secrets.room_dir(room)
+            except SecretRefused:
+                raise ExecRefused(409, "sealed_exec_secret_unconfirmed") from None
+            try:
+                held = []
+                accepted = secrets.accepted(room, incarnation)
+                for item in required:
+                    entry = accepted.get(item["name"])
+                    if (entry is None or entry.receipt is None or entry.file_identity is None
+                            or (entry.version, entry.envelope_sha256) != (item["version"], item["envelope_sha256"])
+                            or _secret_file_identity(fd, item["name"]) != entry.file_identity):
+                        raise ExecRefused(409, "sealed_exec_secret_unconfirmed")
+                    held.append(entry)
+                # Commit only after every file passes; a refusal leaves no partial holds.
+                for entry in held:
+                    entry.exec_holds += 1
+                return tuple(held)
+            finally:
+                os.close(fd)
+
+    def finish_exec_secrets(self, held: tuple) -> None:
+        """Only a completed, non-timeout reply releases holds. Retired entries are harmless."""
+        if self.secrets is not None:
+            with self.secrets.lock:
+                for entry in held:
+                    entry.exec_holds -= 1
+
     def open_sealed_exec(self, room: str, doc, now: float | None = None) -> tuple[dict, dict]:
         """POST /v1/sandboxes/<room>/sealed-exec, up to the run. Returns (header, request); raises ExecRefused.
 
@@ -2104,6 +2266,9 @@ class Ledger:
         # rooms that lost or never signed an action. Marks go when a 2xx delete is signed.
         self.in_flight: dict[str, int] = {}
         self.busy: set[str] = set()
+        # Rooms the TTL reaper is deleting (Server.reap_room): from its last look at expires_at to its signed
+        # delete, no request that could move the limit is let in (AB#385).
+        self.reaping: set[str] = set()
         self.serial: set[str] = set()
         self.broken: set[str] = set()
         # The flag of a serial or pool create needs that nothing ran in the room before the create was signed. The
@@ -2173,8 +2338,13 @@ class Ledger:
             times.append(now)
             return 0.0
 
-    def attest(self, report_data: bytes) -> dict:
-        """A fresh SNP report over the caller's 64 bytes, tied to this boot's binding."""
+    def attest(self, report_data: bytes, escape_claims: bytes | None = None) -> dict:
+        """A fresh SNP report over the caller's 64 bytes, tied to this boot's binding.
+
+        The boot binding's shape is refused unless `escape_claims` shows the head is an Escape
+        claims digest (see escape_claims_bind)."""
+        if binding_shaped(report_data) and not escape_claims_bind(report_data, escape_claims):
+            raise ValueError("REPORT_DATA of the boot binding shape is reserved")
         report, chain = fresh_report(report_data)
         measurement = report_fields(report)["measurement"]
         if measurement != self.binding["measurement"]:
@@ -2211,6 +2381,8 @@ class Ledger:
         """
         with self.lock:
             new_claim = kind == "claim" and room not in self.claimed
+            if room in self.reaping and kind not in ("read", "record_read", "delete"):
+                return None, (409, "room_reaping", "this room is past its limit and is being deleted")
             if new_claim and self.bulk_pending:
                 return None, (409, "pool_bulk_delete_busy", "a bulk delete is waiting or running; the room is not handed over")
             token = False
@@ -2486,6 +2658,54 @@ class Ledger:
         with self.lock:
             return self._sign_locked(fields, create)
 
+    def release_proof(self, room: str, challenge: dict, lookup) -> dict:
+        """Sign a domain-specific freshness proof while this incarnation is current.
+
+        Handler holds an admitted room turn. Lookup is a bounded, read-only call
+        to the guest-local room API, outside the ledger lock. Recheck after it.
+        This is not permission to release a secret and does not call SNP/KMS.
+        """
+        def check() -> None:  # caller holds self.lock
+            if not self.sealed or self.secrets is None:
+                raise ReleaseProofRefused(503, "release_proof_disabled")
+            if not -RELEASE_PROOF_CLOCK_SKEW <= time.time() - challenge["issued_at"] <= RELEASE_PROOF_MAX_AGE:
+                raise ReleaseProofRefused(409, "release_proof_expired")
+            if challenge["binding_sha256"] != self.binding_sha256:
+                raise ReleaseProofRefused(409, "release_proof_wrong_binding")
+            incarnation = self.incarnations.get(room)
+            if incarnation is None or incarnation != challenge["room_create_receipt_sha256"]:
+                raise ReleaseProofRefused(409, "release_proof_wrong_incarnation")
+            if (room in self.broken or room in self.pool or room in self.pool_stale
+                    or room in self.unknown or self.bulk_pending or self.in_flight.get(room) != 1):
+                raise ReleaseProofRefused(409, "release_proof_room_busy")
+            claim = self.claimed.get(room)
+            if claim is not None:
+                st = claim[2]["statement"]
+                linked = claim[0] if st.get("pooled_from") == incarnation else None
+            else:
+                create = next((self.chain[i] for i in reversed(self.by_room.get(room, []))
+                               if self.chain[i]["receipt_sha256"] == incarnation), None)
+                linked = create["statement"].get("cathedral_sandbox_id") if create else None
+            if linked != challenge["sandbox_id"]:
+                raise ReleaseProofRefused(409, "release_proof_wrong_sandbox")
+
+        with self.lock:
+            check()
+        got = lookup()
+        try:
+            live = json.loads(got[1]) if got is not None and got[0] == 200 else None
+        except (ValueError, TypeError, RecursionError):
+            live = None
+        if not isinstance(live, dict) or live.get("id") != room:
+            raise ReleaseProofRefused(409, "release_proof_room_unconfirmed")
+        with self.lock:
+            check()
+            return self._sign_locked({
+                "action": "release_proof", "purpose": RELEASE_PROOF_PURPOSE,
+                "challenge_sha256": sha(canonical(challenge)), "sandbox_id": room,
+                "room_create_receipt_sha256": self.incarnations[room], "status": 200,
+            })
+
     def _sign_locked(self, fields: dict, create: dict | None = None) -> dict:
         """Sign and append one receipt. The caller holds self.lock.
 
@@ -2568,9 +2788,53 @@ SIGNED = [  # (method, path pattern, action)
     ("POST", re.compile("^" + ROOM + r"/thaw$"), "thaw"),
     ("POST", re.compile("^" + ROOM + r"/expose$"), "expose"),
 ]
+# AB#385 slice 3: every other route of the room API that changes a room, the hotel or an account.
+# tests/test_room_kit_signed_routes.py fails when the API gains a route that is neither signed nor on
+# its list of unsigned routes with a reason.
+SIGNED_SLICE3 = [
+    ("PUT", re.compile("^" + ROOM + r"/directories$"), "mkdir"),
+    ("DELETE", re.compile("^" + ROOM + r"/entries$"), "entry_delete"),
+    ("POST", re.compile("^" + ROOM + r"/ports/[0-9]+/http$"), "port_http"),
+    ("POST", re.compile("^" + ROOM + r"/access-tickets$"), "access_ticket"),
+    ("POST", re.compile("^" + ROOM + r"/terminals$"), "terminal_create"),
+    ("DELETE", re.compile("^" + ROOM + r"/terminals/[^/]+$"), "terminal_delete"),
+    ("POST", re.compile("^" + ROOM + r"/terminals/[^/]+/connect$"), "terminal_connect"),
+    ("POST", re.compile("^" + ROOM + r"/terminals/[^/]+/input$"), "terminal_input"),
+    ("POST", re.compile("^" + ROOM + r"/terminals/[^/]+/resize$"), "terminal_resize"),
+    ("POST", re.compile("^" + ROOM + r"/publish$"), "publish"),
+    ("DELETE", re.compile(r"^/v1/snapshots/[^/]+$"), "snapshot_delete"),
+    ("POST", re.compile(r"^/v1/snapshots/[^/]+/push$"), "snapshot_push"),
+    ("POST", re.compile(r"^/v1/workspaces$"), "workspace_create"),
+    ("DELETE", re.compile(r"^/v1/workspaces/[^/]+$"), "workspace_delete"),
+    ("POST", re.compile(r"^/v1/workspaces/[^/]+/versions$"), "workspace_version"),
+    ("POST", re.compile(r"^/v1/workspaces/[^/]+/rollback$"), "workspace_rollback"),
+    ("PUT", re.compile(r"^/v1/secrets/[^/]+$"), "secret_put"),
+    ("DELETE", re.compile(r"^/v1/secrets/[^/]+$"), "secret_delete"),
+    ("POST", re.compile(r"^/v1/images/prefetch$"), "image_prefetch"),
+    ("POST", re.compile(r"^/v1/images/build$"), "image_build"),
+    ("DELETE", re.compile(r"^/v1/images/pins/.+$"), "image_unpin"),
+    ("POST", re.compile(r"^/v1/affline/validate-rerun$"), "affline_rerun"),
+]
+SIGNED += SIGNED_SLICE3
+SNAPSHOT_DELETE_ID = re.compile(r"^/v1/snapshots/(?P<id>[^/]+)$")
 # Archive bodies are never JSON. Not parsing them keeps a large plain tar from
 # being decoded into a str on every pass.
 OPAQUE_BODY = {"tar_put", "tar_get"}
+# Request bodies the front neither pre-checks nor reads fields from: a file's bytes (a JSON file with a
+# lone surrogate escape or a "cmd" key is still just a file) and the slice 3 routes, whose receipts carry
+# only what every receipt carries. customer_request_sha256 still covers the bytes.
+RAW_REQUEST = OPAQUE_BODY | {"file_put"} | {a for _m, _p, a in SIGNED_SLICE3}
+# A plain secret's value is not hashed into a receipt anyone with the hotel key can read: a short value
+# would fall to a guess. The receipt names the secret (target) and says the request hash is withheld.
+REQUEST_WITHHELD = {"secret_put"}
+# Answers the front never parses on success: an archive, or a file's bytes.
+RAW_ANSWER = OPAQUE_BODY | {"file_get"}
+# Answers the front never parses at all: a guest port's answer is whatever the room's own server sent.
+GUEST_ANSWER = {"port_http"}
+# Signed, but still refused on a serial room: a terminal runs commands no receipt orders, and a ticket
+# only opens a terminal or desktop socket.
+SERIAL_CLOSED = {"access_ticket", "terminal_create", "terminal_delete", "terminal_connect", "terminal_input",
+                 "terminal_resize"}
 # Dedicated machine: the requests that start code need the owner signature.
 # A build runs Dockerfile steps in the guest, and the broker sends builds to
 # every hotel, so it is gated like a create.
@@ -2600,6 +2864,13 @@ BULK_POLL_SECONDS = 0.2
 # The front forwards a bulk delete and waits for its answer for at most this long, in total (monotonic clock). After
 # that the caller gets 502 hotel_api_no_answer and the bulk delete counts as uncertain: the machine keeps running it.
 BULK_FORWARD_SECONDS = 300
+# TTL reaper (AB#385, Server.reap_due). The room API removes a room on its own from expires_at plus 300 s
+# (cathedral/sandbox_api.py GC_GRACE_SECONDS). The front deletes it, signed, this long after expires_at:
+# a heartbeat that comes just late still saves the room, and the front is well ahead of the API.
+REAP_SECONDS = 15
+REAP_AFTER_SECONDS = 30
+REAP_AFTER_MAX_SECONDS = 240
+REAP_NO_ANSWER = b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer; the delete may have run"}}'
 
 
 def bulk_outcome_is_certain(status: int) -> bool:
@@ -2683,6 +2954,39 @@ READS = [  # (method, path pattern)
 # was in flight (see Ledger.touched). Past this many, no create is flagged until the creates end.
 TOUCHED_CAP = 4096
 HEX64 = re.compile(r"[0-9a-fA-F]{128}")
+
+
+def binding_shaped(report_data: bytes) -> bool:
+    """True for sha256(something) || 32 zero bytes: the shape of the boot binding report.
+
+    Every verifier accepts a binding when REPORT_DATA = sha256(canonical(binding)) || 32 zero
+    bytes. If /room/attest signed caller bytes of that shape, its caller (the hotel bearer: our
+    broker and API, and customers through POST /v1/hotels/{hotel}/attest) could get a fresh
+    AMD-signed report over a binding this guest never made, naming keys the caller holds, and
+    clients would seal to them (AB#392). So that shape comes only from the boot binding.
+    """
+    return len(report_data) == 64 and report_data[32:] == bytes(32)
+
+
+# gt-challenge-sealed-sandbox receipt.py CLAIMS_DOMAIN. An Escape receipt v1.1 (binding
+# rd-claims-v1) puts sha256(ESCAPE_CLAIMS_DOMAIN || canonical(claims)) || 32 zero bytes in
+# REPORT_DATA, the same shape as the boot binding, and the API asks this route for it.
+ESCAPE_CLAIMS_DOMAIN = b"cathedral-challenge-receipt-v1/claims\0"
+ESCAPE_CLAIMS_MAX = 12 * 1024
+
+
+def escape_claims_bind(report_data: bytes, claims: bytes | None) -> bool:
+    """True when the caller showed the head is sha256(ESCAPE_CLAIMS_DOMAIN || claims).
+
+    That head cannot also be sha256(canonical(binding)): canonical JSON of a binding starts with
+    "{", this preimage starts with the domain, so equal heads would be a SHA-256 collision. A
+    report over it vouches for those Escape claims only, never for a binding (AB#392)."""
+    return (
+        claims is not None
+        and 0 < len(claims) <= ESCAPE_CLAIMS_MAX
+        and len(report_data) == 64
+        and hashlib.sha256(ESCAPE_CLAIMS_DOMAIN + claims).digest() == report_data[:32]
+    )
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization",
        "proxy-authenticate", "content-length", "host", "x-room-exec-handle"}
 
@@ -2694,6 +2998,24 @@ EXEC_HANDLE_HEADER = "X-Room-Exec-Handle"
 EXEC_STATE_HEADER = "X-Room-Exec-State"
 EXEC_HANDLE = re.compile(r"[0-9a-f]{32}")
 EXEC_RESULT_ROUTE = re.compile("^" + ROOM + r"/exec/result$")
+# Terminal WebSocket through the front (AB#385). The front strips Upgrade from what it forwards, so before this a
+# terminal socket never reached the room API through it. Now the front opens the same handshake to the API itself,
+# signs terminal_session_open on the API's answer (the 101 carries X-Room-Receipt), passes raw bytes both ways
+# and signs terminal_session_close at the end with the byte count and sha256 of each direction, counted as the
+# front wrote them to the other side's socket.
+TERMINAL_WS_ROUTE = re.compile("^" + ROOM + r"/terminals/(?P<tid>[^/]+)/ws$")
+WS_FORWARD_HEADERS = ("Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
+                      "X-Cathedral-Access-Ticket")
+WS_SWITCH_HEADERS = ("Sec-WebSocket-Accept", "Sec-WebSocket-Protocol")
+# The hotel PTY socket closes after 600 s with nothing from the caller (PTY_WS_IDLE_SECONDS in
+# cathedral/sandbox_server.py, AB#405). The front is the backstop: 30 s later, so the hotel's own 1000 "idle"
+# close frame reaches the caller first. Frame size is the hotel's limit too: frames pass unread, and the hotel
+# closes 1009 terminal_input_too_large on an input frame over 64 KiB.
+HOTEL_PTY_IDLE_SECONDS = 600
+WS_IDLE_SECONDS = HOTEL_PTY_IDLE_SECONDS + 30
+WS_HEAD_MAX = 64 << 10
+WS_REFUSAL_MAX = 1 << 20
+WS_NO_ANSWER = b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer the terminal handshake"}}'
 EXEC_RESULT_KEEP_SECONDS = 3600  # a finished answer nobody dropped ages out after this
 EXEC_RESULT_MAX = 256  # answers kept, running and finished
 EXEC_RESULT_MAX_BYTES = 64 << 20  # body bytes of finished answers kept
@@ -2844,6 +3166,8 @@ def retire_room(ledger: "Ledger", room: str, exec_results: "ExecResults | None" 
         ledger.sealed_env.retire(room, ledger.room_incarnation)
     if exec_results is not None:
         exec_results.forget_room(room, ledger.room_life)
+    if ledger.ingress is not None and ledger.ingress.serving is not None:
+        ledger.ingress.serving.forget_room(room)  # its Preview URLs answer 404 from here on
 
 
 def room_of(path: str) -> str | None:
@@ -2860,15 +3184,16 @@ def room_of(path: str) -> str | None:
 def route_kind(method: str, path: str) -> str:
     """How the gate sees a request that names a room.
 
-    delete, claim, signed (a row of SIGNED), record_read (the reads an unclaimed pool room allows), read, or
+    delete, claim, signed (a row of SIGNED not in SERIAL_CLOSED), record_read (the reads an unclaimed pool room allows), read, or
     other (anything on no list).
     """
     if method == "DELETE" and re.match("^" + ROOM + "$", path):
         return "delete"
     if method == "POST" and CLAIM_ROUTE.match(path):
         return "claim"
-    if any(meth == method and pat.match(path) for meth, pat, _action in SIGNED):
-        return "signed"
+    action = next((a for meth, pat, a in SIGNED if meth == method and pat.match(path)), None)
+    if action is not None:
+        return "other" if action in SERIAL_CLOSED else "signed"
     if any(meth == method and pat.match(path) for meth, pat in RECORD_READS):
         return "record_read"
     if any(meth == method and pat.match(path) for meth, pat in READS):
@@ -2888,6 +3213,19 @@ def api_request_path(raw_target: str) -> tuple[str, str]:
     return path, forward
 
 
+def iso_epoch(value) -> float | None:
+    """The epoch of an ISO time with an offset (the API's expires_at), or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return None
+    return moment.timestamp()
+
+
 def parse_expires_at(value, now: float) -> float | None:
     """The epoch of the API's expires_at (an ISO time with an offset), or None unless it lies in (now, now + 48 h + 60 s]."""
     if not isinstance(value, str):
@@ -2901,6 +3239,48 @@ def parse_expires_at(value, now: float) -> float | None:
     epoch = moment.timestamp()
     return epoch if now < epoch <= now + EXPIRES_MAX_SECONDS else None
 
+
+def wants_websocket(headers) -> bool:
+    """Whether a request asks for a WebSocket: Upgrade: websocket and an upgrade token in Connection."""
+    if (headers.get("Upgrade") or "").strip().lower() != "websocket":
+        return False
+    return any(tok.strip().lower() == "upgrade" for v in headers.get_all("Connection", []) for tok in v.split(","))
+
+
+def read_ws_answer(sock: socket.socket) -> tuple[int, dict, bytes]:
+    """The API's answer to a WebSocket handshake: (status, lower-case headers, rest).
+
+    *rest* is what came after the head: for a 101, the first bytes of the socket (the API may send output at
+    once); otherwise the body, bounded. Raises ValueError for an answer that is not HTTP.
+    """
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > WS_HEAD_MAX:
+            raise ValueError("handshake answer head too large")
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ValueError("no handshake answer")
+        buf += chunk
+    raw, rest = buf.split(b"\r\n\r\n", 1)
+    status_line, *header_lines = raw.decode("latin-1").split("\r\n")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[0].startswith("HTTP/1.") or not parts[1].isdigit():
+        raise ValueError("not an HTTP answer")
+    head = {}
+    for line in header_lines:
+        name, sep, value = line.partition(":")
+        if sep:
+            head[name.strip().lower()] = value.strip()
+    status = int(parts[1])
+    if status != 101:
+        want = min(int(head.get("content-length", "0") or 0), WS_REFUSAL_MAX)
+        while len(rest) < want:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            rest += chunk
+        rest = rest[:want]
+    return status, head, rest
 
 class Turn:
     """One authorized request between Ledger.enter and Ledger.leave."""
@@ -3104,11 +3484,31 @@ class Handler(BaseHTTPRequestHandler):
             # would be signed as empty and its bytes left on the connection.
             self.close_connection = True
             return self.reply(411, b'{"error":"length_required"}')
+        path, forward_path = api_request_path(self.path)
+        if path == "/room/release-proof":
+            if self.command != "POST":
+                self.close_connection = True
+                return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+            if not self.authorized():
+                self.close_connection = True
+                return self.reply(401, b'{"error":"unauthorized"}')
+            # Bound before reading, including a malformed/negative length. This
+            # route never forwards an unrecognized body to the room API.
+            try:
+                lengths = self.headers.get_all("Content-Length", [])
+                if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
+                    raise ValueError
+                length = int(lengths[0])
+            except ValueError:
+                self.close_connection = True
+                return self.reply(411, b'{"error":"length_required"}')
+            if length > RELEASE_PROOF_MAX_BYTES:
+                self.close_connection = True
+                return self.reply(413, b'{"error":"release_proof_too_large"}')
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else (b"" if self.command in ("POST", "PUT", "PATCH") else None)
         # Same path form as cathedral/sandbox_server.dispatch (urlparse): a
         # ";alias" suffix must not bypass the serial gate or mis-name a receipt.
-        path, forward_path = api_request_path(self.path)
         room = room_of(path)
         if room is not None and unquote(room) != room:
             # The room API decodes route parameters after matching. A different spelling would miss this
@@ -3119,6 +3519,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, canonical(ledger.attestation()))
         if path == "/room/attest":
             return self.handle_attest(ledger, body)
+        if path == "/room/release-proof":
+            return self.handle_release_proof(ledger, body)
         if self.command == "GET" and path == "/room/receipts":
             if not self.authorized():
                 return self.reply(401, b'{"error":"unauthorized"}')
@@ -3211,6 +3613,9 @@ class Handler(BaseHTTPRequestHandler):
         m = CLAIM_ROUTE.match(path)
         if m:
             return self.handle_claim(ledger, m["id"], body)
+        m = TERMINAL_WS_ROUTE.match(path)
+        if m and self.command == "GET" and wants_websocket(self.headers):
+            return self.handle_terminal_ws(ledger, m["id"], m["tid"], forward_path)
         if any(route.match(p) for route in INTERNAL_API_ROUTES for p in (path, unquote(path))):
             # The room API's sealed exec route runs an exec that leaves no history or log, and
             # its env-sealed route sets a room's env from an envelope this front opened; neither
@@ -3218,10 +3623,14 @@ class Handler(BaseHTTPRequestHandler):
             # them (urlparse drops a ";params" suffix, then the raw path), and decoded too; any
             # other path, flag on or off, passes as before.
             return self.reply(404, b'{"error":{"code":"route_not_found","message":"no such route"}}')
+        if (self.command == "POST" and EXPOSE_ROUTE.match(path) and ledger.ingress is not None
+                and ledger.ingress.serving is not None):
+            # Guest ingress (AB#422): answered and signed here; the API's expose (501) is not called.
+            return self.handle_expose(ledger, room, path, forward_path, body)
         # `path` is already the path the API routes on (api_request_path drops a ";params" suffix above),
         # so no spelling of a signed route reaches the API unsigned.
         action = next((a for meth, pat, a in SIGNED if meth == self.command and pat.match(path)), None)
-        if action and body and action not in OPAQUE_BODY:
+        if action and body and action not in RAW_REQUEST:
             # A JSON escape of a lone surrogate parses, but cannot be encoded
             # when the statement is signed. Refuse it before the API runs
             # the action: an action with no receipt is the one thing this
@@ -3310,6 +3719,131 @@ class Handler(BaseHTTPRequestHandler):
             if track is not None and not kept:
                 # Whatever went wrong after the mark, the entry ends: a running entry is never evicted.
                 self.server.exec_results.finish(*track, 502, {}, EXEC_RESULT_FRONT_FAILED, "application/json")
+
+    def handle_terminal_ws(self, ledger: "Ledger", room: str, terminal: str, forward_path: str):
+        """A terminal WebSocket: signed open, raw bytes both ways, signed close. The API checks the ticket."""
+        self.close_connection = True
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if isinstance(self.connection, ssl.SSLSocket):
+            # Raw bytes are passed by two threads, which one TLS socket does not allow. Terminals never reach a
+            # miner hotel (the broker's terminalsRefused), the one front that serves TLS.
+            return self.reply(501, b'{"error":{"code":"websocket_unsupported","message":"no terminal socket over this port"}}')
+        base = {"target": f"GET {forward_path}", "sandbox_id": room, "terminal_id": terminal,
+                "customer_request_sha256": sha(b""), "command_sha256": None, "image": None, "image_digest": None}
+        lines = [f"GET {forward_path} HTTP/1.1", f"Host: 127.0.0.1:{self.server.api_port}", "Upgrade: websocket",
+                 "Connection: Upgrade", "Authorization: Bearer " + self.server.api_key.decode()]
+        for name in WS_FORWARD_HEADERS:
+            lines += [f"{name}: {v}" for v in self.headers.get_all(name, []) if not set(v) & {"\r", "\n"}]
+        if self.turn is not None:
+            self.turn.called = True
+        up = None
+        try:
+            up = socket.create_connection(("127.0.0.1", self.server.api_port), timeout=30)
+            up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+            status, head, rest = read_ws_answer(up)
+        except (OSError, ValueError, UnicodeEncodeError):
+            if up is not None:
+                up.close()
+            up, status, head, rest = None, 502, {}, WS_NO_ANSWER
+            if self.turn is not None:
+                self.turn.lost = True
+        if status != 101:
+            if up is not None:
+                up.close()
+            extra = {}
+            try:
+                extra["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign({
+                    **base, "action": "terminal_session_open", "status": status, "result_sha256": sha(rest)}))).decode()
+            except Exception as exc:  # noqa: BLE001 nothing was opened: answer, and say the receipt is missing
+                traceback.print_exc()
+                extra["X-Room-Receipt-Error"] = type(exc).__name__
+            return self.reply(status, rest, extra, head.get("content-type", "application/json"))
+        session = uuid.uuid4().hex
+        try:
+            opened = ledger.sign({**base, "action": "terminal_session_open", "status": 101,
+                                  "result_sha256": sha(b""), "session_id": session})
+        except Exception:  # noqa: BLE001 a session with no open receipt must not run
+            traceback.print_exc()
+            up.close()
+            return self.reply(503, b'{"error":{"code":"receipt_failed","message":"the terminal session was not opened"}}')
+        self.close_connection = True
+        reply = ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade"]
+        reply += [f"{k}: {head[k.lower()]}" for k in WS_SWITCH_HEADERS if k.lower() in head]
+        reply.append("X-Room-Receipt: " + base64.urlsafe_b64encode(canonical(opened)).decode())
+        started = time.monotonic()
+        streams = {"client": [0, hashlib.sha256()], "room": [0, hashlib.sha256()]}
+        ended: list[str] = []
+
+        def send(sock: socket.socket, side: str, data: bytes) -> None:
+            # Counted as the socket takes them, so a send cut short counts only what went out.
+            view = memoryview(data)
+            while view:
+                n = sock.send(view)
+                streams[side][0] += n
+                streams[side][1].update(view[:n])
+                view = view[n:]
+
+        def end(reason: str) -> None:
+            if not ended:
+                ended.append(reason)
+            for sock in (up, self.connection):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        def from_client() -> None:
+            # Through rfile, so bytes already read past the handshake are kept.
+            while True:
+                try:
+                    data = self.rfile.read1(65536)
+                except TimeoutError:
+                    return end("idle")
+                except (OSError, ValueError):
+                    return end("client_closed")
+                if not data:
+                    return end("client_closed")
+                try:
+                    send(up, "client", data)
+                except OSError:
+                    return end("room_closed")
+
+        reader = None
+        try:
+            self.wfile.write(("\r\n".join(reply) + "\r\n\r\n").encode("latin-1"))
+            self.connection.settimeout(WS_IDLE_SECONDS)
+            up.settimeout(None)
+            reader = threading.Thread(target=from_client, daemon=True, name="room-terminal-ws")
+            reader.start()
+            data = rest
+            while True:
+                if data:
+                    try:
+                        send(self.connection, "room", data)
+                    except OSError:
+                        end("client_closed")
+                        break
+                data = up.recv(65536)
+                if not data:
+                    end("room_closed")
+                    break
+        except OSError:
+            end("room_closed")
+        finally:
+            end("room_closed")
+            if reader is not None:
+                reader.join(5)
+            up.close()
+            try:
+                ledger.sign({**base, "action": "terminal_session_close", "status": None, "result_sha256": None,
+                             "session_id": session, "session_open_receipt_sha256": opened["receipt_sha256"],
+                             "close_reason": ended[0], "duration_ms": int((time.monotonic() - started) * 1000),
+                             "client_bytes": streams["client"][0], "client_sha256": streams["client"][1].hexdigest(),
+                             "room_bytes": streams["room"][0], "room_sha256": streams["room"][1].hexdigest()})
+            except Exception:  # noqa: BLE001 the session already ran; its open receipt stands
+                traceback.print_exc()
+            self.release_turn()
 
     def handle_exec_result(self, room: str):
         """GET: a kept exec's answer (running, or the signed answer as it was) by handle. DELETE: drop it."""
@@ -3407,8 +3941,29 @@ class Handler(BaseHTTPRequestHandler):
             return canonical({"error": {"code": code, "message": msg}}), {}
         return None, (fields if action == "create" else {})
 
+    def handle_release_proof(self, ledger: "Ledger", body: bytes | None):
+        """POST /room/release-proof: sign only the fixed release-proof statement."""
+        if self.command != "POST":
+            return self.reply(405, b'{"error":"method_not_allowed"}', {"Allow": "POST"})
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        if not self.server.pool_scan_ready:
+            return self.reply(503, b'{"error":"pool_state_unknown"}')
+        try:
+            room, challenge = release_proof_request(body or b"")
+            self.turn, refusal = ledger.enter(room, "signed")
+            if refusal is not None:
+                raise ReleaseProofRefused(refusal[0], refusal[1])
+            receipt = ledger.release_proof(room, challenge, lambda: self.server.api_get(
+                f"/v1/sandboxes/{room}", RELEASE_PROOF_LOOKUP_SECONDS, total=RELEASE_PROOF_LOOKUP_SECONDS))
+        except ReleaseProofRefused as exc:
+            return self.reply(exc.status, canonical({"error": {"code": exc.code}}))
+        except Exception:  # noqa: BLE001 signing failure never returns a successful proof
+            return self.reply(503, b'{"error":"release_proof_failed"}')
+        return self.reply(200, canonical({"receipt": receipt}))
+
     def handle_attest(self, ledger: "Ledger", body: bytes | None):
-        """POST /room/attest {"report_data_hex": <128 hex>}: a fresh SNP report.
+        """POST /room/attest {"report_data_hex": <128 hex>, "escape_claims_b64"?}: a fresh SNP report.
 
         REPORT_DATA is the caller's 64 bytes verbatim. The caller must put a
         digest of what it binds there (for example sha512 of its statement);
@@ -3427,6 +3982,22 @@ class Handler(BaseHTTPRequestHandler):
         raw = doc.get("report_data_hex") if isinstance(doc, dict) else None
         if not isinstance(raw, str) or not HEX64.fullmatch(raw):
             return self.reply(400, b'{"error":"report_data_hex must be 128 hex characters (64 bytes)"}')
+        claims_b64 = doc.get("escape_claims_b64")
+        claims = None
+        if claims_b64 is not None:
+            try:
+                if not isinstance(claims_b64, str) or len(claims_b64) > 4 * ESCAPE_CLAIMS_MAX // 3 + 4:
+                    raise ValueError
+                claims = base64.b64decode(claims_b64, validate=True)
+            except ValueError:
+                return self.reply(400, b'{"error":"escape_claims_b64 must be base64 of at most 12 KiB"}')
+            if not escape_claims_bind(bytes.fromhex(raw), claims):
+                return self.reply(400, b'{"error":"escape_claims_mismatch","message":"the first 32 bytes of '
+                                       b'report_data_hex must be sha256(escape claims domain || escape_claims)"}')
+        if binding_shaped(bytes.fromhex(raw)) and claims is None:
+            return self.reply(400, b'{"error":"report_data_reserved","message":"the last 32 bytes must not all be zero: '
+                                   b'that shape is reserved for the boot binding report (an Escape rd-claims-v1 '
+                                   b'report sends its claims in escape_claims_b64)"}')
         room = doc.get("sandbox_id")
         if room is not None and (not isinstance(room, str) or not re.fullmatch(r"[^/\s]{1,200}", room)):
             return self.reply(400, b'{"error":"sandbox_id must be a room id"}')
@@ -3437,7 +4008,7 @@ class Handler(BaseHTTPRequestHandler):
         if wait:
             return self.reply(429, b'{"error":"attest_rate_limit"}', {"Retry-After": str(int(wait) + 1)})
         try:
-            out = ledger.attest(bytes.fromhex(raw))
+            out = ledger.attest(bytes.fromhex(raw), claims)
         except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's, not the caller's
             traceback.print_exc()
             return self.reply(500, canonical({"error": "attest_failed", "detail": type(exc).__name__}))
@@ -3680,16 +4251,29 @@ class Handler(BaseHTTPRequestHandler):
         inner = canonical({"cmd": request["cmd"], "env": request.get("env") or {}, "stdin": request.get("stdin"),
                            "cwd": request.get("cwd"), "user": request.get("user"),
                            "timeout_seconds": header["timeout_seconds"]})
-        request = None
-        status, _headers, out = self.upstream(
-            self.server.api_port, inner, method="POST", path=f"/v1/sandboxes/{room}/{EXEC_API_TAIL}",
-            extra={"Content-Type": "application/json"},
-            timeout=header["timeout_seconds"] + EXEC_ANSWER_MARGIN_SECONDS)
-        inner = None
+        held = ()
+        try:
+            if "required_secrets" in request:
+                held = ledger.hold_exec_secrets(room, header["room_create_receipt_sha256"], request["required_secrets"])
+        except ExecRefused as exc:
+            # Sign and seal the refusal just like an internal API refusal; no command was dispatched.
+            status, out = exc.status, canonical({"error": {"code": exc.code, "message": "required secret not confirmed"}})
+        else:
+            status, _headers, out = self.upstream(
+                self.server.api_port, inner, method="POST", path=f"/v1/sandboxes/{room}/{EXEC_API_TAIL}",
+                extra={"Content-Type": "application/json"},
+                timeout=header["timeout_seconds"] + EXEC_ANSWER_MARGIN_SECONDS)
+        request = inner = None
         try:
             answer = json.loads(out) if out else None
         except ValueError:
             answer = None
+        if (held and status == 200 and isinstance(answer, dict)
+                and type(answer.get("exit_code")) is int and answer.get("timed_out") is False
+                and (answer.get("cancelled") is None or answer.get("cancelled") is False)
+                and isinstance(answer.get("stdout"), str) and isinstance(answer.get("stderr"), str)):
+            ledger.finish_exec_secrets(held)
+        # Any exception, malformed/failed response or timeout leaves holds in place.
         plain = {"status": status, "answer": answer}
         if answer is None and out:
             plain["answer_b64"] = b64(out)
@@ -3725,6 +4309,78 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             extra["X-Room-Receipt-Error"] = type(exc).__name__
         return self.reply(200, reply, extra)
+
+    def handle_expose(self, ledger: "Ledger", room: str, path: str, forward_path: str, body: bytes | None):
+        """POST /v1/sandboxes/<id>/expose with the guest ingress serving (AB#422).
+
+        The room must be one the API answers as running for this caller. The URL is
+        https://<room label>-<port>.<hotel>.<zone>/, served by room_ingress with the key the
+        binding names. Every answer to a caller with the key is signed; a success names the
+        port, the URL, its host and the ingress key's SPKI sha256.
+        """
+        if not self.authorized():
+            return self.reply(401, b'{"error":"unauthorized"}')
+        serving = ledger.ingress.serving
+        port = None
+        try:
+            doc = json.loads(body) if body else None
+            canonical(doc)
+            port = doc.get("port") if isinstance(doc, dict) else None
+        except UnicodeEncodeError:
+            return self.reply(400, b'{"error":{"code":"invalid_request","message":"the body holds a lone surrogate escape"}}')
+        except ValueError:
+            pass
+        extra: dict = {}
+        with ledger.lock:
+            serial = room in ledger.serial
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            status, out = 400, {"error": {"code": "invalid_port", "message": "port must be between 1 and 65535"}}
+        elif serial:
+            # A serial room takes signed requests and reads only; a Preview URL would let unsigned traffic in.
+            status, out = 409, {"error": {"code": "room_serial_unsigned",
+                                          "message": "a serial room serves no Preview URL: its traffic would be unsigned"}}
+        else:
+            try:
+                got = self.upstream(self.server.api_port, None, method="GET", path=f"/v1/sandboxes/{room}",
+                                    timeout=30)
+            except (http.client.HTTPException, OSError):
+                got = (502, [], b'{"error":{"code":"hotel_api_no_answer","message":"the API did not answer"}}')
+            state = None
+            try:
+                state = json.loads(got[2]).get("state") if got[0] == 200 else None
+            except (ValueError, AttributeError):
+                pass
+            if got[0] != 200:
+                status, out = got[0], None
+                try:
+                    out = json.loads(got[2])
+                except ValueError:
+                    out = {"error": {"code": "sandbox_unavailable", "message": "the room could not be read"}}
+            elif state != "running":
+                status, out = 409, {"error": {"code": "sandbox_not_running", "message": "only a running room can be exposed"}}
+            elif not serving.ready:
+                status, out = 503, {"error": {"code": "ingress_not_ready",
+                                              "message": "this hotel has no Preview URL certificate yet; retry shortly"}}
+            else:
+                try:
+                    host, url = serving.expose(room, port)
+                except ValueError as exc:
+                    status, out = 409, {"error": {"code": "expose_refused", "message": str(exc)}}
+                else:
+                    spki = ledger.ingress.tls_spki_sha256
+                    status, out = 200, {"port": port, "url": url, "host": host, "status": "exposed",
+                                        "tls_spki_sha256": spki}
+                    extra = {"expose_port": port, "expose_url": url, "expose_host": host,
+                             "ingress_tls_spki_sha256": spki}
+        raw = canonical(out)
+        headers = {}
+        try:
+            headers["X-Room-Receipt"] = base64.urlsafe_b64encode(canonical(ledger.sign(
+                {**self.fields("expose", path, body, status, raw, target_path=forward_path), **extra}))).decode()
+        except Exception as exc:  # noqa: BLE001 answer, and say the receipt is missing
+            traceback.print_exc()
+            headers["X-Room-Receipt-Error"] = type(exc).__name__
+        return self.reply(status, raw, headers)
 
     def handle_escape_plant_key(self, ledger: "Ledger"):
         """GET /room/escape-plant-key: the guest X25519 public key (Escape hotels only)."""
@@ -3812,14 +4468,15 @@ class Handler(BaseHTTPRequestHandler):
                *, target_path: str | None = None) -> dict:
         req = {}
         try:
-            req = json.loads(body) if body and action not in OPAQUE_BODY else {}
-        except ValueError:
+            req = json.loads(body) if body and action not in RAW_REQUEST else {}
+        except (ValueError, RecursionError):
             pass
         res = {}
         try:
             # tar_get answers an archive on success and a JSON error otherwise.
-            res = json.loads(out) if out and not (action in OPAQUE_BODY and 200 <= status < 300) else {}
-        except ValueError:
+            res = json.loads(out) if out and not (action in RAW_ANSWER and 200 <= status < 300) \
+                and action not in GUEST_ANSWER else {}
+        except (ValueError, RecursionError):
             pass
         m = re.match("^" + ROOM, path)
         sandbox = m["id"] if m else (res.get("id") if isinstance(res, dict) else None)
@@ -3844,12 +4501,15 @@ class Handler(BaseHTTPRequestHandler):
                 start_command = raw_start
                 start_command_sha256 = sha(canonical(start_command))
         receipt_path = target_path if target_path is not None else path
+        # The offline checker reads a snapshot_delete's snapshot_id (verify_receipts.py check 13).
+        snapshot_deleted = SNAPSHOT_DELETE_ID.match(path) if action == "snapshot_delete" else None
         return {
             "action": action,
             # *receipt_path* is path plus query (urlparse drops ``;params``); never the raw client target.
             "target": f"{self.command} {receipt_path}",
             "sandbox_id": sandbox if isinstance(sandbox, str) else None,
-            "customer_request_sha256": sha(body or b""),
+            "customer_request_sha256": None if action in REQUEST_WITHHELD else sha(body or b""),
+            **({"customer_request_withheld": "secret_value"} if action in REQUEST_WITHHELD else {}),
             "command_sha256": sha(canonical(command)) if command is not None else None,
             "image": image,
             "image_digest": self.server.image_digest(image) if image and status in (200, 201, 202) else None,
@@ -3871,6 +4531,8 @@ class Handler(BaseHTTPRequestHandler):
             **({"exec_token_sha256": sha(token.encode())} if isinstance(token, str) and token else {}),
             **({"start_command": start_command, "start_command_sha256": start_command_sha256}
                if action == "create" else {}),
+            # Decoded, as the API decodes its route parameters; target keeps the spelling sent.
+            **({"snapshot_id": unquote(snapshot_deleted["id"])} if snapshot_deleted else {}),
         }
 
     @staticmethod
@@ -3922,9 +4584,12 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 1024
 
     def __init__(self, addr, ledger, api_port, health_port, api_key, docker_sock, attest_per_minute=30, *,
-                 attestation_only=False, look_seconds=None, pool_scan=True):
+                 attestation_only=False, look_seconds=None, pool_scan=True, reap_seconds=None,
+                 reap_after=REAP_AFTER_SECONDS):
         self._stop_look = threading.Event()
         self.look_thread = None
+        self.reap_thread = None
+        self.reap_after = reap_after
         super().__init__(addr, Handler)
         self.attest_per_minute = max(1, int(attest_per_minute))
         self.ledger, self.api_port, self.health_port, self.api_key = ledger, api_port, health_port, api_key
@@ -3941,6 +4606,10 @@ class Server(ThreadingHTTPServer):
                 self.look_thread = threading.Thread(target=self.look_loop, args=(look_seconds,), daemon=True,
                                                     name="room-look")
                 self.look_thread.start()
+            if reap_seconds is not None:
+                self.reap_thread = threading.Thread(target=self.reap_loop, args=(reap_seconds,), daemon=True,
+                                                    name="room-reap")
+                self.reap_thread.start()
             if pool_scan and not self.collect_surviving_pool_rooms():
                 threading.Thread(target=self.pool_scan_loop, daemon=True, name="pool-restart-scan").start()
 
@@ -4041,6 +4710,115 @@ class Server(ThreadingHTTPServer):
             if room not in present:
                 self.look_at(room, incarnation)
 
+    # -- TTL reaper (AB#385). The room API deletes a room past its limit by itself, from expires_at plus its
+    # grace (GC_GRACE_SECONDS, 300 s), and that delete never passes this front. So the front deletes each room
+    # whose limit ran out REAP_AFTER_SECONDS after expires_at, well inside that grace, through the same signed
+    # delete a caller gets: one delete receipt with reason "ttl". The API's own clean-up stays as the backstop
+    # (the front down or slow), and a room it removes is still ended by the look above (room_end).
+    def reap_loop(self, seconds: float) -> None:
+        """Delete the rooms whose limit ran out, every *seconds*, until the server closes."""
+        while not self._stop_look.wait(seconds):
+            try:
+                self.reap_due()
+            except Exception:  # noqa: BLE001 one failed pass must not end the loop
+                traceback.print_exc()
+
+    def reap_due(self, now: float | None = None) -> list[dict]:
+        """One reaper pass: the receipts it signed. A failed list or an unexpected answer deletes nothing."""
+        if not self.pool_scan_ready:
+            return []  # the startup scan decides which rooms this front knows first
+        listed = self.api_get("/v1/sandboxes", 60)
+        if listed is None or listed[0] != 200:
+            return []
+        try:
+            rooms = json.loads(listed[1])["sandboxes"]
+            due = [(doc["id"], doc["expires_at"]) for doc in rooms if self.reap_is_due(doc, now)]
+        except (ValueError, RecursionError, KeyError, TypeError, AttributeError):
+            return []
+        signed = []
+        for room, expires_at in due:
+            receipt = self.reap_room(room, expires_at, now)
+            if receipt is not None:
+                signed.append(receipt)
+        return signed
+
+    def reap_is_due(self, doc, now: float | None = None) -> bool:
+        """Whether a room document from the API names a room whose limit ran out at least reap_after ago."""
+        room, expiry = doc.get("id"), iso_epoch(doc.get("expires_at"))
+        if not isinstance(room, str) or room_of(f"/v1/sandboxes/{room}") != room or unquote(room) != room:
+            return False
+        return expiry is not None and (time.time() if now is None else now) >= expiry + self.reap_after
+
+    def reap_room(self, room: str, expires_at: str, now: float | None = None) -> dict | None:
+        """Delete one due room with a signed receipt, or None when it was left for a later pass.
+
+        The room is entered as a caller's delete is (a busy serial room is left alone). A room with another
+        request in flight is left. Otherwise the room is marked reaping, which refuses every new request but a
+        read or a delete (409 room_reaping), and only then asked for again: a heartbeat since the list moved its
+        limit, and such a room is not deleted. No heartbeat can land between that look and the delete. The delete is sent once; a lost answer is signed
+        as 502, as for a caller.
+        """
+        ledger = self.ledger
+        turn, refusal = ledger.enter(room, "delete")
+        if refusal is not None:
+            return None
+        marked = False
+        try:
+            with ledger.lock:
+                # Alone, and from here no request that could move the limit is let in, so the expires_at read
+                # below is still the room's limit when the delete is sent. A caller's delete still passes.
+                if ledger.in_flight.get(room) != 1 or room in ledger.reaping:
+                    return None
+                ledger.reaping.add(room)
+                marked = True
+            got = self.api_get(f"/v1/sandboxes/{room}", 30)
+            if got is None or got[0] != 200:
+                return None  # gone already (the look ends it) or no answer: nothing is sent
+            try:
+                doc = json.loads(got[1])
+                if doc.get("id") != room or not self.reap_is_due(doc, now):
+                    return None
+                expires_at = doc["expires_at"]
+            except (ValueError, RecursionError, KeyError, TypeError, AttributeError):
+                return None
+            turn.called = True
+            status, out = self.api_send("DELETE", f"/v1/sandboxes/{room}", 120)
+            if status is None:
+                turn.lost = True
+                status, out = 502, REAP_NO_ANSWER
+            try:
+                receipt = ledger.sign({
+                    "action": "delete", "target": f"DELETE /v1/sandboxes/{room}", "sandbox_id": room,
+                    "customer_request_sha256": sha(b""), "command_sha256": None, "image": None,
+                    "image_digest": None, "status": status, "result_sha256": sha(out),
+                    "reason": "ttl", "ttl_expires_at": expires_at,
+                })
+            except Exception:  # noqa: BLE001 the delete was sent: say so, as a caller's delete would
+                traceback.print_exc()
+                return None
+            if 200 <= status < 300:
+                retire_room(ledger, room, self.exec_results)
+            print(f"room-receipts: reaper deleted {room} (expires_at {expires_at}): status {status}, "
+                  f"receipt {receipt['receipt_sha256']}", flush=True)
+            return receipt
+        finally:
+            if marked:
+                with ledger.lock:
+                    ledger.reaping.discard(room)
+            ledger.leave(turn)
+
+    def api_send(self, method: str, path: str, timeout: float) -> tuple[int | None, bytes]:
+        """One request to the room API with the front's own key, sent once: (None, b"") when it gave no answer."""
+        c = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=timeout)
+        try:
+            c.request(method, path, headers={"Authorization": "Bearer " + self.api_key.decode()})
+            r = c.getresponse()
+            return r.status, r.read()
+        except (http.client.HTTPException, OSError):
+            return None, b""
+        finally:
+            c.close()
+
     def look_one(self, room: str) -> None:
         """The same look for one room: one GET, no list. Run before a read of the room's receipts."""
         with self.ledger.lock:
@@ -4074,7 +4852,7 @@ class Server(ThreadingHTTPServer):
         """Build the health answer once a second, off the request path."""
         up = http.client.HTTPConnection("127.0.0.1", self.health_port, timeout=30)
         auth = {"Authorization": "Bearer " + self.api_key.decode()}
-        while True:
+        while not self._stop_look.is_set():  # ends when the server is closed
             try:
                 up.request("GET", "/room/health", headers=auth)
                 r = up.getresponse()
@@ -4094,7 +4872,8 @@ class Server(ThreadingHTTPServer):
             except (http.client.HTTPException, OSError, ValueError, subprocess.SubprocessError):
                 up.close()
                 up = http.client.HTTPConnection("127.0.0.1", self.health_port, timeout=30)
-            time.sleep(1)
+            self._stop_look.wait(1)
+        up.close()
 
     def sev_log(self) -> list[str]:
         """The guest kernel's own SEV lines (dmesg), read once."""
@@ -4157,7 +4936,8 @@ def main() -> int:
     store = env.get("ROOM_RECEIPTS_DIR", "/run/room-receipts")
     secrets = SealedSecrets(env.get("ROOM_SEALED_SECRETS_DIR") or DEFAULT_SECRETS_DIR) if sealed_secrets_wanted() else None
     sealed_exec = SealedExec() if sealed_exec_wanted() else None
-    ingress = GuestIngress(env["ROOM_HOTEL_NAME"]) if guest_ingress_wanted() else None
+    ingress = (GuestIngress(env["ROOM_HOTEL_NAME"], zone=(env.get("ROOM_INGRESS_ZONE") or "").strip() or None)
+               if guest_ingress_wanted() else None)
     try:
         ledger = Ledger(env["ROOM_HOTEL_NAME"], store, miner=miner, secrets=secrets, sealed_exec=sealed_exec,
                         ingress=ingress)
@@ -4182,7 +4962,8 @@ def main() -> int:
             print(f"room-receipts: sealed commands on: key {ledger.sealed_exec.public_b64} in the binding", flush=True)
         if ledger.ingress is not None:
             print(f"room-receipts: guest ingress key on: tls_spki_sha256 {ledger.ingress.tls_spki_sha256} "
-                  "in the binding (nothing serves on it yet)", flush=True)
+                  f"in the binding{'' if ledger.ingress.zone else ' (no ROOM_INGRESS_ZONE: nothing serves on it)'}",
+                  flush=True)
     elif secrets is not None or sealed_exec is not None or ingress is not None:
         flags = [name for name, box in (("ROOM_SEALED_SECRETS", secrets), ("ROOM_SEALED_EXEC", sealed_exec),
                                         ("ROOM_GUEST_INGRESS", ingress)) if box is not None]
@@ -4191,14 +4972,27 @@ def main() -> int:
     else:
         print(f"room-receipts: binding {ledger.binding_sha256} level hotel", flush=True)
     look = float(env.get("ROOM_LOOK_SECONDS", "15"))  # 0 turns the look off
+    reap = float(env.get("ROOM_REAP_SECONDS", str(REAP_SECONDS)))  # 0 leaves TTL deletes to the API alone
+    reap_after = float(env.get("ROOM_REAP_AFTER_SECONDS", str(REAP_AFTER_SECONDS)))
+    if reap < 0 or not 0 <= reap_after <= REAP_AFTER_MAX_SECONDS:
+        raise SystemExit(f"ROOM_REAP_SECONDS must be 0 or more and ROOM_REAP_AFTER_SECONDS 0 to {REAP_AFTER_MAX_SECONDS}")
+    reaper = {"reap_seconds": reap or None, "reap_after": reap_after}
     args = (ledger, int(env.get("ROOM_API_PORT", "18090")), int(env.get("ROOM_HEALTH_PORT", "18091")), api_key,
             env.get("ROOM_DOCKER_SOCK", "/run/pool-room/docker.sock"), int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
+    if ledger.sealed and ledger.ingress is not None and ledger.ingress.zone:
+        import room_ingress  # installed beside this file; only a sealed guest with a zone loads it
+        try:
+            room_ingress.start(ledger, env, args[1], api_key, store)
+        except (ValueError, OSError) as exc:
+            # The hotel keeps serving rooms; expose goes to the API (501) as with the flag off.
+            print(f"room-receipts: guest ingress NOT serving: {exc}", flush=True)
     if miner is None:
-        srv = Server((host, int(port)), *args, look_seconds=look or None)
+        srv = Server((host, int(port)), *args, look_seconds=look or None, **reaper)
         srv.serve_forever()
         return 0
     tls_host, tls_port = env["ROOM_RECEIPTS_TLS_LISTEN"].rsplit(":", 1)
-    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None)
+    tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None,
+                    **reaper)
     plain = Server((host, int(port)), *args, attestation_only=True)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
     print(f"room-receipts: miner hotel: HTTPS {tls_host}:{tls_port} tls_spki_sha256 {miner.tls_spki_sha256}; "

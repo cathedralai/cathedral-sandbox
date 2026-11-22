@@ -150,7 +150,7 @@ def shredded_world(world):
     final_head = registry.head("vol-1")
     keys = KeyService()
     clock.t += 30
-    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys)
+    receipt = registry.shred("vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=keys)
     return registry, volume_doc, holder, lease, commits, final_head, keys, receipt
 
 
@@ -185,14 +185,14 @@ def test_nothing_moves_after_shred(world):
         holder, lease, generation=3, parent_sha256=vc.statement_sha256(commits[-1]),
         restic_repo_id="repo-1", restic_snapshot_id="s3"))
     refused("volume_shredded", registry.grant, "vol-1", binding(holder))
-    refused("volume_shredded", registry.shred, "vol-1", key_id="vk:other", destroy_key=KeyService())
+    refused("volume_shredded", registry.shred, "vol-1", owner="customer-1", key_id="vk:other", destroy_key=KeyService())
     assert registry.log_entries() == log
 
 
 def test_shred_resend_returns_the_same_receipt(world):
     registry, *_, receipt = shredded_world(world)
     keys = KeyService()
-    assert registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys) == receipt
+    assert registry.shred("vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=keys) == receipt
     assert keys.calls == []
 
 
@@ -200,15 +200,15 @@ def test_bad_key_id_never_touches_the_key(world):
     _, registry, _, holder, lease = world
     registry.accept(commit_next(registry, holder, lease, "s1"))
     keys = KeyService()
-    refused("bad_key_id", registry.shred, "vol-1", key_id="k/1", destroy_key=keys)
-    refused("bad_key_id", registry.shred, "vol-1", key_id=None, destroy_key=keys)
+    refused("bad_key_id", registry.shred, "vol-1", owner="customer-1", key_id="k/1", destroy_key=keys)
+    refused("bad_key_id", registry.shred, "vol-1", owner="customer-1", key_id=None, destroy_key=keys)
     assert keys.calls == []
 
 
 def test_volume_with_no_commit_has_nothing_to_shred(world):
     _, registry, *_ = world
     keys = KeyService()
-    refused("nothing_to_shred", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=keys)
+    refused("nothing_to_shred", registry.shred, "vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=keys)
     assert keys.calls == []
 
 
@@ -219,7 +219,7 @@ def test_key_service_refusal_logs_nothing_freezes_and_a_retry_finishes(world, ke
     first = commit_next(registry, holder, lease, "s1")
     registry.accept(first)
     before = registry.log_entries()
-    refused("key_not_destroyed", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=keys)
+    refused("key_not_destroyed", registry.shred, "vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=keys)
     assert registry.log_entries() == before
     # The key may already be gone, so nothing may move until the shred finishes.
     second = vc.make_commit(holder, lease, generation=2, parent_sha256=vc.statement_sha256(first),
@@ -228,7 +228,7 @@ def test_key_service_refusal_logs_nothing_freezes_and_a_retry_finishes(world, ke
     refused("shred_pending", registry.accept, first)
     refused("shred_pending", registry.grant, "vol-1", binding(holder))
     refused("shred_pending", registry.head, "vol-1")
-    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=KeyService())
+    receipt = registry.shred("vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=KeyService())
     assert receipt["final_generation"] == 1
     vl.verify_shred_receipt(receipt, public_keys_by_id=log_keys(registry), entries=registry.log_entries())
 
@@ -246,10 +246,10 @@ def test_lost_key_service_answer_then_idempotent_retry(world):
         destroyed.add(key_id)  # already gone counts as gone
         return True
 
-    refused("key_not_destroyed", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=lossy)
+    refused("key_not_destroyed", registry.shred, "vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=lossy)
     assert destroyed == {"vk:vol-1"}
     refused("shred_pending", registry.grant, "vol-1", binding(holder))
-    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=idempotent)
+    receipt = registry.shred("vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=idempotent)
     with pytest.raises(vl.VolumeLogError, match="volume_shredded"):
         vl.check_restore(registry.log_entries(), volume_id="vol-1", generation=1,
                          manifest_sha256=receipt["final_manifest_sha256"])
@@ -266,12 +266,12 @@ def test_shred_refuses_another_volumes_key(world):
                                    restic_repo_id="repo-2", restic_snapshot_id="t1"))
     before = registry.log_entries()
     keys = KeyService()
-    refused("shred_key_mismatch", registry.shred, "vol-1", key_id="vk:vol-2", destroy_key=keys)
+    refused("shred_key_mismatch", registry.shred, "vol-1", owner="customer-1", key_id="vk:vol-2", destroy_key=keys)
     assert keys.calls == []
     assert registry.log_entries() == before
     # Neither volume froze: vol-2 keeps serving its head and vol-1 can still be shredded with its own key.
     assert registry.head("vol-2")["statement"]["generation"] == 1
-    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys)
+    receipt = registry.shred("vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=keys)
     assert receipt["key_id"] == "vk:vol-1"
     assert keys.calls == ["vk:vol-1"]
 
@@ -285,7 +285,7 @@ def test_destroy_key_is_told_the_volume(world):
         seen.append((volume_id, key_id))
         return True
 
-    registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys)
+    registry.shred("vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=keys)
     assert seen == [("vol-1", "vk:vol-1")]
 
 
@@ -298,13 +298,13 @@ def test_shred_without_a_bound_key_never_touches_a_key(world):
     registry.accept(vc.make_commit(holder, lease, generation=1, parent_sha256=head["head_sha256"],
                                    restic_repo_id="repo-2", restic_snapshot_id="t1"))
     keys = KeyService()
-    refused("key_not_bound", registry.shred, "vol-2", key_id="vk:vol-2", destroy_key=keys)
+    refused("key_not_bound", registry.shred, "vol-2", owner="customer-2", key_id="vk:vol-2", destroy_key=keys)
     assert keys.calls == []
     registry.bind_key("vol-2", "vk:vol-2")
     registry.bind_key("vol-2", "vk:vol-2")  # same key again is fine
     refused("key_already_bound", registry.bind_key, "vol-2", "vk:other")
     refused("key_already_bound", registry.bind_key, "vol-1", "vk:other")
-    assert registry.shred("vol-2", key_id="vk:vol-2", destroy_key=keys)["key_id"] == "vk:vol-2"
+    assert registry.shred("vol-2", owner="customer-2", key_id="vk:vol-2", destroy_key=keys)["key_id"] == "vk:vol-2"
 
 
 def test_lost_answer_retry_with_another_key_id_is_refused(world):
@@ -314,12 +314,13 @@ def test_lost_answer_retry_with_another_key_id_is_refused(world):
     def lossy(volume_id, key_id):
         raise TimeoutError("answer lost")
 
-    refused("key_not_destroyed", registry.shred, "vol-1", key_id="vk:vol-1", destroy_key=lossy)
+    refused("key_not_destroyed", registry.shred, "vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=lossy)
     keys = KeyService()
-    refused("shred_key_mismatch", registry.shred, "vol-1", key_id="vk:something-else", destroy_key=keys)
+    refused("shred_key_mismatch", registry.shred, "vol-1", owner="customer-1", key_id="vk:something-else",
+            destroy_key=keys)
     assert keys.calls == []
     refused("shred_pending", registry.head, "vol-1")
-    receipt = registry.shred("vol-1", key_id="vk:vol-1", destroy_key=keys)
+    receipt = registry.shred("vol-1", owner="customer-1", key_id="vk:vol-1", destroy_key=keys)
     assert receipt["key_id"] == "vk:vol-1"
 
 

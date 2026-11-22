@@ -71,11 +71,16 @@ func newHotel(hc hotelConfig, key string) *hotel {
 		hc.Concurrency = 16
 	}
 	hc.Labels = fixedLabels(hc, hc.Labels)
-	tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: hc.Concurrency + 64, MaxConnsPerHost: hc.Concurrency + 64, IdleConnTimeout: 90 * time.Second}
+	// The data pool is capped by h.conns (hotelconns.go), which logs, counts and
+	// bounds the wait for a free connection; the transport cap is a backstop.
+	conns := dataConns(hc)
+	// +16: Go frees a closed connection's count a moment after the call ends,
+	// and /room/ calls on a shared port are not gated.
+	tr := &http.Transport{MaxIdleConns: 1024, MaxIdleConnsPerHost: conns, MaxConnsPerHost: conns + 16, IdleConnTimeout: 90 * time.Second}
 	// The sync loop (health, quota, list) uses its own small pool: when one
 	// guest's long execs hold every data connection, the hotel must not look down.
 	ctl := &http.Transport{MaxIdleConns: 8, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 8, IdleConnTimeout: 90 * time.Second}
-	h := &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
+	h := &hotel{cfg: hc, key: key, client: &http.Client{Transport: tr}, ctl: &http.Client{Transport: ctl}, conns: newConnGate(hc), sem: make(chan struct{}, hc.Concurrency), rooms: map[string]*room{}}
 	h.tlsPinErr = pinMinerHotel(h)
 	return h
 }
@@ -373,7 +378,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	hc := req.hotelConfig
 	if enroller {
 		if hc.MinerHotkey == "" || !hc.Sealed || (req.Verify != nil && !*req.Verify) ||
-			hc.ReservedFor != "" || hc.Labels != nil ||
+			hc.ReservedFor != "" || hc.Labels != nil || hc.DataConns != 0 || hc.DataConnWaitSeconds != 0 || hc.MemFullPct != nil ||
 			!strings.HasPrefix(hc.API, "https://") || (hc.Health != "" && !strings.HasPrefix(hc.Health, "https://")) {
 			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
 			return
@@ -395,17 +400,10 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	case hc.MinerHotkey != "" && !ss58RE.MatchString(hc.MinerHotkey):
 		writeErr(w, 400, "invalid_hotel", "miner_hotkey must be an SS58 address")
 		return
-	case hc.MinerHotkey != "" && !hc.Sealed:
-		writeErr(w, 400, "invalid_hotel", "miner hotels must be sealed")
-		return
-	case !hc.Sealed && hc.Labels["sealed"] == "true":
-		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
-		return
-	case hc.RequireAttestation && !hc.Sealed:
-		writeErr(w, 400, "invalid_hotel", "require_attestation needs a sealed hotel")
-		return
-	case hc.GuestTLS && !hc.Sealed:
-		writeErr(w, 400, "invalid_hotel", "guest_tls needs a sealed hotel")
+	case !hc.Sealed:
+		// AB#776: every Cathedral room is sealed; there is no unsealed class
+		// for a hotel to join.
+		writeErr(w, 400, "invalid_hotel", `every hotel must join with "sealed": true (there is no unsealed hotel class)`)
 		return
 	case hc.SealedAdmission == sealedAdmissionOff:
 		writeErr(w, 400, "invalid_hotel", `sealed_admission "off" is only for an operator hotel in the config file; a joined hotel is always gated`)
@@ -420,6 +418,15 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	case hc.MaxSlots < 0:
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
+		return
+	case checkDataConnConfig(hc) != nil:
+		writeErr(w, 400, "invalid_hotel", checkDataConnConfig(hc).Error())
+		return
+	case checkDiskConfig(hc) != nil:
+		writeErr(w, 400, "invalid_hotel", checkDiskConfig(hc).Error())
+		return
+	case checkMemFullPct(hc.MemFullPct) != nil:
+		writeErr(w, 400, "invalid_hotel", checkMemFullPct(hc.MemFullPct).Error())
 		return
 	case !validAlertChat(hc.AlertChatID):
 		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
@@ -495,6 +502,13 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	h := newHotel(hc, req.Key)
 	h.runtime = true
 	h.pinChip = joinChip
+	b.markUnlisted(h) // metered admission waits for its first room list (allowance.go)
+	published := false
+	defer func() {
+		if !published {
+			b.unmarkUnlisted(h) // the join failed: nothing stays behind
+		}
+	}()
 	if req.Verify == nil || *req.Verify {
 		var st map[string]any
 		if err := h.getJSON(r.Context(), hc.API, "/v1/status", nil, &st); err != nil {
@@ -595,6 +609,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	}
 	b.saveProbationLogged() // a rejoin under an old id must not inherit its saved probation
+	published = true
 	go b.syncLoop(ctx, h)
 	writeJSON(w, 201, b.hotelDoc(h))
 }
@@ -619,13 +634,14 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		Lend        *bool             `json:"lend"`          // true: lend the reserved hotel to the pool (lend.go)
 		DrainNotice json.RawMessage   `json:"drain_notice"`  // a signed planned-maintenance notice; needs drain=true (drain_notice.go)
 		AlertChatID *string           `json:"alert_chat_id"` // the miner operator's alert chat; "" clears (alerts.go)
+		MemFullPct  json.RawMessage   `json:"mem_full_pct"`  // this hotel's memory limit, 1 to 100; null: the broker-wide value (AB#855)
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil) {
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil || len(req.MemFullPct) != 0) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true, with or without a drain_notice")
 		return
 	}
@@ -657,6 +673,23 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		writeErr(w, 400, "invalid_hotel", "max_slots must be 0 (no cap) or more")
 		return
 	}
+	var memFull **float64 // nil: not in the request; *memFull nil: clear
+	if len(req.MemFullPct) > 0 {
+		var p *float64
+		if string(req.MemFullPct) != "null" {
+			var v float64
+			if json.Unmarshal(req.MemFullPct, &v) != nil {
+				writeErr(w, 400, "invalid_json", "mem_full_pct must be a number or null")
+				return
+			}
+			p = &v
+		}
+		if err := checkMemFullPct(p); err != nil {
+			writeErr(w, 400, "invalid_hotel", err.Error())
+			return
+		}
+		memFull = &p
+	}
 	if req.AlertChatID != nil && !validAlertChat(*req.AlertChatID) {
 		writeErr(w, 400, "invalid_hotel", "alert_chat_id must be a Telegram chat id (digits) or @channel")
 		return
@@ -664,10 +697,6 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if req.AlertChatID != nil && !h.runtime {
 		// A config file hotel's PATCH is not saved: the chat would be lost on restart.
 		writeErr(w, 409, "hotel_in_config", "hotel "+id+" is in the config file; set alert_chat_id there")
-		return
-	}
-	if h.runtime && !h.cfg.Sealed && req.Labels["sealed"] == "true" {
-		writeErr(w, 400, "invalid_hotel", "unsealed hotels cannot claim the sealed label")
 		return
 	}
 	var reserve *string
@@ -751,6 +780,9 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if req.AlertChatID != nil {
 		h.cfg.AlertChatID = *req.AlertChatID
 	}
+	if memFull != nil {
+		h.cfg.MemFullPct = *memFull
+	}
 	h.cfgMu.Unlock()
 	var err error
 	if newNotice != nil {
@@ -777,6 +809,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.LentFrom = oldCfg.LentFrom
 		h.cfg.LentReportID = oldCfg.LentReportID
 		h.cfg.AlertChatID = oldCfg.AlertChatID
+		h.cfg.MemFullPct = oldCfg.MemFullPct
 		h.cfgMu.Unlock()
 		b.mu.Unlock()
 		writeErr(w, 500, "state_write_failed", "cannot keep the hotel update; nothing changed")
@@ -876,7 +909,12 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
 		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
-		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice()}
+		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice(),
+		// rooms_in_use: rooms the broker holds on the hotel, plus creates queued or in flight. A
+		// guest TLS hotel's host has no key to count them, so a re-seal waits for 0 here (AB#817).
+		"rooms_in_use": h.used(),
+		"mem_pct":      h.memPct, "mem_full_pct": b.memFullLimit(h), "mem_full": b.memFull(h)}
+	diskDoc(h, d)
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
 	}
@@ -943,6 +981,11 @@ func (b *broker) loadRuntimeHotelList() error {
 		return err
 	}
 	for _, hc := range list {
+		if !hc.Sealed {
+			// Joined before AB#776 removed the unsealed class.
+			log.Printf("runtime hotel %s skipped: not sealed; every hotel must be sealed (AB#776)", hc.ID)
+			continue
+		}
 		if hc.MinerHotkey != "" && hc.TLSSPKISHA256 == "" {
 			log.Printf("runtime miner hotel %s skipped: no attested TLS pin", hc.ID)
 			continue

@@ -3,20 +3,24 @@
 // A guest policy names hotels by selector instead of by a fixed id list:
 //
 //	"policy": {
-//	  "prefer": [{"class": "sealed"}],
-//	  "allow":  [{"class": "unsealed"}],
+//	  "prefer": [{"label": {"region": "eu"}}],
+//	  "allow":  [{"class": "sealed"}],
 //	  "deny":   [{"hotel": "nc-sealed"}]
 //	}
 //
-// A selector is {"class": "sealed"|"unsealed"}, {"hotel": "<id>"} or
-// {"label": {"k": "v"}} (every pair must match). Deny wins over prefer and
-// allow. A create with no hotel choice goes to the preferred hotels while one
-// of them has a free room, else to the allowed hotels. A hotel that joins at
-// runtime is matched by class and label with no policy edit.
+// A selector is {"class": "sealed"}, {"hotel": "<id>"} or {"label": {"k":
+// "v"}} (every pair must match). Every hotel is sealed (AB#776), so the class
+// selector reaches every hotel the rest of the policy allows; "sealed" is the
+// only class, and a policy naming any other class is refused so a stale
+// "unsealed" policy fails loudly instead of matching nothing. Deny wins over
+// prefer and allow. A create with no hotel choice goes to the preferred
+// hotels while one of them has a free room, else to the allowed hotels. A
+// hotel that joins at runtime is matched by class and label with no policy
+// edit.
 //
-// When a guest has a policy, the policy replaces its "hotels" list and its
-// "default_sealed" flag. Miner hotels are denied unless the guest policy
-// explicitly selects the miner=true label; broad sealed selectors do not opt in.
+// When a guest has a policy, the policy replaces its "hotels" list. Miner
+// hotels are denied unless the guest policy explicitly selects the miner=true
+// label; broad sealed selectors do not opt in.
 //
 // A hotel can be reserved for one guest (hotel field "reserved_for", in the
 // config or by PATCH /v1/broker/hotels/<id>). Every other guest treats it as
@@ -40,10 +44,9 @@ import (
 )
 
 const (
-	classSealed   = "sealed"
-	classUnsealed = "unsealed"
-	tierPrefer    = "prefer"
-	tierAllow     = "allow"
+	classSealed = "sealed"
+	tierPrefer  = "prefer"
+	tierAllow   = "allow"
 )
 
 type selector struct {
@@ -63,13 +66,13 @@ type guestPolicy struct {
 }
 
 // hotelClass is "sealed" for a hotel with the sealed label (a sealed hotel
-// always has it, see newHotel), else "unsealed". It is the same rule as the
-// "prefer" fallback class.
+// always has it, see newHotel). The loader and the join take only sealed
+// hotels (AB#776), so any other hotel is a leftover with no class: "".
 func hotelClass(h *hotel) string {
 	if h.labels()["sealed"] == "true" {
 		return classSealed
 	}
-	return classUnsealed
+	return ""
 }
 
 func (s selector) matches(h *hotel) bool {
@@ -153,8 +156,8 @@ func validSelectors(field string, list []selector) error {
 		n := 0
 		if s.Class != "" {
 			n++
-			if s.Class != classSealed && s.Class != classUnsealed {
-				return fmt.Errorf("policy.%s[%d].class must be \"sealed\" or \"unsealed\"", field, i)
+			if s.Class != classSealed {
+				return fmt.Errorf("policy.%s[%d].class must be \"sealed\" (every hotel is sealed, AB#776)", field, i)
 			}
 		}
 		if s.Hotel != "" {
@@ -257,11 +260,21 @@ func (b *broker) capacityDoc(e capacityEntry, now time.Time, mb *minerBudget) ma
 		"id": h.cfg.ID, "class": hotelClass(h), "labels": labels, "up": h.ok, "drain": h.drain(),
 		"free_rooms": b.admissibleFreeIn(h, now, mb), "source": e.source, "down_since": downSince(h),
 		"reserved_for": reserved, "slots": h.slots, "admission": b.admissionDoc(h, now),
+		// last_ok_at: the last good /room/health answer. health_late: rooms
+		// answer but health is slow; the hotel is still up and placed (AB#869).
+		"last_ok_at": lastOKAt(h), "health_late": h.healthLate,
 	}
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
 	}
 	return d
+}
+
+func lastOKAt(h *hotel) any {
+	if h.lastOK.IsZero() {
+		return nil
+	}
+	return h.lastOK.UTC().Format(time.RFC3339)
 }
 
 // classTotals is one class line of the catalog: hotels, how many take rooms
@@ -282,6 +295,9 @@ type classTotals struct {
 func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.Time, mb *minerBudget) {
 	h := e.h
 	c := t[hotelClass(h)]
+	if c == nil {
+		return // a leftover hotel with no class (hotelClass)
+	}
 	c.Hotels++
 	if e.source == "join" {
 		c.Joined++
@@ -312,7 +328,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 	now := time.Now()
 	out := []map[string]any{}
 	var guest map[string]any
-	totals := map[string]*classTotals{classSealed: {}, classUnsealed: {}}
+	totals := map[string]*classTotals{classSealed: {}}
 	// docs: what one hotel can take now; sum: a budget the totals use up.
 	docs, sum := b.minerBudgetNow(), b.minerBudgetNow()
 	for _, e := range b.capacityEntries() {
@@ -326,17 +342,19 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 				lent = l
 			}
 			d["lent_from"] = lent
+			diskDoc(e.h, d) // disk budget (disk.go, AB#831)
 			out = append(out, d)
 			b.addTotals(totals, e, now, sum)
 			continue
 		}
-		t := g.tierOf(e.h)
-		if t == "" || (g.limits.OwnHostsOnly && isMinerHotel(e.h)) { // placement skips it too (scope)
+		if !g.guestReaches(e.h) { // placement skips it too (scope)
 			continue
 		}
+		t := g.tierOf(e.h)
 		b.addTotals(totals, e, now, sum)
 		d := b.capacityDoc(e, now, docs)
 		d["tier"] = t
+		guestDiskDoc(e.h, d)
 		out = append(out, d)
 	}
 	if g != nil {

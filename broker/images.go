@@ -23,10 +23,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -45,19 +48,14 @@ type placement struct {
 	// id on the hotel.
 	snapshotRef, hotelSnap string
 	allowed                map[string]bool // non-empty: the guest may use only these hotels (guests.go)
-	// images: non-empty for a create from a broker-built image, the hotels
-	// that hold it. Unlike ids it is not a hotel choice: the sealed rule and
-	// the guest's sealed default still apply.
-	images          map[string]bool
-	sealedByDefault bool // match["sealed"] comes from the guest default, not the request
 	// hotelWorkspace: the hotel name of the workspace the create mounts
 	// (workspaces.go). only is then the hotel that holds it.
 	hotelWorkspace string
 	// prefer: "placement": "prefer". When every named hotel is down or full,
 	// the create may go to another hotel of the same class (fallbackFor).
 	prefer bool
-	// class: set only on a fallback. "sealed" or "unsealed": the hotel must be
-	// of that class, on top of every rule above.
+	// class: set only on a fallback, always "sealed" (the one class, AB#776):
+	// the hotel must be of that class, on top of every rule above.
 	class string
 	// policy: the guest's placement policy (capacity.go), nil for a guest
 	// with none. tier: "" for any tier the policy reaches, or "prefer" or
@@ -77,6 +75,18 @@ type placement struct {
 	// matches, whatever the guest policy says, so no retry, fallback or
 	// queue move can reach one either.
 	ownHostsOnly bool
+	// diskGiB: the create's resources.disk_gib (0: the hotel default). Above
+	// the base disk it must fit a hotel's disk budget (disk.go).
+	diskGiB int
+	// registryAuth: the create carries the guest's own registry login
+	// (image.registry_auth, AB#817). Only a hotel whose create leg is
+	// encrypted to the room runtime matches (encryptedCreateLeg), on every
+	// retry, fallback and queue move too.
+	registryAuth bool
+	// deadline: the create's create_timeout_seconds as a time (zero: none,
+	// AB#862). A create still waiting for a hotel create slot at this time
+	// ends with 503 create_timeout; one already sent to a hotel is not cut.
+	deadline time.Time
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -86,13 +96,13 @@ func (pl placement) selects(h *hotel) bool {
 	if pl.ownHostsOnly && isMinerHotel(h) {
 		return false
 	}
+	if pl.registryAuth && !encryptedCreateLeg(h) {
+		return false
+	}
 	if len(pl.allowed) > 0 && !pl.allowed[h.cfg.ID] {
 		return false
 	}
 	if len(pl.ids) > 0 && !pl.ids[h.cfg.ID] {
-		return false
-	}
-	if len(pl.images) > 0 && !pl.images[h.cfg.ID] {
 		return false
 	}
 	if r := h.reservedFor(); r != "" && r != pl.guest {
@@ -107,23 +117,9 @@ func (pl placement) selects(h *hotel) bool {
 			return false
 		}
 	}
-	isSealed := h.labels()["sealed"] == "true"
-	switch pl.class {
-	case "sealed":
-		if !isSealed {
-			return false
-		}
-	case "unsealed":
-		if isSealed {
-			return false
-		}
-	}
-	// A hotel with "sealed": true in the config takes only creates that ask
-	// for a sealed room ("sealed": true or hotel label sealed=true) or name it.
-	// A sealed fallback counts as asking: it comes from a named sealed hotel.
-	// A guest policy that reaches the hotel (checked above) also counts: the
-	// operator gave the guest that class.
-	if h.cfg.Sealed && len(pl.ids) == 0 && pl.match["sealed"] != "true" && pl.class != "sealed" && pl.policy == nil {
+	// Every hotel is sealed (AB#776), so every create is a sealed create and
+	// needs no opt-in: the guest's hotel set and policy (above) decide.
+	if pl.class != "" && hotelClass(h) != pl.class {
 		return false
 	}
 	for k, v := range pl.match {
@@ -138,6 +134,10 @@ func (pl placement) selects(h *hotel) bool {
 	}
 	return true
 }
+
+// withoutDisk is pl with no disk check at all: the hotels pl allows by room
+// alone (disk.go noDiskCheck).
+func (pl placement) withoutDisk() placement { pl.diskGiB = noDiskCheck; return pl }
 
 func (pl placement) allows(h *hotel) bool {
 	return (pl.only == nil || pl.only == h) && pl.selects(h)
@@ -251,6 +251,53 @@ type apiErr struct {
 
 func (e *apiErr) Error() string { return e.code + ": " + e.msg }
 
+// encryptedCreateLeg reports whether a create body sent to h is encrypted all
+// the way to the room runtime that reads it. Only guest TLS qualifies: TLS
+// terminates inside the sealed guest on a key its SNP attestation names
+// (miner_tls.go), so the host never sees registry_auth. Sealed hotels without
+// guest TLS may terminate on the host; unsealed https still exposes the body
+// to the hotel process. AB#817: sealed-only — no unsealed create leg.
+func encryptedCreateLeg(h *hotel) bool {
+	return h.guestTLS()
+}
+
+// createImageRef is the image reference of a create: the string form, or the
+// "image" of the object form {"image", "registry_auth"} (AB#817). "" for none.
+func createImageRef(payload map[string]any) string {
+	switch v := payload["image"].(type) {
+	case string:
+		return v
+	case map[string]any:
+		ref, _ := v["image"].(string)
+		return ref
+	}
+	return ""
+}
+
+// createRegistryAuth checks the registry login of an object form image. It
+// reports whether the create carries one. The login goes to the hotel in the
+// create bytes and nowhere else: no message here names a value.
+func createRegistryAuth(payload map[string]any) (*apiErr, bool) {
+	img, ok := payload["image"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	raw, ok := img["registry_auth"]
+	if !ok || raw == nil {
+		return nil, false
+	}
+	auth, ok := raw.(map[string]any)
+	if !ok || len(auth) != 2 {
+		return &apiErr{400, "invalid_registry_auth", "registry_auth needs exactly username and password"}, true
+	}
+	for _, k := range []string{"username", "password"} {
+		if s, _ := auth[k].(string); s == "" {
+			return &apiErr{400, "invalid_registry_auth", "registry_auth needs non-empty username and password"}, true
+		}
+	}
+	return nil, true
+}
+
 // localImageRefusal refuses an image reference a guest sends that names a
 // hotel-local artifact instead of a registry image. A hotel keeps every
 // guest's snapshot images (cathedral-snap-<id>) in its one Docker image
@@ -268,6 +315,45 @@ func localImageRefusal(ref string) *apiErr {
 		return &apiErr{422, "snapshot_image_by_name", "start from a snapshot with snapshot_id; a snapshot image cannot be named in image"}
 	}
 	return nil
+}
+
+// imageRefPattern is the hotel's image reference grammar, byte for byte
+// (_IMAGE_REF_RE in cathedral/sandbox_api.py): optional registry, repository,
+// then a :tag or an @sha256 digest. A name with neither is refused, not read
+// as :latest: every hotel refuses it, and a mutable implicit tag would also
+// split warm-cache keys (AB#868). image_ref_test.go pins the parity.
+const imageRefPattern = `^(?:(?P<registry>[a-z0-9][a-z0-9._-]*(?::[0-9]+)?)/)?(?P<repository>[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*?)` +
+	`(?::(?P<tag>[A-Za-z0-9][A-Za-z0-9_.-]{0,127})|@(?P<digest>sha256:[0-9a-f]{64}))$`
+
+var (
+	imageRefRE = regexp.MustCompile(imageRefPattern)
+	// The same grammar without the tag or digest: such a ref only lacks one.
+	untaggedRefRE = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9._-]*(?::[0-9]+)?/)?[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*$`)
+	// An Agent IDE template uid, which the hotel resolves to an image (sandbox_api.py _TEMPLATE_UID_RE).
+	templateUIDRE = regexp.MustCompile(`^sbt-[a-z0-9][a-z0-9-]{0,48}$`)
+)
+
+// imageRefRefusal refuses a guest's image reference before anything is
+// placed, started or pulled: a hotel-local artifact (localImageRefusal), or a
+// reference no hotel accepts. A create may also name a template uid; a
+// prefetch may not (the hotel's prefetch takes registry references only).
+func imageRefRefusal(ref string, templateOK bool) *apiErr {
+	if e := localImageRefusal(ref); e != nil {
+		return e
+	}
+	if imageRefRE.MatchString(ref) || (templateOK && templateUIDRE.MatchString(ref)) {
+		return nil
+	}
+	shown := ref
+	if len(shown) > 200 {
+		shown = shown[:200] + "..."
+	}
+	if untaggedRefRE.MatchString(ref) {
+		return &apiErr{400, "invalid_image_reference", fmt.Sprintf(
+			"image %q has no tag or digest: add :tag or @sha256:<digest>, for example %s:<tag>; an untagged name is not read as :latest", shown, shown)}
+	}
+	return &apiErr{400, "invalid_image_reference", fmt.Sprintf(
+		"image %q is not a valid reference: use [registry/]name:tag or [registry/]name@sha256:<64 hex>", shown)}
 }
 
 // imageRepoName is the last path part of an image reference without its
@@ -318,10 +404,15 @@ func stringMap(v any, field string) (map[string]string, *apiErr) {
 }
 
 // parseSelection reads "hotels", "hotel_labels", "exclude_hotel_labels" and
-// "sealed", and applies the guest's hotel set and sealed default (guests.go).
-// It answers 409 for an unknown hotel id and 409 when no hotel matches.
+// "sealed", and applies the guest's hotel set or policy (guests.go). It
+// answers 400 sealed_only for "sealed": false, 409 for an unknown hotel id
+// and 409 when no hotel matches.
 func (b *broker) parseSelection(g *guestState, payload map[string]any) (placement, *apiErr) {
 	var pl placement
+	// First, so the answer does not depend on the rest of the selection.
+	if v, ok := payload["sealed"].(bool); ok && !v {
+		return pl, errSealedOnly
+	}
 	if v, ok := payload["hotels"]; ok && v != nil {
 		list, ok := v.([]any)
 		if !ok {
@@ -343,28 +434,19 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 	if pl.match, e = stringMap(payload["hotel_labels"], "hotel_labels"); e != nil {
 		return pl, e
 	}
-	// "sealed": true is short for hotel_labels {"sealed": "true"}.
+	// "sealed": true is short for hotel_labels {"sealed": "true"}; false was
+	// refused above.
 	if v, ok := payload["sealed"]; ok && v != nil {
-		sealed, ok := v.(bool)
-		if !ok {
+		if _, ok := v.(bool); !ok {
 			return pl, &apiErr{400, "invalid_hotel_selection", "sealed must be true or false"}
 		}
-		if sealed {
-			if pl.match == nil {
-				pl.match = map[string]string{}
-			}
-			pl.match["sealed"] = "true"
+		if pl.match == nil {
+			pl.match = map[string]string{}
 		}
+		pl.match["sealed"] = "true"
 	}
 	if pl.exclude, e = stringMap(payload["exclude_hotel_labels"], "exclude_hotel_labels"); e != nil {
 		return pl, e
-	}
-	// "sealed": false asks for an unsealed hotel.
-	if v, ok := payload["sealed"].(bool); ok && !v {
-		if pl.exclude == nil {
-			pl.exclude = map[string]string{}
-		}
-		pl.exclude["sealed"] = "true"
 	}
 	// "placement": "require" (default) keeps a create on the named hotels;
 	// "prefer" lets it fall back to a hotel of the same class (fallbackFor).
@@ -385,12 +467,20 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 		pl.ownHostsOnly = own
 	}
-	_, named := payload["hotels"]
-	_, sealedField := payload["sealed"]
-	b.scope(g, &pl, named && payload["hotels"] != nil, sealedField && payload["sealed"] != nil)
+	_, pl.registryAuth = createRegistryAuth(payload)
+	b.scope(g, &pl)
 	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			return pl, nil
+		}
+	}
+	if pl.registryAuth {
+		open := pl
+		open.registryAuth = false
+		for _, h := range b.hotelList() {
+			if open.selects(h) {
+				return pl, &apiErr{409, "registry_auth_needs_encrypted_hotel", "a create with registry_auth goes only to a sealed hotel with attested guest TLS; none matches the hotel selection"}
+			}
 		}
 	}
 	if b.lentAway(pl) {
@@ -400,39 +490,26 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 }
 
 // fallbackFor widens a "prefer" placement whose named hotels are all down or
-// full: any other hotel of the same class (sealed or not) that the rest of the
-// selection and the guest's hotel list allow. A sealed fallback needs the
-// guest's own hotel list, so a guest never lands on a sealed hotel it was not
-// given. Named hotels of mixed class, and forks, do not fall back.
+// full: any other sealed hotel that the rest of the selection and the guest's
+// hotel list or policy allow. It needs that list or policy, so a guest never
+// lands on a hotel it was not given. Forks do not fall back.
 func (b *broker) fallbackFor(pl placement) (placement, bool) {
 	if !pl.prefer || len(pl.ids) == 0 || pl.only != nil {
 		return pl, false
 	}
-	n, sealed := 0, 0
 	for id := range pl.ids {
-		h := b.hotelByID(id)
-		if h == nil {
+		if h := b.hotelByID(id); h == nil || hotelClass(h) != classSealed {
 			return pl, false
 		}
-		n++
-		if h.labels()["sealed"] == "true" {
-			sealed++
-		}
 	}
-	if sealed != 0 && sealed != n {
-		return pl, false
-	}
-	if sealed == n && len(pl.allowed) == 0 && pl.policy == nil {
+	if len(pl.allowed) == 0 && pl.policy == nil {
 		return pl, false
 	}
 	// The class is a separate rule, so the request's own hotel_labels and
-	// exclude_hotel_labels (even on the "sealed" label) still apply.
+	// exclude_hotel_labels still apply.
 	fb := pl
 	fb.ids = nil
-	fb.class = "unsealed"
-	if sealed == n {
-		fb.class = "sealed"
-	}
+	fb.class = classSealed
 	return fb, true
 }
 
@@ -459,12 +536,7 @@ func (b *broker) snapshotPlacement(ctx context.Context, g *guestState, payload m
 	if e != nil {
 		return pl, e
 	}
-	// A fork goes to its snapshot's hotel. The guest's sealed default does not
-	// stop a fork of a snapshot on an unsealed hotel.
-	if pl.sealedByDefault && h.labels()["sealed"] != "true" {
-		delete(pl.match, "sealed")
-		pl.sealedByDefault = false
-	}
+	// A fork goes to its snapshot's hotel.
 	if !pl.selects(h) {
 		return pl, &apiErr{409, "snapshot_hotel_excluded", "the hotel that holds this snapshot does not match the hotel selection"}
 	}
@@ -477,7 +549,7 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 	b.mu.Lock()
 	out := []map[string]any{}
 	for _, h := range b.hotelList() {
-		if !g.allowsHotel(h) {
+		if !g.guestReaches(h) {
 			continue
 		}
 		free := b.freeFor(h)
@@ -501,6 +573,13 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 func snapshotName(g *guestState, name string) string { return g.cfg.ID + ":" + name }
 
 // guestSnapshot rewrites one hotel snapshot document for the guest.
+func hotelsWord(ids []string) string {
+	if len(ids) == 1 {
+		return "hotel"
+	}
+	return "hotels"
+}
+
 func guestSnapshot(g *guestState, h *hotel, doc map[string]any) {
 	if sid, ok := doc["snapshot_id"].(string); ok {
 		doc["snapshot_id"] = h.cfg.ID + "." + sid
@@ -558,7 +637,7 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		}
 		list, err := b.hotelSnapshots(ctx, g, h)
 		if err != nil {
-			return nil, "", &apiErr{502, "hotel_unreachable", "hotel " + h.cfg.ID + " did not answer"}
+			return nil, "", hotelAPIErr(h, err)
 		}
 		if sid := matchSnapshot(g, list, rest); sid != "" {
 			return h, sid, nil
@@ -572,6 +651,8 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	}
 	var mu sync.Mutex
 	var hits []hit
+	var busy []string
+	var unanswered []*hotel
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
 		if !g.limitsAllow(b, h.cfg.ID) { // a hotel outside the list may hang; it holds none of this guest's snapshots
@@ -581,7 +662,16 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 		go func(h *hotel) {
 			defer wg.Done()
 			list, err := b.hotelSnapshots(ctx, g, h)
+			if errors.Is(err, errHotelBusy) {
+				mu.Lock()
+				busy = append(busy, h.cfg.ID)
+				mu.Unlock()
+				return
+			}
 			if err != nil {
+				mu.Lock()
+				unanswered = append(unanswered, h)
+				mu.Unlock()
 				return
 			}
 			if sid := matchSnapshot(g, list, ref); sid != "" {
@@ -596,6 +686,34 @@ func (b *broker) findSnapshot(ctx context.Context, g *guestState, ref string) (*
 	case 1:
 		return hits[0].h, hits[0].sid, nil
 	case 0:
+		// A hotel that did not answer may hold the snapshot (AB#866): if it is
+		// up, the miss is a retry, not "not found". One already known down
+		// keeps 404 (named), so a long-down hotel does not make every unknown
+		// name a retry loop.
+		var up, down []string
+		b.mu.Lock()
+		for _, h := range unanswered {
+			if h.ok {
+				up = append(up, h.cfg.ID)
+			} else {
+				down = append(down, h.cfg.ID)
+			}
+		}
+		b.mu.Unlock()
+		sort.Strings(up)
+		sort.Strings(down)
+		if len(up) > 0 {
+			return nil, "", &apiErr{502, "hotel_unreachable", "no answer from " + hotelsWord(up) + " " + strings.Join(up, ", ") +
+				", which may hold snapshot " + ref + "; retry, or use the id <hotel>.<snapshot id>"}
+		}
+		// A busy hotel was never asked; it may hold the snapshot (AB#819).
+		if len(busy) > 0 {
+			return nil, "", busyHotelsErr(busy)
+		}
+		if len(down) > 0 {
+			return nil, "", &apiErr{404, "snapshot_not_found", "no snapshot " + ref + " on the hotels that answered; " +
+				hotelsWord(down) + " " + strings.Join(down, ", ") + " down, not checked"}
+		}
 		return nil, "", notFound
 	default:
 		return nil, "", &apiErr{409, "snapshot_ambiguous", "several hotels have a snapshot " + ref + "; use the id <hotel>.<snapshot id>"}
@@ -619,11 +737,13 @@ func (b *broker) roomSnapshot(w http.ResponseWriter, r *http.Request, g *guestSt
 		payload["name"] = snapshotName(g, name)
 	}
 	out, _ := json.Marshal(payload)
-	status, _, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
+	status, hdr, resp, err := h.do(r.Context(), "POST", "/v1/sandboxes/"+url.PathEscape(hid)+"/snapshot", nil, out, 10*time.Minute)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
+	// The machine's signed receipt travels in X-Room-* headers, as on every other room route.
+	copyRoomHeaders(w.Header(), hdr)
 	var doc map[string]any
 	if json.Unmarshal(resp, &doc) != nil {
 		writeRaw(w, status, resp)
@@ -682,7 +802,7 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	h, sid, e := b.findSnapshot(r.Context(), g, ref)
 	if e != nil {
-		writeErr(w, e.status, e.code, e.msg)
+		writeAPIErr(w, e)
 		return
 	}
 	path := "/v1/snapshots/" + url.PathEscape(sid)
@@ -694,11 +814,12 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 		arg = body
 	}
 	// Delete and push are owner-scoped on the hotel too (AB#650).
-	status, _, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
+	status, hdr, out, err := h.doGuest(r.Context(), g, r.Method, path, nil, arg, timeout)
 	if err != nil {
-		writeErr(w, 502, "hotel_unreachable", "hotel "+h.cfg.ID+" did not answer")
+		writeHotelErr(w, h, err)
 		return
 	}
+	copyRoomHeaders(w.Header(), hdr)
 	var doc map[string]any
 	if json.Unmarshal(out, &doc) == nil && doc["error"] == nil {
 		if _, ok := doc["snapshot_id"]; ok {
@@ -713,16 +834,22 @@ func (b *broker) handleSnapshot(w http.ResponseWriter, r *http.Request, g *guest
 // ---------------------------------------------------------------- prefetch
 
 type prefetchHotel struct {
-	State      string           `json:"state"` // pulling, done, failed
-	Images     []map[string]any `json:"images,omitempty"`
-	Error      map[string]any   `json:"error,omitempty"`
-	StartedAt  time.Time        `json:"started_at"`
-	FinishedAt *time.Time       `json:"finished_at,omitempty"`
+	State  string           `json:"state"` // pulling, done, failed
+	Images []map[string]any `json:"images,omitempty"`
+	Error  map[string]any   `json:"error,omitempty"`
+	// Pin is "pinned" when the hotel kept the images from its GC, or
+	// "not_supported" when it pulled them but has no pins (an older room
+	// kit); empty for a prefetch without pin (AB#860).
+	Pin        string     `json:"pin,omitempty"`
+	Pinned     []any      `json:"pinned,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }
 
 type prefetchJob struct {
 	ID      string                    `json:"prefetch_id"`
 	guest   string                    // not shown
+	pin     int64                     // the pin cap sent with a pin prefetch; 0: no pin (AB#860)
 	Images  []string                  `json:"images"`
 	Created time.Time                 `json:"created_at"`
 	Hotels  map[string]*prefetchHotel `json:"hotels"`
@@ -741,7 +868,7 @@ func newID(prefix string) string {
 	return prefix + hex.EncodeToString(b[:])
 }
 
-// POST /v1/images/prefetch {images, registry_auth?, hotels?, hotel_labels?, exclude_hotel_labels?}
+// POST /v1/images/prefetch {images, registry_auth?, pin?, hotels?, hotel_labels?, exclude_hotel_labels?}
 func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guestState) {
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var req map[string]any
@@ -760,25 +887,63 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 		writeErr(w, 400, "invalid_prefetch", "images must be a non-empty list of image references")
 		return
 	}
+	for _, ref := range images { // refused here, at once, not as a failed pull on every hotel
+		if e := imageRefRefusal(ref, false); e != nil {
+			writeErr(w, e.status, e.code, e.msg)
+			return
+		}
+	}
 	pl, e := b.parseSelection(g, req)
 	if e != nil {
 		writeErr(w, e.status, e.code, e.msg)
 		return
 	}
-	hotelBody := map[string]any{"images": images}
-	if auth, ok := req["registry_auth"]; ok && auth != nil {
-		hotelBody["registry_auth"] = auth // passed to the hotels, never stored
-	}
-	body, _ := json.Marshal(hotelBody)
-
-	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
-	var targets []*hotel
-	for _, h := range b.hotelList() {
-		if pl.selects(h) {
-			targets = append(targets, h)
-			job.Hotels[h.cfg.ID] = &prefetchHotel{State: "pulling", StartedAt: job.Created}
+	pin, _ := req["pin"].(bool)
+	if v, ok := req["pin"]; ok && v != nil {
+		if _, isBool := v.(bool); !isBool {
+			writeErr(w, 400, "invalid_prefetch", "pin must be true or false")
+			return
 		}
 	}
+	var pinMax int64
+	if pin {
+		b.mu.Lock()
+		pinMax = g.limits.pinMaxBytes()
+		b.mu.Unlock()
+		if pinMax == 0 {
+			writeErr(w, 403, "pins_not_enabled", "this key may not pin images; ask Cathedral for a pin limit")
+			return
+		}
+	}
+	auth := req["registry_auth"] // passed to the hotels, never stored
+
+	job := &prefetchJob{ID: newID("pf_"), guest: g.cfg.ID, pin: pinMax, Images: images, Created: time.Now().UTC(), Hotels: map[string]*prefetchHotel{}}
+	var targets []*hotel
+	b.mu.Lock()
+	for _, h := range b.hotelList() {
+		if !pl.selects(h) {
+			continue
+		}
+		st := &prefetchHotel{State: "pulling", StartedAt: job.Created}
+		job.Hotels[h.cfg.ID] = st
+		if b.prefetchDiskFull(h) { // AB#861: a pull would fill the scratch the rooms write to
+			err := imageStoreFull(h)
+			st.State, st.Error, st.FinishedAt = "failed", err, &job.Created
+			for _, ref := range images {
+				st.Images = append(st.Images, map[string]any{"ref": ref, "state": "failed", "error": err})
+			}
+			continue
+		}
+		for _, ref := range images {
+			st.Images = append(st.Images, map[string]any{"ref": ref, "state": "pulling"})
+		}
+		targets = append(targets, h)
+	}
+	gens := make([]int, len(targets))
+	for i, h := range targets {
+		gens[i] = h.warmGen
+	}
+	b.mu.Unlock()
 	b.prefetch.mu.Lock()
 	if b.prefetch.jobs == nil {
 		b.prefetch.jobs = map[string]*prefetchJob{}
@@ -792,51 +957,91 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 	view := b.prefetchView(job)
 	b.prefetch.mu.Unlock()
 
-	for _, h := range targets {
-		go b.prefetchOn(h, job, body)
+	for i, h := range targets {
+		go b.prefetchOn(h, job, auth, gens[i])
 	}
 	writeJSON(w, 202, view)
 }
 
-// prefetchOn pulls the images on one hotel. A pull can take minutes, so it
-// does not use the guest request context. The guest id is forwarded so the
-// hotel grants ownership of the pulled image ids to this guest (AB#650).
-func (b *broker) prefetchOn(h *hotel, job *prefetchJob, body []byte) {
+// prefetchOn pulls the job's images on one hotel, one ref per hotel call and
+// up to prefetchPerHotel at once, each with its own cap (AB#859): one call
+// for the whole list ran past its cap on a long list while the hotel kept
+// pulling. gen is h.warmGen when the job started.
+func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
 	g := b.guests[job.guest]
-	var status int
-	var out []byte
-	var err error
-	if g != nil {
-		status, _, out, err = h.doGuest(context.Background(), g, "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
-	} else {
-		status, _, out, err = h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
+	sem := make(chan struct{}, prefetchPerHotel)
+	var wg sync.WaitGroup
+	for i, ref := range job.Images {
+		sem <- struct{}{}
+		// Earlier pulls of this job may have taken the hotel to its disk line
+		// since the job was accepted: check again before each ref (AB#861).
+		b.mu.Lock()
+		full := b.prefetchDiskFull(h)
+		var refused map[string]any
+		if full {
+			refused = imageStoreFull(h)
+		}
+		b.mu.Unlock()
+		if full {
+			<-sem
+			b.prefetch.mu.Lock()
+			job.Hotels[h.cfg.ID].Images[i] = map[string]any{"ref": ref, "state": "failed", "error": refused}
+			b.prefetch.mu.Unlock()
+			continue
+		}
+		wg.Add(1)
+		go func(i int, ref string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			entry := b.prefetchRefPin(h, g, ref, auth, gen, true, job.pin)
+			b.prefetch.mu.Lock()
+			job.Hotels[h.cfg.ID].Images[i] = entry // a new map: views hold the old one
+			b.prefetch.mu.Unlock()
+		}(i, ref)
 	}
-	var doc map[string]any
-	_ = json.Unmarshal(out, &doc)
+	wg.Wait()
 	now := time.Now().UTC()
 	b.prefetch.mu.Lock()
 	defer b.prefetch.mu.Unlock()
 	st := job.Hotels[h.cfg.ID]
 	st.FinishedAt = &now
-	switch {
-	case err != nil:
-		st.State, st.Error = "failed", map[string]any{"code": "hotel_unreachable", "message": "hotel " + h.cfg.ID + " did not answer"}
-	case status == 200 || status == 202:
-		st.State = "done"
-		if res, ok := doc["result"].(map[string]any); ok {
-			if imgs, ok := res["images"].([]any); ok {
-				for _, x := range imgs {
-					if m, ok := x.(map[string]any); ok {
-						st.Images = append(st.Images, m)
-					}
-				}
+	st.State = "done"
+	failed := 0
+	for _, e := range st.Images {
+		if e["state"] == "failed" {
+			failed++
+			if st.Error == nil {
+				st.Error, _ = e["error"].(map[string]any)
 			}
 		}
-	default:
+	}
+	if job.pin > 0 {
+		// A kit before AB#860 pulls and ignores "pin"; only its echo says the
+		// images are kept, so one hotel without it reads not_supported.
+		done := 0
+		for _, e := range st.Images {
+			if e["state"] == "done" {
+				done++
+			}
+			switch e["pin"] {
+			case "pinned":
+				st.Pinned = append(st.Pinned, e["ref"])
+			case imageListNotKitted:
+				st.Pin = imageListNotKitted
+			}
+		}
+		switch {
+		case st.Pin != "":
+		case len(st.Pinned) > 0 && len(st.Pinned) == done:
+			st.Pin = "pinned"
+		case len(st.Pinned) > 0:
+			st.Pin = "partial" // some pulled images are not pinned: see each entry's pin
+		}
+	}
+	if failed > 0 {
 		st.State = "failed"
-		st.Error = map[string]any{"code": "prefetch_failed", "message": fmt.Sprintf("hotel answered %d", status)}
-		if e, ok := doc["error"].(map[string]any); ok {
-			st.Error = map[string]any{"code": e["code"], "message": e["message"], "status": status}
+		if failed > 1 && st.Error != nil {
+			st.Error = map[string]any{"code": st.Error["code"], "message": fmt.Sprintf("%d of %d images failed; first: %v", failed, len(st.Images), st.Error["message"])}
 		}
 	}
 }
@@ -847,6 +1052,9 @@ func (b *broker) prefetchView(job *prefetchJob) map[string]any {
 	summary := map[string]int{"pulling": 0, "done": 0, "failed": 0}
 	for id, st := range job.Hotels {
 		cp := *st
+		// Entries are replaced, never changed in place, so a copy of the
+		// slice is enough for the caller to encode after the lock.
+		cp.Images = slices.Clone(st.Images)
 		hotels[id] = cp
 		summary[st.State]++
 	}
@@ -872,3 +1080,7 @@ func (b *broker) handlePrefetchStatus(w http.ResponseWriter, g *guestState, id s
 	b.prefetch.mu.Unlock()
 	writeJSON(w, 200, view)
 }
+
+// errSealedOnly answers a create that asks for an unsealed room. Every hotel
+// is sealed (AB#776), so there is no class to place it on.
+var errSealedOnly = &apiErr{400, "sealed_only", `every Cathedral room is sealed; "sealed": false is not accepted (omit it or send "sealed": true)`}
