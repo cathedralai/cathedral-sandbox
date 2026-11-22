@@ -625,3 +625,39 @@ func TestPoolTakesInARoomSeenBeforeTheOldestCreate(t *testing.T) {
 		t.Fatalf("a room first seen 1 s after the oldest create in flight started: %+v, want it left to the create", after)
 	}
 }
+
+// A pool create never waits for a hotel data connection: when customer calls
+// hold every one, the create is not sent, and creates spaced at the broker
+// must not queue there and reach the hotel together once connections free
+// up (Codex review of #663 at 58b5ff4).
+func TestPoolCreatesNeverWaitForAHotelConnection(t *testing.T) {
+	pc := newPoolChain(t, []string{"a"}, func(c *config) { c.Hotels[0].DataConns = 2 })
+	poolSpacingFactor = 1.05
+	f, h := pc.hotels["a"], pc.b.hotelByID("a")
+	pc.up("a")
+	pc.putRefill(30, 1, 1)
+	var rels []func()
+	for i := 0; i < 2; i++ { // customer calls hold every data connection
+		rel, err := h.conns.acquire(context.Background(), "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rels = append(rels, rel)
+	}
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		pc.runPool(15*time.Second, stop)
+		close(done)
+	}()
+	time.Sleep(2400 * time.Millisecond)
+	for _, rel := range rels {
+		rel()
+	}
+	time.Sleep(2500 * time.Millisecond)
+	close(stop)
+	<-done
+	starts := f.createStarts()
+	if w := maxInWindow(starts, time.Second); w > 1 || len(starts) == 0 {
+		t.Fatalf("refill 1 a second, every connection held for 2.4 s: %d creates, %d within one second; want at least 1, never more than 1 a second", len(starts), w)
+	}
+}
