@@ -718,11 +718,17 @@ func testPoolProofFailuresBackOffAndAlarm(t *testing.T, bad func(f *fakePoolHote
 		defer pc.b.mu.Unlock()
 		return pc.b.pool.hotel("a").alarm
 	}
+	// Stop only once the alarm is set and the last unproven room's DELETE
+	// has reached the hotel: the alarm is set before that DELETE is sent,
+	// and cancelling the loop in between drops it (push CI 45022057499).
+	settled := func() bool {
+		return alarmed() != "" && len(f.roomDeletes()) == len(f.creates())
+	}
 	stop := make(chan struct{})
 	go func() {
 		defer close(stop)
 		end := time.Now().Add(25 * time.Second)
-		for time.Now().Before(end) && alarmed() == "" {
+		for time.Now().Before(end) && !settled() {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
