@@ -83,6 +83,9 @@ func (b *broker) handleMeter(w http.ResponseWriter, r *http.Request, id, action 
 	case action == meterRoomsAction && r.Method == "GET":
 		rooms, errs := b.meterRooms(r.Context(), g)
 		writeJSON(w, 200, map[string]any{"rooms": rooms, "hotel_errors": errs})
+	case action == meterFreezeAction && r.Method == "POST" && g.limits.Postpaid:
+		// A postpaid guest is billed, never frozen for balance (guests.go).
+		writeErr(w, 409, "guest_postpaid", "guest "+id+" is postpaid: its rooms are never frozen for balance; nothing changed")
 	case action == meterFreezeAction && r.Method == "POST":
 		b.meterFreezeAll(w, r, g)
 	default:
