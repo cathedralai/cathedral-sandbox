@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"io"
+	"log"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -138,7 +142,7 @@ func TestAllowanceStopFreezesOnlyItsGuestsRunningRooms(t *testing.T) {
 		t.Fatalf("PUT answer: %v", doc)
 	}
 	last := tc.waitStop(t, "g1", "")
-	if last["frozen"] != 2.0 || !reflect.DeepEqual(last["failed"], []any{}) || last["reason"] != "account_suspended" {
+	if last["frozen"] != 2.0 || !reflect.DeepEqual(last["failed"], map[string]any{}) || last["reason"] != "account_suspended" {
 		t.Fatalf("last_stop: %v", last)
 	}
 	if got := freezesOn(tc.hotels["b"]); !reflect.DeepEqual(got, []string{hotelRoomID(r1)}) {
@@ -164,7 +168,7 @@ func TestAllowanceStopRepeatFreezesNothingNew(t *testing.T) {
 	}
 	tc.putAllowance(t, "g1", stopBody(3, "abuse"))
 	second := tc.waitStop(t, "g1", first["at"].(string))
-	if second["frozen"] != 0.0 || !reflect.DeepEqual(second["failed"], []any{}) {
+	if second["frozen"] != 0.0 || !reflect.DeepEqual(second["failed"], map[string]any{}) {
 		t.Fatalf("second stop: %v", second)
 	}
 	if got := freezesOn(tc.hotels["b"]); !reflect.DeepEqual(got, []string{hotelRoomID(r1)}) {
@@ -288,8 +292,11 @@ func TestAllowanceStopResultInTheView(t *testing.T) {
 	bad := tc.room(t, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}})
 	f := tc.hotels["b"]
 	f.mu.Lock()
-	f.freezeFail = map[string]int{hotelRoomID(bad): 500}
+	f.freezeFail = map[string]int{hotelRoomID(bad): 502}
 	f.mu.Unlock()
+	var logged bytes.Buffer
+	log.SetOutput(io.MultiWriter(&logged, os.Stderr))
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 	before := time.Now().UTC()
 	tc.putAllowance(t, "g1", stopBody(2, "abuse"))
 	last := tc.waitStop(t, "g1", "")
@@ -297,8 +304,13 @@ func TestAllowanceStopResultInTheView(t *testing.T) {
 	if err != nil || at.Before(before) {
 		t.Fatalf("last_stop at %v (%v), want after %v", last["at"], err, before)
 	}
-	if last["reason"] != "abuse" || last["frozen"] != 1.0 || !reflect.DeepEqual(last["failed"], []any{bad}) || !reflect.DeepEqual(last["hotel_errors"], []any{}) {
+	if last["reason"] != "abuse" || last["frozen"] != 1.0 || !reflect.DeepEqual(last["failed"], map[string]any{bad: "freeze_failed"}) || !reflect.DeepEqual(last["hotel_errors"], []any{}) {
 		t.Fatalf("last_stop: %v", last)
+	}
+	// AB#948: the log line names each room with its code, so a stop that froze
+	// nothing says why.
+	if want := "not frozen: [" + bad + "=freeze_failed]"; !strings.Contains(logged.String(), want) {
+		t.Fatalf("stop log %q, want %q", logged.String(), want)
 	}
 	if hotelRoomState(f, hotelRoomID(ok)) != "frozen" || hotelRoomState(f, hotelRoomID(bad)) != "running" {
 		t.Fatal("room states after a partial stop")
