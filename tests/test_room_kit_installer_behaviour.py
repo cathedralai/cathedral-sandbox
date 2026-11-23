@@ -163,6 +163,8 @@ case "${1:-}" in
 esac
 exit 0""",
     "ip6tables": "exit 0",
+    # FAKE_HOSTS: "name=ip name=ip", what the resolver answers.
+    "getent": r"""for x in ${FAKE_HOSTS:-}; do [ "${x%%=*}" = "${2:-}" ] && echo "${x#*=}  STREAM ${2}"; done; exit 0""",
     "ip": r"""
 case "$*" in
   "-o route show") printf '%s\n' "${FAKE_IP_ROUTES:-}" ;;
@@ -1130,17 +1132,31 @@ def test_host_net_ingress_forwards_443_to_the_guest_ingress_port(host: FakeHost)
     assert INGRESS_DNAT.replace(" -A ", " -D ") in host.calls("iptables")
 
 
-def test_host_net_ingress_lets_the_guest_reach_a_broker_on_this_host_only_on_its_port(host: FakeHost) -> None:
+def test_host_net_ingress_lets_the_guest_reach_a_broker_on_this_host_only_on_its_address_and_port(host: FakeHost) -> None:
     # AB#422: nc-sealed-2 shares Frankfurt with the broker; live.cathedral.computer resolves to this host,
     # and the guest's DNS-01 PUT was dropped by the IN chain, so no certificate was ever ordered.
-    for env, port in ((INGRESS, "443"), ({**INGRESS, "SEALED_INGRESS_BROKER_URL": "https://broker.example:8443"}, "8443")):
-        proc = _run_host_net(host, "up", env)
+    # Only the broker's own address opens; the host's other addresses (bridge, tailscale) stay shut.
+    addrs = {"FAKE_IP_ADDRS": "eth0=203.0.113.7/24 docker0=172.17.0.1/16 tailscale0=100.101.0.9/32"}
+    for sealed, port in ((INGRESS, "443"), ({**INGRESS, "SEALED_INGRESS_BROKER_URL": "https://broker.example:8443"}, "8443")):
+        url = sealed.get("SEALED_INGRESS_BROKER_URL", "https://live.example")
+        name = url.split("//")[1].split(":")[0]
+        proc = _run_host_net(host, "up", {**sealed, "SEALED_INGRESS_BROKER_URL": url},
+                             FAKE_HOSTS=f"{name}=203.0.113.7 other.example=198.51.100.1", **addrs)
         assert proc.returncode == 0, proc.stderr[-3000:]
         inn = [c.split("SEALED-SNP0-IN ")[1] for c in host.calls("iptables") if c.startswith("iptables -A SEALED-SNP0-IN ")]
         assert inn[-3:] == [
             "-i snp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
-            f"-i snp0 -s 10.215.0.2 -p tcp --dport {port} -m addrtype --dst-type LOCAL -m conntrack --ctstate NEW -j ACCEPT",
+            f"-i snp0 -s 10.215.0.2 -d 203.0.113.7 -p tcp --dport {port} -m conntrack --ctstate NEW -j ACCEPT",
             "-i snp0 -j DROP"], inn
+
+
+def test_host_net_ingress_with_the_broker_elsewhere_keeps_the_guest_off_this_host(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up", {**INGRESS, "SEALED_INGRESS_BROKER_URL": "https://live.example"},
+                         FAKE_HOSTS="live.example=198.51.100.1", FAKE_IP_ADDRS="eth0=203.0.113.7/24")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    inn = [c.split("SEALED-SNP0-IN ")[1] for c in host.calls("iptables") if c.startswith("iptables -A SEALED-SNP0-IN ")]
+    assert inn[-2:] == ["-i snp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT", "-i snp0 -j DROP"], inn
+    assert not any("--dport 443 -m conntrack --ctstate NEW" in c for c in inn)
 
 
 def test_host_net_without_ingress_keeps_the_guest_off_this_host(host: FakeHost) -> None:
