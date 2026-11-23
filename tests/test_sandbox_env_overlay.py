@@ -118,12 +118,12 @@ def test_a_sealed_exec_gets_the_overlay_too(fake, app) -> None:
 
 
 def test_the_image_probes_never_carry_the_overlay(fake, app) -> None:
-    # The bash and timeout probes run once, on the first exec after the overlay is set.
+    # The image probe (AB#732: one exec, at create) and any single probe after it.
     _, api = app
     room = _room(api)
     _set(api, room, {"OVERLAY_A": VALUE})
     call(api, "POST", f"/v1/sandboxes/{room}/exec", {"cmd": "echo probe-marker"})
-    probes = [c for c in fake.calls_of("exec") if c[-1] in ("true", ":")]
+    probes = [c for c in fake.calls_of("exec") if c[-1] in ("true", ":") or "cathedral-image-probe" in c[-1]]
     assert probes and all("-e" not in c for c in probes)
 
 

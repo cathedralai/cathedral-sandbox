@@ -427,6 +427,16 @@ def main(argv):
                 rest = rest[i + 1:]
                 break
         form = b.get("timeout_form", "gnu")
+        if len(rest) == 3 and rest[:2] == ["sh", "-c"] and "cathedral-image-probe" in rest[2]:
+            # The one-exec image probe (AB#732), answered from the same knobs as the single probes.
+            if b.get("no_sh"):
+                print("exec: \"sh\": executable file not found in $PATH", file=sys.stderr)
+                return 127
+            if b.get("image_probe_garbled"):
+                print("garbled")
+                return 0
+            print(f"cathedral-image-probe bash={0 if b.get('no_bash') else 1} timeout={form}")
+            return 0
         if rest[:1] == ["timeout"]:
             # BusyBox: timeout [-s SIG] [-t SECS] PROG; GNU: timeout [-k N] SECS PROG.
             opts = rest[1:]
