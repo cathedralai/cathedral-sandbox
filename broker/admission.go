@@ -99,6 +99,10 @@ type admission struct {
 	// firmware sets it at SNP launch, so a new value means a new launch
 	// (lend.go). Empty when the report carries all zeros there.
 	reportID string
+	// policy and launchTCB (LAUNCH_TCB, 0x1F0, 16 hex) of the admitted
+	// report: a fresh report must carry the same (fresh_attest.go).
+	policy    uint64
+	launchTCB string
 	// amd is the AMD chain result (product, ark_sha256, tcb) of the binding
 	// amdBinding; nil when the chain was not checked.
 	amd        map[string]any
@@ -249,6 +253,9 @@ func (b *broker) admissionDoc(h *hotel, now time.Time) map[string]any {
 	}
 	if inst := h.installDoc(); inst != nil {
 		d["hotel_key_install"] = inst
+	}
+	if fr := b.freshDoc(h, now); fr != nil {
+		d["fresh"] = fr // miner hotels: the fresh attestation gate of new rooms (fresh_attest.go)
 	}
 	if !h.adm.attestedAt.IsZero() {
 		d["attested_at"] = h.adm.attestedAt.UTC().Format(time.RFC3339)
@@ -498,7 +505,7 @@ func verifyAttestation(rawBinding []byte, bindingSHA, reportB64 string, measurem
 		receiptKey = raw
 	}
 	return admission{measurement: measurement, bindingSHA: bsha, chipID: chip[:16], chipFull: chip, receiptKey: receiptKey,
-		reportID: snpReportID(report)}, nil
+		reportID: snpReportID(report), policy: policy, launchTCB: hex.EncodeToString(report[0x1F0:0x1F8])}, nil
 }
 
 // snpReportID is the REPORT_ID of an SEV-SNP attestation report as hex, or

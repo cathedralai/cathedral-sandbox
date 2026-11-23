@@ -240,6 +240,10 @@ type config struct {
 	MinGenoaMicrocodeSPL int     `json:"min_genoa_microcode_spl,omitempty"`
 	AttestTTLSeconds     float64 `json:"attest_ttl_seconds,omitempty"`   // a pass is good this long (default 600)
 	AttestEverySeconds   float64 `json:"attest_every_seconds,omitempty"` // check a passed hotel again this often (default 60)
+	// MinerFreshAttestSeconds (AB#947): a miner hotel takes a new room only
+	// with a fresh report younger than this (fresh_attest.go). Default 30,
+	// 5 to 300.
+	MinerFreshAttestSeconds float64 `json:"miner_fresh_attest_seconds,omitempty"`
 	// RequireSealedGuestTLS (AB#378): every sealed hotel is reached only over
 	// its attested guest TLS key. A sealed config hotel must set "guest_tls":
 	// true, and a sealed join must pass the keyless HTTPS bootstrap. Off by
@@ -391,11 +395,12 @@ type hotel struct {
 	failed          int
 	rejected        int
 	lat             latencies
-	createEWMA      float64   // seconds, moving average of the hotel create call (placement.go)
-	moved           int       // creates that left this hotel's queue for another hotel
-	runtime         bool      // joined at runtime (hotels.go), not from the config file
-	adm             admission // attestation gate of a joined sealed hotel (admission.go)
-	prob            probation // miner probation (probation.go)
+	createEWMA      float64    // seconds, moving average of the hotel create call (placement.go)
+	moved           int        // creates that left this hotel's queue for another hotel
+	runtime         bool       // joined at runtime (hotels.go), not from the config file
+	adm             admission  // attestation gate of a joined sealed hotel (admission.go)
+	freshAtt        freshProof // fresh attestation of a miner hotel before new rooms (fresh_attest.go)
+	prob            probation  // miner probation (probation.go)
 	probationOn     atomic.Bool
 	delivery        delivery // delivered capacity against the commitment (commitment.go)
 	// roomsUnchecked: loaded at start and no room list has answered since. A
@@ -669,6 +674,9 @@ func validateTopConfig(c config) error {
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return err
 	}
+	if err := validateMinerFreshAttest(c.MinerFreshAttestSeconds); err != nil {
+		return err
+	}
 	if c.MinGenoaSNPSPL < 0 || c.MinGenoaSNPSPL > 255 {
 		return errors.New("config: min_genoa_snp_spl must be an 8-bit SNP component value")
 	}
@@ -814,6 +822,9 @@ func buildGuests(c config) (map[string]*guestState, map[string]*guestState, erro
 		}
 		if guests[gc.ID] != nil {
 			return nil, nil, fmt.Errorf("config: guest id %q appears twice", gc.ID)
+		}
+		if gc.ID == freshGuestID {
+			return nil, nil, fmt.Errorf("config: guest id %q is reserved for the broker's fresh attestation checks (AB#947)", freshGuestID)
 		}
 		if gc.Policy != nil {
 			if err := gc.Policy.validate(); err != nil {
@@ -1235,8 +1246,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		b.mu.Lock()
 		// The hotel was admitted when the create was placed, but the create
 		// may have queued for its slot past a refused or expired attestation,
-		// or past a leave. Give the slot back and place the create again.
-		if h.leaving || !b.admitted(h, time.Now()) {
+		// a lapsed fresh proof (a miner hotel, fresh_attest.go), or a leave.
+		// Give the slot back and place the create again.
+		if now := time.Now(); h.leaving || !b.admitted(h, now) || !b.freshAttestOK(h, now) {
 			h.queued--
 			g.queued--
 			h.holdDisk(pl, -1)
@@ -2714,6 +2726,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 	listedAt := time.Now()
 	defer b.sampleProbation(h) // registered first, so it runs last: after the health and attestation steps
 	defer b.fillLentBaseline(ctx, h, herr == nil)
+	defer b.syncFresh(ctx, h, herr == nil)     // after admission: a miner hotel's fresh report (fresh_attest.go)
 	defer b.syncAdmission(ctx, h, herr == nil) // after the health state below is stored
 	forced := false                            // the fail-closed check below made the hotel lent: save it once b.mu is free
 	defer func() {
