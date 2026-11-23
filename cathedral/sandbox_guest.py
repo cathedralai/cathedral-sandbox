@@ -2947,6 +2947,13 @@ class DockerGuestProvider:
         if dind:
             self._capabilities_dind = True
             self._client.wait_dind_ready(container_id)
+        # AB#732: learn the image's tools while the room is made, so its first
+        # command does not wait for the probe. Best effort: on any failure the
+        # first command probes, as before.
+        try:
+            self._probe_image(self._guests[sandbox_id])
+        except SandboxOpError:
+            pass
         # Guest start can take longer than a short idle_timeout; refresh activity
         # so idle GC does not reap a sandbox mid-create.
         with self._inner._lock:  # noqa: SLF001
@@ -3213,8 +3220,9 @@ class DockerGuestProvider:
         """Learn sh, bash and the timeout form in one ``docker exec`` (AB#732).
 
         A room's first command used to wait for up to four probe execs in a row
-        (bash, timeout GNU, timeout BusyBox, sh), about 60 ms each in a sealed
-        room. This runs the same checks inside one ``sh``, once per room. An
+        (bash, timeout GNU, timeout BusyBox, sh), about 55 ms each in a sealed
+        room. This runs the same checks inside one ``sh``, once per room, at
+        create (_after_start) or else before the first command that needs one. An
         answer it cannot read (no sh, odd output) leaves the fields unset and the
         single probes run as before; a paused room is refused and nothing is kept.
         """

@@ -308,11 +308,14 @@ def test_timed_command_still_runs_when_the_image_has_a_timeout_program(fake: Fak
 
 @pytest.mark.parametrize("form", ["gnu", "busybox", "none"])
 @pytest.mark.parametrize("no_bash", [False, True])
-def test_first_command_in_a_room_runs_one_image_probe(fake: FakeDocker, form: str, no_bash: bool) -> None:
+def test_a_room_runs_one_image_probe_at_create_and_none_on_its_commands(
+    fake: FakeDocker, form: str, no_bash: bool
+) -> None:
     fake.set(timeout_form=form, no_bash=no_bash, exec_rules=[{"contains": "first-marker", "stdout": "ok", "exit": 0}])
     provider = DockerGuestProvider()
     try:
         sid = _room(provider)
+        assert len(_image_probes(fake)) == 1  # at create, before any command
         for _ in range(2):
             # A spill token turns on the cancel wrapper, so sh is asked for too.
             result = provider.exec(
@@ -327,6 +330,8 @@ def test_first_command_in_a_room_runs_one_image_probe(fake: FakeDocker, form: st
             assert result.exit_code == 0 and result.stdout == "ok"
         assert len(_image_probes(fake)) == 1
         assert _single_probes(fake) == []
+        calls = fake.calls_of("exec")
+        assert calls.index(_image_probes(fake)[0]) < calls.index(_guest_execs(fake, "first-marker")[0])
         for call in _guest_execs(fake, "first-marker"):
             assert ("bash" not in call) is no_bash
             assert ("timeout" in call) is (form != "none")
@@ -367,12 +372,32 @@ def test_image_probe_on_a_paused_room_is_refused_not_cached(fake: FakeDocker) ->
     provider = DockerGuestProvider()
     try:
         sid = _room(provider)
+        guest = provider._guests[sid]
+        # A room whose probe has not run yet (its create-time probe failed).
+        guest.image_probed, guest.timeout_form, guest.has_bash, guest.has_sh = False, None, None, None
         for cid in fake.containers:
             fake.set_container(cid, status="paused")
         with pytest.raises(SandboxOpError) as err:
             provider.exec(sid, ExecRequest(cmd=["echo", "after-marker"]))
         assert err.value.code == "sandbox_paused"
-        guest = provider._guests[sid]
         assert guest.timeout_form is None and guest.has_bash is None and guest.has_sh is None
+    finally:
+        provider.close()
+
+
+def test_create_succeeds_when_the_image_probe_cannot_run(fake: FakeDocker) -> None:
+    # No sh in the image: the create-time probe gets no answer, the room is still
+    # made, and its first command asks the single probes as before.
+    fake.set(no_sh=True, exec_rules=[{"contains": "nosh-first", "exit": 0}])
+    provider = DockerGuestProvider()
+    try:
+        sid = _room(provider)
+        assert len(_image_probes(fake)) == 1
+        result = provider.exec(sid, ExecRequest(cmd=["echo", "nosh-first"], spill_token="cd" * 16))
+        assert result.exit_code == 0
+        assert len(_image_probes(fake)) == 1
+        assert [c for c in fake.calls_of("exec") if c[-3:] == ["sh", "-c", ":"]]
+        (call,) = _guest_execs(fake, "nosh-first")
+        assert not exec_cancel_wrapped(call)  # no cancel wrapper without sh
     finally:
         provider.close()
