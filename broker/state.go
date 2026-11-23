@@ -1,6 +1,6 @@
 // Durable client state (#290). With state_dir set, the broker keeps in
 // state_dir/client-state.json:
-//   - the client id (UUID) of each room, so an id still works after a restart;
+//   - the client id (UUID) and its owner, so an id still works after a restart;
 //   - finished Idempotency-Key answers, so a repeated create after a restart
 //     returns the first answer and starts no new room;
 //   - deleted-room tombstones;
@@ -39,7 +39,8 @@ type savedTomb struct {
 }
 
 type savedState struct {
-	UUIDs      map[string]string                     `json:"uuids"` // client id -> broker room id
+	UUIDGuests map[string]string                     `json:"uuid_guests,omitempty"` // client id -> owner when saved
+	UUIDs      map[string]string                     `json:"uuids"`                 // client id -> broker room id
 	Idem       map[string]savedIdem                  `json:"idempotency"`
 	Tombs      map[string]savedTomb                  `json:"tombstones"`
 	Images     map[string]*compatImage               `json:"images"`
@@ -87,13 +88,14 @@ func (b *broker) saveCompat() error {
 	b.stateSaveMu.Lock()
 	defer b.stateSaveMu.Unlock()
 	st := savedState{
-		UUIDs: map[string]string{}, Idem: map[string]savedIdem{}, Tombs: map[string]savedTomb{},
+		UUIDs: map[string]string{}, UUIDGuests: map[string]string{}, Idem: map[string]savedIdem{}, Tombs: map[string]savedTomb{},
 		Images: map[string]*compatImage{}, GuestRooms: map[string]map[string]map[string]bool{},
 	}
 	b.mu.Lock()
 	for u, rm := range b.byUUID {
 		if rm.id != "" {
 			st.UUIDs[u] = rm.id
+			st.UUIDGuests[u] = rm.guest
 		}
 	}
 	// Ids read at start whose rooms the sync loop has not listed yet: keep
@@ -101,6 +103,9 @@ func (b *broker) saveCompat() error {
 	for bid, u := range b.savedUUIDs {
 		if _, taken := st.UUIDs[u]; !taken {
 			st.UUIDs[u] = bid
+			if owner := b.savedUUIDGuests[bid]; owner != "" {
+				st.UUIDGuests[u] = owner
+			}
 		}
 	}
 	for guest, byHotel := range b.guestRooms {
@@ -199,7 +204,7 @@ func (b *broker) loadCompat() error {
 	}
 	var st savedState
 	var bad []string
-	for name, into := range map[string]any{"uuids": &st.UUIDs, "idempotency": &st.Idem, "tombstones": &st.Tombs,
+	for name, into := range map[string]any{"uuids": &st.UUIDs, "uuid_guests": &st.UUIDGuests, "idempotency": &st.Idem, "tombstones": &st.Tombs,
 		"images": &st.Images, "guest_rooms": &st.GuestRooms, "miner_exits": &st.MinerExits, "ended_rooms": &st.EndedRooms} {
 		if v, ok := sections[name]; ok && len(v) > 0 {
 			if err := json.Unmarshal(v, into); err != nil {
@@ -215,8 +220,10 @@ func (b *broker) loadCompat() error {
 	b.restoreMinerExits(st.MinerExits, time.Now())
 	b.restoreEnded(st.EndedRooms, time.Now())
 	b.savedUUIDs = map[string]string{}
+	b.savedUUIDGuests = map[string]string{}
 	for u, bid := range st.UUIDs {
 		b.savedUUIDs[bid] = u
+		b.savedUUIDGuests[bid] = st.UUIDGuests[u]
 	}
 	if len(st.GuestRooms) > 0 {
 		b.guestRooms = map[string]map[string]map[string]struct{}{}

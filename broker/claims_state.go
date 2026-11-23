@@ -117,6 +117,7 @@ func (b *broker) mapRoomLocked(h *hotel, rm *room, guest string, m roomMapping) 
 	// Mapped back: the pool period, if it had one, ends by absence.
 	rm.periodRun = ""
 	delete(b.savedUUIDs, rm.id) // the journal's client id wins over client-state.json
+	delete(b.savedUUIDGuests, rm.id)
 	b.byUUID[rm.uuid] = rm
 	b.markDirty()
 	b.rememberGuestRoom(guest, h.cfg.ID, rm.hid)
