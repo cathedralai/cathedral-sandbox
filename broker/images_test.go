@@ -606,6 +606,25 @@ func (tc *testChain) start(t *testing.T) {
 	tc.b = b
 	tc.srv = httptest.NewServer(b)
 	t.Cleanup(tc.srv.Close)
+	// Joined hotels' sync loops (fresh checks write a verifier temp file in
+	// state_dir) must end before the test's temp dirs are removed, also for
+	// a broker the test replaced with a restart.
+	t.Cleanup(func() { stopHotelLoops(b) })
+}
+
+func stopHotelLoops(b *broker) {
+	for _, h := range b.hotelList() {
+		if h.stop == nil {
+			continue
+		}
+		h.stop()
+		if h.syncDone != nil {
+			select {
+			case <-h.syncDone:
+			case <-time.After(10 * time.Second):
+			}
+		}
+	}
 }
 
 func (tc *testChain) call(t *testing.T, key, method, path string, body any) (int, map[string]any) {
