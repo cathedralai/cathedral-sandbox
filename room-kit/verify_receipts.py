@@ -180,9 +180,17 @@ Usage:
   verify_receipts.py --broker ... --operator-key-file OP --hotel <id>   # receipts from earlier boots
   verify_receipts.py --origin https://<miner ip>:<port> --require-sealed [--expected-measurement M]
   add --owner-pubkey B64 --expected-measurement HEX for a dedicated machine
+  verify_receipts.py --fresh-report answer.json --report-data-hex HEX128 --ark-sha256 HEX [--kds-cache DIR]
   verify_receipts.py --oneshot run.json --recipe recipe.json (--context ctx.json | --no-context) \\
       --ark-sha256 HEX --expected-measurement HEX [--run-id UUID] [--input-sha256 PATH=HEX | --input-file PATH=FILE] \\
       [--output-file PATH=FILE]
+
+Fresh report mode (--fresh-report FILE --report-data-hex HEX, AB#947) checks one answer of POST /room/attest:
+the report's REPORT_DATA is exactly the 64 bytes given, debug is off in the policy, and the report signature
+verifies under the AMD chain (KDS or --kds-cache, pinned by --ark-sha256, which this mode requires). Nothing
+else in the answer is read: its binding_sha256 and measurement members are unsigned. The output names the
+signed fields (measurement, chip id, REPORT_ID, policy, launch and reported TCB) for the caller to compare
+with what it admitted. It takes only --ark-sha256, --kds-cache and --product; any other flag is exit 2.
 
 When receipts name a binding_sha256 other than the live attestation, pass --broker and
 --operator-key-file so GET /v1/broker/bindings/<sha> can load each archived binding.
@@ -440,6 +448,33 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
     except InvalidSignature as exc:
         raise Fail("report signature does not verify with the VCEK") from exc
     return {"product": prod, "ark_sha256": ark_fp, "tcb": {"bootloader": bl, "tee": tee, "snp": snp, "microcode": ucode}}
+
+
+def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: str,
+                        ark_sha256: str | list[str] | None) -> dict:
+    """One POST /room/attest answer: REPORT_DATA is the caller's, debug is off, the AMD chain signs the report.
+
+    Only the signed report is read. The answer's other members (binding_sha256, measurement) are the hotel's
+    word and are ignored; the caller compares the signed fields this returns with what it admitted."""
+    need(isinstance(answer, dict), "the fresh report answer is not a JSON object")
+    raw = answer.get("report_b64")
+    need(isinstance(raw, str) and raw != "", "the fresh report answer has no report_b64")
+    try:
+        report = base64.b64decode(raw, validate=True)
+    except ValueError as exc:
+        raise Fail("the fresh report's report_b64 is not base64") from exc
+    rep = parse_report(report)
+    need(re.fullmatch(r"[0-9a-fA-F]{128}", report_data_hex or "") is not None,
+         "--report-data-hex must be 128 hex characters (64 bytes)")
+    need(rep["report_data"] == bytes.fromhex(report_data_hex), "REPORT_DATA is not the value sent")
+    need(not rep["policy"] & (1 << 19), "guest policy allows debug")
+    need(bool(ark_sha256), "a fresh report needs --ark-sha256: an unpinned chain proves nothing")
+    amd = verify_amd(report, rep, product(rep, prod), cache, ark_sha256)
+    return {"fresh_report": {"report_data_hex": rep["report_data"].hex(), "measurement": rep["measurement"],
+                             "chip_id": rep["chip_id"].hex(), "report_id": report[0x140:0x160].hex(),
+                             "policy": hex(rep["policy"]), "launch_tcb": report[0x1F0:0x1F8].hex(),
+                             "reported_tcb": rep["reported_tcb"].hex(), "report_version": rep["version"]},
+            "attestation": {"amd": amd}}
 
 
 def is_hotel_level(att: dict) -> bool:
@@ -2431,7 +2466,32 @@ def main() -> int:
                                      "and check the TLS peer and the install key")
     ap.add_argument("--cathedral-sandbox", help="a Cathedral sandbox id (UUID): fail unless a successful create "
                                                 "receipt names it")
+    ap.add_argument("--fresh-report", help="fresh report mode: an answer of POST /room/attest to check (AB#947)")
+    ap.add_argument("--report-data-hex", help="fresh report mode: the 64 bytes (128 hex) sent as REPORT_DATA")
     a = ap.parse_args()
+    if a.fresh_report is not None or a.report_data_hex is not None:
+        # Fresh report mode reads the signed report and nothing else: every other flag would be a check
+        # the caller believes ran.
+        clash = [flag for flag, value in vars(a).items()
+                 if flag not in ("fresh_report", "report_data_hex", "ark_sha256", "kds_cache", "product")
+                 and value is not None and value is not False and value != []]
+        if clash:
+            ap.error("--fresh-report takes only --report-data-hex, --ark-sha256, --kds-cache and --product; not "
+                     + ", ".join("--" + f.replace("_", "-") for f in clash))
+        if not a.fresh_report or a.report_data_hex is None:
+            ap.error("--fresh-report FILE and --report-data-hex HEX go together")
+        try:
+            out = verify_fresh_report(read_document(a.fresh_report, "fresh report answer"), a.report_data_hex,
+                                      a.product, a.kds_cache or os.path.expanduser("~/.cache/amd-kds"),
+                                      a.ark_sha256)
+        except Fail as exc:
+            print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
+            return 1
+        except (KeyError, TypeError, AttributeError, IndexError) as exc:
+            print(json.dumps({"verdict": "FAIL", "reason": f"internal error: {type(exc).__name__}"}))
+            return 1
+        print(json.dumps({"verdict": "PASS", **out}, indent=1))
+        return 0
     if a.min_genoa_snp_spl is not None and not 1 <= a.min_genoa_snp_spl <= 255:
         ap.error("--min-genoa-snp-spl must be an integer from 1 to 255")
     if a.oneshot:

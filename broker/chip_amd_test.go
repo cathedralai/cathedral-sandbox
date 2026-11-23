@@ -45,6 +45,7 @@ func recheck(t *testing.T, tc *testChain, id string) {
 	h.adm.checkedAt = time.Time{}
 	tc.b.mu.Unlock()
 	tc.b.syncAdmission(context.Background(), h, true)
+	freshSettled(tc, h)
 }
 
 func TestOneHotelPerChip(t *testing.T) {
@@ -575,5 +576,42 @@ func TestRealVerifierChecksTheAMDChain(t *testing.T) {
 	b.cfg.AMDVerifier.ARKSHA256 = arkPins{arkMilan, hex.EncodeToString(arkSum[:])}
 	if _, err := b.verifyAMDChain(context.Background(), doc(bad)); err == nil || !strings.Contains(err.Error(), "signature") {
 		t.Fatalf("bad signature with a list: %v", err)
+	}
+
+	// AB#947: the fresh report mode, run as checkFresh runs it. The answer's
+	// binding_sha256 is unsigned and wrong here; the verifier does not read it.
+	b.cfg.AMDVerifier.ARKSHA256 = arkPins{hex.EncodeToString(arkSum[:])}
+	fresh := append([]byte{}, rep...)
+	sent := make([]byte, 64)
+	for i := range sent {
+		sent[i] = byte(0x6d + i)
+	}
+	copy(fresh[0x50:0x90], sent)
+	sign(fresh)
+	runFresh := func(report, rd []byte) (map[string]any, error) {
+		answer, _ := json.Marshal(map[string]any{"report_b64": base64.StdEncoding.EncodeToString(report), "binding_sha256": strings.Repeat("0", 64)})
+		return b.runAMDVerifier(context.Background(), answer, []string{"--fresh-report", "", "--report-data-hex", hex.EncodeToString(rd)}, 1, freshSlotAcquire(time.Second))
+	}
+	if amd, err := runFresh(fresh, sent); err != nil || amd["product"] != "Genoa" {
+		t.Fatalf("fresh report: %v %v", amd, err)
+	}
+	flipped := append([]byte{}, sent...)
+	flipped[9] ^= 1
+	if _, err := runFresh(fresh, flipped); err == nil || !strings.Contains(err.Error(), "REPORT_DATA is not the value sent") {
+		t.Fatalf("fresh report over another value: %v", err)
+	}
+	if _, err := runFresh(fresh, rep[0x50:0x90]); err == nil || !strings.Contains(err.Error(), "REPORT_DATA is not the value sent") {
+		t.Fatalf("the boot report replayed as fresh: %v", err)
+	}
+	forged := append([]byte{}, fresh...)
+	forged[0x50+9] ^= 1
+	if _, err := runFresh(forged, forged[0x50:0x90]); err == nil || !strings.Contains(err.Error(), "signature") {
+		t.Fatalf("fresh report with a REPORT_DATA byte flipped after signing: %v", err)
+	}
+	otherChip := append([]byte{}, fresh...)
+	otherChip[0x1A0] ^= 0xff
+	_ = os.WriteFile(filepath.Join(cache, "vcek-"+hex.EncodeToString(otherChip[0x1A0:0x1E0])[:16]+"-"+hex.EncodeToString(tcb)+".der"), vcek.Raw, 0o600)
+	if _, err := runFresh(otherChip, sent); err == nil || !strings.Contains(err.Error(), "hwID") {
+		t.Fatalf("fresh report naming another chip: %v", err)
 	}
 }

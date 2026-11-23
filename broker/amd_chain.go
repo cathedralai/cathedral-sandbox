@@ -38,6 +38,14 @@
 //	Genoa  4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1
 //	Turin  1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a
 //
+// A miner hotel's fresh check (fresh_attest.go) runs the same verifier as
+//
+//	<command...> --fresh-report <file> --report-data-hex <hex> --ark-sha256 <pin>... [--kds-cache <dir>]
+//
+// on the POST /room/attest answer: REPORT_DATA must be the value sent, debug
+// off, and the AMD chain must sign the report. One of the amdParallel slots
+// is reserved for these checks (amdSlots).
+//
 // verify_receipts.py reads the Milan and Genoa TCB layouts only: a Turin pin
 // is accepted here but a Turin report fails until the verifier handles it.
 package main
@@ -105,12 +113,62 @@ func (c *amdVerifierConfig) validate() error {
 	return nil
 }
 
-// amdSlots limits verifier processes across the broker.
-var amdSlots = make(chan struct{}, amdParallel)
+// amdSlots limits verifier processes across the broker. Joins and admission
+// checks take only amdSlots; a fresh check of a miner hotel (fresh_attest.go)
+// takes freshSlot first, or an amdSlots slot when one is free. So at most
+// amdParallel verifiers run, and slow joins (a KDS fetch can hold a slot for
+// 30 s) cannot starve the fresh checks that keep miner hotels placeable.
+var (
+	amdSlots  = make(chan struct{}, amdParallel-1)
+	freshSlot = make(chan struct{}, 1)
+)
+
+// errVerifierBusy is a verifier run that got no slot before its deadline.
+var errVerifierBusy = errors.New("AMD chain verifier is busy")
+
+// verifierNoVerdict is a verifier run that printed no PASS or FAIL: it did
+// not run, timed out, or crashed. Not an answer about the report.
+type verifierNoVerdict struct{ error }
 
 // verifyAMDChain runs the configured verifier on raw, the attestation
 // document as served. It returns the verifier's "amd" result.
 func (b *broker) verifyAMDChain(ctx context.Context, raw []byte) (map[string]any, error) {
+	return b.runAMDVerifier(ctx, raw, []string{"--attestation", "", "--require-sealed"}, 1, amdSlotAcquire)
+}
+
+// amdSlotAcquire takes a join or admission verifier slot.
+func amdSlotAcquire(ctx context.Context) (func(), error) {
+	select {
+	case amdSlots <- struct{}{}:
+		return func() { <-amdSlots }, nil
+	case <-ctx.Done():
+		return nil, errVerifierBusy
+	}
+}
+
+// freshSlotAcquire takes the reserved fresh slot or a shared one, whichever
+// is free first, waiting at most wait.
+func freshSlotAcquire(wait time.Duration) func(ctx context.Context) (func(), error) {
+	return func(ctx context.Context) (func(), error) {
+		t := time.NewTimer(wait)
+		defer t.Stop()
+		select {
+		case freshSlot <- struct{}{}:
+			return func() { <-freshSlot }, nil
+		case amdSlots <- struct{}{}:
+			return func() { <-amdSlots }, nil
+		case <-t.C:
+			return nil, errVerifierBusy
+		case <-ctx.Done():
+			return nil, errVerifierBusy
+		}
+	}
+}
+
+// runAMDVerifier writes raw to a temporary file and runs the verifier with
+// mode, whose element fileAt is replaced by that file's path, then the ARK
+// pins and the KDS cache.
+func (b *broker) runAMDVerifier(ctx context.Context, raw []byte, mode []string, fileAt int, acquire func(context.Context) (func(), error)) (map[string]any, error) {
 	c := b.cfg.AMDVerifier
 	timeout := defaultAMDTimeout
 	if c.TimeoutSeconds > 0 {
@@ -118,23 +176,24 @@ func (b *broker) verifyAMDChain(ctx context.Context, raw []byte) (map[string]any
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	select {
-	case amdSlots <- struct{}{}:
-		defer func() { <-amdSlots }()
-	case <-ctx.Done():
-		return nil, errors.New("AMD chain verifier is busy")
+	release, err := acquire(ctx)
+	if err != nil {
+		return nil, err
 	}
+	defer release()
 	f, err := os.CreateTemp(b.cfg.StateDir, "attestation-*.json")
 	if err != nil {
-		return nil, fmt.Errorf("AMD chain verifier: %v", err)
+		return nil, verifierNoVerdict{fmt.Errorf("AMD chain verifier: %v", err)}
 	}
 	defer os.Remove(f.Name())
 	if _, err := f.Write(raw); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("AMD chain verifier: %v", err)
+		return nil, verifierNoVerdict{fmt.Errorf("AMD chain verifier: %v", err)}
 	}
 	f.Close()
-	args := append(append([]string{}, c.Command[1:]...), "--attestation", f.Name(), "--require-sealed")
+	mode = append([]string{}, mode...)
+	mode[fileAt] = f.Name()
+	args := append(append([]string{}, c.Command[1:]...), mode...)
 	for _, pin := range c.ARKSHA256 {
 		args = append(args, "--ark-sha256", strings.ToLower(pin))
 	}
@@ -153,7 +212,7 @@ func (b *broker) verifyAMDChain(ctx context.Context, raw []byte) (map[string]any
 		} `json:"attestation"`
 	}
 	if json.Unmarshal(stdout.Bytes(), &out) != nil || (out.Verdict != "PASS" && out.Verdict != "FAIL") {
-		return nil, fmt.Errorf("AMD chain verifier gave no verdict: %v %s", runErr, lastLine(stderr.String()))
+		return nil, verifierNoVerdict{fmt.Errorf("AMD chain verifier gave no verdict: %v %s", runErr, lastLine(stderr.String()))}
 	}
 	switch {
 	case out.Verdict == "FAIL":

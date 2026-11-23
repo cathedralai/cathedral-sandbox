@@ -212,6 +212,9 @@ func (b *broker) admissibleFreeIn(h *hotel, now time.Time, mb *minerBudget) int 
 	if !h.ok || h.leaving || h.drain() || now.Before(h.backoffUntil) || !b.admitted(h, now) || b.awaitsRoomCheck(h) {
 		return 0
 	}
+	if !b.freshAttestOK(h, now) {
+		return 0 // a miner hotel without a fresh pass takes no new room (fresh_attest.go)
+	}
 	f := b.freeFor(h)
 	if l := mb.limit(h); l >= 0 && l < f {
 		f = l
@@ -308,7 +311,7 @@ func (b *broker) addTotals(t map[string]*classTotals, e capacityEntry, now time.
 	switch {
 	case h.drain():
 		c.Draining++
-	case h.ok && (!b.admitted(h, now) || b.awaitsRoomCheck(h)):
+	case h.ok && (!b.admitted(h, now) || b.awaitsRoomCheck(h) || !b.freshAttestOK(h, now)):
 		c.Pending++
 	case h.ok && !now.Before(h.backoffUntil):
 		c.Placeable++
@@ -357,6 +360,7 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 		guestDiskDoc(e.h, d)
 		out = append(out, d)
 	}
+	heldOut := b.freshHeldOutCount(now)
 	if g != nil {
 		guest = map[string]any{"id": g.cfg.ID, "max_rooms": g.limits.maxRooms(), "active_rooms": b.activeRooms(g), "policy": g.limits.Policy != nil}
 	}
@@ -398,6 +402,9 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"miner_max_rooms_per_hotkey": b.cfg.MinerMaxRoomsPerHotkey,
 			"miner_pool_share":           b.cfg.MinerPoolShare,
 		}
+		// Miner hotels up and admitted but held out of placement for a
+		// stale or failed fresh proof (fresh_attest.go).
+		doc["miner_fresh"] = map[string]any{"max_age_seconds": b.minerFreshAttest().Seconds(), "held_out": heldOut}
 		if docs != nil && b.cfg.MinerPoolShare > 0 {
 			doc["miner_pool"] = map[string]any{"own_slots": docs.ownPoolSlots, "miner_room_cap": docs.poolCap, "miner_rooms": docs.poolMinerRooms}
 		}
