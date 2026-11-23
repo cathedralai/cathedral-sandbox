@@ -64,8 +64,9 @@ LinkLocalAddressing=no
 IPv6AcceptRA=no
 EOF
 sed "s/@SEALED_HOST_IP@/$host_ip/g" "$GUARD" > "$OUT/guard.nft"
-{ printf 'SEALED_LINK_HOST_IP=%s\nSEALED_LINK_GUEST_IP=%s\n' "$host_ip" "$guest_ip"
-  [ -z "$port_line" ] || printf '%s\n' "$port_line"; } > "$OUT/link.env"
 printf 'ListenAddress %s\n' "$guest_ip" > "$OUT/sshd-listen.conf"
 "$NFT" -f "$OUT/guard.nft"
+# link.env last: guest-boot.sh starts the hotel only once the guard is loaded.
+{ printf 'SEALED_LINK_HOST_IP=%s\nSEALED_LINK_GUEST_IP=%s\n' "$host_ip" "$guest_ip"
+  [ -z "$port_line" ] || printf '%s\n' "$port_line"; } > "$OUT/link.env"
 log "link $host_ip/30 -> guest $guest_ip${port_line:+, ingress public port ${port_line#*=}}"

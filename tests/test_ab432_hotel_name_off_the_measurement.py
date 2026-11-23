@@ -135,7 +135,8 @@ def test_the_measured_room_env_stops_the_install_without_a_link(tmp_path: Path) 
 
 
 def _guest_link(tmp_path: Path, raw: bytes | None, nets: str = "10.214.0.0/22", debug: bool = False,
-                ingress: bool = False, port: bytes | None = None) -> tuple[subprocess.CompletedProcess[str], Path]:
+                ingress: bool = False, port: bytes | None = None,
+                nft_fails: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
     extra = {"SEALED_DEBUG_SSH_PUBKEY": "ssh-ed25519 AAAA test"} if debug else {}
     if ingress:
         extra.update(INGRESS)
@@ -149,7 +150,7 @@ def _guest_link(tmp_path: Path, raw: bytes | None, nets: str = "10.214.0.0/22", 
         fw.write_bytes(raw)
     run = tmp_path / "run"
     nft = tmp_path / "nft"
-    nft.write_text(f'#!/bin/bash\n[ "$1" = -f ] && cp "$2" "{tmp_path}/loaded.nft"\n')
+    nft.write_text("#!/bin/bash\nexit 1\n" if nft_fails else f'#!/bin/bash\n[ "$1" = -f ] && cp "$2" "{tmp_path}/loaded.nft"\n')
     nft.chmod(0o755)
     env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SEALED_LINK_FW_CFG": str(fw), "SEALED_LINK_FW_CFG_PORT": str(fw_port),
            "SEALED_LINK_GUARD": str(image / "etc/sealed-guard.nft"), "SEALED_LINK_ROOM_ENV": str(image / "opt/room-kit/room.env"),
@@ -216,6 +217,11 @@ def test_guest_link_closes_the_uplink_on_a_missing_or_bad_link(tmp_path: Path, r
     assert "18090" not in loaded and "@SEALED_HOST_IP@" not in loaded and 'iifname "uplink" drop' in loaded
     assert not (run / "systemd/network/10-uplink.network").exists()
     assert not (run / "sealed-link/link.env").exists()
+
+
+def test_guest_link_writes_no_link_env_when_the_guard_does_not_load(tmp_path: Path) -> None:
+    proc, run = _guest_link(tmp_path, b"10.215.0.9 10.215.0.10", nft_fails=True)
+    assert proc.returncode != 0 and not (run / "sealed-link/link.env").exists()
 
 
 def test_the_guard_unit_runs_guest_link_before_the_network() -> None:
