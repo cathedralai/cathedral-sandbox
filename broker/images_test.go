@@ -506,6 +506,9 @@ func (f *fakeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if rm["id"] == id {
 				doc := map[string]any{"id": id, "state": "running", "labels": rm["labels"], "runtime": "docker",
 					"network": map[string]any{"mode": "deny_all", "allow": []any{}}}
+				if rm["state"] == "frozen" { // after a freeze, as the hotel lists it (#704)
+					doc["state"] = "frozen"
+				}
 				if f.healthRuntime != "" {
 					delete(doc, "runtime") // the real hotel's room document has none
 				}
