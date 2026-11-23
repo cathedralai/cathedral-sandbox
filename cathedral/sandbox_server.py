@@ -1578,6 +1578,7 @@ class _Server(ThreadingHTTPServer):
         # wait for the GIL. Workers are added only when none is idle, so a burst
         # never waits for a free worker.
         self._idle_workers = 0
+        self._workers = 0
         self._pool_lock = threading.Lock()
         self._pool_queue: queue.SimpleQueue = queue.SimpleQueue()
         super().__init__(*args, **kwargs)
@@ -1587,6 +1588,8 @@ class _Server(ThreadingHTTPServer):
             spawn = self._idle_workers == 0
             if not spawn:
                 self._idle_workers -= 1  # this connection is that worker's
+            else:
+                self._workers += 1
         self._pool_queue.put((request, client_address))
         if spawn:
             threading.Thread(target=self._pool_worker, name="cathedral-sandbox-conn", daemon=True).start()
@@ -1601,11 +1604,22 @@ class _Server(ThreadingHTTPServer):
                     # connection may be on its way into the queue.
                     if self._idle_workers > 0:
                         self._idle_workers -= 1
+                        self._workers -= 1
                         return
                 continue
+            if request is None:  # server_close
+                return
             self.process_request_thread(request, client_address)
             with self._pool_lock:
                 self._idle_workers += 1
+
+    def server_close(self) -> None:
+        super().server_close()
+        # End every worker once it is done with its connection.
+        with self._pool_lock:
+            workers, self._workers, self._idle_workers = self._workers, 0, 0
+        for _ in range(workers):
+            self._pool_queue.put((None, None))
 
 
 def serve(app: SandboxApplication, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:

@@ -73,3 +73,16 @@ def test_without_pidfd_the_exit_is_still_seen_and_the_limit_kept(monkeypatch) ->
     with pytest.raises(subprocess.TimeoutExpired):
         _run(["sleep", "5"], timeout=0.2)
     assert time.monotonic() - start < 1.0
+
+
+def test_a_failing_hook_ends_the_command(tmp_path) -> None:
+    pidfile = tmp_path / "pid"
+
+    def boom(chunk: bytes) -> None:
+        raise OSError("spill disk full")
+
+    with pytest.raises(OSError):
+        _run(["sh", "-c", f"echo $$ > {pidfile}; echo x; exec sleep 30"], on_stdout=boom)
+    pid = int(pidfile.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

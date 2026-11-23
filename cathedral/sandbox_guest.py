@@ -518,6 +518,12 @@ def _run_bounded(
                     if hook is not None and publish_end > before:
                         hook(bytes(buf[before:publish_end]))
         proc.wait()
+    except BaseException:
+        # A hook or read failed: the command must not outlive the call.
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        raise
     finally:
         sel.close()
         if pidfd is not None:

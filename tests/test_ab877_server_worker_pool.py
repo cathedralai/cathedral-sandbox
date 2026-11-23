@@ -103,3 +103,18 @@ def test_idle_workers_end_after_the_idle_time() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_server_close_ends_the_workers() -> None:
+    base = _workers()
+    server = _serve(hold=0.1)
+    port = server.server_address[1]
+    with ThreadPoolExecutor(8) as pool:
+        assert all(s == 200 for s, _ in pool.map(lambda _: _get(port), range(8)))
+    assert _workers() > base
+    server.shutdown()
+    server.server_close()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _workers() > base:
+        time.sleep(0.05)
+    assert _workers() == base
