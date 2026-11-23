@@ -1130,6 +1130,26 @@ def test_host_net_ingress_forwards_443_to_the_guest_ingress_port(host: FakeHost)
     assert INGRESS_DNAT.replace(" -A ", " -D ") in host.calls("iptables")
 
 
+def test_host_net_ingress_lets_the_guest_reach_a_broker_on_this_host_only_on_its_port(host: FakeHost) -> None:
+    # AB#422: nc-sealed-2 shares Frankfurt with the broker; live.cathedral.computer resolves to this host,
+    # and the guest's DNS-01 PUT was dropped by the IN chain, so no certificate was ever ordered.
+    for env, port in ((INGRESS, "443"), ({**INGRESS, "SEALED_INGRESS_BROKER_URL": "https://broker.example:8443"}, "8443")):
+        proc = _run_host_net(host, "up", env)
+        assert proc.returncode == 0, proc.stderr[-3000:]
+        inn = [c.split("SEALED-SNP0-IN ")[1] for c in host.calls("iptables") if c.startswith("iptables -A SEALED-SNP0-IN ")]
+        assert inn[-3:] == [
+            "-i snp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+            f"-i snp0 -s 10.215.0.2 -p tcp --dport {port} -m addrtype --dst-type LOCAL -m conntrack --ctstate NEW -j ACCEPT",
+            "-i snp0 -j DROP"], inn
+
+
+def test_host_net_without_ingress_keeps_the_guest_off_this_host(host: FakeHost) -> None:
+    proc = _run_host_net(host, "up", {})
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    inn = [c.split("SEALED-SNP0-IN ")[1] for c in host.calls("iptables") if c.startswith("iptables -A SEALED-SNP0-IN ")]
+    assert inn == ["-i snp0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT", "-i snp0 -j DROP"]
+
+
 def test_host_net_miner_with_ingress_keeps_both_ways_in(host: FakeHost) -> None:
     proc = _run_host_net(host, "up", {**MINER, **INGRESS})
     assert proc.returncode == 0, proc.stderr[-3000:]

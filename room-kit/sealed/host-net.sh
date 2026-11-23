@@ -14,6 +14,10 @@
 # Preview URL ingress (SEALED_GUEST_INGRESS=1, AB#423): one more PREROUTING
 # forward, SEALED_INGRESS_PUBLIC_PORT (default 443) to the guest's ingress port
 # SEALED_INGRESS_TLS_PORT (default 8443). The guest holds the TLS key.
+# It also lets the guest open TCP to this host's own addresses on the broker
+# URL's port (SEALED_INGRESS_BROKER_URL, default 443) and nothing else there:
+# when the broker runs on this host, the broker name resolves to this host, and
+# the guest's DNS-01 PUT for its certificate (room_acme.py) must reach it.
 set -euo pipefail
 # shellcheck disable=SC1090
 source "${2:?sealed.env}"
@@ -32,6 +36,8 @@ PUBLIC_PORT=${SEALED_MINER_PUBLIC_PORT:-9443}
 INGRESS=${SEALED_GUEST_INGRESS:-0}
 INGRESS_TLS_PORT=${SEALED_INGRESS_TLS_PORT:-8443}
 INGRESS_PUBLIC_PORT=${SEALED_INGRESS_PUBLIC_PORT:-443}
+BROKER_PORT=$(sed -nE 's#^https://[^/:]+:([0-9]{1,5})/?$#\1#p' <<< "${SEALED_INGRESS_BROKER_URL:-}")
+BROKER_PORT=${BROKER_PORT:-443}
 INGRESS_DNAT=(-p tcp --dport "$INGRESS_PUBLIC_PORT" -m addrtype --dst-type LOCAL -m comment --comment "$TAG" -j DNAT --to-destination "$SEALED_GUEST_IP:$INGRESS_TLS_PORT")
 # Two more FWD rules per way in (answers out, new connections in).
 RULES=5
@@ -190,6 +196,9 @@ up)
   iptables -C FORWARD -m comment --comment "$TAG" -j "$FWD" 2>/dev/null || iptables -I FORWARD 1 -m comment --comment "$TAG" -j "$FWD"
   iptables -N "$IN" 2>/dev/null || iptables -F "$IN"
   iptables -A "$IN" -i "$TAP" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  if [ "$INGRESS" = 1 ]; then
+    iptables -A "$IN" -i "$TAP" -s "$SEALED_GUEST_IP" -p tcp --dport "$BROKER_PORT" -m addrtype --dst-type LOCAL -m conntrack --ctstate NEW -j ACCEPT
+  fi
   iptables -A "$IN" -i "$TAP" -j DROP
   iptables -C INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null || iptables -I INPUT 1 -m comment --comment "$TAG" -j "$IN"
   iptables -t nat -C POSTROUTING -s "$SEALED_GUEST_IP/32" ! -o "$TAP" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null \
