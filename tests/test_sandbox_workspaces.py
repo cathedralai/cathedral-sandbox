@@ -392,3 +392,26 @@ def test_local_copier_does_not_follow_symlinks(tmp_path) -> None:
     assert copied.is_symlink()
     store.delete("o", "repo")
     assert (outside / "host-file").read_text() == "host"
+
+
+def test_meta_is_synced_before_and_after_the_rename(tmp_path, monkeypatch) -> None:
+    # AB#598: a sealed guest restart is a power cut. meta.json and its directory entries must be
+    # on disk before the API answers, or the workspace is hidden after the restart.
+    import os
+
+    synced: list[str] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    store = WorkspaceStore(tmp_path / "ws", LocalCopier(), check_mount=False)
+    store.create("owner-a", "proj")
+    owner_dir = next((tmp_path / "ws").iterdir())
+    ws = owner_dir / "proj"
+    assert str(ws / "meta.json.tmp") in synced  # file content, before the rename
+    assert str(ws) in synced  # the rename itself
+    assert str(owner_dir) in synced and str(tmp_path / "ws") in synced  # the new directories
+    assert json.loads((ws / "meta.json").read_text())["name"] == "proj"
