@@ -98,7 +98,7 @@ Design, threat model, upgrade path and the proof on an SNP host:
 | Files the kit downloads at boot (gVisor, uv, Python, Caddy, the pinned API wheel set) | No, but pinned | The installer refuses a file whose sha256 or sha512 differs from `versions.lock` and `requirements.lock`, which are in the measured initrd |
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
 | Hotel name | No | QEMU fw_cfg `opt/cathedral/hotel-name`, checked against `^[a-z0-9][a-z0-9-]{0,58}$`; the guest refuses to start without it. The receipts front puts it in the attested binding (REPORT_DATA covers the binding). Two hotels of one build share one measurement |
-| Host IP, guest IP, guest MAC | Yes | `SEALED_HOST_IP` / `SEALED_GUEST_IP` / `SEALED_GUEST_MAC` in `sealed.env`, default 10.215.0.1, 10.215.0.2, 52:54:00:5e:a1:ed (`guest-constants.sh`). One /30 per guest, so several guests fit one host; the installer refuses a /30 another interface or sealed hotel on the host uses, and a move of a running guest's link. A hotel with its own values has its own measurement, the same at every rebuild of one kit; `manifest.json` names the IP pair (`link`) when it is not the default. Hotels on the defaults share one measurement per build |
+| Host IP, guest IP, guest MAC | No | `SEALED_HOST_IP` / `SEALED_GUEST_IP` / `SEALED_GUEST_MAC` in `sealed.env`, default 10.215.0.1, 10.215.0.2, 52:54:00:5e:a1:ed (`guest-constants.sh`). One /30 per guest, so several guests fit one host; the installer refuses a /30 another interface or sealed hotel on the host uses, and a move of a running guest's link. The pair goes to the guest in QEMU fw_cfg `opt/cathedral/link` (AB#432). `sealed-link.sh` (`guest-link.sh`, measured) checks it in the guest with the same `guest-constants.sh` rules, then writes the `.network` file, the uplink guard (host IP) and the listen addresses under `/run`; a missing or bad pair keeps the uplink closed and the hotel down. The guest names its one virtio NIC by driver, so the MAC is only on the QEMU command line. Hotels of one build share one measurement whatever their link |
 | DNS | Yes, as an image constant | `guest-constants.sh`; the same on every host, not read from `sealed.env` |
 | Hotel API key | No | Config hotel: fw_cfg. It authenticates the broker. The host gives it, so the host can call the API too; each create, exec, process start, network change and delete gets a receipt. Miner hotel: never from the host (see "Miner hotel") |
 | Miner hotel settings (`ROOM_MINER`, TLS port, install signers) | Yes | In the guest `room.env`, and the HTTPS port rule in the guest firewall; only when `SEALED_MINER=1` |
@@ -593,8 +593,11 @@ the guest and name its SPKI sha256 in the binding (`guest_ingress`). Add
 https origin) and the guest also serves on that key:
 
 - `build-guest.sh` writes `ROOM_INGRESS_ZONE`, `ROOM_INGRESS_BROKER_URL`,
-  `ROOM_INGRESS_TLS_LISTEN` (`<guest ip>:SEALED_INGRESS_TLS_PORT`),
-  `ROOM_INGRESS_PUBLIC_PORT` and `ROOM_ACME_DIRECTORY` (default Let's Encrypt)
+  `ROOM_INGRESS_TLS_LISTEN` (`${SEALED_LINK_GUEST_IP}:SEALED_INGRESS_TLS_PORT`, the guest IP
+  from the fw_cfg link at boot, so not a per-hotel value in the image),
+  `ROOM_INGRESS_PUBLIC_PORT` (`${SEALED_LINK_INGRESS_PUBLIC_PORT}`: `SEALED_INGRESS_PUBLIC_PORT`
+  through fw_cfg `opt/cathedral/ingress-public-port`, since two ingress hotels on one host
+  forward two public ports) and `ROOM_ACME_DIRECTORY` (default Let's Encrypt)
   into the measured room.env, and adds a guest nft accept for
   `SEALED_INGRESS_TLS_PORT` on the uplink from any source, like the miner
   port. Without a zone neither is written: room.env and the firewall are byte

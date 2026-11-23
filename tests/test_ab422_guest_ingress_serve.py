@@ -426,7 +426,7 @@ def test_build_opens_the_ingress_port_and_writes_the_measured_settings_only_with
     rule = BUILD.index('tcp dport $INGRESS_TLS_PORT accept')
     assert BUILD.rindex('if [ -n "$INGRESS_ZONE" ]; then', 0, rule) > BUILD.index("# >>> guest ingress")
     env = BUILD.split('if [ -n "$INGRESS_ZONE" ]; then\n  cat >> "$R/opt/room-kit/room.env"')[1].split("\nfi\n")[0]
-    for key in ("ROOM_INGRESS_ZONE=", "ROOM_INGRESS_BROKER_URL=", "ROOM_INGRESS_TLS_LISTEN=$SEALED_GUEST_IP:",
+    for key in ("ROOM_INGRESS_ZONE=", "ROOM_INGRESS_BROKER_URL=", "ROOM_INGRESS_TLS_LISTEN=\\${SEALED_LINK_GUEST_IP:?}:",
                 "ROOM_ACME_DIRECTORY="):
         assert key in env
     assert BUILD.index("# >>> guest ingress") < BUILD.index("PKGS=")

@@ -246,7 +246,9 @@ def _sealed_guard(miner: bool) -> str:
     assert m, "sealed-guard.nft heredoc not found in build-guest.sh"
     input_rules = f'iifname "uplink" tcp dport {TLS_PORT} accept' if miner else ""
     script = f'SEALED_HOST_IP={HOST_IP}\nINPUT_RULES={json.dumps(input_rules)}\ncat <<EOF\n{m.group(1)}\nEOF\n'
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
+    guard = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True).stdout
+    # The host IP is filled in at boot by guest-link.sh from the fw_cfg link (AB#432).
+    return guard.replace("@SEALED_HOST_IP@", HOST_IP)
 
 
 @pytest.fixture(scope="module")
