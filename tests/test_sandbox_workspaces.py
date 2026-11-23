@@ -415,3 +415,35 @@ def test_meta_is_synced_before_and_after_the_rename(tmp_path, monkeypatch) -> No
     assert str(ws) in synced  # the rename itself
     assert str(owner_dir) in synced and str(tmp_path / "ws") in synced  # the new directories
     assert json.loads((ws / "meta.json").read_text())["name"] == "proj"
+
+
+
+def test_version_files_are_synced_before_the_version_is_listed(tmp_path, monkeypatch) -> None:
+    # Bugbot on #695: meta.json lists a version durably, so the copied files must be synced first.
+    import os
+
+    store = WorkspaceStore(tmp_path / "ws", LocalCopier(), check_mount=False)
+    store.create("owner-a", "proj")
+    data = store.mount("owner-a", "proj", "room-1")
+    (data / "sub").mkdir()
+    (data / "sub" / "f.txt").write_text("hello")
+    store.unmount("owner-a", "proj", "room-1")
+    events: list[str] = []
+    real_fsync, real_save = os.fsync, WorkspaceStore._save_meta
+
+    def spy(fd):
+        events.append("sync:" + os.readlink(f"/proc/self/fd/{fd}"))
+        return real_fsync(fd)
+
+    def save(self, path, meta):
+        events.append("save:" + str(len(meta.get("versions", []))))
+        return real_save(self, path, meta)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    monkeypatch.setattr(WorkspaceStore, "_save_meta", save)
+    v = store.version("owner-a", "proj")
+    vdir = data.parent / "versions" / str(v["version"])
+    listed = events.index("save:1")
+    synced = [e for e in events[:listed] if e.startswith("sync:")]
+    assert "sync:" + str(vdir / "sub" / "f.txt") in synced
+    assert "sync:" + str(vdir / "sub") in synced and "sync:" + str(vdir) in synced
