@@ -86,6 +86,20 @@ def _ledger(tmp_path, monkeypatch, *, secrets: bool = True, sealed: bool = True)
 MARK_NS = 1_795_000_000_000_000_000
 
 
+# Every Api and front a test starts, closed after it. Left open they keep their sockets until the
+# process ends, and the suite's later select()-based tests (room-kit terminal) run past 1024 fds.
+_SERVERS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _close_servers():
+    yield
+    while _SERVERS:
+        server = _SERVERS.pop()
+        server.shutdown()
+        server.server_close()
+
+
 class Api:
     """The room API behind the front. Records every call; a secret route must never reach it.
 
@@ -122,14 +136,16 @@ class Api:
             do_GET = do_POST = do_DELETE = answer  # noqa: N815
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        Thread(target=self.server.serve_forever, daemon=True).start()
+        Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        _SERVERS.append(self.server)
         self.port = self.server.server_address[1]
 
 
 def _front(ledger):
     api = Api()
     server = rr.Server(("127.0.0.1", 0), ledger, api.port, 1, KEY, "/nonexistent.sock", pool_scan=False)
-    Thread(target=server.serve_forever, daemon=True).start()
+    Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    _SERVERS.append(server)
     return server.server_address[1], api
 
 
