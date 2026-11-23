@@ -326,6 +326,9 @@ type room struct {
 	// mapping: a claimed ready room's customer run (claims_state.go); nil
 	// for every other room, which then takes exactly the paths it always did.
 	mapping *roomMapping
+	// periodRun: the run of a time a once-claimed room is the pool's again
+	// (claims_state.go, poolPeriodLocked); "" for every other room.
+	periodRun string
 }
 
 type latencies struct{ hotel, queue, overhead []float64 }
@@ -2763,6 +2766,7 @@ func (b *broker) syncHotel(ctx context.Context, h *hotel) {
 		rm.noteListed(s.Labels, s.ExpiresAt, s.EndReason)
 		h.rooms[s.ID] = rm
 		if !b.adoptMappedLocked(h, rm) { // a claimed room after a restart: the journal's customer (claims_state.go)
+			b.poolPeriodLocked(rm, false, now) // once claimed and the pool's again: its own run
 			b.register(rm)
 		}
 		h.place(rm)

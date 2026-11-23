@@ -589,6 +589,17 @@ func (m *usageMeter) runOpen(run string) bool {
 	return m.runs[run] != nil
 }
 
+// runEnded reports whether run has its ended reading and the meter still
+// remembers it (usageEndedKeep).
+func (m *usageMeter) runEnded(run string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ended[run] != nil
+}
+
 // end writes the ended reading of a run. confirmed: the broker's own delete
 // removed the room at at, so the time since its last sighting counts, when
 // the gap is short and no answered list since that sighting left the room

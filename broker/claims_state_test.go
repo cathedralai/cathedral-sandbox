@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1127,5 +1128,262 @@ func TestLateJournalOpenLeavesAnEndedRunSetAside(t *testing.T) {
 	}
 	if n := len(pc.hotels["a"].roomDeletes()); n != 0 {
 		t.Fatalf("%d deletes of the set-aside room, want none", n)
+	}
+}
+
+// periodRuns is the readings of every pool period run of the room physical
+// (<physical>:<unix ms>), by run id.
+func (pc *poolChain) periodRuns(physical string) map[string][]usageReading {
+	pc.t.Helper()
+	mustFlush(pc.t, pc.b.usageMeter)
+	out := map[string][]usageReading{}
+	for _, r := range logReadings(pc.t, filepath.Join(pc.stateDir, usageDirName)) {
+		if strings.HasPrefix(r.Run, physical+":") {
+			out[r.Run] = append(out[r.Run], r)
+		}
+	}
+	return out
+}
+
+// onePoolRun fails unless rs is one pool run: the pool guest, never billable,
+// one first reading, and ended ended readings, the last one if any.
+func onePoolRun(t *testing.T, what string, rs []usageReading, ended int) {
+	t.Helper()
+	if len(rs) == 0 {
+		t.Fatalf("%s: no readings", what)
+	}
+	for i, r := range rs {
+		if r.Guest != poolGuestID || r.Billable == nil || r.StartedAt != rs[0].StartedAt {
+			t.Fatalf("%s: reading %d is not a pool run's (guest %q, billable %v): %+v", what, i, r.Guest, r.Billable, rs)
+		}
+		if r.State == "ended" && i != len(rs)-1 {
+			t.Fatalf("%s: a reading follows the ended one: %+v", what, rs)
+		}
+	}
+	if n := endedCount(rs); n != ended {
+		t.Fatalf("%s: %d ended readings, want %d: %+v", what, n, ended, rs)
+	}
+}
+
+// The API's importer accepts a run id of letters, digits and "._:-" only
+// (polariscomputer polaris/services/cathedral_direct_meter.py, _RUN). A
+// period run must fit it, must not be a claim run, and must not be the
+// physical id.
+func TestPoolPeriodRunShape(t *testing.T) {
+	importerRun := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$`)
+	at := time.UnixMilli(1795400000123)
+	run := poolPeriodRun("a.sbx-1", at)
+	if run != "a.sbx-1:1795400000123" {
+		t.Fatalf("period run %q, want a.sbx-1:1795400000123", run)
+	}
+	if !importerRun.MatchString(run) {
+		t.Fatalf("period run %q does not fit the importer's run id rule", run)
+	}
+	if usageClaimRun(run) {
+		t.Fatalf("period run %q reads as a claim run; the journal hold would keep it", run)
+	}
+	if poolPeriodRun("a.sbx-1", at.Add(time.Millisecond)) == run {
+		t.Fatal("two periods a millisecond apart share a run id")
+	}
+}
+
+// Decision A, the gap: the journal opens late. Until then the claimed room is
+// the pool's, and its physical run already has its ended reading from the
+// win. The gap sits on its own pool run, once; the physical id gets nothing
+// more; the late open maps the room back, the gap's run ends, and the
+// customer's run goes on with no ended reading.
+func TestLateOpenGapSitsOnItsOwnPoolRun(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	run, _ := lateOpen(t, pc, false)
+	physBefore := pc.readingsOfRun("a.sbx-1")
+	if endedCount(physBefore) != 1 {
+		t.Fatalf("the room's physical run before the gap: %+v, want its one ended reading from the win", physBefore)
+	}
+	for i := 0; i < 3; i++ {
+		pc.sync("a")
+		time.Sleep(400 * time.Millisecond)
+	}
+	gap := pc.periodRuns("a.sbx-1")
+	if len(gap) != 1 {
+		t.Fatalf("pool period runs in the gap: %d (%v), want exactly one", len(gap), gap)
+	}
+	gapRun := ""
+	for id, rs := range gap {
+		gapRun = id
+		onePoolRun(t, "the gap's run "+id, rs, 0)
+	}
+	if gapRun == "a.sbx-1" || gapRun == run || usageClaimRun(gapRun) {
+		t.Fatalf("the gap's run id %q reuses the physical or the customer's id, or reads as a claim run", gapRun)
+	}
+	if after := pc.readingsOfRun("a.sbx-1"); len(after) != len(physBefore) {
+		t.Fatalf("physical run a.sbx-1: %d readings before the gap, %d in it; an ended id takes nothing more", len(physBefore), len(after))
+	}
+	if !pc.b.usageMeter.runOpen(run) || endedCount(pc.readingsOfRun(run)) != 0 {
+		t.Fatalf("the customer's run in the gap is not held open: %+v", pc.readingsOfRun(run))
+	}
+	pc.openLate()
+	pc.b.mu.Lock()
+	rm := pc.b.hotelByID("a").rooms["sbx-1"]
+	mapped := rm != nil && rm.guest == "g1" && rm.runID() == run && rm.periodRun == ""
+	pc.b.mu.Unlock()
+	if !mapped {
+		t.Fatalf("after the late open: %+v, want g1's room on run %s with no period run", rm, run)
+	}
+	pc.sync("a")
+	pc.letGo("a")
+	gap = pc.periodRuns("a.sbx-1")
+	if len(gap) != 1 {
+		t.Fatalf("pool period runs after the late open: %d, want still the one", len(gap))
+	}
+	onePoolRun(t, "the gap's run after the late open", gap[gapRun], 1)
+	if pc.b.usageMeter.runOpen(gapRun) {
+		t.Fatalf("the gap's run %s is still open after the room was mapped back", gapRun)
+	}
+	if !pc.b.usageMeter.runOpen(run) || endedCount(pc.readingsOfRun(run)) != 0 {
+		t.Fatalf("the customer's run after the late open: %+v, want open, no ended reading", pc.readingsOfRun(run))
+	}
+}
+
+// Decision A, set aside: the customer's run has its ended reading, so the
+// late open maps nothing and the room stays the pool's. That time sits on a
+// pool run too: the gap and the set-aside time after the open are one period
+// on one run, and a restart begins a second period on a second run. No run
+// id is used twice, the physical id and the customer's ended run get nothing.
+func TestSetAsidePeriodsEachSitOnTheirOwnPoolRun(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	run, custBefore := lateOpen(t, pc, true)
+	physBefore := pc.readingsOfRun("a.sbx-1")
+	for i := 0; i < 2; i++ {
+		pc.sync("a")
+		time.Sleep(300 * time.Millisecond)
+	}
+	pc.openLate()
+	for i := 0; i < 2; i++ {
+		pc.sync("a")
+		time.Sleep(300 * time.Millisecond)
+	}
+	first := pc.periodRuns("a.sbx-1")
+	if len(first) != 1 {
+		t.Fatalf("pool period runs before the restart: %d (%v), want one (the gap and the set-aside time are one period)", len(first), first)
+	}
+	firstRun := ""
+	for id, rs := range first {
+		firstRun = id
+		onePoolRun(t, "the first period "+id, rs, 0)
+	}
+	pc.b.mu.Lock()
+	rm := pc.b.hotelByID("a").rooms["sbx-1"]
+	aside := rm != nil && rm.guest == poolGuestID && rm.mapping == nil && rm.runID() == firstRun
+	pc.b.mu.Unlock()
+	if !aside {
+		t.Fatalf("after the late open: %+v, want the pool's room on its period run %s", rm, firstRun)
+	}
+	if err := pc.b.saveCompat(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond) // a new period begins at a later millisecond
+	pc.start()
+	pc.up("a")
+	for i := 0; i < 2; i++ {
+		pc.sync("a")
+		time.Sleep(300 * time.Millisecond)
+	}
+	pc.letGo("a")
+	both := pc.periodRuns("a.sbx-1")
+	if len(both) != 2 {
+		t.Fatalf("pool period runs after the restart: %d (%v), want two", len(both), both)
+	}
+	for id, rs := range both {
+		if id == firstRun {
+			onePoolRun(t, "the first period after the restart", rs, 1)
+		} else {
+			onePoolRun(t, "the second period "+id, rs, 0)
+		}
+	}
+	if after := pc.readingsOfRun("a.sbx-1"); len(after) != len(physBefore) {
+		t.Fatalf("physical run a.sbx-1 took %d more readings after its ended one", len(after)-len(physBefore))
+	}
+	if after := pc.readingsOfRun(run); len(after) != len(custBefore) {
+		t.Fatalf("the customer's ended run took %d more readings", len(after)-len(custBefore))
+	}
+	if n := len(pc.hotels["a"].roomDeletes()); n != 0 {
+		t.Fatalf("%d deletes of the set-aside room, want none", n)
+	}
+}
+
+// Decision A when the meter no longer remembers the physical run's ended
+// reading (it forgets an ended id after usageEndedKeep): the journal still
+// names the room, its customer's run is ended, so it is set aside, and that
+// alone gives it a period run. Without it the physical id would start a
+// second run under an id already ended.
+func TestSetAsideRoomGetsAPeriodRunWhenThePhysicalEndIsForgotten(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	wonAt := time.Now().Add(-time.Minute)
+	run := pc.mapRoom("sbx-1", "g1", jobA, wonAt)
+	pc.writeWon("g1", "sbx-1", run, jobA, wonAt)
+	pc.sync("a")
+	time.Sleep(1100 * time.Millisecond)
+	pc.sync("a")
+	pc.b.usageMeter.checkpoint(time.Now())
+	pc.b.usageMeter.end(run, time.Now(), false)
+	physBefore := pc.readingsOfRun("a.sbx-1")
+	if endedCount(physBefore) != 1 {
+		t.Fatalf("the room's physical run after the win: %+v, want its one ended reading", physBefore)
+	}
+	if err := pc.b.saveCompat(); err != nil {
+		t.Fatal(err)
+	}
+	pc.start() // the journal is read at this start: no gap
+	if pc.b.pool.journalState != "complete" {
+		t.Fatalf("journal %s at start, want complete", pc.b.pool.journalState)
+	}
+	m := pc.b.usageMeter
+	m.mu.Lock()
+	if m.ended["a.sbx-1"] == nil {
+		m.mu.Unlock()
+		t.Fatal("the meter does not hold the physical run's ended reading after the replay; the test would prove nothing")
+	}
+	delete(m.ended, "a.sbx-1") // what pruneEndedLocked does after usageEndedKeep
+	m.mu.Unlock()
+	pc.up("a")
+	for i := 0; i < 2; i++ {
+		pc.sync("a")
+		time.Sleep(300 * time.Millisecond)
+	}
+	periods := pc.periodRuns("a.sbx-1")
+	if len(periods) != 1 {
+		t.Fatalf("pool period runs of the set-aside room: %d (%v), want one", len(periods), periods)
+	}
+	for id, rs := range periods {
+		onePoolRun(t, "the set-aside period "+id, rs, 0)
+	}
+	if after := pc.readingsOfRun("a.sbx-1"); len(after) != len(physBefore) {
+		t.Fatalf("physical run a.sbx-1 took %d more readings: an ended id started again", len(after)-len(physBefore))
+	}
+}
+
+// A pool room that was never claimed keeps its physical run: no period run.
+func TestNeverClaimedPoolRoomKeepsItsPhysicalRun(t *testing.T) {
+	pc, _ := newMappedChain(t, 1)
+	pc.sync("a")
+	if err := pc.b.saveCompat(); err != nil {
+		t.Fatal(err)
+	}
+	pc.start()
+	pc.up("a")
+	pc.sync("a")
+	pc.b.mu.Lock()
+	n, period := 0, 0
+	for _, rm := range pc.b.hotelByID("a").rooms {
+		if rm.guest == poolGuestID {
+			n++
+			if rm.periodRun != "" || rm.runID() != rm.id {
+				period++
+			}
+		}
+	}
+	pc.b.mu.Unlock()
+	if n == 0 || period != 0 {
+		t.Fatalf("%d pool rooms after a restart, %d on a period run; want some rooms and none on a period run", n, period)
 	}
 }

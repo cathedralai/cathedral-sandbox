@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +38,42 @@ func (rm *room) runID() string {
 	if rm.mapping != nil {
 		return rm.mapping.run
 	}
+	if rm.periodRun != "" {
+		return rm.periodRun // once claimed, the pool's again (poolPeriodLocked)
+	}
 	return rm.id
+}
+
+// poolPeriodRun is the run id of a period that began at began in which the
+// room physical, once claimed, is the pool's again: <hotel>.<room>:<unix ms>.
+// It has a ".", so it is never a claim run (usageClaimRun) and the journal
+// hold never keeps it. The coordinator's decision A named the shape
+// <hotel>.<room>@<unix ms>; the API's importer refuses a run id with an "@"
+// (polariscomputer polaris/services/cathedral_direct_meter.py, _RUN:
+// letters, digits and "._:-" only), so the separator here is ":".
+// TestPoolPeriodRunShape pins the shape against that rule.
+func poolPeriodRun(physical string, began time.Time) string {
+	return physical + ":" + strconv.FormatInt(began.UnixMilli(), 10)
+}
+
+// poolPeriodLocked gives rm its own run for a period in which it is the
+// pool's again after a claim (decision A). After a win the room's physical
+// run <hotel>.<room> has its ended reading, and the meter writes nothing more
+// under an ended id (usageMeter.seenLocked), so without this the period is
+// recorded nowhere, and once the ended id is forgotten the same id would
+// start a second run. The period is a pool run: pool guest, never billable.
+// It ends by absence when the room is mapped back (mapRoomLocked clears it)
+// or is gone. named: the claim journal names this room and it was not mapped
+// (set aside). Without that, the meter's ended physical run is the sign (the
+// gap before a late open, when the journal is not read yet). A room never
+// claimed has neither and keeps its physical run. Caller holds b.mu.
+func (b *broker) poolPeriodLocked(rm *room, named bool, at time.Time) {
+	if rm.mapping != nil || rm.guest != poolGuestID || rm.periodRun != "" {
+		return
+	}
+	if named || b.usageMeter.runEnded(rm.id) {
+		rm.periodRun = poolPeriodRun(rm.id, at)
+	}
 }
 
 // viewLabels is the labels rm shows its guest and is matched against label
@@ -77,6 +113,8 @@ func (b *broker) mapRoomLocked(h *hotel, rm *room, guest string, m roomMapping) 
 	}
 	m.customerLabels = labels
 	rm.guest, rm.uuid, rm.born, rm.mapping = guest, m.run, m.wonAt, &m
+	// Mapped back: the pool period, if it had one, ends by absence.
+	rm.periodRun = ""
 	delete(b.savedUUIDs, rm.id) // the journal's client id wins over client-state.json
 	b.byUUID[rm.uuid] = rm
 	b.markDirty()
@@ -183,6 +221,7 @@ func (b *broker) adoptMappedLocked(h *hotel, rm *room) bool {
 	delete(p.mappings, rm.id) // decided once
 	if b.guests[cm.guest] == nil || !b.usageMeter.runOpen(cm.m.run) {
 		log.Printf("ready rooms: room %s: its claim run %s is not open in the usage meter (or guest %s is gone); the room stays set aside", rm.id, cm.m.run, cm.guest)
+		b.poolPeriodLocked(rm, true, time.Now()) // set aside: the period sits on its own run
 		return false
 	}
 	b.mapRoomLocked(h, rm, cm.guest, cm.m)
