@@ -942,3 +942,54 @@ func TestNativeBackgroundExecTakesABodyOverOneMiB(t *testing.T) {
 		t.Fatalf("start with a 3 MiB stdin: %d %v", status, doc)
 	}
 }
+
+// #704: a background exec on a frozen room is refused with 409 before
+// anything is stored or sent to the hotel; a running room is unchanged.
+
+func TestNativeBackgroundExecOnFrozenRoomIs409BeforeAnyWork(t *testing.T) {
+	tc, release := execChain(t, t.TempDir())
+	release()
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	if status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/freeze", map[string]any{}); status != 200 || doc["state"] != "frozen" {
+		t.Fatalf("freeze: %d %v", status, doc)
+	}
+	before := hotelExecCalls(tc)
+	status, doc := tc.call(t, "key1", "POST", "/v1/sandboxes/"+bid+"/execs", map[string]any{"cmd": []string{"job"}})
+	if status != 409 || errCode(doc) != "sandbox_frozen" {
+		t.Fatalf("start on a frozen room: %d %v, want 409 sandbox_frozen", status, doc)
+	}
+	if got := hotelExecCalls(tc); got != before {
+		t.Errorf("the hotel got %d exec calls for a refused start", got-before)
+	}
+	tc.b.nexec.mu.Lock()
+	left := len(tc.b.nexec.execs)
+	tc.b.nexec.mu.Unlock()
+	if left != 0 {
+		t.Errorf("a refused start left %d execs in memory", left)
+	}
+}
+
+func TestNativeBackgroundExecOnRunningRoomIsUnchanged(t *testing.T) {
+	tc, release := execChain(t, t.TempDir())
+	release()
+	bid := tc.room(t, "key1", map[string]any{"image": "alpine:3.20"})
+	eid := startBG(t, tc, "key1", bid, "job")
+	status, _, doc := tc.rawCall(t, "key1", "GET", "/v1/sandboxes/"+bid+"/execs/"+eid+"?wait=10", nil)
+	if status != 200 || doc["state"] != "exited" || doc["stdout"] != "out-job" {
+		t.Fatalf("running room: %d %v", status, doc)
+	}
+}
+
+func TestNativeBackgroundExecFrozenAfterStartEndsLostWithReason(t *testing.T) {
+	ex := &nativeExec{State: "running"}
+	doc := map[string]any{"error": map[string]any{"code": "sandbox_frozen", "message": "sandbox x is frozen"}}
+	finishNativeExecLocked(ex, 409, http.Header{}, doc, nil)
+	if ex.State != "lost" || ex.Result["reason"] != "sandbox_frozen" {
+		t.Fatalf("hotel 409 sandbox_frozen: %s %v", ex.State, ex.Result)
+	}
+	other := &nativeExec{State: "running"}
+	finishNativeExecLocked(other, 409, http.Header{}, map[string]any{"error": map[string]any{"code": "sandbox_not_running"}}, nil)
+	if other.Result["reason"] != "hotel_error" {
+		t.Errorf("another 409 changed its reason: %v", other.Result)
+	}
+}

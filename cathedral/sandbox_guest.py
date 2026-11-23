@@ -2976,6 +2976,14 @@ class DockerGuestProvider:
         guest = self._guests.get(sandbox_id)
         if guest is None:
             raise self._refuse_without_guest(sandbox_id)
+        # A frozen room is refused before anything reaches the engine (#704). Without this the engine's
+        # "is paused" error came back as a 200 with exit_code 1, which clients read as a command that ran.
+        # Only frozen goes through the running fence (owner check, then 409 sandbox_frozen); every other
+        # state keeps its old path.
+        with self._inner._lock:  # noqa: SLF001
+            record = self._inner._sandboxes.get(sandbox_id)  # noqa: SLF001
+            if record is not None and record.state == "frozen":
+                self._inner._require_running(sandbox_id)  # noqa: SLF001
         cwd = request.cwd or "/work"
         argv = list(request.argv)
         # Portable shell: ExecRequest maps string cmds to bash -c; many customer images

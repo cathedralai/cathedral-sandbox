@@ -389,6 +389,12 @@ func (b *broker) nativeExecStart(w http.ResponseWriter, g *guestState, rm *room,
 		timeout = int(v)
 	}
 	timeout = b.clampExecTimeout(timeout)
+	// A frozen room is refused before anything is stored or started (#704):
+	// the hotel would refuse the exec, but only after this answered 202.
+	if b.roomFrozen(rm) {
+		writeErr(w, 409, "sandbox_frozen", "sandbox "+bid+" is frozen; thaw before exec")
+		return
+	}
 	// A 202 promises a result or lost/broker_restarted after a restart, never
 	// 404. So the running entry is on disk before anything goes to the hotel,
 	// and a broker that cannot write it refuses (AB#733).
@@ -446,6 +452,19 @@ func (b *broker) nativeExecStart(w http.ResponseWriter, g *guestState, rm *room,
 		b.endNativeExec(ex, herr == nil, func() { finishNativeExecLocked(ex, status, hdr, doc, herr) })
 	}()
 	writeJSON(w, 202, map[string]any{"exec_id": ex.ID, "state": "running"})
+}
+
+// roomFrozen reports whether the hotel lists the room as frozen. Any other
+// answer, or none, is not frozen: those starts keep their old path, and the
+// hotel's own exec refusal still covers a freeze that lands after this read.
+func (b *broker) roomFrozen(rm *room) bool {
+	var doc struct {
+		State string `json:"state"`
+	}
+	if err := rm.h.getJSON(context.Background(), rm.h.cfg.API, "/v1/sandboxes/"+url.PathEscape(rm.hid), nil, &doc); err != nil {
+		return false
+	}
+	return doc.State == "frozen"
 }
 
 // nativeExecPoll answers GET (optionally waiting up to 25 s) and DELETE.
@@ -534,6 +553,9 @@ func finishNativeExecLocked(ex *nativeExec, status int, hdr http.Header, doc map
 		ex.State, ex.Result = "lost", map[string]any{"message": "the hotel had no free connection, so the command did not start; run it again", "reason": "sold_out"}
 	case herr != nil:
 		ex.State, ex.Result = "lost", map[string]any{"message": "the hotel did not answer", "reason": "hotel_unreachable"}
+	case status == 409 && frozenRefusal(doc):
+		// Frozen between the start's check and the hotel call: the command did not run (#704).
+		ex.State, ex.Result = "lost", map[string]any{"message": "the room was frozen, so the command did not start; thaw and run it again", "reason": "sandbox_frozen"}
 	case status != 200:
 		ex.State, ex.Result = "lost", map[string]any{"message": fmt.Sprintf("hotel answered %d", status), "reason": "hotel_error"}
 	default:
@@ -552,6 +574,12 @@ func finishNativeExecLocked(ex *nativeExec, status int, hdr http.Header, doc map
 		ex.Headers = map[string][]string{}
 		copyRoomHeaders(http.Header(ex.Headers), room)
 	}
+}
+
+// frozenRefusal reports a hotel exec answer of 409 sandbox_frozen.
+func frozenRefusal(doc map[string]any) bool {
+	e, _ := doc["error"].(map[string]any)
+	return e["code"] == "sandbox_frozen"
 }
 
 // lostNativeExecLocked ends a running exec as lost. The caller holds n.mu.

@@ -1749,12 +1749,16 @@ def test_a_probe_refused_by_a_paused_room_is_not_cached_as_no_timeout_tool(fake,
 
     sid = _source(provider)
     fake.set(exec_model=None)
-    provider.freeze(sid)  # the engine refuses any exec on a paused container, as docker does
+    # Paused at the engine only (as a capture does), so the record is not frozen and the exec reaches the
+    # probe; a customer freeze is refused before it (#704). The engine refuses any exec on a paused
+    # container, as docker does.
+    cid = provider._guests[sid].container_id  # noqa: SLF001
+    provider._client.pause(cid)  # noqa: SLF001
     with pytest.raises(SandboxOpError) as err:
         provider.exec(sid, ExecRequest(cmd=["echo", "x"], timeout_seconds=5))
     assert err.value.code == "sandbox_paused"
     assert provider._guests[sid].timeout_form is None and provider._guests[sid].has_bash is None  # noqa: SLF001
-    provider.thaw(sid)
+    provider._client.unpause(cid)  # noqa: SLF001
     # After the room runs again the probe reads the image: with the fake's default exec it finds a timeout tool.
     result = provider.exec(sid, ExecRequest(cmd=["echo", "x"], timeout_seconds=5))
     assert provider._guests[sid].timeout_form in ("gnu", "busybox") and result.exit_code == 0  # noqa: SLF001
