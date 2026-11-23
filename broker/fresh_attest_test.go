@@ -333,7 +333,7 @@ func TestFreshStateOfAnOlderBindingIsIgnored(t *testing.T) {
 	// A check that finishes after the hotel was admitted with another
 	// binding is dropped.
 	tc.b.mu.Lock()
-	tc.b.noteFresh(h, strings.Repeat("1", 64), nil, time.Now())
+	tc.b.noteFresh(h, strings.Repeat("1", 64), nil, time.Now(), time.Now())
 	ok := tc.b.freshAttestOK(h, time.Now())
 	tc.b.mu.Unlock()
 	if ok {
@@ -533,5 +533,25 @@ func TestFreshVerifierGetsTheReportGoChecked(t *testing.T) {
 	got, _ := base64.StdEncoding.DecodeString(doc["report_b64"].(string))
 	if !bytes.Equal(got, report) {
 		t.Fatal("the verifier would check another report than the one Go checked")
+	}
+}
+
+// Codex P2 on #689: a pass counts from when the challenge was issued, so a
+// slow hotel or verifier cannot hand an already-aged report a whole window.
+func TestFreshPassCountsFromTheChallengeNotTheVerdict(t *testing.T) {
+	tc := newChainState(t, t.TempDir())
+	optInMiner(t, tc, "g1")
+	_, h := freshMiner(t, tc, "m1")
+	window := tc.b.minerFreshAttest()
+	now := time.Now()
+	tc.b.mu.Lock()
+	defer tc.b.mu.Unlock()
+	tc.b.noteFresh(h, h.adm.bindingSHA, nil, now.Add(-window-time.Second), now)
+	if tc.b.freshAttestOK(h, now) {
+		t.Fatal("a challenge issued longer ago than the window passed on a late verdict")
+	}
+	tc.b.noteFresh(h, h.adm.bindingSHA, nil, now.Add(-time.Second), now)
+	if !tc.b.freshAttestOK(h, now) {
+		t.Fatal("a recent challenge with a pass was not accepted")
 	}
 }
