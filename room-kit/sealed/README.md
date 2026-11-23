@@ -588,8 +588,8 @@ hotels starting together cannot both take one port.
 
 `SEALED_ROOM_GUEST_INGRESS=1` makes the front create the ingress TLS key in
 the guest and name its SPKI sha256 in the binding (`guest_ingress`). Add
-`SEALED_INGRESS_ZONE` (the broker's `acme_dns` zone, for example
-`hotels.cathedral.computer`) and `SEALED_INGRESS_BROKER_URL` (the broker's
+`SEALED_INGRESS_ZONE` (the broker's `acme_dns` zone; the planned zone is
+`hotels.cathedralusercontent.com`, not live yet) and `SEALED_INGRESS_BROKER_URL` (the broker's
 https origin) and the guest also serves on that key:
 
 - `build-guest.sh` writes `ROOM_INGRESS_ZONE`, `ROOM_INGRESS_BROKER_URL`,
@@ -637,7 +637,8 @@ the front) makes a new key, so each orders a new certificate: Let's Encrypt allo
 names per week, so a hotel that restarts more often than that waits for the
 limit (the old URLs serve the self-issued certificate meanwhile). Every
 hotel in the zone also shares Let's Encrypt's 50 certificates per week for the
-registered domain (cathedral.computer for hotels.cathedral.computer). A
+registered domain (cathedralusercontent.com for the planned
+hotels.cathedralusercontent.com). A
 certificate that expires without a renewal turns expose off again (503) until
 the next one arrives. Point
 `SEALED_ACME_DIRECTORY` at Let's Encrypt staging for trials.
