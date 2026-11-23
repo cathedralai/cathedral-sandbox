@@ -980,6 +980,21 @@ var syncAllowanceDir = func(dir string) error {
 // cannot open admission closes that guest and keeps its issue, or that clock
 // value when the issue is not usable. A file that cannot be read stops the
 // broker.
+// checkMeteredGuests holds the allowance rules a config file must meet. Start,
+// live reload and -check-config share it, so a reload cannot install a guest
+// the next start would refuse (AB#946).
+func checkMeteredGuests(c config, guests map[string]*guestState) error {
+	for id, g := range guests {
+		if g.limits.Metered && g.limits.Postpaid {
+			return fmt.Errorf("config: guest %q is both metered and postpaid; a postpaid guest is never gated on its allowance", id)
+		}
+		if g.limits.Metered && c.StateDir == "" {
+			return fmt.Errorf("config: guest %q is metered, which needs state_dir to keep its allowance", id)
+		}
+	}
+	return nil
+}
+
 func (b *broker) loadAllowances() error {
 	b.allow.byGuest = map[string]*guestAllowance{}
 	b.allow.uncertain = map[string]int{}
@@ -997,13 +1012,8 @@ func (b *broker) loadAllowances() error {
 		b.allow.hold = time.Duration(hold) * time.Second
 	}
 	startMs := time.Now().UnixMilli()
-	for id, g := range b.guests {
-		if g.limits.Metered && g.limits.Postpaid {
-			return fmt.Errorf("config: guest %q is both metered and postpaid; a postpaid guest is never gated on its allowance", id)
-		}
-		if g.limits.Metered && b.cfg.StateDir == "" {
-			return fmt.Errorf("config: guest %q is metered, which needs state_dir to keep its allowance", id)
-		}
+	if err := checkMeteredGuests(b.cfg, b.guests); err != nil {
+		return err
 	}
 	if b.cfg.StateDir == "" {
 		return nil

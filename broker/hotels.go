@@ -275,6 +275,15 @@ func (b *broker) dropHotelIf(id string, expected *hotel) bool {
 	return true
 }
 
+// loopsContext is the context main cancels at SIGTERM, or Background before
+// main set it (tests).
+func (b *broker) loopsContext() context.Context {
+	if p := b.loopsCtx.Load(); p != nil {
+		return *p
+	}
+	return context.Background()
+}
+
 // startSync runs the sync loop of h until the hotel leaves.
 func (b *broker) startSync(ctx context.Context, h *hotel) {
 	ctx, cancel := context.WithCancel(ctx)

@@ -28,7 +28,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -188,6 +187,9 @@ func parseConfigFile(raw []byte) (config, []*hotel, map[string]*guestState, map[
 	}
 	guests, byKey, err := buildGuests(c)
 	if err != nil {
+		return c, nil, nil, nil, err
+	}
+	if err := checkMeteredGuests(c, guests); err != nil {
 		return c, nil, nil, nil, err
 	}
 	if guests[poolGuestID] != nil {
@@ -431,7 +433,7 @@ func (b *broker) reloadConfig(wantSHA string) (reloadSummary, error) {
 			log.Printf("config reload: hotel %s not added: %v", h.cfg.ID, err)
 			continue
 		}
-		b.startSync(context.Background(), h)
+		b.startSync(b.loopsContext(), h)
 		sum.HotelsAdded = append(sum.HotelsAdded, h.cfg.ID)
 	}
 	b.fileCfg.Store(&nc)

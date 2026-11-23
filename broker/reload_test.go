@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"os"
@@ -477,3 +478,49 @@ func TestReloadRacesKeyLookupsAndSignIn(t *testing.T) {
 }
 
 func rlJSON(v any) []byte { raw, _ := json.Marshal(v); return raw }
+
+// A reload and -check-config refuse the allowance rules a start refuses, so a
+// reload cannot install a guest the next restart would stop on (#685 review).
+func TestReloadRefusesAGuestAStartWouldRefuse(t *testing.T) {
+	c := reloadBase(t, t.TempDir())
+	rg := newReloadRig(t, c)
+	both := c
+	both.Guests = append(append([]guestConfig{}, c.Guests...), guestConfig{ID: "g6", KeySHA256: sha("key-6"), guestLimits: guestLimits{Metered: true, Postpaid: true}})
+	if code, doc := rg.reload(both, "operator-key"); code != 400 || rlCode(doc) != "invalid_config" || !strings.Contains(rlMsg(doc), "metered and postpaid") {
+		t.Fatalf("metered and postpaid: %d %v", code, doc)
+	}
+	if err := checkConfigFile(rg.path); err == nil {
+		t.Fatal("-check-config passed a metered and postpaid guest")
+	}
+	if rg.b.guestByID("g6") != nil {
+		t.Fatal("a refused reload applied a guest")
+	}
+	noState := c
+	noState.StateDir = ""
+	noState.Guests = append(append([]guestConfig{}, c.Guests...), guestConfig{ID: "g7", KeySHA256: sha("key-7"), guestLimits: guestLimits{Metered: true}})
+	raw, _ := json.Marshal(noState)
+	_ = os.WriteFile(rg.path, raw, 0o600)
+	if err := checkConfigFile(rg.path); err == nil || !strings.Contains(err.Error(), "needs state_dir") {
+		t.Fatalf("-check-config on a metered guest with no state_dir: %v", err)
+	}
+}
+
+// A hotel added by a reload stops with the sync loops main cancels at SIGTERM.
+func TestReloadedHotelStopsWithTheLoops(t *testing.T) {
+	c := reloadBase(t, t.TempDir())
+	rg := newReloadRig(t, c)
+	ctx, stopLoops := context.WithCancel(context.Background())
+	defer stopLoops()
+	rg.b.loopsCtx.Store(&ctx)
+	c.Hotels = append(c.Hotels, reloadHotel(t, rg.dir, "h2"))
+	if code, doc := rg.reload(c, "operator-key"); code != 200 {
+		t.Fatalf("reload %d %v", code, doc)
+	}
+	h2 := rg.b.hotelByID("h2")
+	stopLoops()
+	select {
+	case <-h2.syncDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a reloaded hotel's sync loop ran on after the loops were cancelled")
+	}
+}
