@@ -433,3 +433,43 @@ def test_install_checks_the_name_cap_before_the_build() -> None:
     text = (SEALED / "install-sealed.sh").read_text()
     assert "{0,58}$" in text and "{0,62}" not in text
     assert text.index("SEALED_NAME must match") < text.index("\"$KIT/sealed/build-guest.sh\"")
+
+
+def _shadow_day(tmp_path: Path, name: str, shadow: str, epoch: str) -> subprocess.CompletedProcess[str]:
+    text = (SEALED / "build-guest.sh").read_text()
+    block = text[text.index("# >>> shadow day"):text.index("# <<< shadow day")]
+    root = tmp_path / name
+    (root / "etc").mkdir(parents=True)
+    for f in ("shadow", "shadow-"):
+        (root / "etc" / f).write_text(shadow)
+        (root / "etc" / f).chmod(0o640)
+    return subprocess.run([BASH, "-c", "set -euo pipefail\n" + block], capture_output=True, text=True, timeout=30,
+                          env={"PATH": "/usr/bin:/bin", "R": str(root), "SOURCE_DATE_EPOCH": epoch})
+
+
+def _shadow(day: int) -> str:
+    return (f"root:*:{day}:0:99999:7:::\ndaemon:*:{day}:0:99999:7:::\nsystemd-network:!*:{day}:::::1:\n"
+            "nobody:*::0:99999:7:::\n")
+
+
+def test_two_hosts_with_bases_cached_on_different_days_get_the_same_shadow(tmp_path: Path) -> None:
+    # The live pair on 23 Nov: nc-sealed-2's base was cached on day 20749, nc-sealed-3's on 20753.
+    epoch = str(20780 * 86400 + 5000)
+    for name, day in (("a", 20749), ("b", 20753)):
+        proc = _shadow_day(tmp_path, name, _shadow(day), epoch)
+        assert proc.returncode == 0, proc.stderr
+    for f in ("shadow", "shadow-"):
+        a, b = (tmp_path / "a/etc" / f), (tmp_path / "b/etc" / f)
+        assert a.read_text() == b.read_text() == _shadow(20780).replace("nobody:*::", "nobody:*::")
+        assert oct(a.stat().st_mode & 0o777) == "0o640"
+    assert "nobody:*::0:" in (tmp_path / "a/etc/shadow").read_text(), "an empty day stays empty"
+
+
+def test_an_unknown_commit_time_leaves_the_shadow_file_alone(tmp_path: Path) -> None:
+    proc = _shadow_day(tmp_path, "z", _shadow(20749), "0")
+    assert proc.returncode == 0 and (tmp_path / "z/etc/shadow").read_text() == _shadow(20749)
+
+
+def test_the_shadow_day_is_pinned_after_the_last_account_change() -> None:
+    text = (SEALED / "build-guest.sh").read_text()
+    assert text.index("in_root passwd -l root") < text.index("# >>> shadow day") < text.index("pack_initrd \"$R\"")
