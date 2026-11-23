@@ -8,6 +8,7 @@
 //	PATCH  /v1/broker/hotels/<id>   {drain, drain_notice, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go; drain_notice: drain_notice.go)
 
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
+//	GET    /v1/broker/hotels/<id>/restart-check   200 only when a restart or roll may go (restart_guard.go)
 //
 // A hotel added at runtime is kept in state_dir/hotels.json, and its key in
 // state_dir/hotel-keys/<id>.key (mode 0600). A hotel from the config file
@@ -347,6 +348,14 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 		return
 	}
 	hotelID, action, hadAction := strings.Cut(id, "/")
+	if hadAction && action == "restart-check" && hotelID != "" && r.Method == "GET" {
+		if !operator {
+			writeErr(w, 403, "enroller_scope", "miner enrollment cannot check a hotel restart")
+			return
+		}
+		b.handleRestartCheck(w, hotelID)
+		return
+	}
 	if hadAction && action == "escape-nonce" && hotelID != "" && r.Method == "POST" {
 		if !operator {
 			writeErr(w, 403, "enroller_scope", "miner enrollment cannot plant Escape nonces")
@@ -984,11 +993,8 @@ func (b *broker) saveRuntimeHotelsLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(b.cfg.StateDir, runtimeHotelsFile+".tmp")
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(b.cfg.StateDir, runtimeHotelsFile))
+	// A joined hotel's drain lives here: synced like the drains file (AB#875).
+	return writeFileDurable(filepath.Join(b.cfg.StateDir, runtimeHotelsFile), raw)
 }
 
 // loadRuntimeHotels adds the hotels that joined at runtime before a restart,

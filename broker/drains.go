@@ -7,6 +7,11 @@
 // the time (config_drain). At start, and when a reload changes the file's
 // drain, a saved drain applies only while the file still says config_drain:
 // once someone changed the file, the file wins and the record is dropped.
+//
+// AB#875: the drains file and hotels.json (joined hotels' drains) are
+// written with fsync on the file and its directory, so a drain the PATCH
+// answered 200 for is on disk before the answer, and a power loss or a
+// crash right after cannot reopen the hotel.
 package main
 
 import (
@@ -57,12 +62,49 @@ func (b *broker) saveConfigDrainsLocked() error {
 	if err := os.MkdirAll(b.cfg.StateDir, 0o700); err != nil {
 		return err
 	}
-	tmp := filepath.Join(b.cfg.StateDir, drainsFile+".tmp")
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	return writeFileDurable(filepath.Join(b.cfg.StateDir, drainsFile), raw)
+}
+
+// writeFileDurable replaces name with raw (mode 0600) through a synced temp
+// file and a rename, then syncs the directory: the rename is durable only
+// once the directory is.
+func writeFileDurable(name string, raw []byte) error {
+	tmp := name + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(b.cfg.StateDir, drainsFile))
+	if err := f.Chmod(0o600); err != nil { // a leftover tmp file keeps its old mode
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
+	}
+	if err := durableSync(f); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, name); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(name))
+	if err != nil {
+		return err
+	}
+	if err := durableSync(d); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
+
+// durableSync is f.Sync; a variable so a test can see the calls or make one fail.
+var durableSync = func(f *os.File) error { return f.Sync() }
 
 // loadConfigDrains applies state_dir/hotel-drains.json to the config file
 // hotels at start. A record whose config_drain is no longer the file's drain,
