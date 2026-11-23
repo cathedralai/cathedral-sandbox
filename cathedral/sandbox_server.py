@@ -20,6 +20,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import re
 import socket
 import sys
@@ -1567,6 +1568,58 @@ class _Server(ThreadingHTTPServer):
     # caller retries 1 s later.
     # room_receipts.py's front sets the same value for the same reason.
     request_queue_size = 1024
+    # A worker with no connection for this long ends, so the pool shrinks after a burst.
+    worker_idle_seconds = 300.0
+
+    def __init__(self, *args, **kwargs) -> None:
+        # Kept worker threads instead of one new thread per connection (AB#877).
+        # The receipts front opens a new connection for every exec, so at 1,000
+        # concurrent execs the accept thread started 1,000 threads, each start a
+        # wait for the GIL. Workers are added only when none is idle, so a burst
+        # never waits for a free worker.
+        self._idle_workers = 0
+        self._workers = 0
+        self._pool_lock = threading.Lock()
+        self._pool_queue: queue.SimpleQueue = queue.SimpleQueue()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address) -> None:
+        with self._pool_lock:
+            spawn = self._idle_workers == 0
+            if not spawn:
+                self._idle_workers -= 1  # this connection is that worker's
+            else:
+                self._workers += 1
+        self._pool_queue.put((request, client_address))
+        if spawn:
+            threading.Thread(target=self._pool_worker, name="cathedral-sandbox-conn", daemon=True).start()
+
+    def _pool_worker(self) -> None:
+        while True:
+            try:
+                request, client_address = self._pool_queue.get(timeout=self.worker_idle_seconds)
+            except queue.Empty:
+                with self._pool_lock:
+                    # Leave only while a spare idle worker exists: a reserved
+                    # connection may be on its way into the queue.
+                    if self._idle_workers > 0:
+                        self._idle_workers -= 1
+                        self._workers -= 1
+                        return
+                continue
+            if request is None:  # server_close
+                return
+            self.process_request_thread(request, client_address)
+            with self._pool_lock:
+                self._idle_workers += 1
+
+    def server_close(self) -> None:
+        super().server_close()
+        # End every worker once it is done with its connection.
+        with self._pool_lock:
+            workers, self._workers, self._idle_workers = self._workers, 0, 0
+        for _ in range(workers):
+            self._pool_queue.put((None, None))
 
 
 def serve(app: SandboxApplication, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
