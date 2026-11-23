@@ -1428,3 +1428,39 @@ func TestLabelsMatchTakesTheLastValueOfARepeatedKey(t *testing.T) {
 		}
 	}
 }
+
+// Codex on #667: one sync list that misses a claimed room marks it deleting
+// without confirming it gone (no deleteSent), and keeps it until a later list
+// decides. A bulk delete by its customer label in that interval must still
+// delete it at the hotel: the hotel's own bulk delete cannot reach it under
+// the pool's labels, and skipping it answered 200 while the room ran and its
+// run stayed open.
+func TestBulkDeleteReachesAClaimedRoomOneListMissed(t *testing.T) {
+	pc, mh := newMappedChain(t, 1)
+	run := pc.mapRoom("sbx-1", "g1", jobA, time.Now())
+	pc.sync("a")
+	pc.b.mu.Lock()
+	pc.b.byBID("a.sbx-1").since = time.Now().Add(-time.Minute) // past the sync's 5 s grace for a new room
+	pc.b.mu.Unlock()
+	mh.mu.Lock()
+	mh.hidden["sbx-1"] = true
+	mh.mu.Unlock()
+	pc.sync("a")
+	pc.b.mu.Lock()
+	rm := pc.b.byBID("a.sbx-1")
+	if rm == nil || rm.state != stDeleting || rm.deleteSent {
+		pc.b.mu.Unlock()
+		t.Fatalf("after one list that missed it: room %+v, want it kept as deleting and unconfirmed; the test would prove nothing", rm)
+	}
+	pc.b.mu.Unlock()
+	if st, doc := pc.as("key1", "DELETE", "/v1/sandboxes?label="+url.QueryEscape("job=a"), false); st != 200 {
+		t.Fatalf("bulk delete: %d %v", st, doc)
+	}
+	f := pc.hotels["a"]
+	if n := len(f.callsOf("DELETE", "/v1/sandboxes/sbx-1")); n != 1 || f.roomCount() != 0 {
+		t.Fatalf("deletes of the claimed room at the hotel: %d, hotel rooms %d; want it deleted once and gone", n, f.roomCount())
+	}
+	if rs := pc.readingsOfRun(run); endedCount(rs) != 1 {
+		t.Fatalf("the customer's run: %+v, want ended once", rs)
+	}
+}

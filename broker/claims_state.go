@@ -439,7 +439,12 @@ func (b *broker) deleteClaimedRooms(ctx context.Context, g *guestState, filters 
 	b.mu.Lock()
 	for _, h := range b.hotelList() {
 		for _, rm := range h.rooms {
-			if rm.mapping != nil && rm.guest == g.cfg.ID && rm.state == stRunning && labelsMatch(rm.mapping.customerLabels, filters) {
+			// Running, or marked deleting by a sync list that missed it and
+			// not confirmed gone (no deleteSent): that room may still run,
+			// and the hotel's own bulk delete cannot reach it under the
+			// pool's labels.
+			unconfirmed := rm.state == stRunning || (rm.state == stDeleting && !rm.deleteSent)
+			if rm.mapping != nil && rm.guest == g.cfg.ID && unconfirmed && labelsMatch(rm.mapping.customerLabels, filters) {
 				targets = append(targets, rm)
 			}
 		}
