@@ -87,10 +87,11 @@ func (rm *room) viewLabels() map[string]string {
 
 // labelsMatch reports whether labels hold every filter as the hotel reads
 // them (cathedral/sandbox_provider.py _parse_label_filters): "k=v" wants k
-// with the value v, a bare "k" wants k with the empty value.
+// with the value v, a bare "k" wants k with the empty value, and a key given
+// twice takes its last value (parseLabelFilters, the same reading the broker
+// gives ordinary rooms).
 func labelsMatch(labels map[string]string, filters []string) bool {
-	for _, f := range filters {
-		k, v, _ := strings.Cut(f, "=")
+	for k, v := range parseLabelFilters(filters) {
 		if got, ok := labels[k]; !ok || got != v {
 			return false
 		}
@@ -222,6 +223,12 @@ func (b *broker) adoptMappedLocked(h *hotel, rm *room) bool {
 	if b.guests[cm.guest] == nil || !b.usageMeter.runOpen(cm.m.run) {
 		log.Printf("ready rooms: room %s: its claim run %s is not open in the usage meter (or guest %s is gone); the room stays set aside", rm.id, cm.m.run, cm.guest)
 		b.poolPeriodLocked(rm, true, time.Now()) // set aside: the period sits on its own run
+		// The state file names the claim run as this room's client id (the
+		// mapping made it so). The room is the pool's again: register must
+		// give it an id of its own, never the customer's.
+		if b.savedUUIDs[rm.id] == cm.m.run {
+			delete(b.savedUUIDs, rm.id)
+		}
 		return false
 	}
 	b.mapRoomLocked(h, rm, cm.guest, cm.m)

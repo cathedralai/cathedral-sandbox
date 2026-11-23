@@ -1360,6 +1360,21 @@ func TestSetAsideRoomGetsAPeriodRunWhenThePhysicalEndIsForgotten(t *testing.T) {
 	if after := pc.readingsOfRun("a.sbx-1"); len(after) != len(physBefore) {
 		t.Fatalf("physical run a.sbx-1 took %d more readings: an ended id started again", len(after)-len(physBefore))
 	}
+	// Bugbot on #667: the state file still names the claim run as this room's
+	// client id. A set-aside room is the pool's: it must not answer to the
+	// customer's id, nor carry it into its end record.
+	pc.b.mu.Lock()
+	defer pc.b.mu.Unlock()
+	rm := pc.b.byBID("a.sbx-1")
+	if rm == nil {
+		t.Fatal("the set-aside room is not in the room map")
+	}
+	if rm.uuid == run || pc.b.byUUID[run] != nil {
+		t.Fatalf("the set-aside pool room answers to the claim run %s (room uuid %s)", run, rm.uuid)
+	}
+	if rm.uuid == "" || pc.b.byUUID[rm.uuid] != rm {
+		t.Fatalf("the set-aside room has no client id of its own (uuid %q)", rm.uuid)
+	}
 }
 
 // A pool room that was never claimed keeps its physical run: no period run.
@@ -1385,5 +1400,31 @@ func TestNeverClaimedPoolRoomKeepsItsPhysicalRun(t *testing.T) {
 	pc.b.mu.Unlock()
 	if n == 0 || period != 0 {
 		t.Fatalf("%d pool rooms after a restart, %d on a period run; want some rooms and none on a period run", n, period)
+	}
+}
+
+// Codex on #667: a key given twice in the query takes its last value, as the
+// hotel reads it (_parse_label_filters) and as the broker's own
+// parseLabelFilters does for ordinary rooms. Matching each filter on its own
+// wanted both values at once, so "?label=job=old&label=job=new" skipped a
+// claimed room labelled job=new in lists, usage and bulk deletion.
+func TestLabelsMatchTakesTheLastValueOfARepeatedKey(t *testing.T) {
+	labels := map[string]string{"job": "new", "bare": ""}
+	for _, c := range []struct {
+		filters []string
+		want    bool
+	}{
+		{nil, true},
+		{[]string{"job=new"}, true},
+		{[]string{"job=old"}, false},
+		{[]string{"job=old", "job=new"}, true},
+		{[]string{"job=new", "job=old"}, false},
+		{[]string{"bare"}, true},
+		{[]string{"bare=x", "bare"}, true},
+		{[]string{"missing"}, false},
+	} {
+		if got := labelsMatch(labels, c.filters); got != c.want {
+			t.Errorf("labelsMatch(%v) = %v, want %v", c.filters, got, c.want)
+		}
 	}
 }
