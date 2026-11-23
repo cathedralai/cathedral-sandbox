@@ -213,6 +213,28 @@ ROOM_KERNEL_OOM_GUARD = ("--oom-score-adj", "-1000")
 ROOM_DEATH_SETTLE_SECONDS = 3.0
 ROOM_DEATH_POLL_SECONDS = 0.25
 
+# The image probe (AB#732): the same checks as the single probes, in one sh.
+# bash: `bash -c :` runs. timeout: GNU `timeout 5 true` first, then BusyBox
+# `timeout -t 5 true`, as _timeout_form tries them. Only "true" and ":" run.
+IMAGE_PROBE_SCRIPT = (
+    "b=0; t=none; "
+    "if bash -c : >/dev/null 2>&1; then b=1; fi; "
+    "if timeout 5 true >/dev/null 2>&1; then t=gnu; "
+    "elif timeout -t 5 true >/dev/null 2>&1; then t=busybox; fi; "
+    'echo "cathedral-image-probe bash=$b timeout=$t"'
+)
+_IMAGE_PROBE_LINE = re.compile(r"cathedral-image-probe bash=([01]) timeout=(gnu|busybox|none)")
+
+
+def parse_image_probe(code: int, out: str) -> tuple[bool, str] | None:
+    """(has_bash, timeout form) from the probe's answer; None when it cannot be read."""
+    if code != 0:
+        return None
+    match = _IMAGE_PROBE_LINE.fullmatch(out.strip())
+    if match is None:
+        return None
+    return match.group(1) == "1", match.group(2)
+
 
 def is_dind_image(image: str) -> bool:
     """True when the image is a Docker-in-Docker base used for compose tasks."""
@@ -374,6 +396,8 @@ class GuestRecord:
     has_bash: bool | None = None
     # Whether the image can run ``sh`` (the cancel wrapper needs it). None: not probed yet.
     has_sh: bool | None = None
+    # The one-exec image probe (AB#732) has run (a paused refusal aside), so it is not asked again.
+    image_probed: bool = False
     # (owner, name, path, version_on_delete) of the mounted workspace (#305).
     workspace: tuple[str, str, str, bool] | None = None
     # Owner of the room (sandbox_owner.owner_id). The egress proxy reads the
@@ -3185,8 +3209,39 @@ class DockerGuestProvider:
             if count:
                 registry.signal_end(entry, sent)
 
+    def _probe_image(self, guest: GuestRecord) -> None:
+        """Learn sh, bash and the timeout form in one ``docker exec`` (AB#732).
+
+        A room's first command used to wait for up to four probe execs in a row
+        (bash, timeout GNU, timeout BusyBox, sh), about 60 ms each in a sealed
+        room. This runs the same checks inside one ``sh``, once per room. An
+        answer it cannot read (no sh, odd output) leaves the fields unset and the
+        single probes run as before; a paused room is refused and nothing is kept.
+        """
+        if guest.image_probed:
+            return
+        try:
+            code, out, err, _ = self._client.exec(
+                guest.container_id, ["sh", "-c", IMAGE_PROBE_SCRIPT], cwd=None, env={}, timeout_seconds=20, stdin=None
+            )
+        except SandboxOpError:
+            return
+        self._refuse_probe_on_paused(code, err)
+        guest.image_probed = True
+        found = parse_image_probe(code, out)
+        if found is None:
+            return
+        has_bash, form = found
+        guest.has_sh = True
+        if guest.has_bash is None:
+            guest.has_bash = has_bash
+        if guest.timeout_form is None:
+            guest.timeout_form = form
+
     def _has_sh(self, guest: GuestRecord) -> bool:
         """True when the guest image can run ``sh``. Probe once; the probe has no side effect."""
+        if guest.has_sh is None:
+            self._probe_image(guest)
         if guest.has_sh is None:
             code, _, _, _ = self._client.exec(
                 guest.container_id, ["sh", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
@@ -3196,6 +3251,8 @@ class DockerGuestProvider:
 
     def _has_bash(self, guest: GuestRecord) -> bool:
         """True when the guest image can run ``bash``. Probe once; the probe has no side effect."""
+        if guest.has_bash is None:
+            self._probe_image(guest)
         if guest.has_bash is None:
             code, _, err, _ = self._client.exec(
                 guest.container_id, ["bash", "-c", ":"], cwd=None, env={}, timeout_seconds=20, stdin=None
@@ -3209,6 +3266,8 @@ class DockerGuestProvider:
 
         The probe runs only "true", so a repeat has no side effect.
         """
+        if guest.timeout_form is None:
+            self._probe_image(guest)
         if guest.timeout_form is not None:
             return guest.timeout_form
         form = "none"
