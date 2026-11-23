@@ -50,8 +50,22 @@ def _workers() -> int:
     return sum(1 for t in threading.enumerate() if t.name == "cathedral-sandbox-conn")
 
 
+def _settled_workers() -> int:
+    """The worker count to compare against, once earlier servers' workers are gone.
+
+    A server closed by the test before this one ends its workers a moment
+    after server_close returns. A base read in that moment counted a worker
+    that then exited, and "back to base" could never be true (assert 0 == 1,
+    about 1 run in 150 here, and on main's CI).
+    """
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _workers() > 0:
+        time.sleep(0.01)
+    return _workers()
+
+
 def test_a_burst_runs_at_once_and_the_next_burst_reuses_the_workers() -> None:
-    base = _workers()
+    base = _settled_workers()
     server = _serve(hold=0.5)
     try:
         port = server.server_address[1]
@@ -88,7 +102,7 @@ def test_sequential_connections_share_one_worker() -> None:
 
 
 def test_idle_workers_end_after_the_idle_time() -> None:
-    base = _workers()
+    base = _settled_workers()
     server = _serve(hold=0.2, idle=0.3)
     try:
         port = server.server_address[1]
@@ -106,7 +120,7 @@ def test_idle_workers_end_after_the_idle_time() -> None:
 
 
 def test_server_close_ends_the_workers() -> None:
-    base = _workers()
+    base = _settled_workers()
     server = _serve(hold=0.1)
     port = server.server_address[1]
     with ThreadPoolExecutor(8) as pool:
