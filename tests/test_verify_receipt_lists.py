@@ -1629,16 +1629,50 @@ def _bulk(count: int, rooms: int) -> list[dict]:
     return receipts
 
 
-@pytest.mark.parametrize("count, rooms", [(30000, 1), (30000, 30000)], ids=["one-room", "many-rooms"])
-def test_room_numbering_takes_time_in_proportion_to_the_receipts(count, rooms) -> None:
-    import time
+def _numbering_line_work(vr, receipts):
+    """Bound Python work, not elapsed time on a shared CI runner.
 
+    Count every verifier line, including helper functions and comprehensions.
+    Abort excessive work during the call so a quadratic regression fails fast.
+    Native sorting remains covered by the existing large-chain checks.
+    """
+    lines = 0
+    limit = 200 * len(receipts)
+    filename = vr.room_numbering.__code__.co_filename
+
+    def trace(frame, event, arg):
+        nonlocal lines
+        if frame.f_code.co_filename != filename:
+            return None
+        if event == "line":
+            lines += 1
+            assert lines <= limit, f"room numbering exceeded {limit} verifier line steps"
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        out = vr.room_numbering(receipts)
+    finally:
+        sys.settrace(previous)
+    return out, lines
+
+
+@pytest.mark.parametrize("many_rooms", [False, True], ids=["one-room", "many-rooms"])
+def test_room_numbering_work_is_in_proportion_to_the_receipts(many_rooms) -> None:
     vr = _load_checker()
-    receipts = _bulk(count, rooms)
-    started = time.perf_counter()
-    out = vr.room_numbering(receipts)
-    assert time.perf_counter() - started < 5.0
-    assert len(out["rooms"]) == rooms
+    work = []
+    for count in (3000, 30000):
+        rooms = count if many_rooms else 1
+        out, lines = _numbering_line_work(vr, _bulk(count, rooms))
+        assert len(out["rooms"]) == rooms
+        assert sum(room["receipts"] for room in out["rooms"].values()) == count
+        assert out["warnings"] == []
+        assert lines > count  # Confirm instrumentation actually ran.
+        work.append(lines)
+    # Ten times as many receipts may use a little more than ten times the work,
+    # but must not approach the hundredfold growth of a nested scan.
+    assert work[1] <= 12 * work[0], work
 
 
 def test_a_chain_of_many_receipts_is_checked_in_proportion_to_their_number(tmp_path) -> None:
