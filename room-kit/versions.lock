@@ -72,7 +72,10 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # AB#877), #681 (wait for the drain only once the command has exited, AB#877) and #679 (SEALED_ROOM_QUOTA_VCPU,
 # AB#857; room-kit code, rides with the kit commit). Same make-dist.sh; the cb80ac4 tarball rebuilds to its pinned
 # sha with the same tool.
-CATHEDRAL_COMMIT=5b0e8ae
-CATHEDRAL_TARBALL=dist/cathedral-5b0e8ae.tar.gz
-CATHEDRAL_TARBALL_SHA256=293cf62988513310d741341c2b44eea198dedfff81e585cc144adde780f192f6
+# Pinned 2026-11-23 to 1fa7a80: main after #695 (workspace meta.json, version trees and their directories
+# are synced before the API answers, so a workspace survives a guest restart, AB#598). The only change to
+# cathedral/ since 5b0e8ae. Same make-dist.sh; the 5b0e8ae tarball rebuilds to its pinned sha with the same tool.
+CATHEDRAL_COMMIT=1fa7a80
+CATHEDRAL_TARBALL=dist/cathedral-1fa7a80.tar.gz
+CATHEDRAL_TARBALL_SHA256=12699cd5318965be614e1ebaa7c6040287e73511844215e1ebd74aff780958bf
 PROBE_IMAGE=alpine:3.20
