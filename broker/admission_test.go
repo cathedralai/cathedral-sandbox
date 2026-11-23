@@ -38,7 +38,8 @@ type attestOpts struct {
 	measurement   byte   // fill byte of the measurement (default 0xab)
 	chip          byte   // CHIP_ID seed: hotels with one seed are one machine
 	receiptKey    []byte // 32-byte Ed25519 public key; default is the placeholder "AAAA"
-	reportID      byte   // fill byte of REPORT_ID (0x140, 32 bytes); 0 leaves it all zeros
+	reportID      byte   // fill byte of REPORT_ID (0x140, 32 bytes); 0 is the default fill 0x3c
+	noReportID    bool   // REPORT_ID all zeros
 	sealedSecrets bool   // the binding names a sealed secrets key (room-kit ROOM_SEALED_SECRETS=1, AB#417)
 }
 
@@ -70,8 +71,18 @@ func snpAttestation(t testing.TB, o attestOpts) []byte {
 	for i := 0x1A0; i < 0x1E0; i++ {
 		rep[i] = byte(i) + o.chip
 	}
+	rid := o.reportID
+	if rid == 0 {
+		rid = 0x3c
+	}
+	if o.noReportID {
+		rid = 0
+	}
 	for i := 0x140; i < 0x160; i++ {
-		rep[i] = o.reportID
+		rep[i] = rid
+	}
+	for i := 0x1F0; i < 0x1F8; i++ {
+		rep[i] = 0x07 // LAUNCH_TCB
 	}
 	cmdline := "console=ttyS0 root=/dev/vda"
 	if o.debugCmdline {
@@ -121,6 +132,10 @@ type minerHotel struct {
 	slots atomic.Int64
 	cert  *x509.Certificate
 	quota atomic.Pointer[quotaGate] // set: /v1/quota calls wait until the gate opens
+	// fresh is how POST /room/attest from the broker's fresh check
+	// (fresh_attest.go) answers; "" is a good fresh report (freshAnswer).
+	fresh      atomic.Value // string
+	freshCalls atomic.Int64
 }
 
 // quotaGate holds /v1/quota calls open. A sync step asks health first and
@@ -140,6 +155,10 @@ func (m *minerHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-g.open:
 		case <-r.Context().Done(): // the caller gave up; httptest Close does not wait on us
 		}
+	}
+	if r.URL.Path == "/room/attest" && r.Header.Get(guestHeader) == freshGuestID {
+		m.serveFresh(w, r)
+		return
 	}
 	if r.URL.Path == "/room/health" {
 		m.mu.Lock()
@@ -310,6 +329,9 @@ func healthDown(tc *testChain, m *minerHotel, id string) {
 func syncNow(tc *testChain, id string) {
 	if h := tc.b.hotelByID(id); h != nil {
 		tc.b.syncHotel(context.Background(), h)
+		// A join's sync loop that still runs may have had the fresh check
+		// in flight (fresh_attest.go): wait for its result.
+		freshSettled(tc, h)
 	}
 }
 
@@ -322,6 +344,7 @@ func admitNow(t *testing.T, tc *testChain, id string) {
 	h.adm.checkedAt = time.Time{} // due now
 	tc.b.mu.Unlock()
 	tc.b.syncAdmission(context.Background(), h, true)
+	freshSettled(tc, h) // a miner hotel: its fresh report, as the sync step runs it (AB#947)
 	tc.b.mu.Lock()
 	defer tc.b.mu.Unlock()
 	if !tc.b.admitted(h, time.Now()) {
@@ -1029,7 +1052,12 @@ const amdPass = `{"verdict": "PASS", "attestation": {"amd": {"product": "Genoa",
 func fakeAMDVerifier(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	script := "#!/bin/sh\nd=$(dirname \"$0\")\necho \"$@\" >> \"$d/calls.log\"\ncat \"$d/verdict.json\"\n"
+	// A fresh check (--fresh-report, fresh_attest.go) logs to fresh.log and
+	// prints fresh_verdict.json when there is one, so admission call counts
+	// stay as they were.
+	script := "#!/bin/sh\nd=$(dirname \"$0\")\n" +
+		"if [ \"$1\" = --fresh-report ]; then echo \"$@\" >> \"$d/fresh.log\"; if [ -f \"$d/fresh_verdict.json\" ]; then cat \"$d/fresh_verdict.json\"; else cat \"$d/verdict.json\"; fi; exit 0; fi\n" +
+		"echo \"$@\" >> \"$d/calls.log\"\ncat \"$d/verdict.json\"\n"
 	if err := os.WriteFile(filepath.Join(dir, "verify.sh"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1052,4 +1080,67 @@ func setAMDVerdict(t *testing.T, dir, verdict string) {
 func amdCalls(dir string) []string {
 	raw, _ := os.ReadFile(filepath.Join(dir, "calls.log"))
 	return strings.FieldsFunc(string(raw), func(r rune) bool { return r == '\n' })
+}
+
+// setFresh sets how the hotel answers fresh checks (serveFresh).
+func (m *minerHotel) setFresh(mode string) { m.fresh.Store(mode) }
+
+// serveFresh answers the broker's fresh check like room_receipts.py: the boot
+// report with REPORT_DATA set to the 64 bytes asked for. Modes: "429", "500",
+// "hang" (no answer for a second), "replay" (the boot report as
+// is), "report_id" (another REPORT_ID), "no_report_id", "debug", "chip",
+// "launch_tcb".
+func (m *minerHotel) serveFresh(w http.ResponseWriter, r *http.Request) {
+	m.freshCalls.Add(1)
+	mode, _ := m.fresh.Load().(string)
+	switch mode {
+	case "429":
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, 429, map[string]string{"error": "attest_rate_limit"})
+		return
+	case "500":
+		writeJSON(w, 500, map[string]string{"error": "attest_failed"})
+		return
+	case "hang":
+		// Longer than the broker's call timeout in the test; bounded, so
+		// httptest's Close does not wait on it.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+		}
+		return
+	}
+	var req struct {
+		ReportData string `json:"report_data_hex"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	want, err := hex.DecodeString(req.ReportData)
+	if err != nil || len(want) != 64 {
+		writeJSON(w, 400, map[string]string{"error": "report_data_hex must be 128 hex characters (64 bytes)"})
+		return
+	}
+	m.mu.Lock()
+	var doc struct {
+		Report string `json:"report_b64"`
+	}
+	_ = json.Unmarshal(m.attestation, &doc)
+	m.mu.Unlock()
+	rep, _ := base64.StdEncoding.DecodeString(doc.Report)
+	if mode != "replay" {
+		copy(rep[0x50:0x90], want)
+	}
+	switch mode {
+	case "report_id":
+		rep[0x140] ^= 0xff
+	case "no_report_id":
+		copy(rep[0x140:0x160], make([]byte, 32))
+	case "debug":
+		rep[0x08+2] |= 0x08
+	case "chip":
+		rep[0x1A0] ^= 0xff
+	case "launch_tcb":
+		rep[0x1F0] ^= 0xff
+	}
+	writeJSON(w, 200, map[string]any{"report_b64": base64.StdEncoding.EncodeToString(rep), "cert_chain": nil,
+		"binding_sha256": strings.Repeat("0", 64), "measurement": "unsigned", "generated_at": 1})
 }

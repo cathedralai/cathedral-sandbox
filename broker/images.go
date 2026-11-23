@@ -204,8 +204,8 @@ func (b *broker) noRoomReason(pl placement) createResult {
 			draining++
 		case now.Before(h.backoffUntil):
 			resting++
-		case !b.admitted(h, now) || b.awaitsRoomCheck(h):
-			pending++
+		case !b.admitted(h, now) || b.awaitsRoomCheck(h) || !b.freshAttestOK(h, now):
+			pending++ // a miner hotel without a fresh pass waits like admission (fresh_attest.go)
 		case b.freeFor(h) > 0 && mb.limit(h) == 0:
 			full++ // a miner cap (placement.go) takes no more rooms here
 			capped++
@@ -559,7 +559,7 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 			continue
 		}
 		free := b.freeFor(h)
-		if free < 0 || !h.ok || h.drain() || !b.admitted(h, time.Now()) {
+		if now := time.Now(); free < 0 || !h.ok || h.drain() || !b.admitted(h, now) || !b.freshAttestOK(h, now) {
 			free = 0
 		}
 		labels := h.labels()

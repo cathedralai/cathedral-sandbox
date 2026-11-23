@@ -22,7 +22,7 @@ func setLaunch(t *testing.T, tc *testChain, id string, fill byte) {
 	t.Helper()
 	f := tc.hotels[id]
 	f.mu.Lock()
-	f.attestation = snpAttestation(t, attestOpts{chip: chipOf(id), reportID: fill})
+	f.attestation = snpAttestation(t, attestOpts{chip: chipOf(id), reportID: fill, noReportID: fill == 0})
 	f.mu.Unlock()
 }
 

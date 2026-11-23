@@ -1081,6 +1081,30 @@ miner hotels have always taken.
   new rooms. Rooms already on it keep working; the broker deletes none.
 - After a broker restart every sealed hotel is `pending` until its first
   check, normally within a second or two of start.
+- Fresh attestation of miner hotels (AB#947, `fresh_attest.go`). Every keyed
+  call to a miner hotel is pinned to the guest TLS key its boot report names,
+  so a replayed document cannot finish the handshake. What the boot report
+  cannot show is that the chip still vouches for the guest answering now: a
+  guest TLS key that leaked and is used after that guest died would keep
+  passing. So a miner hotel takes a new room only with a fresh report younger
+  than `miner_fresh_attest_seconds` (default 30). The sync loop asks every
+  half window, one check at a time per hotel: `POST /room/attest` over the
+  pinned client, guest id `_broker_fresh` (reserved), REPORT_DATA
+  `sha512("cathedral.broker.fresh/v1" || hotel id || admitted binding sha256
+  || 32-byte nonce)`. A pass needs REPORT_DATA equal to the value sent,
+  REPORT_ID non-empty and equal to the admitted one, measurement, CHIP_ID,
+  policy and LAUNCH_TCB equal to the admitted report's, debug off, the
+  measurement still listed, the AMD chain signature (`verify_receipts.py
+  --fresh-report`) and the firmware floors. A 429, a timeout or a busy
+  verifier keeps the last pass until its window ends; an answered failure
+  clears it. Stale, failed or never checked: the hotel is not a candidate
+  (the create goes elsewhere, or 503 `hotels_not_admitted`). Rooms already
+  running are untouched. Admission itself, the one-chip check and probation
+  do not read fresh state. The hotel document shows `admission.fresh`
+  (`at`, `ok`, `reason`, `max_age_seconds`); the operator capacity view
+  shows `miner_fresh.held_out`, the miner hotels up and admitted but held
+  out for a stale proof. Operator hotels are unchanged. One verifier slot of
+  four is reserved for fresh checks, so slow joins cannot starve them.
 
 `"sealed_admission": "off"` on one hotel's entry in the config file `hotels`
 list is the emergency ops escape: that hotel skips the gate, as config
@@ -1163,6 +1187,7 @@ Config (all optional):
 | `min_genoa_snp_spl` | Optional Genoa SNP component floor, 0 to 255. Zero leaves it unset. When nonzero, after AMD-chain verification the broker checks current, reported, committed and launch TCB SNP bytes on every gated Genoa hotel. Missing or older values refuse admission; a sealed hotel with `sealed_admission: "off"` makes the config invalid. Set it to `30` (`0x1e`) only after a patched canary is verified and the operator approves the capacity impact. This checks the AMD-SB-3059 SNP TCB component; it does not prove the separate OEM PI or microcode mitigations in AMD-SB-3059 and AMD-SB-3061. |
 | `min_genoa_microcode_spl` | Optional Genoa microcode component floor, 0 to 255 (AB#809). Zero leaves it unset. Same checks as `min_genoa_snp_spl` but on the microcode byte (byte 7) of the current, reported, committed and launch TCBs; a newer SNP byte does not compensate. AMD-SB-3061 (CVE-2026-40671) is fixed by Genoa microcode 0x0A10115B (RS-B1) / 0x0A10125B (RS-B2), which only an OEM BIOS with Genoa_100J Patch 3 delivers; the floor for it is `91` (`0x5b`). Set it only after every admitted Genoa hotel reads microcode 0x5b or later, and the operator approves the capacity impact. |
 | `attest_ttl_seconds`, `attest_every_seconds` | As above. |
+| `miner_fresh_attest_seconds` | A miner hotel takes a new room only with a fresh report younger than this (above). Default 30, 5 to 300. |
 | `require_sealed_guest_tls` | Top level, default false. Every sealed hotel must be reached over its attested guest TLS key (above). Per hotel entry: `"guest_tls": true` (sealed, `https://` api and health, not with `sealed_admission: "off"`). |
 | `sealed_admission` | Top level: `"on"` or absent; `"off"` is refused. Per hotel entry: `"gate"` (default) or `"off"`, the ops escape for one operator hotel (above). |
 | `amd_verifier` | `{"command": ["python3", "/opt/room-kit/verify_receipts.py"], "ark_sha256": "<AMD ARK DER sha256>", "kds_cache"?: "<dir>", "timeout_seconds"?: 120}`. `ark_sha256` is one pin or a list (one per product: Milan, Genoa, Turin; values in `amd_chain.go`); the verifier passes if the report's product chain has any listed ARK, in one run. The host needs Python with `cryptography` and HTTPS to `kdsintf.amd.com` (or a filled KDS cache). |
