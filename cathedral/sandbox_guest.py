@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shlex
 import shutil
 import stat
@@ -416,6 +417,13 @@ def _guest_start_fault(stderr: str) -> str | None:
     return None
 
 
+# After the command exits, output still in its pipes is read for at most this long. A
+# process the command left behind can hold a pipe open forever; the call must still end.
+RUN_BOUNDED_EXIT_DRAIN_SECONDS = 2.0
+# Exit check interval where pidfd_open is missing (non-Linux or a kernel before 5.3).
+_RUN_BOUNDED_POLL_SECONDS = 0.05
+
+
 def _run_bounded(
     argv,
     *,
@@ -430,8 +438,12 @@ def _run_bounded(
 
     ``on_stdout`` and ``on_stderr`` see each retained chunk up to ``cap`` bytes,
     not the extra overflow byte, while the process is still running.
-    ``read1`` returns a short pipe read. ``BufferedReader.read`` waits until the
-    buffer fills or the process exits, which would hide a line until the command ends.
+
+    One thread does all of it with a selector (AB#877): the pipes, stdin and the
+    exit (a pidfd, so the answer comes when the command ends, not at a poll
+    point). The old form started three helper threads per call; at 1,000
+    concurrent execs that was 3,000 extra threads fighting for the GIL, and
+    each start cost the request path a GIL handoff.
     """
     proc = subprocess.Popen(
         argv,
@@ -440,48 +452,87 @@ def _run_bounded(
         stderr=subprocess.PIPE,
         env=env,
     )
-    kept: dict[str, bytes] = {}
-    hooks = {"out": on_stdout, "err": on_stderr}
-
-    def drain(name: str, stream) -> None:
-        buf = bytearray()
-        hook = hooks[name]
-        for chunk in iter(lambda: stream.read1(65536), b""):
-            if len(buf) <= cap:
-                before = len(buf)
-                buf.extend(chunk[: cap + 1 - len(buf)])
-                publish_end = min(len(buf), cap)
-                if hook is not None and publish_end > before:
-                    hook(bytes(buf[before:publish_end]))
-        kept[name] = bytes(buf)
-
-    readers = [threading.Thread(target=drain, args=(n, st), daemon=True) for n, st in (("out", proc.stdout), ("err", proc.stderr))]
-    for t in readers:
-        t.start()
-    if input_bytes is not None:
-        def feed() -> None:
-            try:
-                proc.stdin.write(input_bytes)
-                proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
-        threading.Thread(target=feed, daemon=True).start()
-    exited = threading.Event()
-
-    def reap() -> None:
+    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    kept = {out_fd: bytearray(), err_fd: bytearray()}
+    hooks = {out_fd: on_stdout, err_fd: on_stderr}
+    deadline = None if timeout is None else time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    pidfd = None
+    try:
+        for stream in (proc.stdout, proc.stderr):
+            sel.register(stream, selectors.EVENT_READ)
+        pending = memoryview(input_bytes) if input_bytes else None
+        if proc.stdin is not None:
+            if pending:
+                os.set_blocking(proc.stdin.fileno(), False)
+                sel.register(proc.stdin, selectors.EVENT_WRITE)
+            else:
+                _close_quietly(proc.stdin)
         try:
-            proc.wait()  # blocks until the child ends; wait(timeout=...) polls with sleeps of up to 50 ms
-        finally:
-            exited.set()
+            pidfd = os.pidfd_open(proc.pid)
+            sel.register(pidfd, selectors.EVENT_READ)
+        except (AttributeError, OSError):
+            pidfd = None
+        drain_until = None  # set once the command has exited
+        while True:
+            now = time.monotonic()
+            if drain_until is None and pidfd is None and proc.poll() is not None:
+                drain_until = now + RUN_BOUNDED_EXIT_DRAIN_SECONDS
+            readers_open = any(key.fd in kept for key in sel.get_map().values())
+            if drain_until is not None and (not readers_open or now >= drain_until):
+                break
+            if drain_until is None and deadline is not None and now >= deadline:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(argv, timeout)
+            limits = [t - now for t in (deadline, drain_until) if t is not None]
+            if pidfd is None and drain_until is None:
+                limits.append(_RUN_BOUNDED_POLL_SECONDS)
+            for key, _events in sel.select(max(0.0, min(limits)) if limits else None):
+                if key.fd == pidfd:
+                    sel.unregister(pidfd)
+                    if drain_until is None:
+                        drain_until = time.monotonic() + RUN_BOUNDED_EXIT_DRAIN_SECONDS
+                    continue
+                if proc.stdin is not None and key.fileobj is proc.stdin:
+                    try:
+                        pending = pending[os.write(key.fd, pending[:65536]):]
+                    except BlockingIOError:
+                        continue
+                    except OSError:  # the command closed its stdin
+                        pending = None
+                    if not pending:
+                        sel.unregister(proc.stdin)
+                        _close_quietly(proc.stdin)
+                    continue
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                    continue
+                buf = kept[key.fd]
+                if len(buf) <= cap:
+                    before = len(buf)
+                    buf.extend(chunk[: cap + 1 - len(buf)])
+                    publish_end = min(len(buf), cap)
+                    hook = hooks[key.fd]
+                    if hook is not None and publish_end > before:
+                        hook(bytes(buf[before:publish_end]))
+        proc.wait()
+    finally:
+        sel.close()
+        if pidfd is not None:
+            os.close(pidfd)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                _close_quietly(stream)
+    return subprocess.CompletedProcess(argv, proc.returncode, bytes(kept[out_fd]), bytes(kept[err_fd]))
 
-    threading.Thread(target=reap, daemon=True).start()
-    if not exited.wait(timeout):
-        proc.kill()
-        exited.wait()
-        raise subprocess.TimeoutExpired(argv, timeout)
-    for t in readers:
-        t.join()
-    return subprocess.CompletedProcess(argv, proc.returncode, kept.get("out", b""), kept.get("err", b""))
+
+def _close_quietly(stream) -> None:
+    try:
+        stream.close()
+    except OSError:
+        pass
 
 
 def _auth_pulled_path() -> Path:
