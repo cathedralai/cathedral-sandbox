@@ -469,8 +469,9 @@ type guestState struct {
 
 type broker struct {
 	cfg              config
-	freshReplays     freshReplays  // AB#683 fresh creates by attempt and launch (escape_fresh_create.go)
-	terminalWSIdle   time.Duration // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
+	loopsCtx         atomic.Pointer[context.Context] // the sync loops' context from main; nil in tests (loopsContext)
+	freshReplays     freshReplays                    // AB#683 fresh creates by attempt and launch (escape_fresh_create.go)
+	terminalWSIdle   time.Duration                   // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
@@ -3455,6 +3456,7 @@ func main() {
 		log.Fatal("config: listen is required (an empty listen would bind :http on every interface)")
 	}
 	ctx, stopLoops := context.WithCancel(context.Background())
+	b.loopsCtx.Store(&ctx) // hotels added by a live reload stop with the rest at SIGTERM
 	if err := b.loadCompat(); err != nil {
 		log.Printf("client state not loaded: %v", err)
 	}

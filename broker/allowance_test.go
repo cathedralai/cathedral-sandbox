@@ -49,6 +49,10 @@ type lifeHotel struct {
 	// holdLabelLists: holdList applies to label-filtered lists (the orphan
 	// cleanup) instead of the plain room list.
 	holdLabelLists bool
+	// holdFreezes, when set, holds each room freeze until it is closed;
+	// freezeEntered gets the room path when a freeze arrives (AB#948).
+	holdFreezes   chan struct{}
+	freezeEntered chan string
 }
 
 type lifeCall struct {
@@ -61,7 +65,14 @@ func (l *lifeHotel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	l.seen = append(l.seen, r.Method+" "+r.URL.Path)
 	hide, holdCreates, entered, holdDeletes := l.hideDeletes, l.holdCreates, l.enteredCreate, l.holdDeletes
 	holdList, listTaken, labelLists := l.holdList, l.listTaken, l.holdLabelLists
+	holdFreezes, freezeEntered := l.holdFreezes, l.freezeEntered
 	l.mu.Unlock()
+	if holdFreezes != nil && r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/v1/sandboxes/") && strings.HasSuffix(r.URL.Path, "/freeze") {
+		if freezeEntered != nil {
+			freezeEntered <- r.URL.Path
+		}
+		<-holdFreezes
+	}
 	if holdList != nil && r.Method == "GET" && r.URL.Path == "/v1/sandboxes" && (r.URL.RawQuery != "") == labelLists {
 		rec := httptest.NewRecorder()
 		l.inner.ServeHTTP(rec, r)

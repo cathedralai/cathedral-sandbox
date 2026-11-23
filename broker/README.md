@@ -504,8 +504,8 @@ guest that is not metered behaves as before.
 
 | Route (operator key) | What it does |
 |---|---|
-| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. |
-| `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`. A guest that is not metered: `{"metered": false, "live_rooms"}`. |
+| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. Optional `"stop": {"reason": "account_suspended" \| "abuse"}` (AB#948): see "Allowance stop" below. |
+| `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`; once a stop was sent since the broker started, also `stop_running` and `last_stop` (`null` while the first pass runs, else `{"at", "reason", "frozen": n, "failed": [room ids], "hotel_errors": [hotel ids]}`). A guest that is not metered: `{"metered": false, "live_rooms"}`. |
 
 A metered create, and each lifetime extension of a metered room, is refused:
 
@@ -551,11 +551,32 @@ Size and lifetime of a metered room:
   the room keeps the deadline it has.
 - A room claim (`POST .../claim`, room kit) gets 403 `claim_refused_metered`:
   it sets a lifetime outside the allowance.
+- A thaw (`POST .../thaw`) is an admission like an extension: refused 402
+  `allowance_exhausted` when the live rooms pass the cap (so always at cap
+  0), 402 `allowance_lease_expired` on a stale lease, 503 `allowance_recount`
+  during a recount. A refused thaw sends nothing; the room stays frozen.
 - An owner-signed create on a dedicated machine signs the body the hotel
   receives: send `ttl_seconds` and `resources.memory_gib` within the
   allowance, so the broker changes nothing.
 
-Nothing here stops or deletes a running room. After a restart the file is
+### Allowance stop
+
+A PUT may carry `"stop": {"reason": "account_suspended" | "abuse"}`. It is
+level-triggered: the ledger sends it on every PUT while the account stays
+stopped; the broker keeps no stop id. It needs `cap` 0 in the same PUT (else
+400 `invalid_stop`; an unknown reason is 400 too). A guest that is not
+metered gets 409 `guest_not_metered` before anything changes, and a postpaid
+guest can never be metered, so a stop never reaches const. The PUT saves
+and answers at once (with `"stop": {"reason", "started"}`), then runs the
+freeze-all pass of the meter route in the background: rooms in state
+`running` are frozen, no other room is touched, nothing is deleted. One pass
+runs per guest at a time; a stop while one runs starts none (`started:
+false`). A repeated stop freezes nothing new, retries rooms that failed, and
+freezes a room that was still `creating` at the earlier stop. The last
+result shows in the GET view as `last_stop` (memory only). A frozen room
+keeps its TTL and still bills to it, like the API path's prepaid hold.
+
+Nothing else here stops a running room, and nothing here deletes one. After a restart the file is
 read again: a cap of 0 stays 0, the issue is kept, and a lease keeps its
 `ledger_seen_at`, so it can expire across the restart. A missing file leaves
 every metered guest closed. A file that does not parse is moved aside
@@ -901,14 +922,14 @@ New customer keys, new hotels and new measurements need no restart.
 POST /v1/broker/config/reload   operator key   {"sha256": "<sha256 of the config file>"}
 ```
 
-- The broker reads its config file again and checks it exactly as a start does. `thin-broker -check-config -config <file>` runs the same checks with no side effect (exit 0 or 1).
+- The broker reads its config file again and runs the start's config checks on it. `thin-broker -check-config -config <file>` runs the same checks with no side effect (exit 0 or 1). Not covered (checked only at start; a reload cannot change them anyway): `listen`, `uncertain_create_hold_seconds`, `usage_meter_every_seconds`, `ready_rooms`.
 - The file is compared with the last file applied, not with live state, so a runtime PATCH stays unless the file changed that field.
 - Applied live: a new guest; a guest's `key_sha256` / `next_key_sha256` (the old hash stops at once); each guest limit the file changed; `sealed_measurements`, `sealed_host_data`, `miner_hotkey_caps`, `miner_max_hotels`; a new hotel; a config hotel's `drain`.
 - Anything else (a removed guest or hotel, any other field) answers 409 `needs_restart` naming each field, and nothing changes. A wrong sha256 answers 409 `config_changed`; a file that would not start answers 400 `invalid_config`.
-- A measurement that leaves the list refuses its hotels at once; every gated hotel is checked again under the new lists.
+- A measurement that leaves the list refuses its hotels at once; every gated hotel is checked again under the new lists. A removed `sealed_host_data` entry applies at the hotel's next successful check.
 - The answer lists ids and counts only, never a key or hash.
 
-A config hotel's runtime `PATCH {"drain": ...}` is kept in `state_dir/hotel-drains.json` and survives a restart, unless the file's own `drain` changed since (the file wins).
+A config hotel's runtime `PATCH {"drain": ...}` is kept in `state_dir/hotel-drains.json` and survives a restart, unless the file's own `drain` changed since (the file wins). The PATCH needs `state_dir` writable: on a full disk it is refused rather than kept in memory only. A file that does not parse is kept aside as `.corrupt-<time>` with an ops alert; its drains must be set again.
 
 ## Hotels at runtime
 

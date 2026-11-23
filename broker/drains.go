@@ -12,9 +12,11 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const drainsFile = "hotel-drains.json"
@@ -85,7 +87,16 @@ func (b *broker) loadConfigDrains() {
 		err = json.Unmarshal(raw, &saved)
 	}
 	if err != nil {
-		log.Printf("DRAINS NOT LOADED: %s: %v; config file drains apply", drainsFile, err)
+		// Starting is right (const must not wait on this file), but the
+		// PATCHed drains are lost: keep the file aside before the next PATCH
+		// overwrites it, and tell ops which drains to set again.
+		path := filepath.Join(b.cfg.StateDir, drainsFile)
+		aside := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405Z")
+		kept := "the old file was not kept aside"
+		if werr := os.WriteFile(aside, raw, 0o600); werr == nil {
+			kept = "the old file is kept at " + aside
+		}
+		b.alerts.send("OPS-ALERT", b.alerts.opsChat, fmt.Sprintf("DRAINS NOT LOADED: %s: %v; config file drains apply, so a hotel drained by PATCH is open again; %s. Re-drain by PATCH.", drainsFile, err, kept), nil, nil)
 		return
 	}
 	dropped := false
