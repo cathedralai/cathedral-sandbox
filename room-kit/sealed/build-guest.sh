@@ -323,11 +323,13 @@ EOF
 if [ -n "$INGRESS_ZONE" ]; then
   cat >> "$R/opt/room-kit/room.env" <<EOF
 # Preview URL ingress (AB#422): the front serves HTTPS here with the guest-made key,
-# certificate from the ACME directory over DNS-01 through the broker.
+# certificate from the ACME directory over DNS-01 through the broker. The listen IP and
+# the public port are per hotel (two ingress hotels on one host forward two public
+# ports), so they come from fw_cfg through guest-boot.sh (AB#432).
 ROOM_INGRESS_ZONE=$INGRESS_ZONE
 ROOM_INGRESS_BROKER_URL=$INGRESS_BROKER_URL
 ROOM_INGRESS_TLS_LISTEN=\${SEALED_LINK_GUEST_IP:?}:$INGRESS_TLS_PORT
-ROOM_INGRESS_PUBLIC_PORT=$INGRESS_PUBLIC_PORT
+ROOM_INGRESS_PUBLIC_PORT=\${SEALED_LINK_INGRESS_PUBLIC_PORT:?}
 ROOM_ACME_DIRECTORY=$ACME_DIRECTORY
 EOF
 fi

@@ -41,6 +41,10 @@ grep -qE '^SEALED_LINK_GUEST_IP=[0-9.]+$' "$LINK_ENV" 2>/dev/null \
   || { log "no checked link from sealed-link.sh ($LINK_ENV); refusing to start"; exit 1; }
 SEALED_LINK_GUEST_IP=$(sed -n 's/^SEALED_LINK_GUEST_IP=//p' "$LINK_ENV")
 export SEALED_LINK_GUEST_IP
+if grep -qE '^SEALED_LINK_INGRESS_PUBLIC_PORT=[0-9]+$' "$LINK_ENV"; then
+  SEALED_LINK_INGRESS_PUBLIC_PORT=$(sed -n 's/^SEALED_LINK_INGRESS_PUBLIC_PORT=//p' "$LINK_ENV")
+  export SEALED_LINK_INGRESS_PUBLIC_PORT
+fi
 log "guest IP $SEALED_LINK_GUEST_IP"
 
 DEV=/dev/disk/by-id/virtio-sealed-scratch

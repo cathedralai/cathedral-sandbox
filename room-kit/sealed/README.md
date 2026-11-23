@@ -595,7 +595,9 @@ https origin) and the guest also serves on that key:
 - `build-guest.sh` writes `ROOM_INGRESS_ZONE`, `ROOM_INGRESS_BROKER_URL`,
   `ROOM_INGRESS_TLS_LISTEN` (`${SEALED_LINK_GUEST_IP}:SEALED_INGRESS_TLS_PORT`, the guest IP
   from the fw_cfg link at boot, so not a per-hotel value in the image),
-  `ROOM_INGRESS_PUBLIC_PORT` and `ROOM_ACME_DIRECTORY` (default Let's Encrypt)
+  `ROOM_INGRESS_PUBLIC_PORT` (`${SEALED_LINK_INGRESS_PUBLIC_PORT}`: `SEALED_INGRESS_PUBLIC_PORT`
+  through fw_cfg `opt/cathedral/ingress-public-port`, since two ingress hotels on one host
+  forward two public ports) and `ROOM_ACME_DIRECTORY` (default Let's Encrypt)
   into the measured room.env, and adds a guest nft accept for
   `SEALED_INGRESS_TLS_PORT` on the uplink from any source, like the miner
   port. Without a zone neither is written: room.env and the firewall are byte

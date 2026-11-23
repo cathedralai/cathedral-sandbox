@@ -2,12 +2,14 @@
 # Runs INSIDE the sealed guest before the network (sealed-guard.service, AB#432).
 # The link (host IP and guest IP of the hotel's /30) is per hotel, so it is not in
 # the measured image: the host passes it in QEMU fw_cfg (opt/cathedral/link,
-# "<host ip> <guest ip>"). Two hotels of one build on one host then share one
+# "<host ip> <guest ip>"), and, for a guest-ingress build, the public port of its
+# Preview URLs (opt/cathedral/ingress-public-port). Two hotels of one build on one host then share one
 # measurement. This script checks the pair with the same rules the host used
 # (guest-constants.sh, in the measured kit) and writes, under /run:
 #   systemd/network/10-uplink.network   the static /30 and gateway
 #   sealed-link/guard.nft               the uplink guard with the host IP
-#   sealed-link/link.env                SEALED_LINK_HOST_IP, SEALED_LINK_GUEST_IP for guest-boot.sh
+#   sealed-link/link.env                SEALED_LINK_HOST_IP, SEALED_LINK_GUEST_IP (and
+#                                       SEALED_LINK_INGRESS_PUBLIC_PORT) for guest-boot.sh
 #   sealed-link/sshd-listen.conf        ListenAddress for a debug build
 # Then it loads the guard. A missing or bad link loads the guard WITHOUT the
 # host-IP lines (the uplink takes nothing new), writes no address and exits 1;
@@ -17,6 +19,7 @@
 set -euo pipefail
 log() { echo "[sealed-link] $*"; }
 FW=${SEALED_LINK_FW_CFG:-/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral/link/raw}
+FW_PORT=${SEALED_LINK_FW_CFG_PORT:-/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral/ingress-public-port/raw}
 GUARD=${SEALED_LINK_GUARD:-/etc/sealed-guard.nft}
 ROOM_ENV=${SEALED_LINK_ROOM_ENV:-/opt/room-kit/room.env}
 CONSTANTS=${SEALED_LINK_CONSTANTS:-/opt/room-kit/sealed/guest-constants.sh}
@@ -43,6 +46,13 @@ nets=$(sed -n 's/^ROOM_NETS="\(.*\)"$/\1/p' "$ROOM_ENV")
 err=$(SEALED_HOST_IP=$host_ip SEALED_GUEST_IP=$guest_ip SEALED_ROOM_NETS=$nets \
   bash -c 'set -euo pipefail; unset SEALED_GUEST_MAC; source "$1"' _ "$CONSTANTS" 2>&1 >/dev/null) \
   || closed "link $host_ip $guest_ip refused: ${err:-check failed}"
+port_line=""
+if grep -q '^ROOM_INGRESS_ZONE=.' "$ROOM_ENV"; then
+  [ -r "$FW_PORT" ] || closed "guest ingress build, no public port in fw_cfg (opt/cathedral/ingress-public-port)"
+  port=$(head -c 16 "$FW_PORT")
+  { [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$port" -le 65535 ]; } || closed "ingress public port in fw_cfg is not a TCP port"
+  port_line="SEALED_LINK_INGRESS_PUBLIC_PORT=$port"
+fi
 
 cat > "$RUN/systemd/network/10-uplink.network" <<EOF
 [Match]
@@ -54,7 +64,8 @@ LinkLocalAddressing=no
 IPv6AcceptRA=no
 EOF
 sed "s/@SEALED_HOST_IP@/$host_ip/g" "$GUARD" > "$OUT/guard.nft"
-printf 'SEALED_LINK_HOST_IP=%s\nSEALED_LINK_GUEST_IP=%s\n' "$host_ip" "$guest_ip" > "$OUT/link.env"
+{ printf 'SEALED_LINK_HOST_IP=%s\nSEALED_LINK_GUEST_IP=%s\n' "$host_ip" "$guest_ip"
+  [ -z "$port_line" ] || printf '%s\n' "$port_line"; } > "$OUT/link.env"
 printf 'ListenAddress %s\n' "$guest_ip" > "$OUT/sshd-listen.conf"
 "$NFT" -f "$OUT/guard.nft"
-log "link $host_ip/30 -> guest $guest_ip"
+log "link $host_ip/30 -> guest $guest_ip${port_line:+, ingress public port ${port_line#*=}}"

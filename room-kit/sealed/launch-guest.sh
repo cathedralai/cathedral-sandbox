@@ -64,6 +64,12 @@ FW_CFG+=(-fw_cfg "name=opt/cathedral/hotel-name,string=$SEALED_NAME")
 # The link (AB#432): per hotel, so outside the measured image. guest-link.sh checks it
 # in the guest with the same guest-constants.sh rules sourced above.
 FW_CFG+=(-fw_cfg "name=opt/cathedral/link,string=$SEALED_HOST_IP $SEALED_GUEST_IP")
+# The public port of guest ingress (AB#422) is per hotel too: it names the port in a
+# Preview URL. Always passed; the guest reads it only when its measured room.env has a zone.
+INGRESS_PUBLIC_PORT=${SEALED_INGRESS_PUBLIC_PORT:-443}
+[[ "$INGRESS_PUBLIC_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$INGRESS_PUBLIC_PORT" -le 65535 ] \
+  || { echo "SEALED_INGRESS_PUBLIC_PORT must be a TCP port" >&2; exit 1; }
+FW_CFG+=(-fw_cfg "name=opt/cathedral/ingress-public-port,string=$INGRESS_PUBLIC_PORT")
 exec /usr/bin/qemu-system-x86_64 -no-user-config -nodefaults -name "sealed-$SEALED_NAME" \
   -enable-kvm -cpu "$SEALED_CPU_MODEL" -smp "$SEALED_VCPUS" -m "${SEALED_MEM_GIB}G" \
   -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \

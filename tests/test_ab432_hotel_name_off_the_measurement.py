@@ -81,14 +81,17 @@ MINER = {"SEALED_MINER": "1", "SEALED_HOTEL_KEY_INSTALL_SIGNERS": "A" * 43 + "="
 @pytest.mark.parametrize("extra", [{}, INGRESS, MINER, {**INGRESS, **MINER}], ids=["config", "ingress", "miner", "both"])
 def test_two_hotels_on_one_host_with_their_own_links_share_the_measured_inputs(tmp_path: Path, extra: dict) -> None:
     # Frankfurt runs several guests on one host, one /30 each: nc-sealed-2 10.215.0.5/.6, nc-sealed-3 .9/.10.
-    nc2, cmd2 = _measured_inputs(tmp_path, "nc-sealed-2", **NC2, **extra)
-    nc3, cmd3 = _measured_inputs(tmp_path, "nc-sealed-3", **NC3, **extra)
+    # Two ingress hotels on one host forward two public ports (nc-sealed-2 8444): per hotel too.
+    port2 = {"SEALED_INGRESS_PUBLIC_PORT": "8444"} if extra.get("SEALED_INGRESS_ZONE") else {}
+    port3 = {"SEALED_INGRESS_PUBLIC_PORT": "8445"} if extra.get("SEALED_INGRESS_ZONE") else {}
+    nc2, cmd2 = _measured_inputs(tmp_path, "nc-sealed-2", **NC2, **extra, **port2)
+    nc3, cmd3 = _measured_inputs(tmp_path, "nc-sealed-3", **NC3, **extra, **port3)
     default, cmd_default = _measured_inputs(tmp_path, "hotel-a", **extra)
     assert nc2 == nc3 == default and cmd2 == cmd3 == cmd_default, "a per-hotel link changed a measured file"
     for name in ("nc-sealed-2", "nc-sealed-3", "hotel-a"):
         root = tmp_path / f"root-{name}"
         text = "".join(p.read_text() for p in root.rglob("*") if p.is_file())
-        for value in ("10.215.0.", "52:54:00", name):
+        for value in ("10.215.0.", "52:54:00", "8444", "8445", name):
             assert value not in text, f"{value} in the measured files of {name}"
     root = tmp_path / "root-nc-sealed-2"
     assert not (root / "etc/systemd/network/10-uplink.network").exists()
@@ -98,6 +101,7 @@ def test_two_hotels_on_one_host_with_their_own_links_share_the_measured_inputs(t
     assert "ROOM_RECEIPTS_LISTEN=${SEALED_LINK_GUEST_IP:?}:18090\n" in env
     if extra.get("SEALED_INGRESS_ZONE"):
         assert "ROOM_INGRESS_TLS_LISTEN=${SEALED_LINK_GUEST_IP:?}:8443\n" in env
+        assert "ROOM_INGRESS_PUBLIC_PORT=${SEALED_LINK_INGRESS_PUBLIC_PORT:?}\n" in env
     if extra.get("SEALED_MINER"):
         assert "ROOM_RECEIPTS_TLS_LISTEN=${SEALED_LINK_GUEST_IP:?}:18443\n" in env
 
@@ -113,15 +117,16 @@ def _resolve_room_env(tmp_path: Path, guest_ip: str | None, **extra: str) -> sub
     _measured_inputs(tmp_path, "nc-sealed-3", **NC3, **extra)
     env = tmp_path / "root-nc-sealed-3/opt/room-kit/room.env"
     script = (f'set -euo pipefail\nsource "{env}"\n'
-              'echo "$ROOM_RECEIPTS_LISTEN ${ROOM_INGRESS_TLS_LISTEN:-} ${ROOM_RECEIPTS_TLS_LISTEN:-}"')
-    run_env = {"PATH": "/usr/bin:/bin", **({"SEALED_LINK_GUEST_IP": guest_ip} if guest_ip else {})}
+              'echo "$ROOM_RECEIPTS_LISTEN ${ROOM_INGRESS_TLS_LISTEN:-} ${ROOM_INGRESS_PUBLIC_PORT:-} ${ROOM_RECEIPTS_TLS_LISTEN:-}"')
+    run_env = {"PATH": "/usr/bin:/bin", "SEALED_LINK_INGRESS_PUBLIC_PORT": "8445",
+               **({"SEALED_LINK_GUEST_IP": guest_ip} if guest_ip else {})}
     return subprocess.run([BASH, "-c", script], capture_output=True, text=True, timeout=30, env=run_env)
 
 
 def test_the_measured_room_env_resolves_the_listen_addresses_from_the_link(tmp_path: Path) -> None:
     proc = _resolve_room_env(tmp_path, "10.215.0.10", **INGRESS, **MINER)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.split() == ["10.215.0.10:18090", "10.215.0.10:8443", "10.215.0.10:18443"]
+    assert proc.stdout.split() == ["10.215.0.10:18090", "10.215.0.10:8443", "8445", "10.215.0.10:18443"]
 
 
 def test_the_measured_room_env_stops_the_install_without_a_link(tmp_path: Path) -> None:
@@ -129,9 +134,15 @@ def test_the_measured_room_env_stops_the_install_without_a_link(tmp_path: Path) 
     assert proc.returncode != 0 and "SEALED_LINK_GUEST_IP" in proc.stderr
 
 
-def _guest_link(tmp_path: Path, raw: bytes | None, nets: str = "10.214.0.0/22", debug: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
+def _guest_link(tmp_path: Path, raw: bytes | None, nets: str = "10.214.0.0/22", debug: bool = False,
+                ingress: bool = False, port: bytes | None = None) -> tuple[subprocess.CompletedProcess[str], Path]:
     extra = {"SEALED_DEBUG_SSH_PUBKEY": "ssh-ed25519 AAAA test"} if debug else {}
+    if ingress:
+        extra.update(INGRESS)
     _measured_inputs(tmp_path, "guest", SEALED_ROOM_NETS=nets, **extra)
+    fw_port = tmp_path / "fw-port"
+    if port is not None:
+        fw_port.write_bytes(port)
     image = tmp_path / "root-guest"
     fw = tmp_path / "fw-link"
     if raw is not None:
@@ -140,7 +151,7 @@ def _guest_link(tmp_path: Path, raw: bytes | None, nets: str = "10.214.0.0/22", 
     nft = tmp_path / "nft"
     nft.write_text(f'#!/bin/bash\n[ "$1" = -f ] && cp "$2" "{tmp_path}/loaded.nft"\n')
     nft.chmod(0o755)
-    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SEALED_LINK_FW_CFG": str(fw),
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SEALED_LINK_FW_CFG": str(fw), "SEALED_LINK_FW_CFG_PORT": str(fw_port),
            "SEALED_LINK_GUARD": str(image / "etc/sealed-guard.nft"), "SEALED_LINK_ROOM_ENV": str(image / "opt/room-kit/room.env"),
            "SEALED_LINK_CONSTANTS": str(SEALED / "guest-constants.sh"), "SEALED_LINK_RUN": str(run), "SEALED_LINK_NFT": str(nft)}
     script = f'sleep() {{ :; }}\nexport -f sleep\nsource "{SEALED}/guest-link.sh"'
@@ -161,6 +172,27 @@ def test_guest_link_writes_the_network_guard_and_listen_address(tmp_path: Path, 
     assert loaded.rstrip().endswith("}") and 'iifname "uplink" drop' in loaded
     assert (run / "sealed-link/link.env").read_text() == f"SEALED_LINK_HOST_IP={host}\nSEALED_LINK_GUEST_IP={guest}\n"
     assert (run / "sealed-link/sshd-listen.conf").read_text() == f"ListenAddress {guest}\n"
+
+
+@pytest.mark.parametrize("ingress,port,want", [(True, b"8445", "8445"), (True, b"443\n", "443"), (False, b"8445", None),
+                                               (False, None, None)])
+def test_guest_link_passes_the_ingress_public_port_only_for_an_ingress_build(tmp_path: Path, ingress: bool,
+                                                                             port: bytes | None, want: str | None) -> None:
+    proc, run = _guest_link(tmp_path, b"10.215.0.9 10.215.0.10", ingress=ingress, port=port)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    env = (run / "sealed-link/link.env").read_text()
+    if want:
+        assert env.endswith(f"SEALED_LINK_INGRESS_PUBLIC_PORT={want}\n")
+    else:
+        assert "INGRESS" not in env
+
+
+@pytest.mark.parametrize("port", [None, b"", b"0", b"65536", b"8445;x", b"08445", b"84 45"])
+def test_guest_link_closes_the_uplink_on_a_bad_ingress_public_port(tmp_path: Path, port: bytes | None) -> None:
+    proc, run = _guest_link(tmp_path, b"10.215.0.9 10.215.0.10", ingress=True, port=port)
+    assert proc.returncode == 1 and "uplink stays closed" in proc.stdout
+    assert "18090" not in (tmp_path / "loaded.nft").read_text()
+    assert not (run / "sealed-link/link.env").exists()
 
 
 def test_guest_link_fills_the_debug_ssh_rule(tmp_path: Path) -> None:
@@ -197,23 +229,28 @@ def test_the_guard_unit_runs_guest_link_before_the_network() -> None:
 def test_launch_passes_the_link_in_fw_cfg() -> None:
     text = (SEALED / "launch-guest.sh").read_text()
     assert 'FW_CFG+=(-fw_cfg "name=opt/cathedral/link,string=$SEALED_HOST_IP $SEALED_GUEST_IP")' in text
+    assert 'FW_CFG+=(-fw_cfg "name=opt/cathedral/ingress-public-port,string=$INGRESS_PUBLIC_PORT")' in text
     assert text.index("guest-constants.sh") < text.index("opt/cathedral/link")
 
 
 def _guest_boot_link_gate(tmp_path: Path, content: str | None) -> subprocess.CompletedProcess[str]:
     text = (SEALED / "guest-boot.sh").read_text()
     gate = text[text.index("LINK_ENV=/run/sealed-link/link.env"):text.index('log "guest IP $SEALED_LINK_GUEST_IP"')]
+    assert "SEALED_LINK_INGRESS_PUBLIC_PORT" in gate
     link = tmp_path / "link.env"
     if content is not None:
         link.write_text(content)
     gate = gate.replace("/run/sealed-link/link.env", str(link))
-    script = f'set -euo pipefail\nlog() {{ echo "$*"; }}\n{gate}\nbash -c \'echo "child $SEALED_LINK_GUEST_IP"\''
+    script = f'set -euo pipefail\nlog() {{ echo "$*"; }}\n{gate}\nbash -c \'echo "child $SEALED_LINK_GUEST_IP ${{SEALED_LINK_INGRESS_PUBLIC_PORT:--}}"\''
     return subprocess.run([BASH, "-c", script], capture_output=True, text=True, timeout=30)
 
 
 def test_guest_boot_exports_the_checked_guest_ip_before_install(tmp_path: Path) -> None:
     proc = _guest_boot_link_gate(tmp_path, "SEALED_LINK_HOST_IP=10.215.0.9\nSEALED_LINK_GUEST_IP=10.215.0.10\n")
-    assert proc.returncode == 0 and proc.stdout.strip() == "child 10.215.0.10"
+    assert proc.returncode == 0 and proc.stdout.strip() == "child 10.215.0.10 -"
+    proc = _guest_boot_link_gate(tmp_path, "SEALED_LINK_HOST_IP=10.215.0.9\nSEALED_LINK_GUEST_IP=10.215.0.10\n"
+                                           "SEALED_LINK_INGRESS_PUBLIC_PORT=8445\n")
+    assert proc.returncode == 0 and proc.stdout.strip() == "child 10.215.0.10 8445"
     text = (SEALED / "guest-boot.sh").read_text()
     assert text.index("export SEALED_LINK_GUEST_IP") < text.index("/opt/room-kit/install.sh /opt/room-kit/room.env")
 
