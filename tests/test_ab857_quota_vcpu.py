@@ -100,3 +100,42 @@ def test_sealed_guests_size_their_vcpu_quota_from_the_pool(tmp_path: Path) -> No
     assert proc.returncode == 0, proc.stderr
     lines = (root / "opt" / "room-kit" / "room.env").read_text().splitlines()
     assert "ROOM_QUOTA_VCPU=pool" in lines
+
+
+def _sealed_room_env(tmp_path: Path, **extra: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run the quota check and the room.env heredoc of build-guest.sh with sealed.env values."""
+    text = (REPO / "room-kit" / "sealed" / "build-guest.sh").read_text()
+    check = text[text.index("# Hotel vCPU quota (AB#857)"):text.index("esac\n", text.index("# Hotel vCPU quota (AB#857)")) + 5]
+    env = text[text.index('cat > "$R/opt/room-kit/room.env" <<EOF'):text.index("# Units: no logins")]
+    root = tmp_path / "root"
+    (root / "opt" / "room-kit").mkdir(parents=True)
+    script = tmp_path / "slice.sh"
+    script.write_text("set -eo pipefail\n" + check + env)
+    values = {"R": str(root), "SEALED_GUEST_IP": "10.215.0.2", "SEALED_DNS": "1.1.1.1",
+              "SEALED_ROOM_MAX_SLOTS": "1200", "SEALED_ROOM_NETS": "10.214.0.0/22 10.214.4.0/22", **extra}
+    proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60,
+                          env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", **values})
+    out = root / "opt" / "room-kit" / "room.env"
+    return proc, out.read_text().splitlines() if out.exists() else []
+
+
+def test_sealed_env_can_set_a_vcpu_quota_for_2_vcpu_rooms_at_every_slot(tmp_path: Path) -> None:
+    proc, lines = _sealed_room_env(tmp_path, SEALED_ROOM_QUOTA_VCPU="2400")
+    assert proc.returncode == 0, proc.stderr
+    assert "ROOM_QUOTA_VCPU=2400" in lines
+    # size.py takes it: 1,200 slots x 2 vCPU on a 144-thread host whose pool is 2,272.
+    assert _quota(tmp_path, "--max-slots", "1200", "--quota-vcpu", "2400", threads=144, ram_gib=1152) == "1200:2400:4800"
+
+
+def test_sealed_env_without_a_quota_keeps_the_pool(tmp_path: Path) -> None:
+    proc, lines = _sealed_room_env(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "ROOM_QUOTA_VCPU=pool" in lines
+
+
+@pytest.mark.parametrize("bad", ["0", "02400", "2.5", "lots", "-1", "pool slots"])
+def test_a_bad_sealed_quota_stops_the_build(tmp_path: Path, bad: str) -> None:
+    proc, lines = _sealed_room_env(tmp_path, SEALED_ROOM_QUOTA_VCPU=bad)
+    assert proc.returncode != 0
+    assert "SEALED_ROOM_QUOTA_VCPU" in proc.stderr
+    assert lines == []

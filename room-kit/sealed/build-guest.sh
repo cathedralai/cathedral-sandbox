@@ -73,6 +73,14 @@ if [ "$GUEST_INGRESS" = 1 ] && [ -n "${SEALED_INGRESS_ZONE:-}" ]; then
   fi
 fi
 # <<< guest ingress
+# Hotel vCPU quota (AB#857): "pool" (the overcommitted CPU pool, default), "slots"
+# (one vCPU per slot) or a whole number, never below one vCPU per slot (size.py).
+# A number lets every slot hold a 2 vCPU room where the pool is smaller than 2 x slots.
+# It is written into the measured room.env, so it is part of the measurement.
+case "${SEALED_ROOM_QUOTA_VCPU:-pool}" in
+  pool|slots) ;;
+  *[!0-9]*|0*|"") echo "SEALED_ROOM_QUOTA_VCPU must be pool, slots or a whole number of vCPUs" >&2; exit 1 ;;
+esac
 
 # Docker Hub mirrors for the guest's dockerd (daemon.json registry-mirrors, AB#854). Part of
 # the measured room.env. Unset keeps mirror.gcr.io, so a hotel that does not set it builds the
@@ -289,7 +297,7 @@ CPU_OVERCOMMIT=16
 MEM_OVERCOMMIT=20
 DISK_OVERCOMMIT=1000
 ROOM_MAX_SLOTS=$SEALED_ROOM_MAX_SLOTS
-ROOM_QUOTA_VCPU=pool
+ROOM_QUOTA_VCPU=${SEALED_ROOM_QUOTA_VCPU:-pool}
 ROOM_CREATES_PER_MINUTE=6000
 ROOM_GC_PARALLELISM=16
 ROOM_DIND_DOCKERD_ARGS="--iptables=false --ip6tables=false --bridge=none --default-network-opt bridge=com.docker.network.advertise_addr_nmsgs=0 --default-address-pool base=10.200.0.0/14,size=24"
