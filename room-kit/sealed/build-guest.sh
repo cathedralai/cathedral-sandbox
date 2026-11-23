@@ -369,12 +369,28 @@ fi
 # Host keys made at build time would be in the measured initrd; make them at boot instead.
 rm -f "$R"/etc/ssh/ssh_host_*
 
+# SOURCE_DATE_EPOCH: the kit commit time, so the same kit gives the same bytes on any host.
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$KIT" log -1 --format=%ct 2>/dev/null || echo 0)}
+# >>> shadow day (tests/test_ab432_hotel_name_off_the_measurement.py runs this block)
+# /etc/shadow field 3 is the day each account was made: the day THIS host cached its base
+# rootfs (base-*), so two hosts of one kit measured differently (AB#432: nc-sealed-2 20749,
+# nc-sealed-3 20753). Pin it to the kit commit day. 0 would mean "change the password at
+# the next login", so an unknown commit time leaves the file as it is.
+SHADOW_DAY=$(( SOURCE_DATE_EPOCH / 86400 ))
+if [ "$SHADOW_DAY" -gt 0 ]; then
+  for f in "$R/etc/shadow" "$R/etc/shadow-"; do
+    [ -f "$f" ] || continue
+    awk -F: -v OFS=: -v d="$SHADOW_DAY" '$3 != "" { $3 = d } { print }' "$f" > "$f.tmp"
+    cat "$f.tmp" > "$f"  # keeps the file's owner and mode
+    rm -f "$f.tmp"
+  done
+fi
+# <<< shadow day
+
 # ---------------------------------------------------------------- 4. initrd = whole root, cmdline
 log "packing initrd"
-# SOURCE_DATE_EPOCH: the kit commit time, so the same kit gives the same bytes on any host.
 # shellcheck disable=SC1091
 source "$KIT/sealed/pack-initrd.sh"
-SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$KIT" log -1 --format=%ct 2>/dev/null || echo 0)}
 pack_initrd "$R" "$OUT/initrd.cpio.zst" "$SOURCE_DATE_EPOCH"
 CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init cathedral.debug=$DEBUG"
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
