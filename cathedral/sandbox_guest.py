@@ -3379,7 +3379,10 @@ class DockerGuestProvider:
             if guest is None:
                 raise SandboxOpError("sandbox_not_found", 404, f"sandbox {sandbox_id} not found")
             if guest.sealed_since_ns is None:
-                guest.sealed_since_ns = time.time_ns()
+                # A secret file already there with no mark has withheld the whole log (0):
+                # keep that, so a late mark cannot serve lines it withheld.
+                since = self._sealed_since_ns(sandbox_id, guest)
+                guest.sealed_since_ns = time.time_ns() if since is None else since
             return guest.sealed_since_ns
 
     def _sealed_since_ns(self, sandbox_id: str, guest: GuestRecord) -> int | None:

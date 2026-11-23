@@ -568,3 +568,60 @@ def test_entrypoint_cap_inside_the_next_stamp_does_not_stall(fake, guest, monkey
         fake.add_log(cid, "stdout", line, T0 + 10 * i)
     out, _, truncated = _page_all(guest, sid)
     assert out == "".join(lines) and truncated is False
+
+
+def test_ab791_sealed_exec_marks_the_room_so_its_entrypoint_output_is_withheld(fake, sealed_hotel) -> None:
+    """A room with no secret file that runs a sealed exec writing to PID 1's stdout (HOLD on #707)."""
+    app = SandboxApplication(sealed_hotel)
+    body = json.dumps({"image": "alpine:3.20", "resources": {"vcpu": 1, "memory_gib": 1, "disk_gib": 5}})
+    sid = json.loads(app.dispatch("POST", "/v1/sandboxes", AUTH, body.encode()).body)["id"]
+    cid = _cid(sealed_hotel, sid)
+    fake.add_log(cid, "stdout", "booting\n", T0)
+    run = json.dumps({"cmd": ["sh", "-c", "echo secret-value >/proc/1/fd/1"], "env": {"TOKEN": "secret-value"}})
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sandbox_guest.time, "time_ns", lambda: T0 + 5)
+        resp = app.dispatch("POST", f"/v1/sandboxes/{sid}/exec-sealed", AUTH, run.encode())
+    assert resp.status == 200
+    # What the sealed exec wrote to the entrypoint's stdout, stamped as it ran.
+    fake.add_log(cid, "stdout", "secret-value\n", T0 + 6)
+    first = json.loads(app.dispatch("GET", f"/v1/sandboxes/{sid}/logs?entrypoint_cursor=", AUTH, b"").body)["entrypoint"]
+    assert first["stdout"] == "booting\n" and first["sealed_since_ns"] == T0 + 5
+    cursor = first["next_cursor"]
+    second = json.loads(app.dispatch("GET", f"/v1/sandboxes/{sid}/logs?entrypoint_cursor={cursor}", AUTH, b"").body)["entrypoint"]
+    assert second["error"].startswith("entrypoint_log_withheld")
+    assert "secret-value" not in json.dumps(first) + json.dumps(second)
+
+
+def test_ab791_sealed_exec_on_a_hotel_without_sealed_secrets_runs_unmarked(fake, guest) -> None:
+    app = SandboxApplication(guest)
+    body = json.dumps({"image": "alpine:3.20", "resources": {"vcpu": 1, "memory_gib": 1, "disk_gib": 5}})
+    sid = json.loads(app.dispatch("POST", "/v1/sandboxes", AUTH, body.encode()).body)["id"]
+    resp = app.dispatch("POST", f"/v1/sandboxes/{sid}/exec-sealed", AUTH, json.dumps({"cmd": ["true"]}).encode())
+    assert resp.status == 200 and guest._guests[sid].sealed_since_ns is None  # noqa: SLF001
+
+
+def test_ab791_sealed_exec_is_refused_when_the_mark_fails(fake, sealed_hotel, monkeypatch) -> None:
+    """Fail closed, as a failed mark refuses a secret file: no mark, no sealed exec."""
+    app = SandboxApplication(sealed_hotel)
+    body = json.dumps({"image": "alpine:3.20", "resources": {"vcpu": 1, "memory_gib": 1, "disk_gib": 5}})
+    sid = json.loads(app.dispatch("POST", "/v1/sandboxes", AUTH, body.encode()).body)["id"]
+
+    def broken(_sid):
+        raise SandboxOpError("sealed_mark_failed", 503, "mark store unavailable")
+
+    ran = []
+    monkeypatch.setattr(sealed_hotel, "mark_sealed", broken)
+    monkeypatch.setattr(sealed_hotel, "exec", lambda *a, **k: ran.append(a))
+    resp = app.dispatch("POST", f"/v1/sandboxes/{sid}/exec-sealed", AUTH, json.dumps({"cmd": ["true"]}).encode())
+    assert resp.status == 503 and ran == []
+
+
+def test_ab791_a_late_mark_keeps_the_whole_log_withheld_after_an_unmarked_secret_file(fake, sealed_hotel, tmp_path, monkeypatch) -> None:
+    """An unmarked secret file withheld everything (0): a later mark must not re-open those lines."""
+    sid = _room(sealed_hotel)
+    fake.add_log(_cid(sealed_hotel, sid), "stdout", "secret-value\n", T0)
+    (tmp_path / "secrets" / sid / "TOKEN").write_text("x")
+    assert _mark_at(sealed_hotel, sid, T0 + 50, monkeypatch) == 0
+    page = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert page["error"].startswith("entrypoint_log_withheld") and page["sealed_since_ns"] == 0
+    assert "secret-value" not in json.dumps(page)

@@ -570,8 +570,27 @@ class SandboxApplication:
             spill_token=payload.get("spill_token"),
             launch_by=payload.get("launch_by"),
         )
+        if sealed:
+            self._mark_sealed_exec(id)
         result = self.provider.exec(id, req)
         return Response.json(200, result.to_document())
+
+    def _mark_sealed_exec(self, id) -> None:
+        """Mark the room before a sealed exec runs (AB#791): it can write to the entrypoint's stdout.
+
+        ROOM_SEALED_EXEC does not imply a secret file, so without this a room that
+        only ran sealed execs would serve that output in its log. A hotel without
+        sealed secrets has no mark and withholds nothing, as before; any other
+        failure refuses the exec, as a failed mark refuses a secret file.
+        """
+        marker = getattr(self.provider, "mark_sealed", None)
+        if not callable(marker):
+            return
+        try:
+            marker(id)
+        except SandboxOpError as exc:
+            if exc.code != "sealed_mark_not_supported":
+                raise
 
     def exec_cancel(self, *, id, body, **_):
         """Stop the exec that started with this spill_token (AB#406).
