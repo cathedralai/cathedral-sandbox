@@ -1775,9 +1775,26 @@ func TestClaimJournalTimingOnThisDisk(t *testing.T) {
 	if err := claimAck(t, j.compact(snap)); err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	c := compactions[len(compactions)-1]
-	mu.Unlock()
+	// The journal acknowledges a compaction before it reports its timing (run: finish, then note),
+	// so the timing may not be here yet. Reading compactions[len-1] at once could index an empty
+	// slice and panic with mu held; the writer then blocked in observe on mu, the cleanup's close
+	// waited for the writer, and the whole package ran into its 10 minute timeout with this test
+	// "running" (seen in CI on #688). Wait for the timing, and never index under the lock.
+	var c claimJournalTiming
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		mu.Lock()
+		n := len(compactions)
+		if n > 0 {
+			c = compactions[n-1]
+		}
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no compaction timing 10 s after the compaction was acknowledged")
+		}
+	}
 	t.Logf("claim journal timing, %s: compaction to a new generation of 1,000 records (%d bytes, replacing 1,200 records): %v",
 		label, j.size(), c.Total.Round(time.Microsecond))
 }
