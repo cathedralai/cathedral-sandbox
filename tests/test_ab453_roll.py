@@ -846,3 +846,15 @@ def test_stuck_install_resume_waits_for_zero_in_use_at_the_broker_before_rollbac
     assert "ssh rollback" not in calls(fake)
     assert patches(fake) == []
     assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_resume_from_drained_waits_for_zero_in_use_at_the_broker(env):
+    # A roll killed after the drain resumes at PHASE=drained and goes straight to the pre-install gate.
+    e, fake, home = env
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 1}))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=drained\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "broker_rooms_in_use=1" in r.stdout, r.stdout
+    assert "ssh install" not in calls(fake)
