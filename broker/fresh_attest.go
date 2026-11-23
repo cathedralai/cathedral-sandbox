@@ -174,6 +174,9 @@ func (b *broker) syncFresh(ctx context.Context, h *hotel, healthOK bool) {
 		return
 	}
 	gen := b.admGen.Load()
+	// The window starts when the challenge goes out, not when the answer has
+	// been verified: a slow hotel or verifier must not stretch a pass.
+	issued := time.Now()
 	err := b.checkFresh(ctx, h, t)
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -185,11 +188,12 @@ func (b *broker) syncFresh(ctx context.Context, h *hotel, healthOK bool) {
 		h.freshAtt.checkedAt = time.Time{}
 		return
 	}
-	b.noteFresh(h, t.binding, err, time.Now())
+	b.noteFresh(h, t.binding, err, issued, time.Now())
 }
 
-// noteFresh records a fresh check of binding. Caller holds b.mu.
-func (b *broker) noteFresh(h *hotel, binding string, err error, now time.Time) {
+// noteFresh records a fresh check of binding whose challenge was issued at
+// issued; a pass counts from then. Caller holds b.mu.
+func (b *broker) noteFresh(h *hotel, binding string, err error, issued, now time.Time) {
 	if h.freshAtt.binding != binding {
 		h.freshAtt = freshProof{binding: binding, running: h.freshAtt.running, shownOK: h.freshAtt.shownOK}
 	}
@@ -197,7 +201,7 @@ func (b *broker) noteFresh(h *hotel, binding string, err error, now time.Time) {
 	var na errFreshNoAnswer
 	switch {
 	case err == nil:
-		h.freshAtt.passedAt, h.freshAtt.reason = now, ""
+		h.freshAtt.passedAt, h.freshAtt.reason = issued, ""
 	case errors.As(err, &na):
 		h.freshAtt.reason = err.Error() // the last pass stands until its window ends
 	default:
