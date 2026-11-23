@@ -20,6 +20,7 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +100,9 @@ class FakeHotel:
         self.rooms: dict[str, dict] = {}
         self.live = 0              # foreign live rooms
         self.not_ready = 0         # 503 health_not_ready answers left
+        self.pool_not_ready = 0    # explicit pre-create refusals left after restart
+        self.after_pool_not_ready = 0
+        self.pool_refusals = 0
         # scenario knobs
         self.after_state = "open"
         self.after_key_id = None
@@ -147,6 +151,7 @@ class FakeHotel:
         self.up = True
         self.boot += 1
         self.not_ready = 2
+        self.pool_not_ready = self.after_pool_not_ready
         self.rooms.clear()
         data = self.dir / "data.raw"
         try:
@@ -215,6 +220,10 @@ class FakeHotel:
                 return h.send(200, {"sandboxes": [{"id": f"x{i}"} for i in range(self.live)] +
                                     [{"id": k} for k in self.rooms]})
             if path == "/v1/sandboxes" and method == "POST":
+                if self.pool_not_ready:
+                    self.pool_not_ready -= 1
+                    self.pool_refusals += 1
+                    return h.send(503, {"error": {"code": "pool_state_unknown"}})
                 b = h.body()
                 if b["workspace"] not in self.workspaces:
                     return h.send(404, {"error": "workspace_not_found"})
@@ -313,6 +322,77 @@ def test_restart_pass(hotel_dir, hotel, capsys):
     assert "[sealed-data] open" in out
     assert KEY not in out and KEY not in err
     assert hotel.workspaces == {} and hotel.rooms == {}  # workspace and rooms cleaned up
+
+
+def test_restart_waits_for_pool_scan_after_storage_is_open(hotel_dir, hotel, capsys):
+    env, _ = hotel_dir
+    hotel.after_pool_not_ready = 3
+    rc, out, err = run_restart(env, hotel, capsys)
+    assert rc == 0, out + err
+    assert "Result: **PASS**" in out
+    assert "new room reads the marker and 20,000 lines back" in out
+    assert hotel.pool_refusals == 3
+    assert hotel.next_id == 2  # refusals never reached create
+    assert hotel.workspaces == {} and hotel.rooms == {}
+
+
+@pytest.mark.parametrize("code,doc", [
+    (503, {"error": {"code": "capacity_exhausted"}}),
+    (500, {"error": {"code": "pool_state_unknown"}}),
+    (401, {"error": {"code": "unauthorized"}}),
+    (503, {"error": "pool_state_unknown"}),
+    (202, {}),
+])
+def test_create_does_not_retry_other_refusals_or_malformed_success(code, doc):
+    calls = []
+
+    def call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return code, doc
+
+    p = sdp.Proof.__new__(sdp.Proof)
+    p.hotel, p.args, p.rooms = SimpleNamespace(call=call), SimpleNamespace(poll=1), []
+    with pytest.raises(RuntimeError, match="room create answered"):
+        p.create_room("test-workspace")
+    assert len(calls) == 1
+    assert p.rooms == []
+
+
+@pytest.mark.parametrize("error", [TimeoutError("lost reply"), OSError("connection reset")])
+def test_create_does_not_retry_ambiguous_transport_failure(error):
+    calls = []
+
+    def call(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise error
+
+    p = sdp.Proof.__new__(sdp.Proof)
+    p.hotel, p.args, p.rooms = SimpleNamespace(call=call), SimpleNamespace(poll=1), []
+    with pytest.raises(type(error), match=str(error)):
+        p.create_room("test-workspace")
+    assert len(calls) == 1
+    assert p.rooms == []
+
+
+def test_create_pool_wait_has_one_deadline(monkeypatch):
+    now, deadlines = [0.0], []
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    def call(*args, **kwargs):
+        deadlines.append(now[0] + kwargs["timeout"])
+        now[0] += 0.25  # request time also counts against the deadline
+        return 503, {"error": {"code": "pool_state_unknown"}}
+
+    monkeypatch.setattr(sdp, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    p = sdp.Proof.__new__(sdp.Proof)
+    p.hotel, p.args, p.rooms = SimpleNamespace(call=call), SimpleNamespace(poll=7), []
+    with pytest.raises(RuntimeError, match="pool_state_unknown after 120 s"):
+        p.create_room("test-workspace")
+    assert now[0] == 120
+    assert len(deadlines) > 1 and set(deadlines) == {120}
+    assert p.rooms == []
 
 
 def test_restart_not_open_after_restart_fails(hotel_dir, hotel, capsys):

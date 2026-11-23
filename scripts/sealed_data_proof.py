@@ -449,7 +449,21 @@ class Proof:
         return b, s
 
     def create_room(self, workspace: str) -> str:
-        code, doc = self.hotel.call("POST", "/v1/sandboxes", {"image": IMAGE, "workspace": workspace, "timeout_seconds": 600})
+        # Storage can be open before the front finishes its startup pool scan.
+        # Only this explicit pre-create refusal is safe to retry. A lost reply
+        # or another error may hide a successful create, so let it fail.
+        deadline = time.monotonic() + 120
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("room create still refused: pool_state_unknown after 120 s")
+            code, doc = self.hotel.call("POST", "/v1/sandboxes",
+                                       {"image": IMAGE, "workspace": workspace, "timeout_seconds": 600},
+                                       timeout=remaining)
+            error = doc.get("error") if isinstance(doc, dict) else None
+            if code != 503 or not isinstance(error, dict) or error.get("code") != "pool_state_unknown":
+                break
+            time.sleep(min(self.args.poll, max(0, deadline - time.monotonic())))
         if code not in (200, 201, 202) or not isinstance(doc, dict) or not doc.get("id"):
             raise RuntimeError(f"room create answered {code}: {json.dumps(doc)[:300]}")
         rid = doc["id"]
