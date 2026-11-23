@@ -41,6 +41,7 @@ UNSIGNED = {
     ("PATCH", S + r"/lifetime"): "keepalive: as PATCH /v1/sandboxes/{id}",
     ("POST", S + r"/exec-sealed"): "internal: the front's own route for a sealed exec; refused 404 to callers",
     ("PUT", S + r"/env-sealed"): "internal: the front's own route for a sealed env overlay; refused 404 to callers",
+    ("POST", S + r"/sealed-mark"): "internal: the front's own call before a room's first secret lands; refused 404 to callers",
     ("GET", S + r"/processes/(?P<pid>[^/]+)/logs"): "read: a process's output",
     ("POST", S + r"/processes/(?P<pid>[^/]+)/attach"): "unsupported: the API always answers 501",
     ("GET", S + r"/entries"): "read: a directory listing",
