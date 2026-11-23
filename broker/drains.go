@@ -68,7 +68,13 @@ func (b *broker) saveConfigDrainsLocked() error {
 // writeFileDurable replaces name with raw (mode 0600) through a synced temp
 // file and a rename, then syncs the directory: the rename is durable only
 // once the directory is.
+//
+// A caller treats any error as "not saved" and keeps its old state in
+// memory. So when the directory sync fails after the rename, the old file
+// is put back (best effort): a restart then reads what memory holds, not a
+// change the caller reported as failed.
 func writeFileDurable(name string, raw []byte) error {
+	old, oldErr := os.ReadFile(name)
 	tmp := name + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -92,7 +98,22 @@ func writeFileDurable(name string, raw []byte) error {
 	if err := os.Rename(tmp, name); err != nil {
 		return err
 	}
-	d, err := os.Open(filepath.Dir(name))
+	err = syncDir(filepath.Dir(name))
+	if err != nil {
+		switch {
+		case oldErr == nil:
+			if werr := os.WriteFile(tmp, old, 0o600); werr == nil {
+				_ = os.Rename(tmp, name)
+			}
+		case os.IsNotExist(oldErr):
+			_ = os.Remove(name)
+		}
+	}
+	return err
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}

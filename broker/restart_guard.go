@@ -29,7 +29,7 @@ type restartCheck struct {
 	Rooms      int      `json:"rooms"`       // rooms the broker holds on the hotel, ready pool rooms included
 	Creating   int      `json:"creating"`    // creates in flight, pool creates included
 	Queued     int      `json:"queued"`      // creates waiting for a slot
-	PoolClaims int      `json:"pool_claims"` // pool claims in flight
+	PoolClaims int      `json:"pool_claims"` // pool claims in flight (poolClaimBegin; no claim path calls it yet)
 	Unreaped   int      `json:"unreaped"`    // failed create batches whose rooms are not yet confirmed gone
 	HotelRooms int      `json:"hotel_rooms"` // running plus frozen rooms in the hotel's last health answer
 	CountKnown bool     `json:"count_known"` // a room list answered since start and the last one did

@@ -147,3 +147,51 @@ func TestDrainSavesAreSynced(t *testing.T) {
 		t.Fatalf("failed sync: %d drain=%v", w.Code, rg.b.hotelByID("h1").drain())
 	}
 }
+
+// A directory sync that fails after the rename puts the old file back: the
+// PATCH answers 500 and keeps the old drain in memory, so a restart must
+// read the old drain too (#693 Codex P1).
+func TestFailedDirSyncPutsTheOldDrainsFileBack(t *testing.T) {
+	c := reloadBase(t, t.TempDir())
+	rg := newReloadRig(t, c)
+	patchDrain(t, rg.b, "h1", true)
+	old := durableSync
+	durableSync = func(f *os.File) error {
+		if fi, err := f.Stat(); err == nil && fi.IsDir() {
+			return os.ErrPermission
+		}
+		return f.Sync()
+	}
+	t.Cleanup(func() { durableSync = old })
+	r := httptest.NewRequest("PATCH", "/v1/broker/hotels/h1", strings.NewReader(`{"drain": false}`))
+	r.Header.Set("Authorization", "Bearer operator-key")
+	w := httptest.NewRecorder()
+	rg.b.handler().ServeHTTP(w, r)
+	if w.Code != 500 || !rg.b.hotelByID("h1").drain() {
+		t.Fatalf("dir sync failure: %d drain=%v", w.Code, rg.b.hotelByID("h1").drain())
+	}
+	durableSync = old
+	b2, err := loadBroker(rg.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b2.hotelByID("h1").drain() {
+		t.Fatal("a failed undrain reopened the hotel at restart")
+	}
+	// A first save that fails the same way leaves no file behind.
+	c2 := reloadBase(t, t.TempDir())
+	rg2 := newReloadRig(t, c2)
+	durableSync = func(f *os.File) error {
+		if fi, err := f.Stat(); err == nil && fi.IsDir() {
+			return os.ErrPermission
+		}
+		return f.Sync()
+	}
+	r = httptest.NewRequest("PATCH", "/v1/broker/hotels/h1", strings.NewReader(`{"drain": true}`))
+	r.Header.Set("Authorization", "Bearer operator-key")
+	w = httptest.NewRecorder()
+	rg2.b.handler().ServeHTTP(w, r)
+	if _, err := os.Stat(filepath.Join(c2.StateDir, drainsFile)); w.Code != 500 || !os.IsNotExist(err) {
+		t.Fatalf("first save: %d, file %v", w.Code, err)
+	}
+}
