@@ -118,3 +118,22 @@ def test_server_close_ends_the_workers() -> None:
     while time.monotonic() < deadline and _workers() > base:
         time.sleep(0.05)
     assert _workers() == base
+
+
+def test_a_failed_thread_start_leaves_nothing_queued(monkeypatch) -> None:
+    server = _serve(hold=0.0)
+    try:
+        def no_thread(self):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", no_thread)
+        try:
+            server.process_request(None, ("127.0.0.1", 1))
+        except RuntimeError:
+            pass
+        monkeypatch.undo()
+        assert server._workers == 0
+        assert server._pool_queue.empty()
+    finally:
+        server.shutdown()
+        server.server_close()

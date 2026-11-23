@@ -485,9 +485,13 @@ def _run_bounded(
                 proc.kill()
                 proc.wait()
                 raise subprocess.TimeoutExpired(argv, timeout)
-            limits = [t - now for t in (deadline, drain_until) if t is not None]
-            if pidfd is None and drain_until is None:
-                limits.append(_RUN_BOUNDED_POLL_SECONDS)
+            if drain_until is not None:
+                # The limit is over once the command has exited: wait for the drain only.
+                limits = [drain_until - now]
+            else:
+                limits = [] if deadline is None else [deadline - now]
+                if pidfd is None:
+                    limits.append(_RUN_BOUNDED_POLL_SECONDS)
             for key, _events in sel.select(max(0.0, min(limits)) if limits else None):
                 if key.fd == pidfd:
                     sel.unregister(pidfd)

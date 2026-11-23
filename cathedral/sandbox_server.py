@@ -1590,9 +1590,15 @@ class _Server(ThreadingHTTPServer):
                 self._idle_workers -= 1  # this connection is that worker's
             else:
                 self._workers += 1
-        self._pool_queue.put((request, client_address))
         if spawn:
-            threading.Thread(target=self._pool_worker, name="cathedral-sandbox-conn", daemon=True).start()
+            try:
+                threading.Thread(target=self._pool_worker, name="cathedral-sandbox-conn", daemon=True).start()
+            except BaseException:
+                # No thread and nothing queued: the caller closes the connection (handle_error).
+                with self._pool_lock:
+                    self._workers -= 1
+                raise
+        self._pool_queue.put((request, client_address))
 
     def _pool_worker(self) -> None:
         while True:
@@ -1615,7 +1621,9 @@ class _Server(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         super().server_close()
-        # End every worker once it is done with its connection.
+        # End every worker once it is done with its connection. Like the
+        # stdlib's daemon request threads (ThreadingHTTPServer.daemon_threads,
+        # which _Threads never joins), requests in flight are not waited for.
         with self._pool_lock:
             workers, self._workers, self._idle_workers = self._workers, 0, 0
         for _ in range(workers):

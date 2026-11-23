@@ -86,3 +86,13 @@ def test_a_failing_hook_ends_the_command(tmp_path) -> None:
     pid = int(pidfile.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def test_the_drain_after_a_near_limit_exit_sleeps_instead_of_spinning() -> None:
+    # The command exits at once; its child holds stdout past the 0.1 s limit.
+    cpu = time.process_time()
+    result = _run(["sh", "-c", "sleep 10 & echo $!"], timeout=0.1)
+    used = time.process_time() - cpu
+    assert result.returncode == 0
+    assert used < 0.5, f"the drain used {used:.2f} s of CPU"
+    os.kill(int(result.stdout.split()[0]), 9)
