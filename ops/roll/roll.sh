@@ -130,6 +130,27 @@ try:
 except Exception:
     print("?")'
 }
+# The broker's own count before a guest restart (AB#875): "<drain> <rooms_in_use>". rooms_in_use
+# includes creates queued or in flight, which the hotel's room list does not show yet.
+broker_busy() {
+  curl -s -m 20 -H "Authorization: Bearer $(opkey)" "$BROKER/v1/broker/hotels/$HOTEL" | python3 -I -c '
+import json, sys
+try:
+    h = json.load(sys.stdin); n = h["rooms_in_use"]
+    print(h.get("drain"), n if isinstance(n, int) and not isinstance(n, bool) else "?")
+except Exception:
+    print("? ?")'
+}
+# restart_ok [capacity]: a guest restart may run only on a hotel the broker's hotel document reads as
+# drained, with 0 rooms in use at the broker (creates in flight included) and 0 live rooms on the hotel.
+# With "capacity", the capacity view must read drain=True as well (the recovery rollback). Prints why not.
+restart_ok() {
+  local up adm meas dr=True sl fr bd bn r
+  if [ "${1:-}" = capacity ]; then read -r up adm meas dr sl fr <<< "$(hotel_state)"; fi
+  read -r bd bn <<< "$(broker_busy)"; r=$(rooms)
+  if [ "$dr" = True ] && [ "$bd" = True ] && [ "$bn" = 0 ] && [ "$r" = 0 ]; then return 0; fi
+  echo "drain=$dr hotel_drain=$bd broker_rooms_in_use=$bn hotel_rooms=$r"; return 1
+}
 # "<live_rooms> <max_rooms> <public_open>" from the public Escape Open endpoint.
 escape_open() {
   curl -s -m 20 "$OPEN_URL" | python3 -I -c '
@@ -304,11 +325,10 @@ recover() {
   esac
   if [ "$phase" != drained ] && [ "$phase" != draining ] && [ "$(st_get NEW_GOOD)" != 1 ] && [ "$(st_get HOST_ROLLED_BACK)" != 1 ]; then
     # The rollback restarts the guest: only on a hotel read back as drained with 0 live rooms.
-    local r; read -r up adm meas dr sl fr <<< "$(hotel_state)"; r=$(rooms)
-    if [ "$dr" != True ] || [ "$r" != 0 ]; then
-      stuck "$phase" "0 rooms not proven before the host rollback (drain=$dr rooms=$r); guest not restarted"; return
+    local why; if ! why=$(restart_ok capacity); then
+      stuck "$phase" "0 rooms not proven before the host rollback ($why); guest not restarted"; return
     fi
-    log "recovery: drain=True rooms=0; rolling the host back to $OLDIMG"
+    log "recovery: drain=True rooms=0 at broker and hotel; rolling the host back to $OLDIMG"
     local rb; rb=$(host_rollback "$(st_get TS)")
     while read -r l; do log "host: $l"; done <<< "$rb"
     case "$rb" in
@@ -408,9 +428,8 @@ run_apply() {
     local code; code=$(drain true)
     [ "$code" = 200 ] || die "drain PATCH answered ${code:-nothing}; the drain may have applied"
     st_set PHASE drained; phase=drained; log "drained at broker"; sleep "$DRAIN_SETTLE"
-    local r; r=$(rooms)
-    [ "$r" = 0 ] || die "$HOTEL has rooms=$r after the drain; undrained, nothing installed"
-    log "0 rooms"
+    local why; why=$(restart_ok) || die "$HOTEL is not empty after the drain ($why); undrained, nothing installed"
+    log "0 rooms at broker and hotel, creates in flight included"
   fi
   if [ "$phase" = stuck_drained ]; then
     # resumed after a failed recovery: repeat the recovery of the phase that got stuck. A drain-only
@@ -422,8 +441,9 @@ run_apply() {
   if [ "$phase" = draining ]; then
     die "resuming an interrupted drain; reading the drain state back"
   fi
-  if [ "$phase" = drained ] && [ "$(rooms)" != 0 ]; then die "$HOTEL has rooms after resume; nothing installed"; fi
   if [ "$phase" = drained ]; then
+    # Checked again right before the install, which restarts the guest.
+    local why; why=$(restart_ok) || die "$HOTEL is not empty before the install ($why); nothing installed"
     st_set PHASE installing; phase=installing
     local out; out=$(host_install "$TS")
     while read -r l; do log "host: $l"; done <<< "$out"
