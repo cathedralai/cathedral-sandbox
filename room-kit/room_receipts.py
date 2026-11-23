@@ -379,7 +379,12 @@ ENV_ROUTE = re.compile(r"^/v1/sandboxes/(?P<id>[^/]+)/sealed-env$")
 # request that names it in any spelling is refused, as for exec-sealed.
 ENV_API_TAIL = "env-sealed"
 ENV_API_ROUTE = re.compile(r"^/v1/sandboxes/[^/]+/env-sealed$")
-INTERNAL_API_ROUTES = (EXEC_API_ROUTE, ENV_API_ROUTE)
+# The room API's route this front calls before a room's first secret file lands (AB#791): from
+# that time on the API withholds the room's entrypoint log. Refused to every caller.
+MARK_API_TAIL = "sealed-mark"
+MARK_API_ROUTE = re.compile(r"^/v1/sandboxes/[^/]+/sealed-mark$")
+MARK_TIMEOUT_SECONDS = 30
+INTERNAL_API_ROUTES = (EXEC_API_ROUTE, ENV_API_ROUTE, MARK_API_ROUTE)
 
 
 class PlantError(ValueError):
@@ -1860,8 +1865,14 @@ class Ledger:
         })
         return answer("installed"), receipt
 
-    def write_sealed_secret(self, room: str, doc) -> tuple[dict, dict | None]:
+    def write_sealed_secret(self, room: str, doc, mark=None) -> tuple[dict, dict | None]:
         """POST /v1/sandboxes/<room>/sealed-secrets. Returns (answer, receipt); raises SecretRefused.
+
+        mark() tells the room API a secret is about to land and returns the
+        room's switch point (unix ns of its first install), or raises
+        SecretRefused. It runs before the file is in place, so the API withholds
+        every entrypoint line that could have read it (AB#791); the receipt
+        names the switch point. The handler always passes it.
 
         Checked in this order: the fields, this boot's binding, the room in
         the path, the name and version, the room's incarnation (its create
@@ -1946,6 +1957,9 @@ class Ledger:
                 if held is not None:
                     return answer("unchanged"), held.receipt
             value = open_secret(doc, secrets.private)
+            # Before the file is in place and outside the lock (an HTTP call): a mark for a
+            # write that then fails only withholds more of the room's own log.
+            sealed_since_ns = mark() if mark is not None else None
             with secrets.lock:
                 # A newer write, a delete or a re-create may have landed while this one opened.
                 held = check_order()
@@ -1973,6 +1987,8 @@ class Ledger:
                         "envelope_sha256": envelope_sha256,
                         "path": path,
                         "status": 200,
+                        **({"entrypoint_log_withheld_from_ns": sealed_since_ns}
+                           if sealed_since_ns is not None else {}),
                     })
                 except Exception:  # noqa: BLE001 the file is written: answer, and say the receipt is missing
                     traceback.print_exc()
@@ -4551,7 +4567,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             doc = None
         try:
-            out, receipt = ledger.write_sealed_secret(room, doc)
+            out, receipt = ledger.write_sealed_secret(room, doc, self.secret_mark(room))
         except SecretRefused as exc:
             return self.reply(exc.status, canonical({"error": {"code": exc.code, "message": exc.code.replace("_", " ")}}))
         extra = {}
@@ -4561,6 +4577,36 @@ class Handler(BaseHTTPRequestHandler):
         else:
             extra["X-Room-Receipt-Error"] = "sign_failed"
         return self.reply(200, canonical(out), extra)
+
+    def secret_mark(self, room: str):
+        """The mark of a sealed secret write: tell the room API, before the file lands (AB#791).
+
+        Returns the room's switch point, unix ns. Anything but a 200 with one
+        refuses the write: no secret lands in a room whose log is still served.
+        """
+        def mark() -> int:
+            try:
+                status, _headers, out = self.upstream(
+                    self.server.api_port, b"{}", method="POST",
+                    path=f"/v1/sandboxes/{room}/{MARK_API_TAIL}", extra={"Content-Type": "application/json"},
+                    timeout=MARK_TIMEOUT_SECONDS)
+            except Exception:  # noqa: BLE001 no answer is no mark
+                traceback.print_exc()
+                raise SecretRefused(502, "sealed_secret_mark_failed") from None
+            try:
+                doc = json.loads(out)
+            except (ValueError, RecursionError):
+                doc = None
+            doc = doc if isinstance(doc, dict) else {}
+            error = doc.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            if status == 404 and code != "route_not_found":
+                raise SecretRefused(404, "sealed_secret_room_not_found")
+            since = doc.get("sealed_since_ns")
+            if status != 200 or type(since) is not int or since < 0:
+                raise SecretRefused(502, "sealed_secret_mark_failed")
+            return since
+        return mark
 
     def env_apply(self, room: str):
         """The apply of a sealed env write: PUT the opened overlay on the room API over loopback.

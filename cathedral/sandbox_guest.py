@@ -410,6 +410,10 @@ class GuestRecord:
     # AB#414: the room's env overlay, set after create only through a sealed envelope
     # the receipts front opened. Merged under each exec's own env; never in a doc or log.
     env_overlay: dict[str, str] = field(default_factory=dict, repr=False)
+    # AB#791: unix ns of the room's first customer-sealed secret install (a file
+    # or a non-empty env overlay), taken before the install lands. Set once; from
+    # it on the room's entrypoint log is withheld. None: never sealed.
+    sealed_since_ns: int | None = None
 
 
 # A room's exec output, process log and the API's own log record are capped
@@ -1755,6 +1759,53 @@ def entrypoint_log_page(
         "more": any(cut),
         # A line longer than a read came back cut; the rest of it is not readable.
         "truncated": out_cut or err_cut,
+    }
+
+
+def _before_ns(text: str, limit_ns: int) -> tuple[str, bool]:
+    """The part of one ``docker logs --timestamps`` stream stamped before *limit_ns* (AB#791).
+
+    Returns (text, True) when the stream reached the switch: nothing after the
+    kept text is ever served. A line with no stamp belongs to the line before
+    it and goes with it. The kept text ends at a line boundary whenever
+    anything was dropped.
+
+    docker stamps every partial of a line over 16 KiB with the first one's
+    time (_join_partials), so such a line may have been finished after the
+    install under an earlier stamp. Only a later line stamped before the limit
+    proves it ended before the install; the last kept line, when it is one of
+    those, is dropped and the stream ends there.
+    """
+    if limit_ns <= 0:
+        return "", bool(text)
+    pos, last, last_partial, hit = 0, 0, False, False
+    while pos < len(text):
+        end = text.find("\n", pos)
+        stop = len(text) if end < 0 else end + 1
+        stamp, sep, rest = text[pos:stop].partition(" ")
+        ns = _docker_log_ns(stamp) if sep else None
+        if ns is not None and ns >= limit_ns:
+            hit = True
+            break
+        if ns is not None:
+            last, last_partial = pos, (stamp + " ") in rest
+        pos = stop
+    if last_partial:
+        return text[:last], True
+    return text[:pos], hit
+
+
+def _withheld_page(page: dict[str, Any], sealed_ns: int) -> dict[str, Any]:
+    """The entrypoint answer of a room past its first sealed-secret install (AB#791).
+
+    sealed_since_ns marks the switch point (0: a secret with no known install
+    time, nothing is returned). The cursor stays: nothing more is ever served.
+    """
+    return {
+        **page,
+        "sealed_since_ns": sealed_ns,
+        "error": "entrypoint_log_withheld: this room has customer-sealed secrets; "
+                 "its entrypoint output from the first install on stays in the room",
     }
 
 
@@ -3307,8 +3358,48 @@ class DockerGuestProvider:
             guest = self._guests.get(sandbox_id)
             if guest is None:
                 raise SandboxOpError("sandbox_not_found", 404, f"sandbox {sandbox_id} not found")
+            if overlay and guest.sealed_since_ns is None:
+                # An exec under the overlay can write to the entrypoint's stdout (AB#791).
+                guest.sealed_since_ns = time.time_ns()
             guest.env_overlay = overlay
         return sorted(overlay)
+
+    def mark_sealed(self, sandbox_id: str) -> int:
+        """Record the room's first sealed-secret install (AB#791). Returns the switch point, unix ns.
+
+        Only the receipts front calls this, before it puts the room's first
+        secret file in place, so every entrypoint line stamped at or after the
+        returned time may have seen a secret. Later calls return the first time.
+        """
+        if self._secrets_root is None:
+            raise SandboxOpError("sealed_mark_not_supported", 501, "this hotel does not take sealed secrets")
+        with self._inner._lock:  # noqa: SLF001
+            self._inner._require_active(sandbox_id)  # noqa: SLF001
+            guest = self._guests.get(sandbox_id)
+            if guest is None:
+                raise SandboxOpError("sandbox_not_found", 404, f"sandbox {sandbox_id} not found")
+            if guest.sealed_since_ns is None:
+                guest.sealed_since_ns = time.time_ns()
+            return guest.sealed_since_ns
+
+    def _sealed_since_ns(self, sandbox_id: str, guest: GuestRecord) -> int | None:
+        """The room's switch point (AB#791), or None for a room that never had a sealed secret.
+
+        A secret file with no mark (a front from before AB#791, or a mark lost)
+        has no known switch point: the whole entrypoint log is withheld (0).
+        """
+        if guest.sealed_since_ns is not None:
+            return guest.sealed_since_ns
+        path = self._secrets_dir(sandbox_id)
+        if path is None:
+            return None
+        try:
+            with os.scandir(path) as entries:
+                if any(not entry.name.startswith(".") for entry in entries):
+                    return 0
+        except OSError:
+            return None
+        return None
 
     def start_process(self, sandbox_id: str, request: ExecRequest) -> ProcessHandle:
         guest = self._guests.get(sandbox_id)
@@ -3378,12 +3469,9 @@ class DockerGuestProvider:
             # Asked for only: docker logs reads the whole kept log on each call.
             return doc
         page: dict[str, Any] = {"cursor": entrypoint_cursor}
-        if self._secrets_root is not None:
-            # A hotel with customer-sealed secrets keeps the room's own output from
-            # whoever holds the hotel key, as it keeps sealed exec output
-            # (docs/SEALED_COMMANDS.md): the entrypoint can read /run/secrets.
-            page["error"] = "entrypoint_log_withheld: this hotel keeps sealed rooms' output to the room"
-            return {**doc, "entrypoint": page}
+        sealed = self._sealed_since_ns(sandbox_id, guest)
+        if sealed is not None and min(cursor[0], cursor[2]) >= sealed:
+            return {**doc, "entrypoint": _withheld_page(page, sealed)}
         try:
             code, out, err, cut = self._client.entrypoint_logs(
                 guest.container_id, since_ns=min(cursor[0], cursor[2]), cap=ENTRYPOINT_LOG_PAGE
@@ -3395,12 +3483,29 @@ class DockerGuestProvider:
             # log (a room started with --log-driver none has none to read).
             page["error"] = (err.strip().splitlines() or ["docker logs failed"])[-1][:300]
             return {**doc, "entrypoint": page}
+        # Read the mark again after the read: the front marks before a secret lands,
+        # so a mark still absent now means no line read was written after an install.
+        sealed = self._sealed_since_ns(sandbox_id, guest)
+        if sealed is not None:
+            # A room with customer-sealed secrets keeps its own output after the first
+            # install from whoever holds the hotel key, as it keeps sealed exec output
+            # (docs/SEALED_COMMANDS.md): the entrypoint can read /run/secrets. Lines
+            # stamped before the install are the room's earlier output and are kept.
+            (out, out_hit), (err, err_hit) = _before_ns(out, sealed), _before_ns(err, sealed)
+            # Stamps rise within a stream: a stream that reached the switch has no more to read.
+            cut = (cut[0] and not out_hit, cut[1] and not err_hit)
         running = True
         if (out and not out.endswith("\n")) or (err and not err.endswith("\n")):
             # A last line without its newline is whole only once the room has stopped.
             state = self._client.container_state(guest.container_id)
             running = state is None or state[0]
-        page.update(entrypoint_log_page(out, err, cut, cursor, running=running))
+        entry = entrypoint_log_page(out, err, cut, cursor, running=running)
+        if sealed is not None:
+            if not (entry["stdout"] or entry["stderr"] or entry["more"]):
+                # Nothing before the switch is left to read.
+                return {**doc, "entrypoint": _withheld_page(page, sealed)}
+            entry["sealed_since_ns"] = sealed
+        page.update(entry)
         return {**doc, "entrypoint": page}
 
     def stop_process(self, sandbox_id: str, process_id: str) -> None:

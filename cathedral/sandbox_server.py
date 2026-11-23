@@ -299,6 +299,9 @@ class SandboxApplication:
         # The receipts front's own route for an env overlay it opened from a sealed envelope
         # (AB#414); the front refuses it to every caller, as it does exec-sealed.
         self._add("PUT", s + r"/(?P<id>[^/]+)/env-sealed", self.set_env_sealed)
+        # The receipts front's own call before a room's first sealed secret lands (AB#791):
+        # the switch point of the room's entrypoint log. Refused to every caller by the front.
+        self._add("POST", s + r"/(?P<id>[^/]+)/sealed-mark", self.mark_sealed)
         self._add("POST", s + r"/(?P<id>[^/]+)/heartbeat", self.heartbeat)
         self._add("POST", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
         self._add("PATCH", s + r"/(?P<id>[^/]+)/lifetime", self.heartbeat)
@@ -600,6 +603,13 @@ class SandboxApplication:
             return Response.error(501, "env_overlay_not_supported", "this runtime has no env overlay")
         names = setter(id, env)
         return Response.json(200, {"sandbox_id": id, "names": names})
+
+    def mark_sealed(self, *, id, **_):
+        """Record the room's first sealed-secret install; answers its switch point, unix ns (AB#791)."""
+        marker = getattr(self.provider, "mark_sealed", None)
+        if not callable(marker):
+            return Response.error(501, "sealed_mark_not_supported", "this runtime has no sealed secrets")
+        return Response.json(200, {"sandbox_id": id, "sealed_since_ns": marker(id)})
 
     def start_process(self, *, id, body, **_):
         payload = self._json(body)

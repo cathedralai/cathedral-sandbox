@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from cathedral import sandbox_guest
 from cathedral.sandbox_api import CreateSandboxRequest, ExecRequest, ImageSource, Resources
 from cathedral.sandbox_guest import (
     DockerGuestProvider,
@@ -250,18 +251,163 @@ def test_entrypoint_docker_failure_keeps_the_rest_of_the_answer(fake, guest) -> 
     assert doc["sandbox_id"] == sid and "exec_history" in doc
 
 
-def test_entrypoint_withheld_on_a_sealed_secrets_hotel(fake, tmp_path, monkeypatch) -> None:
+@pytest.fixture
+def sealed_hotel(fake, tmp_path, monkeypatch):
+    """A hotel with customer-sealed secrets (AB#417): CATHEDRAL_SEALED_SECRETS_DIR set."""
     (tmp_path / "secrets").mkdir()
     monkeypatch.setenv("CATHEDRAL_SEALED_SECRETS_DIR", str(tmp_path / "secrets"))
     provider = DockerGuestProvider()
     try:
-        sid = _room(provider)
-        fake.add_log(_cid(provider, sid), "stdout", "secret-ish\n", T0)
-        page = provider.logs(sid, entrypoint_cursor="")["entrypoint"]
-        assert "withheld" in page["error"] and "stdout" not in page
-        assert fake.calls_of("logs") == []
+        yield provider
     finally:
         provider.close()
+
+
+def _mark_at(provider, sid: str, ns: int, _monkeypatch=None) -> int:
+    """What the receipts front does before a room's first secret file lands (AB#791)."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sandbox_guest.time, "time_ns", lambda: ns)
+        return provider.mark_sealed(sid)
+
+
+def test_ab791_never_sealed_room_on_a_sealed_hotel_returns_its_lines(fake, sealed_hotel) -> None:
+    """Withholding is per room: a room that never had a sealed secret reads as on any hotel."""
+    sid = _room(sealed_hotel)
+    cid = _cid(sealed_hotel, sid)
+    fake.add_log(cid, "stdout", "booting\n", T0)
+    fake.add_log(cid, "stderr", "warn\n", T0 + 1)
+    first = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert first["stdout"] == "booting\n" and first["stderr"] == "warn\n"
+    assert "error" not in first and "sealed_since_ns" not in first
+    fake.add_log(cid, "stdout", "ready\n", T0 + 9)
+    second = sealed_hotel.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
+    assert second["stdout"] == "ready\n" and "error" not in second
+
+
+def test_ab791_room_sealed_before_any_output_is_withheld(fake, sealed_hotel, monkeypatch) -> None:
+    sid = _room(sealed_hotel)
+    cid = _cid(sealed_hotel, sid)
+    mark = _mark_at(sealed_hotel, sid, T0, monkeypatch)
+    fake.add_log(cid, "stdout", "secret-value\n", T0 + 1)
+    fake.add_log(cid, "stderr", "secret-value\n", T0 + 2)
+    page = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert page["error"].startswith("entrypoint_log_withheld")
+    assert page["sealed_since_ns"] == mark == T0
+    assert "stdout" not in page and "stderr" not in page and "secret-value" not in json.dumps(page)
+
+
+def test_ab791_room_sealed_mid_life_returns_only_pre_install_lines_then_withheld(fake, sealed_hotel, monkeypatch) -> None:
+    sid = _room(sealed_hotel)
+    cid = _cid(sealed_hotel, sid)
+    fake.add_log(cid, "stdout", "before 1\n", T0)
+    fake.add_log(cid, "stderr", "before err\n", T0 + 1)
+    fake.add_log(cid, "stdout", "before 2\n", T0 + 2)
+    mark = _mark_at(sealed_hotel, sid, T0 + 5, monkeypatch)
+    fake.add_log(cid, "stdout", "after secret-value\n", T0 + 5)  # at the mark: may have read the secret
+    fake.add_log(cid, "stderr", "after secret-value\n", T0 + 6)
+    first = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert first["stdout"] == "before 1\nbefore 2\n" and first["stderr"] == "before err\n"
+    assert first["sealed_since_ns"] == mark and "error" not in first and first["more"] is False
+    second = sealed_hotel.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
+    assert second["error"].startswith("entrypoint_log_withheld") and second["sealed_since_ns"] == mark
+    assert "secret-value" not in json.dumps(first) + json.dumps(second)
+    # A later install does not move the switch point.
+    assert _mark_at(sealed_hotel, sid, T0 + 50, monkeypatch) == mark
+
+
+def test_ab791_mark_read_after_the_docker_read_cuts_lines_logged_meanwhile(fake, sealed_hotel, monkeypatch) -> None:
+    """A secret that lands while docker logs runs: the mark is read after the read, so its lines go."""
+    sid = _room(sealed_hotel)
+    cid = _cid(sealed_hotel, sid)
+    fake.add_log(cid, "stdout", "before\n", T0)
+    fake.add_log(cid, "stdout", "after secret-value\n", T0 + 5)
+    real = sealed_hotel._client.entrypoint_logs  # noqa: SLF001
+
+    def read_then_install(*args, **kwargs):
+        answer = real(*args, **kwargs)
+        sealed_hotel._guests[sid].sealed_since_ns = T0 + 5  # noqa: SLF001
+        return answer
+
+    monkeypatch.setattr(sealed_hotel._client, "entrypoint_logs", read_then_install)  # noqa: SLF001
+    page = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert page["stdout"] == "before\n" and page["sealed_since_ns"] == T0 + 5
+
+
+def test_ab791_a_long_line_finished_after_the_install_is_not_served(fake, sealed_hotel, monkeypatch) -> None:
+    """docker stamps a long line's parts with its first part's time: its end may be after the install."""
+    sid = _room(sealed_hotel)
+    cid = _cid(sealed_hotel, sid)
+    fake.add_log(cid, "stdout", "before\n", T0)
+    fake.add_long_line(cid, "stdout", "a" * 16 * 1024 + "secret-value\n", T0 + 1)
+    _mark_at(sealed_hotel, sid, T0 + 5, monkeypatch)
+    first = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert first["stdout"] == "before\n"
+    second = sealed_hotel.logs(sid, entrypoint_cursor=first["next_cursor"])["entrypoint"]
+    assert second["error"].startswith("entrypoint_log_withheld")
+    assert "secret-value" not in json.dumps(first) + json.dumps(second)
+
+
+def test_ab791_a_long_line_followed_by_an_earlier_stamped_line_is_served(fake, sealed_hotel, monkeypatch) -> None:
+    sid = _room(sealed_hotel)
+    cid = _cid(sealed_hotel, sid)
+    long_line = "b" * 16 * 1024 + "end\n"
+    fake.add_long_line(cid, "stdout", long_line, T0)
+    fake.add_log(cid, "stdout", "next\n", T0 + 1)
+    _mark_at(sealed_hotel, sid, T0 + 5, monkeypatch)
+    page = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert page["stdout"] == long_line + "next\n"
+
+
+def test_ab791_a_secret_file_with_no_mark_withholds_the_whole_log(fake, sealed_hotel, tmp_path) -> None:
+    """A front from before AB#791 writes no mark: no switch point is known, so nothing is served."""
+    sid = _room(sealed_hotel)
+    fake.add_log(_cid(sealed_hotel, sid), "stdout", "line\n", T0)
+    (tmp_path / "secrets" / sid / "TOKEN").write_text("x")
+    page = sealed_hotel.logs(sid, entrypoint_cursor="")["entrypoint"]
+    assert page["error"].startswith("entrypoint_log_withheld") and page["sealed_since_ns"] == 0
+    assert fake.calls_of("logs") == []
+
+
+def test_ab791_a_sealed_env_overlay_marks_the_room_and_an_empty_one_does_not(fake, sealed_hotel, monkeypatch) -> None:
+    sid = _room(sealed_hotel)
+    sealed_hotel.set_env_overlay(sid, {})
+    assert sealed_hotel._guests[sid].sealed_since_ns is None  # noqa: SLF001
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sandbox_guest.time, "time_ns", lambda: T0 + 3)
+        sealed_hotel.set_env_overlay(sid, {"TOKEN": "x"})
+    assert sealed_hotel._guests[sid].sealed_since_ns == T0 + 3  # noqa: SLF001
+
+
+def test_ab791_mark_is_refused_on_a_hotel_without_sealed_secrets(guest) -> None:
+    sid = _room(guest)
+    with pytest.raises(SandboxOpError) as err:
+        guest.mark_sealed(sid)
+    assert err.value.code == "sealed_mark_not_supported"
+
+
+def test_ab791_non_owner_is_refused_as_before_sealed_or_not(fake, sealed_hotel, monkeypatch) -> None:
+    never, sealed = _room(sealed_hotel), _room(sealed_hotel)
+    fake.add_log(_cid(sealed_hotel, never), "stdout", "mine\n", T0)
+    _mark_at(sealed_hotel, sealed, T0, monkeypatch)
+    sealed_hotel._inner._ctx.api_key = "someone-else"  # noqa: SLF001
+    for sid in (never, sealed):
+        with pytest.raises(SandboxOpError) as err:
+            sealed_hotel.logs(sid, entrypoint_cursor="")
+        assert err.value.http_status == 404 and err.value.code == "sandbox_not_found"
+        with pytest.raises(SandboxOpError) as err:
+            sealed_hotel.mark_sealed(sid)
+        assert err.value.http_status == 404
+    assert fake.calls_of("logs") == []
+
+
+def test_ab791_server_mark_route_answers_the_switch_point(fake, sealed_hotel, monkeypatch) -> None:
+    app = SandboxApplication(sealed_hotel)
+    body = json.dumps({"image": "alpine:3.20", "resources": {"vcpu": 1, "memory_gib": 1, "disk_gib": 5}})
+    sid = json.loads(app.dispatch("POST", "/v1/sandboxes", AUTH, body.encode()).body)["id"]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sandbox_guest.time, "time_ns", lambda: T0 + 7)
+        resp = app.dispatch("POST", f"/v1/sandboxes/{sid}/sealed-mark", AUTH, b"{}")
+    assert resp.status == 200 and json.loads(resp.body) == {"sandbox_id": sid, "sealed_since_ns": T0 + 7}
 
 
 def test_entrypoint_cursor_must_be_one_the_api_returned(guest) -> None:
