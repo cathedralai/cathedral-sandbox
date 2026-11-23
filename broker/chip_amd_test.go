@@ -328,7 +328,9 @@ func TestMinerGlobalCapCountsAllHotkeysAndDrainingHotels(t *testing.T) {
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", third); status != 201 {
 		t.Fatalf("replacement under global cap: %d %v", status, doc)
 	}
-	tc.b.cfg.MinerMaxHotels = 0
+	tc.b.mu.Lock()
+	tc.b.cfg.MinerMaxHotels = 0 // the sync loops read it (fresh checks, AB#947)
+	tc.b.mu.Unlock()
 	_, url = newMinerHotel(t, 1, snpAttestation(t, attestOpts{chip: chipOf("m4")}))
 	if status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{
 		"id": "m4", "api": url, "key": joinKey, "sealed": true, "miner_hotkey": otherHotkey,

@@ -515,3 +515,23 @@ func freshSettled(tc *testChain, h *hotel) {
 		}
 	}
 }
+
+// The verifier gets exactly the report Go checked, under one key, whatever
+// else the hotel's answer holds.
+func TestFreshVerifierGetsTheReportGoChecked(t *testing.T) {
+	signed := bytes.Repeat([]byte{1}, snpReportMinLen)
+	forged := bytes.Repeat([]byte{2}, snpReportMinLen)
+	raw := []byte(`{"report_b64":"` + base64.StdEncoding.EncodeToString(signed) + `","REPORT_B64":"` + base64.StdEncoding.EncodeToString(forged) + `"}`)
+	report, canon, err := freshAnswerReport(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(canon, &doc); err != nil || len(doc) != 1 {
+		t.Fatalf("canon %s: %v", canon, err)
+	}
+	got, _ := base64.StdEncoding.DecodeString(doc["report_b64"].(string))
+	if !bytes.Equal(got, report) {
+		t.Fatal("the verifier would check another report than the one Go checked")
+	}
+}
