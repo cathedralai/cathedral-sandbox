@@ -974,7 +974,7 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 // for the whole list ran past its cap on a long list while the hotel kept
 // pulling. gen is h.warmGen when the job started.
 func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
-	g := b.guests[job.guest]
+	g := b.guestByID(job.guest)
 	sem := make(chan struct{}, prefetchPerHotel)
 	var wg sync.WaitGroup
 	for i, ref := range job.Images {

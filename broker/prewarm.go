@@ -331,7 +331,7 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 				continue
 			}
 			var pin int64
-			if g := b.guests[guest]; g != nil && h.guestPinned[guest][ref] {
+			if g := b.guestByID(guest); g != nil && h.guestPinned[guest][ref] {
 				pin = g.limits.pinMaxBytes() // the cap now: Fred may have changed it
 			}
 			jobs = append(jobs, job{guest, ref, pin})
@@ -347,7 +347,7 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 	allowed := map[string]bool{}
 	for _, j := range jobs {
 		if _, seen := allowed[j.guest]; !seen {
-			g := b.guests[j.guest]
+			g := b.guestByID(j.guest)
 			allowed[j.guest] = g != nil && g.limitsAllow(b, h.cfg.ID)
 		}
 	}
@@ -369,7 +369,7 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 		go func(j job) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			g := b.guests[j.guest]
+			g := b.guestByID(j.guest)
 			// A hotel that was only unreachable for a while still holds its
 			// images: mark those warm without a pull. Only a wiped scratch
 			// (a reboot, a sealed roll) pulls again.

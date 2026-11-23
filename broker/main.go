@@ -422,6 +422,9 @@ type hotel struct {
 	// guestPinned: per guest, the refs this hotel pinned for it, so the replay
 	// after a reboot pins them again (AB#860). Guarded by broker.mu.
 	guestPinned map[string]map[string]bool
+	// fileDrain: this config file hotel's drain in the last file applied
+	// (drains.go). Guarded by broker.mu.
+	fileDrain bool
 }
 
 // unreapedBatch is one create request's leftover rooms on a hotel.
@@ -461,8 +464,9 @@ type guestState struct {
 
 type broker struct {
 	cfg              config
-	freshReplays     freshReplays  // AB#683 fresh creates by attempt and launch (escape_fresh_create.go)
-	terminalWSIdle   time.Duration // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
+	loopsCtx         atomic.Pointer[context.Context] // the sync loops' context from main; nil in tests (loopsContext)
+	freshReplays     freshReplays                    // AB#683 fresh creates by attempt and launch (escape_fresh_create.go)
+	terminalWSIdle   time.Duration                   // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
 	hotelsMu         sync.Mutex               // serialises joins and leaves
@@ -519,6 +523,22 @@ type broker struct {
 
 	// pool is the ready-room pool (pool.go). nil: no ready_rooms config.
 	pool *readyRooms
+
+	// Live reload (reload.go, AB#946). cfgPath: the config file; fileCfg:
+	// the last file applied (start or reload), what a reload compares with.
+	// adml and keys: the reloaded admission lists and key index (nil: the
+	// start's b.cfg and b.byKey). guestsMu guards b.guests against a reload
+	// adding guests while handlers without b.mu read it. admGen: bumped when
+	// the admission lists change, so a check that read the old lists is
+	// dropped. drains: saved runtime drains of config file hotels (drains.go),
+	// guarded by b.mu.
+	cfgPath  string
+	fileCfg  atomic.Pointer[config]
+	adml     atomic.Pointer[admissionLists]
+	keys     atomic.Pointer[map[string]*guestState]
+	guestsMu sync.RWMutex
+	admGen   atomic.Uint64
+	drains   map[string]drainRecord
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -566,102 +586,18 @@ func loadBroker(path string) (*broker, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
+	if err := validateTopConfig(c); err != nil {
 		return nil, err
-	}
-	if c.MinGenoaSNPSPL < 0 || c.MinGenoaSNPSPL > 255 {
-		return nil, errors.New("config: min_genoa_snp_spl must be an 8-bit SNP component value")
-	}
-	if c.MinGenoaMicrocodeSPL < 0 || c.MinGenoaMicrocodeSPL > 255 {
-		return nil, errors.New("config: min_genoa_microcode_spl must be an 8-bit microcode component value")
-	}
-	if c.MinerEnrollKeySHA256 != "" {
-		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
-		if err != nil || len(hash) != sha256.Size {
-			return nil, errors.New("config: miner_enroll_key_sha256 must be a SHA-256 hex digest")
-		}
-	}
-	if c.MinerEnrollKeySHA256 != "" && strings.EqualFold(c.MinerEnrollKeySHA256, c.OperatorKeySHA256) {
-		return nil, errors.New("config: miner enrollment key must differ from the operator key")
-	}
-	if c.OperatorReadKeySHA256 != "" {
-		hash, err := hex.DecodeString(c.OperatorReadKeySHA256)
-		if err != nil || len(hash) != sha256.Size {
-			return nil, errors.New("config: operator_read_key_sha256 must be a SHA-256 hex digest")
-		}
-		if strings.EqualFold(c.OperatorReadKeySHA256, c.OperatorKeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, c.MinerEnrollKeySHA256) {
-			return nil, errors.New("config: operator read key must differ from the operator key and the miner enrollment key")
-		}
-	}
-	if c.MeterKeySHA256 != "" {
-		hash, err := hex.DecodeString(c.MeterKeySHA256)
-		if err != nil || len(hash) != sha256.Size {
-			return nil, errors.New("config: meter_key_sha256 must be a SHA-256 hex digest")
-		}
-		if strings.EqualFold(c.MeterKeySHA256, c.OperatorKeySHA256) || strings.EqualFold(c.MeterKeySHA256, c.OperatorReadKeySHA256) || strings.EqualFold(c.MeterKeySHA256, c.MinerEnrollKeySHA256) {
-			return nil, errors.New("config: meter key must differ from the operator key, the operator read key and the miner enrollment key")
-		}
-	}
-	for hotkey, cap := range c.MinerHotkeyCaps {
-		if !ss58RE.MatchString(hotkey) || cap < 1 {
-			return nil, fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
-		}
-	}
-	if c.MinerMaxHotels < 0 {
-		return nil, errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
-	}
-	if err := validateProbationConfig(c); err != nil {
-		return nil, err
-	}
-	if c.MinerMaxRoomsPerHotkey < 0 {
-		return nil, errors.New("config: miner_max_rooms_per_hotkey must be 0 (no cap) or more")
-	}
-	if c.MinerPoolShare != 0 && !(c.MinerPoolShare > 0 && c.MinerPoolShare < 1) {
-		return nil, errors.New("config: miner_pool_share must be 0 (no cap) or between 0 and 1, exclusive")
-	}
-	if err := validateMinCommitment(c.MinerMinCommitment); err != nil {
-		return nil, err
-	}
-	for _, id := range c.TerminalHotels {
-		if id == "" || strings.Contains(id, ".") {
-			return nil, fmt.Errorf("config: terminal_hotels entry %q must be a hotel id (non-empty, no dot)", id)
-		}
-	}
-	switch c.SealedAdmission {
-	case "", "on":
-	case sealedAdmissionOff:
-		return nil, errors.New(`config: top-level "sealed_admission": "off" is refused (AB#596): joined and miner hotels are always gated; to skip the gate for one operator hotel, set "sealed_admission": "off" on its entry in hotels`)
-	default:
-		return nil, fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
 	}
 	alerts, err := newAlerter(c.Alerts)
 	if err != nil {
 		return nil, err
 	}
-	b := &broker{cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), shares: map[string]*liveShare{}, started: time.Now()}
+	b := &broker{cfgPath: path, cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), shares: map[string]*liveShare{}, started: time.Now()}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
-		// AB#776: every Cathedral room is sealed, so a hotel that is not
-		// sealed has no class to serve. Refuse at load rather than run it.
-		if !hc.Sealed {
-			return nil, fmt.Errorf(`config: hotel %q: every hotel must be "sealed": true (AB#776: there is no unsealed hotel class; remove the hotel or seal it)`, hc.ID)
-		}
-		if err := validateSealedAdmission(hc); err != nil {
-			return nil, err
-		}
-		if c.MinGenoaSNPSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
-			return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_snp_spl", hc.ID)
-		}
-		if c.MinGenoaMicrocodeSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
-			return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_microcode_spl", hc.ID)
-		}
-		if hc.MinerHotkey != "" {
-			return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
-		}
-		if hc.Commitment != nil {
-			return nil, fmt.Errorf("config: hotel %q: only a miner hotel declares a commitment, and miner hotels join at runtime", hc.ID)
-		}
-		if err := validateGuestTLS(hc, c.RequireSealedGuestTLS); err != nil {
+		h, err := prepareConfigHotel(c, hc)
+		if err != nil {
 			return nil, err
 		}
 		if hc.RequireAttestation {
@@ -670,36 +606,8 @@ func loadBroker(path string) (*broker, error) {
 		if hc.SealedAdmission == sealedAdmissionOff {
 			log.Printf("config: hotel %s: sealed_admission off: the SEV-SNP admission gate is OFF for this hotel (ops escape, AB#596)", hc.ID)
 		}
-		if strings.Contains(hc.ID, ".") || hc.ID == "" {
-			return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
-		}
-		if !validAlertChat(hc.AlertChatID) {
-			return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
-		}
-		if err := checkDataConnConfig(hc); err != nil {
-			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
-		}
-		if err := checkDiskConfig(hc); err != nil {
-			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
-		}
-		if err := checkMemFullPct(hc.MemFullPct); err != nil {
-			return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
-		}
-		k, err := os.ReadFile(hc.KeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("hotel %s key: %w", hc.ID, err)
-		}
-		if hc.Concurrency <= 0 {
-			hc.Concurrency = 16
-		}
-		installer, err := loadInstallSigner(hc)
-		if err != nil {
-			return nil, err
-		}
-		h := newHotel(hc, strings.TrimSpace(string(k)))
-		if installer != nil {
-			h.installer = installer
-			log.Printf("config: hotel %s: broker installs its hotel key into the guest, signer %s", hc.ID, installSignerPublicB64(installer))
+		if h.installer != nil {
+			log.Printf("config: hotel %s: broker installs its hotel key into the guest, signer %s", hc.ID, installSignerPublicB64(h.installer))
 		}
 		if err := b.addHotel(h); err != nil {
 			return nil, err
@@ -716,60 +624,11 @@ func loadBroker(path string) (*broker, error) {
 	if len(optedIn) > 0 {
 		b.noteRequireAttestation(strings.Join(optedIn, ", "))
 	}
-	for _, gc := range c.Guests {
-		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {
-			return nil, errors.New("config: miner enrollment key must differ from guest keys and view tokens")
-		}
-		if c.OperatorReadKeySHA256 != "" && (strings.EqualFold(c.OperatorReadKeySHA256, gc.KeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.ViewTokenSHA256)) {
-			return nil, errors.New("config: operator read key must differ from guest keys and view tokens")
-		}
-		if c.MeterKeySHA256 != "" && (strings.EqualFold(c.MeterKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MeterKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.MeterKeySHA256, gc.ViewTokenSHA256)) {
-			return nil, errors.New("config: meter key must differ from guest keys and view tokens")
-		}
-		if gc.ID == "" {
-			return nil, errors.New("config: a guest has no id (rooms with no broker_guest label would be its own)")
-		}
-		if b.guests[gc.ID] != nil {
-			return nil, fmt.Errorf("config: guest id %q appears twice", gc.ID)
-		}
-		if gc.Policy != nil {
-			if err := gc.Policy.validate(); err != nil {
-				return nil, fmt.Errorf("config: guest %q: %w", gc.ID, err)
-			}
-		}
-		if err := validateFreshGuestConfig(gc); err != nil {
-			return nil, err
-		}
-		g := &guestState{cfg: gc, limits: gc.guestLimits}
-		g.limits.Hotels = append([]string(nil), gc.Hotels...)
-		b.guests[gc.ID] = g
-		if gc.KeySHA256 != "" {
-			k := strings.ToLower(gc.KeySHA256)
-			if other := b.byKey[k]; other != nil {
-				return nil, fmt.Errorf("config: guests %q and %q share one key hash", other.cfg.ID, gc.ID)
-			}
-			b.byKey[k] = g
-		}
-		if gc.NextKeySHA256 != "" {
-			k := strings.ToLower(gc.NextKeySHA256)
-			if raw, err := hex.DecodeString(k); err != nil || len(raw) != sha256.Size {
-				return nil, fmt.Errorf("config: guest %q: next_key_sha256 must be a SHA-256 hex digest", gc.ID)
-			}
-			if gc.KeySHA256 == "" {
-				return nil, fmt.Errorf("config: guest %q: next_key_sha256 needs key_sha256 (it is a rotation, not a first key)", gc.ID)
-			}
-			if strings.EqualFold(k, gc.KeySHA256) {
-				return nil, fmt.Errorf("config: guest %q: next_key_sha256 equals key_sha256", gc.ID)
-			}
-			if strings.EqualFold(k, c.OperatorKeySHA256) {
-				return nil, fmt.Errorf("config: guest %q: next_key_sha256 must differ from the operator key", gc.ID)
-			}
-			if other := b.byKey[k]; other != nil {
-				return nil, fmt.Errorf("config: guests %q and %q share one key hash", other.cfg.ID, gc.ID)
-			}
-			b.byKey[k] = g
-		}
+	guests, byKey, err := buildGuests(c)
+	if err != nil {
+		return nil, err
 	}
+	b.guests, b.byKey = guests, byKey
 	if err := c.AMDVerifier.validate(); err != nil {
 		return nil, fmt.Errorf("config: amd_verifier: %w", err)
 	}
@@ -785,6 +644,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		h.roomsUnchecked = true
 	}
+	b.loadConfigDrains() // PATCHed drains of config file hotels (drains.go, AB#946)
+	fc := c
+	b.fileCfg.Store(&fc)
 	// The lend state in state_dir wins over reserved_for in the config file.
 	if err := b.loadConfigLends(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
@@ -799,6 +661,199 @@ func loadBroker(path string) (*broker, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// validateTopConfig is the start's check of the config file's top-level
+// fields. A live reload (reload.go) runs it on the new file too.
+func validateTopConfig(c config) error {
+	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
+		return err
+	}
+	if c.MinGenoaSNPSPL < 0 || c.MinGenoaSNPSPL > 255 {
+		return errors.New("config: min_genoa_snp_spl must be an 8-bit SNP component value")
+	}
+	if c.MinGenoaMicrocodeSPL < 0 || c.MinGenoaMicrocodeSPL > 255 {
+		return errors.New("config: min_genoa_microcode_spl must be an 8-bit microcode component value")
+	}
+	if c.MinerEnrollKeySHA256 != "" {
+		hash, err := hex.DecodeString(c.MinerEnrollKeySHA256)
+		if err != nil || len(hash) != sha256.Size {
+			return errors.New("config: miner_enroll_key_sha256 must be a SHA-256 hex digest")
+		}
+	}
+	if c.MinerEnrollKeySHA256 != "" && strings.EqualFold(c.MinerEnrollKeySHA256, c.OperatorKeySHA256) {
+		return errors.New("config: miner enrollment key must differ from the operator key")
+	}
+	if c.OperatorReadKeySHA256 != "" {
+		hash, err := hex.DecodeString(c.OperatorReadKeySHA256)
+		if err != nil || len(hash) != sha256.Size {
+			return errors.New("config: operator_read_key_sha256 must be a SHA-256 hex digest")
+		}
+		if strings.EqualFold(c.OperatorReadKeySHA256, c.OperatorKeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, c.MinerEnrollKeySHA256) {
+			return errors.New("config: operator read key must differ from the operator key and the miner enrollment key")
+		}
+	}
+	if c.MeterKeySHA256 != "" {
+		hash, err := hex.DecodeString(c.MeterKeySHA256)
+		if err != nil || len(hash) != sha256.Size {
+			return errors.New("config: meter_key_sha256 must be a SHA-256 hex digest")
+		}
+		if strings.EqualFold(c.MeterKeySHA256, c.OperatorKeySHA256) || strings.EqualFold(c.MeterKeySHA256, c.OperatorReadKeySHA256) || strings.EqualFold(c.MeterKeySHA256, c.MinerEnrollKeySHA256) {
+			return errors.New("config: meter key must differ from the operator key, the operator read key and the miner enrollment key")
+		}
+	}
+	for hotkey, cap := range c.MinerHotkeyCaps {
+		if !ss58RE.MatchString(hotkey) || cap < 1 {
+			return fmt.Errorf("config: miner_hotkey_caps requires an SS58 hotkey and a positive machine cap")
+		}
+	}
+	if c.MinerMaxHotels < 0 {
+		return errors.New("config: miner_max_hotels must be positive when miner hotels are allowed")
+	}
+	if err := validateProbationConfig(c); err != nil {
+		return err
+	}
+	if c.MinerMaxRoomsPerHotkey < 0 {
+		return errors.New("config: miner_max_rooms_per_hotkey must be 0 (no cap) or more")
+	}
+	if c.MinerPoolShare != 0 && !(c.MinerPoolShare > 0 && c.MinerPoolShare < 1) {
+		return errors.New("config: miner_pool_share must be 0 (no cap) or between 0 and 1, exclusive")
+	}
+	if err := validateMinCommitment(c.MinerMinCommitment); err != nil {
+		return err
+	}
+	for _, id := range c.TerminalHotels {
+		if id == "" || strings.Contains(id, ".") {
+			return fmt.Errorf("config: terminal_hotels entry %q must be a hotel id (non-empty, no dot)", id)
+		}
+	}
+	switch c.SealedAdmission {
+	case "", "on":
+	case sealedAdmissionOff:
+		return errors.New(`config: top-level "sealed_admission": "off" is refused (AB#596): joined and miner hotels are always gated; to skip the gate for one operator hotel, set "sealed_admission": "off" on its entry in hotels`)
+	default:
+		return fmt.Errorf(`config: sealed_admission %q: the top-level value can only be "on" (or absent)`, c.SealedAdmission)
+	}
+	return nil
+}
+
+// prepareConfigHotel checks one config file hotel entry and builds its hotel
+// (key read, install signer). The start and a live reload (reload.go) both
+// use it, so a hotel the reload adds passes exactly the start's checks.
+func prepareConfigHotel(c config, hc hotelConfig) (*hotel, error) {
+	// AB#776: every Cathedral room is sealed, so a hotel that is not
+	// sealed has no class to serve. Refuse at load rather than run it.
+	if !hc.Sealed {
+		return nil, fmt.Errorf(`config: hotel %q: every hotel must be "sealed": true (AB#776: there is no unsealed hotel class; remove the hotel or seal it)`, hc.ID)
+	}
+	if err := validateSealedAdmission(hc); err != nil {
+		return nil, err
+	}
+	if c.MinGenoaSNPSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
+		return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_snp_spl", hc.ID)
+	}
+	if c.MinGenoaMicrocodeSPL > 0 && hc.Sealed && hc.SealedAdmission == sealedAdmissionOff {
+		return nil, fmt.Errorf("config: hotel %q: sealed_admission off bypasses min_genoa_microcode_spl", hc.ID)
+	}
+	if hc.MinerHotkey != "" {
+		return nil, fmt.Errorf("config: miner hotel %q must join with attested guest TLS", hc.ID)
+	}
+	if hc.Commitment != nil {
+		return nil, fmt.Errorf("config: hotel %q: only a miner hotel declares a commitment, and miner hotels join at runtime", hc.ID)
+	}
+	if err := validateGuestTLS(hc, c.RequireSealedGuestTLS); err != nil {
+		return nil, err
+	}
+	if strings.Contains(hc.ID, ".") || hc.ID == "" {
+		return nil, fmt.Errorf("hotel id %q: must be non-empty and have no dot", hc.ID)
+	}
+	if !validAlertChat(hc.AlertChatID) {
+		return nil, fmt.Errorf("config: hotel %q: alert_chat_id must be a Telegram chat id (digits) or @channel", hc.ID)
+	}
+	if err := checkDataConnConfig(hc); err != nil {
+		return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
+	}
+	if err := checkDiskConfig(hc); err != nil {
+		return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
+	}
+	if err := checkMemFullPct(hc.MemFullPct); err != nil {
+		return nil, fmt.Errorf("config: hotel %q: %w", hc.ID, err)
+	}
+	k, err := os.ReadFile(hc.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("hotel %s key: %w", hc.ID, err)
+	}
+	if hc.Concurrency <= 0 {
+		hc.Concurrency = 16
+	}
+	installer, err := loadInstallSigner(hc)
+	if err != nil {
+		return nil, err
+	}
+	h := newHotel(hc, strings.TrimSpace(string(k)))
+	h.installer = installer
+	return h, nil
+}
+
+// buildGuests checks the config file guests and builds them with their key
+// index. The start and a live reload (reload.go) both use it.
+func buildGuests(c config) (map[string]*guestState, map[string]*guestState, error) {
+	guests, byKey := map[string]*guestState{}, map[string]*guestState{}
+	for _, gc := range c.Guests {
+		if c.MinerEnrollKeySHA256 != "" && (strings.EqualFold(c.MinerEnrollKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.MinerEnrollKeySHA256, gc.ViewTokenSHA256)) {
+			return nil, nil, errors.New("config: miner enrollment key must differ from guest keys and view tokens")
+		}
+		if c.OperatorReadKeySHA256 != "" && (strings.EqualFold(c.OperatorReadKeySHA256, gc.KeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.OperatorReadKeySHA256, gc.ViewTokenSHA256)) {
+			return nil, nil, errors.New("config: operator read key must differ from guest keys and view tokens")
+		}
+		if c.MeterKeySHA256 != "" && (strings.EqualFold(c.MeterKeySHA256, gc.KeySHA256) || strings.EqualFold(c.MeterKeySHA256, gc.NextKeySHA256) || strings.EqualFold(c.MeterKeySHA256, gc.ViewTokenSHA256)) {
+			return nil, nil, errors.New("config: meter key must differ from guest keys and view tokens")
+		}
+		if gc.ID == "" {
+			return nil, nil, errors.New("config: a guest has no id (rooms with no broker_guest label would be its own)")
+		}
+		if guests[gc.ID] != nil {
+			return nil, nil, fmt.Errorf("config: guest id %q appears twice", gc.ID)
+		}
+		if gc.Policy != nil {
+			if err := gc.Policy.validate(); err != nil {
+				return nil, nil, fmt.Errorf("config: guest %q: %w", gc.ID, err)
+			}
+		}
+		if err := validateFreshGuestConfig(gc); err != nil {
+			return nil, nil, err
+		}
+		g := &guestState{cfg: gc, limits: gc.guestLimits}
+		g.limits.Hotels = append([]string(nil), gc.Hotels...)
+		guests[gc.ID] = g
+		if gc.KeySHA256 != "" {
+			k := strings.ToLower(gc.KeySHA256)
+			if other := byKey[k]; other != nil {
+				return nil, nil, fmt.Errorf("config: guests %q and %q share one key hash", other.cfg.ID, gc.ID)
+			}
+			byKey[k] = g
+		}
+		if gc.NextKeySHA256 != "" {
+			k := strings.ToLower(gc.NextKeySHA256)
+			if raw, err := hex.DecodeString(k); err != nil || len(raw) != sha256.Size {
+				return nil, nil, fmt.Errorf("config: guest %q: next_key_sha256 must be a SHA-256 hex digest", gc.ID)
+			}
+			if gc.KeySHA256 == "" {
+				return nil, nil, fmt.Errorf("config: guest %q: next_key_sha256 needs key_sha256 (it is a rotation, not a first key)", gc.ID)
+			}
+			if strings.EqualFold(k, gc.KeySHA256) {
+				return nil, nil, fmt.Errorf("config: guest %q: next_key_sha256 equals key_sha256", gc.ID)
+			}
+			if strings.EqualFold(k, c.OperatorKeySHA256) {
+				return nil, nil, fmt.Errorf("config: guest %q: next_key_sha256 must differ from the operator key", gc.ID)
+			}
+			if other := byKey[k]; other != nil {
+				return nil, nil, fmt.Errorf("config: guests %q and %q share one key hash", other.cfg.ID, gc.ID)
+			}
+			byKey[k] = g
+		}
+	}
+	return guests, byKey, nil
 }
 
 // ---------------------------------------------------------------- hotel calls
@@ -1060,7 +1115,7 @@ func (b *broker) guestFromKey(r *http.Request) *guestState {
 	if len(a) < 8 || !strings.EqualFold(a[:7], "bearer ") {
 		return nil
 	}
-	return b.byKey[sha(strings.TrimSpace(a[7:]))]
+	return b.keyGuest(sha(strings.TrimSpace(a[7:])))
 }
 
 // downSince is when the hotel went down, for the hotel lists; nil while up.
@@ -2919,7 +2974,7 @@ type viewAuth struct {
 // for a guest with no view token.
 func (b *broker) viewGuest(r *http.Request, guestID string) (*guestState, viewAuth) {
 	var a viewAuth
-	g := b.guests[guestID]
+	g := b.guestByID(guestID)
 	if g == nil {
 		return nil, a
 	}
@@ -2982,7 +3037,7 @@ func (b *broker) handleSignIn(w http.ResponseWriter, r *http.Request, guestID st
 	if r.ParseForm() == nil {
 		token = r.PostForm.Get("token")
 	}
-	g := b.guests[guestID]
+	g := b.guestByID(guestID)
 	if g == nil || g.cfg.ViewTokenSHA256 == "" || token == "" ||
 		subtle.ConstantTimeCompare([]byte(sha(token)), []byte(strings.ToLower(g.cfg.ViewTokenSHA256))) != 1 {
 		writeSignIn(w, guestID, "The token is not correct. Try again.")
@@ -3210,6 +3265,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.handleMeter(w, r, id, action) // meter key only (meter.go)
 		return
 	}
+	if p == "/v1/broker/config/reload" && b.isOperator(r) {
+		b.handleConfigReload(w, r) // AB#946
+		return
+	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
 		b.handleGuestAdmin(w, r, strings.TrimPrefix(strings.TrimPrefix(p, "/v1/broker/guests"), "/"))
 		return
@@ -3361,7 +3420,15 @@ func (b *broker) handler() http.Handler {
 func main() {
 	cfgPath := flag.String("config", "/etc/thin-broker/config.json", "private config file")
 	printDigest := flag.Bool("print-catalog-digest", false, "print the compiled-in catalog digest and exit; reads no config (AB#546 swap check)")
+	checkOnly := flag.Bool("check-config", false, "check the config file as a start would and exit 0 (ok) or 1; touches no state and calls no hotel (AB#946)")
 	flag.Parse()
+	if *checkOnly {
+		if err := checkConfigFile(*cfgPath); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("config ok")
+		return
+	}
 	if *printDigest {
 		if err := printCatalogDigest(os.Stdout); err != nil {
 			log.Fatal(err)
@@ -3376,6 +3443,7 @@ func main() {
 		log.Fatal("config: listen is required (an empty listen would bind :http on every interface)")
 	}
 	ctx, stopLoops := context.WithCancel(context.Background())
+	b.loopsCtx.Store(&ctx) // hotels added by a live reload stop with the rest at SIGTERM
 	if err := b.loadCompat(); err != nil {
 		log.Printf("client state not loaded: %v", err)
 	}

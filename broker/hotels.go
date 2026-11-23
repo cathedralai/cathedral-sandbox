@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -173,11 +174,11 @@ func (b *broker) addHotelWithCapCheck(h *hotel, checkCaps bool) error {
 	defer b.hotelsMu.Unlock()
 	old := b.hset.Load()
 	if hotkey := h.cfg.MinerHotkey; checkCaps && hotkey != "" {
-		cap := b.cfg.MinerHotkeyCaps[hotkey]
+		cap := b.minerHotkeyCaps()[hotkey]
 		if cap < 1 {
 			return errMinerNotApproved
 		}
-		if b.cfg.MinerMaxHotels < 1 {
+		if b.minerMaxHotels() < 1 {
 			return errMinerGlobalCapUnset
 		}
 		used, total := 0, 0
@@ -194,8 +195,8 @@ func (b *broker) addHotelWithCapCheck(h *hotel, checkCaps bool) error {
 		if used >= cap {
 			return fmt.Errorf("%w (%d)", errMinerCapReached, cap)
 		}
-		if total >= b.cfg.MinerMaxHotels {
-			return fmt.Errorf("%w (%d)", errMinerGlobalCapReached, b.cfg.MinerMaxHotels)
+		if total >= b.minerMaxHotels() {
+			return fmt.Errorf("%w (%d)", errMinerGlobalCapReached, b.minerMaxHotels())
 		}
 	}
 	next := &hotelSet{byID: map[string]*hotel{}}
@@ -221,14 +222,14 @@ func (b *broker) minerOverCap(h *hotel) bool {
 	if hotkey == "" {
 		return false
 	}
-	cap := b.cfg.MinerHotkeyCaps[hotkey]
-	if cap < 1 || b.cfg.MinerMaxHotels < 1 {
+	cap := b.minerHotkeyCaps()[hotkey]
+	if cap < 1 || b.minerMaxHotels() < 1 {
 		return true
 	}
 	used, total := 0, 0
 	for _, existing := range b.hotelList() {
 		if existing == h {
-			return used >= cap || total >= b.cfg.MinerMaxHotels
+			return used >= cap || total >= b.minerMaxHotels()
 		}
 		if existing.cfg.MinerHotkey != "" {
 			total++
@@ -272,6 +273,15 @@ func (b *broker) dropHotelIf(id string, expected *hotel) bool {
 	}
 	b.hset.Store(next)
 	return true
+}
+
+// loopsContext is the context main cancels at SIGTERM, or Background before
+// main set it (tests).
+func (b *broker) loopsContext() context.Context {
+	if p := b.loopsCtx.Load(); p != nil {
+		return *p
+	}
+	return context.Background()
 }
 
 // startSync runs the sync loop of h until the hotel leaves.
@@ -369,6 +379,7 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 }
 
 func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool) {
+	admGen := b.admGen.Load() // admission lists this join is checked against (reload.go)
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	var req joinRequest
 	if json.Unmarshal(raw, &req) != nil {
@@ -521,6 +532,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		need := b.needsAttestation(h)
 		b.mu.Unlock()
 		if need {
+			admGen = b.admGen.Load()
 			res, err := b.checkAttestation(r.Context(), h)
 			if err != nil {
 				writeErr(w, 422, "attestation_failed", "the hotel's SEV-SNP attestation did not pass: "+err.Error())
@@ -543,6 +555,14 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	h.cfg.KeyFile = filepath.Join(keyDir, hc.ID+".key")
 	b.hotelsMutationMu.Lock()
 	defer b.hotelsMutationMu.Unlock()
+	if b.admGen.Load() != admGen {
+		// A reload changed the admission lists after this join's check: the
+		// pass is from the old lists. The hotel joins pending and the sync
+		// loop checks it under the new ones (AB#946).
+		b.mu.Lock()
+		h.adm.attestedAt, h.adm.checkedAt = time.Time{}, time.Time{}
+		b.mu.Unlock()
+	}
 	// The stop function is set before the hotel is in the set, so a leave
 	// that races this join reads it set.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -791,12 +811,32 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		// evidence that the miner sent the notice at received_at.
 		err = b.appendDrainNotice(*newNotice)
 	}
+	// A config file hotel's drain is kept in hotel-drains.json (drains.go,
+	// AB#946). It is written first, and put back if a later save fails, so
+	// a PATCH with drain and lend keeps both or neither.
+	var drainsBefore map[string]drainRecord
+	drainSaved := false
+	if err == nil && req.Drain != nil && !h.runtime && b.cfg.StateDir != "" {
+		drainsBefore = maps.Clone(b.drains)
+		b.noteConfigDrainLocked(h)
+		if err = b.saveConfigDrainsLocked(); err != nil {
+			b.drains = drainsBefore
+		} else {
+			drainSaved = true
+		}
+	}
 	switch {
 	case err != nil:
 	case lc.lend || lc.reclaim:
 		err = b.saveLendStateLocked(h) // the lend state must survive a restart (lend.go)
 	case h.runtime:
 		err = b.saveRuntimeHotelsLocked()
+	}
+	if err != nil && drainSaved {
+		b.drains = drainsBefore
+		if e := b.saveConfigDrainsLocked(); e != nil {
+			log.Printf("hotel %s: %s not put back: %v", h.cfg.ID, drainsFile, e)
+		}
 	}
 	if err != nil {
 		log.Printf("hotel %s update not saved: %v", h.cfg.ID, err)
@@ -924,7 +964,7 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 func (b *broker) guestExists(id string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.guests[id] != nil
+	return b.guestByID(id) != nil
 }
 
 // ---------------------------------------------------------------- persistence

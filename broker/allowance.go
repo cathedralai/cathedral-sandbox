@@ -8,8 +8,11 @@
 //
 // The ledger sends and reads the allowance with the operator key:
 //
-//	PUT /v1/broker/guests/<id>/allowance  {"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}
-//	GET /v1/broker/guests/<id>/allowance  the allowance, live rooms and the lease seconds left
+//	PUT /v1/broker/guests/<id>/allowance  {"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib", optional "stop"}
+//	GET /v1/broker/guests/<id>/allowance  the allowance, live rooms, the lease seconds left and the last stop
+//
+// "stop" (AB#948, allowance_stop.go) freezes the guest's running rooms after
+// the PUT answers; it needs cap 0 in the same PUT.
 //
 // A PUT for a guest that is not metered answers 409 guest_not_metered. A PUT
 // stamps ledger_seen_at with the broker's clock and keeps the allowance in
@@ -68,8 +71,12 @@
 // sends ttl_seconds of at most max_ttl_seconds, and a refused one sends
 // nothing, so the room keeps the deadline it has. A room claim (room kit) is
 // refused for a metered guest: it sets a lifetime this gate does not see.
+// A thaw (POST on the room's thaw route) is an admission too, like an
+// extension: refused when the live rooms pass the cap (so at cap 0), the
+// lease is stale or a recount is pending; a refused thaw sends nothing.
 //
-// Nothing here stops or deletes a running room.
+// Nothing here deletes a room. A PUT with "stop" freezes the guest's running
+// rooms (allowance_stop.go); nothing else here stops one.
 package main
 
 import (
@@ -178,6 +185,9 @@ type allowances struct {
 	// hold is how long a lost create attempt whose reap found no room still
 	// counts (uncertain_create_hold_seconds).
 	hold time.Duration
+	// stops is guest id -> its allowance stop state (allowance_stop.go).
+	// Guarded by broker.mu.
+	stops map[string]*guestStops
 }
 
 func orphanKey(hotelID, batchID string) string { return hotelID + "\x00" + batchID }
@@ -700,13 +710,23 @@ func lifetimeRoute(method, gate, tail string) bool {
 // that sets no lifetime, passes unchanged.
 func (b *broker) meteredRoomRoute(w http.ResponseWriter, r *http.Request, g *guestState, h *hotel, hid, gate, tail string, body []byte) ([]byte, bool) {
 	isClaim := gate == "claim" && !strings.Contains(tail, "/")
-	if !isClaim && !lifetimeRoute(r.Method, gate, tail) {
+	isThaw := thawRoute(r.Method, gate, tail)
+	if !isClaim && !isThaw && !lifetimeRoute(r.Method, gate, tail) {
 		return body, true
 	}
 	b.mu.Lock()
 	metered, _ := b.meteredLocked(g)
 	b.mu.Unlock()
 	if !metered {
+		return body, true
+	}
+	if isThaw {
+		// A thaw restarts a frozen room (an allowance stop or the meter froze
+		// it), so it is admitted like an extension. The body goes unchanged.
+		if _, e, retry := b.meteredExtension(g); e != nil {
+			writeLimitErr(w, e, retry)
+			return nil, false
+		}
 		return body, true
 	}
 	if isClaim {
@@ -751,6 +771,20 @@ func (b *broker) meteredRoomRoute(w http.ResponseWriter, r *http.Request, g *gue
 	return out, true
 }
 
+// thawRoute reports whether a room request is the hotel's thaw route (POST
+// /v1/sandboxes/{id}/thaw). Like lifetimeRoute it matches methods in any case
+// and counts every writing method: the hotel has no other route there.
+func thawRoute(method, gate, tail string) bool {
+	if gate != "thaw" || strings.Contains(tail, "/") {
+		return false
+	}
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD", "OPTIONS", "DELETE":
+		return false
+	}
+	return true
+}
+
 // roomTTLSeconds reads ttl_seconds from the hotel's room document.
 func roomTTLSeconds(r *http.Request, h *hotel, hid string) (float64, bool) {
 	status, _, out, err := h.do(r.Context(), "GET", "/v1/sandboxes/"+url.PathEscape(hid), nil, nil, 30*time.Second)
@@ -785,7 +819,7 @@ func (b *broker) handleAllowance(w http.ResponseWriter, r *http.Request, id stri
 	case "GET":
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		g := b.guests[id]
+		g := b.guestByID(id)
 		if g == nil {
 			writeErr(w, 404, "guest_not_found", "no guest "+id)
 			return
@@ -805,12 +839,15 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 		LeaseSeconds  *int   `json:"lease_seconds"`
 		MaxTTLSeconds *int   `json:"max_ttl_seconds"`
 		MaxMemoryGiB  *int   `json:"max_memory_gib"`
+		// Stop freezes the guest's running rooms after the answer
+		// (allowance_stop.go).
+		Stop *allowanceStop `json:"stop"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil || dec.More() {
-		writeErr(w, 400, "invalid_json", "body must be one JSON object with issue, cap, lease_seconds, max_ttl_seconds and max_memory_gib, all whole numbers")
+		writeErr(w, 400, "invalid_json", "body must be one JSON object with issue, cap, lease_seconds, max_ttl_seconds and max_memory_gib, all whole numbers, and an optional stop {\"reason\"}")
 		return
 	}
 	bad := ""
@@ -832,10 +869,22 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 		writeErr(w, 400, "invalid_allowance", bad)
 		return
 	}
+	if req.Stop != nil {
+		switch {
+		case !stopReasons[req.Stop.Reason]:
+			bad = "stop.reason must be account_suspended or abuse"
+		case *req.Cap != 0:
+			bad = "a stop needs cap 0 in the same allowance"
+		}
+		if bad != "" {
+			writeErr(w, 400, "invalid_stop", bad+"; nothing changed")
+			return
+		}
+	}
 	b.allow.saveMu.Lock()
 	defer b.allow.saveMu.Unlock()
 	b.mu.Lock()
-	g := b.guests[id]
+	g := b.guestByID(id)
 	if g == nil {
 		b.mu.Unlock()
 		writeErr(w, 404, "guest_not_found", "no guest "+id)
@@ -844,6 +893,11 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 	if !g.limits.Metered {
 		b.mu.Unlock()
 		writeErr(w, 409, "guest_not_metered", "guest "+id+" is not metered: mark it \"metered\": true in the broker config first; nothing changed")
+		return
+	}
+	if req.Stop != nil && g.limits.Postpaid { // never both (loadAllowances); kept as a guard
+		b.mu.Unlock()
+		writeErr(w, 409, "guest_postpaid", "guest "+id+" is postpaid: its rooms are never frozen for balance; nothing changed")
 		return
 	}
 	if b.cfg.StateDir == "" { // a metered guest needs state_dir (loadAllowances); kept as a guard
@@ -882,8 +936,17 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 	}
 	b.mu.Lock()
 	b.allow.byGuest = next
+	var started bool
+	if req.Stop != nil {
+		// After the save: the guest is at cap 0 before any room is frozen,
+		// so nothing it frees can be refilled. The pass runs after the answer.
+		started = b.startStopLocked(g, req.Stop.Reason)
+	}
 	view := b.allowanceViewLocked(g, time.Now())
 	b.mu.Unlock()
+	if req.Stop != nil {
+		view["stop"] = map[string]any{"reason": req.Stop.Reason, "started": started}
+	}
 	writeJSON(w, 200, view)
 }
 
@@ -904,12 +967,14 @@ func (b *broker) allowanceViewLocked(g *guestState, now time.Time) map[string]an
 	if a.fresh(now) {
 		left = int((time.Duration(a.LeaseSeconds)*time.Second - now.Sub(a.LedgerSeenAt)).Seconds())
 	}
-	return map[string]any{
+	view := map[string]any{
 		"guest": g.cfg.ID, "metered": true, "issue": a.Issue, "cap": a.Cap, "lease_seconds": a.LeaseSeconds,
 		"max_ttl_seconds": a.MaxTTLSeconds, "max_memory_gib": a.MaxMemoryGiB, "ledger_seen_at": seen,
 		"live_rooms": b.meteredLiveLocked(g), "lease_fresh": a.fresh(now), "lease_seconds_left": left,
 		"recount_pending": b.recountPendingLocked(g),
 	}
+	b.addStopViewLocked(g, view)
+	return view
 }
 
 // ---------------------------------------------------------------- state_dir
@@ -980,6 +1045,21 @@ var syncAllowanceDir = func(dir string) error {
 // cannot open admission closes that guest and keeps its issue, or that clock
 // value when the issue is not usable. A file that cannot be read stops the
 // broker.
+// checkMeteredGuests holds the allowance rules a config file must meet. Start,
+// live reload and -check-config share it, so a reload cannot install a guest
+// the next start would refuse (AB#946).
+func checkMeteredGuests(c config, guests map[string]*guestState) error {
+	for id, g := range guests {
+		if g.limits.Metered && g.limits.Postpaid {
+			return fmt.Errorf("config: guest %q is both metered and postpaid; a postpaid guest is never gated on its allowance", id)
+		}
+		if g.limits.Metered && c.StateDir == "" {
+			return fmt.Errorf("config: guest %q is metered, which needs state_dir to keep its allowance", id)
+		}
+	}
+	return nil
+}
+
 func (b *broker) loadAllowances() error {
 	b.allow.byGuest = map[string]*guestAllowance{}
 	b.allow.uncertain = map[string]int{}
@@ -997,13 +1077,8 @@ func (b *broker) loadAllowances() error {
 		b.allow.hold = time.Duration(hold) * time.Second
 	}
 	startMs := time.Now().UnixMilli()
-	for id, g := range b.guests {
-		if g.limits.Metered && g.limits.Postpaid {
-			return fmt.Errorf("config: guest %q is both metered and postpaid; a postpaid guest is never gated on its allowance", id)
-		}
-		if g.limits.Metered && b.cfg.StateDir == "" {
-			return fmt.Errorf("config: guest %q is metered, which needs state_dir to keep its allowance", id)
-		}
+	if err := checkMeteredGuests(b.cfg, b.guests); err != nil {
+		return err
 	}
 	if b.cfg.StateDir == "" {
 		return nil
