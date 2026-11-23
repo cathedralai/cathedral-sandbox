@@ -504,8 +504,8 @@ guest that is not metered behaves as before.
 
 | Route (operator key) | What it does |
 |---|---|
-| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. |
-| `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`. A guest that is not metered: `{"metered": false, "live_rooms"}`. |
+| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. Optional `"stop": {"reason": "account_suspended" \| "abuse"}` (AB#948): see "Allowance stop" below. |
+| `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`; once a stop was sent since the broker started, also `stop_running` and `last_stop` (`null` while the first pass runs, else `{"at", "reason", "frozen": n, "failed": [room ids], "hotel_errors": [hotel ids]}`). A guest that is not metered: `{"metered": false, "live_rooms"}`. |
 
 A metered create, and each lifetime extension of a metered room, is refused:
 
@@ -551,11 +551,32 @@ Size and lifetime of a metered room:
   the room keeps the deadline it has.
 - A room claim (`POST .../claim`, room kit) gets 403 `claim_refused_metered`:
   it sets a lifetime outside the allowance.
+- A thaw (`POST .../thaw`) is an admission like an extension: refused 402
+  `allowance_exhausted` when the live rooms pass the cap (so always at cap
+  0), 402 `allowance_lease_expired` on a stale lease, 503 `allowance_recount`
+  during a recount. A refused thaw sends nothing; the room stays frozen.
 - An owner-signed create on a dedicated machine signs the body the hotel
   receives: send `ttl_seconds` and `resources.memory_gib` within the
   allowance, so the broker changes nothing.
 
-Nothing here stops or deletes a running room. After a restart the file is
+### Allowance stop
+
+A PUT may carry `"stop": {"reason": "account_suspended" | "abuse"}`. It is
+level-triggered: the ledger sends it on every PUT while the account stays
+stopped; the broker keeps no stop id. It needs `cap` 0 in the same PUT (else
+400 `invalid_stop`; an unknown reason is 400 too). A guest that is not
+metered gets 409 `guest_not_metered` before anything changes, and a postpaid
+guest can never be metered, so a stop never reaches const. The PUT saves
+and answers at once (with `"stop": {"reason", "started"}`), then runs the
+freeze-all pass of the meter route in the background: rooms in state
+`running` are frozen, no other room is touched, nothing is deleted. One pass
+runs per guest at a time; a stop while one runs starts none (`started:
+false`). A repeated stop freezes nothing new, retries rooms that failed, and
+freezes a room that was still `creating` at the earlier stop. The last
+result shows in the GET view as `last_stop` (memory only). A frozen room
+keeps its TTL and still bills to it, like the API path's prepaid hold.
+
+Nothing else here stops a running room, and nothing here deletes one. After a restart the file is
 read again: a cap of 0 stays 0, the issue is kept, and a lease keeps its
 `ledger_seen_at`, so it can expire across the restart. A missing file leaves
 every metered guest closed. A file that does not parse is moved aside

@@ -154,7 +154,25 @@ func wholeNumber(v any) any {
 // meterFreezeAll freezes every running room of g. Rooms in any other state
 // (frozen, creating, deleting) are not touched.
 func (b *broker) meterFreezeAll(w http.ResponseWriter, r *http.Request, g *guestState) {
-	rooms, errs := b.meterRooms(r.Context(), g)
+	out := b.freezeAllRooms(r.Context(), g)
+	writeJSON(w, 200, map[string]any{"frozen": out.frozen, "failed": out.failed, "hotel_errors": out.hotelErrors})
+}
+
+// freezeOutcome is what one freeze-all pass did: the room ids it froze
+// (sorted), the rooms it could not freeze with why, and the hotels whose room
+// list did not answer (their rooms were not seen).
+type freezeOutcome struct {
+	frozen      []string
+	failed      map[string]string
+	hotelErrors map[string]string
+}
+
+// freezeAllRooms freezes every running room of g on the hotels it may use.
+// Rooms in any other state are not touched, so a second pass freezes
+// nothing new. It never deletes and never thaws. The meter route and the
+// allowance stop (allowance_stop.go) both use it.
+func (b *broker) freezeAllRooms(ctx context.Context, g *guestState) freezeOutcome {
+	rooms, errs := b.meterRooms(ctx, g)
 	frozen := []string{}
 	failed := map[string]string{}
 	var mu sync.Mutex
@@ -179,7 +197,7 @@ func (b *broker) meterFreezeAll(w http.ResponseWriter, r *http.Request, g *guest
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			code := freezeRoom(r.Context(), h, g, hid)
+			code := freezeRoom(ctx, h, g, hid)
 			mu.Lock()
 			defer mu.Unlock()
 			if code == "" {
@@ -191,7 +209,7 @@ func (b *broker) meterFreezeAll(w http.ResponseWriter, r *http.Request, g *guest
 	}
 	wg.Wait()
 	sort.Strings(frozen)
-	writeJSON(w, 200, map[string]any{"frozen": frozen, "failed": failed, "hotel_errors": errs})
+	return freezeOutcome{frozen: frozen, failed: failed, hotelErrors: errs}
 }
 
 // freezeRoom asks hotel h to freeze room hid for guest g. It returns "" on
