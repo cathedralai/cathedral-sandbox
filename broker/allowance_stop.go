@@ -39,8 +39,8 @@ type stopResult struct {
 	at          time.Time
 	reason      string
 	frozen      int
-	failed      []string // room ids that did not freeze, sorted
-	hotelErrors []string // hotels whose room list did not answer, sorted
+	failed      map[string]string // room id -> why it did not freeze (freezeRoom's code), as the meter route answers
+	hotelErrors []string          // hotels whose room list did not answer, sorted
 }
 
 // guestStops is the stop state of one guest. Guarded by broker.mu.
@@ -73,18 +73,22 @@ func (b *broker) startStopLocked(g *guestState, reason string) bool {
 // timeout (fanout, freezeRoom).
 func (b *broker) runStop(g *guestState, st *guestStops, reason string) {
 	out := b.freezeAllRooms(context.Background(), g)
-	res := &stopResult{at: time.Now(), reason: reason, frozen: len(out.frozen), failed: []string{}, hotelErrors: []string{}}
-	for id := range out.failed {
-		res.failed = append(res.failed, id)
+	res := &stopResult{at: time.Now(), reason: reason, frozen: len(out.frozen), failed: map[string]string{}, hotelErrors: []string{}}
+	// Each room keeps its code (AB#948): without it a stop that froze nothing
+	// cannot say whether the hotel refused, did not answer, or is out of reach.
+	notFrozen := []string{}
+	for id, code := range out.failed {
+		res.failed[id] = code
+		notFrozen = append(notFrozen, id+"="+code)
 	}
 	for id := range out.hotelErrors {
 		res.hotelErrors = append(res.hotelErrors, id)
 	}
-	sort.Strings(res.failed)
+	sort.Strings(notFrozen)
 	sort.Strings(res.hotelErrors)
 	if len(res.failed) > 0 || len(res.hotelErrors) > 0 {
 		log.Printf("allowance stop for guest %s (%s): froze %d rooms; not frozen: [%s]; hotels not listed: [%s]; the next stop retries",
-			g.cfg.ID, reason, res.frozen, strings.Join(res.failed, " "), strings.Join(res.hotelErrors, " "))
+			g.cfg.ID, reason, res.frozen, strings.Join(notFrozen, " "), strings.Join(res.hotelErrors, " "))
 	} else {
 		log.Printf("allowance stop for guest %s (%s): froze %d rooms", g.cfg.ID, reason, res.frozen)
 	}
