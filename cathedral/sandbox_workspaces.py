@@ -173,21 +173,6 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _fsync_tree(root: Path) -> None:
-    """Sync every file and directory under root, symlinks not followed."""
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        for fn in filenames:
-            p = os.path.join(dirpath, fn)
-            if os.path.islink(p) or not os.path.isfile(p):
-                continue
-            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        _fsync_dir(Path(dirpath))
-
-
 def _not_found(name: str) -> SandboxOpError:
     return SandboxOpError("workspace_not_found", 404, f"no workspace {name}")
 
@@ -485,9 +470,10 @@ class WorkspaceStore:
         try:
             self.copier.copy(path / "data", vdir)
             # The version is listed durably below, so its files must be on disk first: a rollback
-            # to a version whose files a power cut emptied would replace data/ with nothing.
-            _fsync_tree(vdir)
-            _fsync_dir(vdir.parent)
+            # to a version whose files a power cut emptied would replace data/ with nothing. The
+            # copy holds room files the API user cannot open (root, 0600), so flush the whole
+            # filesystem instead of opening them; it runs outside the lock.
+            os.sync()
         except Exception:
             shutil.rmtree(vdir, ignore_errors=True)
             raise
@@ -517,6 +503,7 @@ class WorkspaceStore:
             self._mounts.setdefault((owner, name), set()).add("rollback")
         try:
             self.copier.replace(path / "versions" / str(version), path / "data")
+            os.sync()  # the answer says rolled back: data/ must be on disk before it goes out
         finally:
             with self._lock:
                 self._release(owner, name, "rollback")

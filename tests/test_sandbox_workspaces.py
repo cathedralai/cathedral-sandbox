@@ -419,31 +419,44 @@ def test_meta_is_synced_before_and_after_the_rename(tmp_path, monkeypatch) -> No
 
 
 def test_version_files_are_synced_before_the_version_is_listed(tmp_path, monkeypatch) -> None:
-    # Bugbot on #695: meta.json lists a version durably, so the copied files must be synced first.
+    # Bugbot on #695: meta.json lists a version durably, so the copied files must be on disk first.
+    # The copy holds room files the API user cannot open, so the store flushes with os.sync().
     import os
 
     store = WorkspaceStore(tmp_path / "ws", LocalCopier(), check_mount=False)
     store.create("owner-a", "proj")
-    data = store.mount("owner-a", "proj", "room-1")
-    (data / "sub").mkdir()
-    (data / "sub" / "f.txt").write_text("hello")
-    store.unmount("owner-a", "proj", "room-1")
     events: list[str] = []
-    real_fsync, real_save = os.fsync, WorkspaceStore._save_meta
+    real_sync, real_save = os.sync, WorkspaceStore._save_meta
 
-    def spy(fd):
-        events.append("sync:" + os.readlink(f"/proc/self/fd/{fd}"))
-        return real_fsync(fd)
+    def sync():
+        events.append("sync")
+        return real_sync()
 
     def save(self, path, meta):
         events.append("save:" + str(len(meta.get("versions", []))))
         return real_save(self, path, meta)
 
-    monkeypatch.setattr(os, "fsync", spy)
+    monkeypatch.setattr(os, "sync", sync)
     monkeypatch.setattr(WorkspaceStore, "_save_meta", save)
-    v = store.version("owner-a", "proj")
-    vdir = data.parent / "versions" / str(v["version"])
-    listed = events.index("save:1")
-    synced = [e for e in events[:listed] if e.startswith("sync:")]
-    assert "sync:" + str(vdir / "sub" / "f.txt") in synced
-    assert "sync:" + str(vdir / "sub") in synced and "sync:" + str(vdir) in synced
+    store.version("owner-a", "proj")
+    assert "sync" in events[: events.index("save:1")]
+
+
+def test_version_sync_does_not_open_room_files(tmp_path, monkeypatch) -> None:
+    # A room file the API cannot open (root, 0600) must not fail the version.
+    import os
+
+    store = WorkspaceStore(tmp_path / "ws", LocalCopier(), check_mount=False)
+    store.create("owner-a", "proj")
+    data = store.mount("owner-a", "proj", "room-1")
+    (data / "secret").write_text("x")
+    store.unmount("owner-a", "proj", "room-1")
+    real_open = os.open
+
+    def no_room_files(p, *a, **k):
+        if "versions" in str(p) and not os.path.isdir(p):
+            raise PermissionError(13, "Permission denied", str(p))
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr(os, "open", no_room_files)
+    assert store.version("owner-a", "proj")["version"] == 1
