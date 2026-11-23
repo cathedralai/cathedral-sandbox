@@ -78,7 +78,10 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # Pinned 2026-11-23 to 1e79d18: main after #697 (a room's image is probed once at create, so its first
 # command waits for no probe, AB#732). The only change to cathedral/ since 1fa7a80. Same make-dist.sh; the
 # 1fa7a80 tarball rebuilds to its pinned sha 12699cd5... with the same tool.
-CATHEDRAL_COMMIT=1e79d18
-CATHEDRAL_TARBALL=dist/cathedral-1e79d18.tar.gz
-CATHEDRAL_TARBALL_SHA256=9f4a3d4d3965d45c0211ef097bae0e9c49de0e4c2bc7749e2f991f13cbd5dd89
+# Pinned 2026-11-23 to 82016c3: main after #705 (exec on a frozen room answers 409 sandbox_frozen before any
+# work, AB#948). The only change to cathedral/ since 1e79d18, so the one non-const re-seal carries #697 and #705.
+# Same make-dist.sh; the 1e79d18 tarball rebuilds to its pinned sha 9f4a3d4d... with the same tool.
+CATHEDRAL_COMMIT=82016c3
+CATHEDRAL_TARBALL=dist/cathedral-82016c3.tar.gz
+CATHEDRAL_TARBALL_SHA256=bdbb135944a54df5860036c1d1a41d24572adf7010f41997d34cd7f534429d2b
 PROBE_IMAGE=alpine:3.20
