@@ -33,6 +33,16 @@ export ROOM_HOTEL_NAME
 hostname "room-$ROOM_HOTEL_NAME"
 log "hotel $ROOM_HOTEL_NAME"
 
+# Link: from fw_cfg too (AB#432), checked by sealed-link.sh before the network
+# came up. The measured room.env takes the listen addresses from it. No checked
+# link: the uplink is closed, so stop here.
+LINK_ENV=/run/sealed-link/link.env
+grep -qE '^SEALED_LINK_GUEST_IP=[0-9.]+$' "$LINK_ENV" 2>/dev/null \
+  || { log "no checked link from sealed-link.sh ($LINK_ENV); refusing to start"; exit 1; }
+SEALED_LINK_GUEST_IP=$(sed -n 's/^SEALED_LINK_GUEST_IP=//p' "$LINK_ENV")
+export SEALED_LINK_GUEST_IP
+log "guest IP $SEALED_LINK_GUEST_IP"
+
 DEV=/dev/disk/by-id/virtio-sealed-scratch
 for _ in $(seq 60); do [ -b "$DEV" ] && break; sleep 1; done
 [ -b "$DEV" ] || { log "no scratch disk"; exit 1; }

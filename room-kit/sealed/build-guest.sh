@@ -157,20 +157,16 @@ echo "room-sealed" > "$R/etc/hostname"
 rm -f "$R/etc/resolv.conf"
 for d in $SEALED_DNS; do echo "nameserver $d"; done > "$R/etc/resolv.conf"
 
+# The link (host IP, guest IP) is per hotel and NOT in the image (AB#432): the host
+# passes it in fw_cfg (opt/cathedral/link) and sealed-link.sh checks it and writes
+# the .network file, the guard and the listen addresses under /run at boot. The
+# only NIC is the virtio one (QEMU -nodefaults), so the .link matches the driver,
+# not the per-hotel MAC.
 cat > "$R/etc/systemd/network/10-uplink.link" <<EOF
 [Match]
-MACAddress=$SEALED_GUEST_MAC
+Driver=virtio_net
 [Link]
 Name=uplink
-EOF
-cat > "$R/etc/systemd/network/10-uplink.network" <<EOF
-[Match]
-Name=uplink
-[Network]
-Address=$SEALED_GUEST_IP/30
-Gateway=$SEALED_HOST_IP
-LinkLocalAddressing=no
-IPv6AcceptRA=no
 EOF
 cat > "$R/etc/modules-load.d/sealed.conf" <<'EOF'
 sev-guest
@@ -185,8 +181,10 @@ EOF
 DEBUG=0; [ -n "${SEALED_DEBUG_SSH_PUBKEY:-}" ] && DEBUG=1
 # Guest firewall on the uplink: replies, the hotel API from the host, nothing else.
 # A miner hotel adds its attested HTTPS port from any source: the host forwards
-# one public port to it, and only the guest holds that TLS key.
-SSH_RULE=""; [ $DEBUG = 1 ] && SSH_RULE="iifname \"uplink\" ip saddr $SEALED_HOST_IP tcp dport 22 accept"
+# one public port to it, and only the guest holds that TLS key. @SEALED_HOST_IP@
+# is filled in at boot by sealed-link.sh from the checked fw_cfg link; with no
+# valid link it loads the guard without those lines (uplink closed).
+SSH_RULE=""; [ $DEBUG = 1 ] && SSH_RULE='iifname "uplink" ip saddr @SEALED_HOST_IP@ tcp dport 22 accept'
 INPUT_RULES=$SSH_RULE
 if [ "$MINER" = 1 ]; then
   INPUT_RULES="${SSH_RULE:+$SSH_RULE
@@ -202,7 +200,7 @@ table inet sealed_guard {
   chain input {
     type filter hook input priority -10; policy accept;
     iifname "uplink" ct state established,related accept
-    iifname "uplink" ip saddr $SEALED_HOST_IP tcp dport 18090 accept
+    iifname "uplink" ip saddr @SEALED_HOST_IP@ tcp dport 18090 accept
     $INPUT_RULES
     iifname "uplink" drop
   }
@@ -223,12 +221,13 @@ After=systemd-modules-load.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f /etc/sealed-guard.nft
+ExecStart=/usr/local/sbin/sealed-link.sh
 [Install]
 WantedBy=sysinit.target
 EOF
 
 install -m 0755 "$KIT/sealed/guest-boot.sh" "$R/usr/local/sbin/sealed-hotel-boot.sh"
+install -m 0755 "$KIT/sealed/guest-link.sh" "$R/usr/local/sbin/sealed-link.sh"
 install -m 0755 "$KIT/sealed/sealed-data.sh" "$R/usr/local/sbin/sealed-data.sh"
 install -m 0755 "$KIT/sealed/sealed_data_key.py" "$R/usr/local/sbin/sealed_data_key.py"
 cat > "$R/etc/systemd/system/sealed-hotel.service" <<'EOF'
@@ -306,7 +305,7 @@ ROOM_NETS="$SEALED_ROOM_NETS"
 ROOM_NET_SIZE=1000
 ROOM_NET_BRIDGE_PREFIX=rmnet
 ROOM_RECEIPTS=1
-ROOM_RECEIPTS_LISTEN=$SEALED_GUEST_IP:18090
+ROOM_RECEIPTS_LISTEN=\${SEALED_LINK_GUEST_IP:?}:18090
 ROOM_SECRETS_PERSIST=0
 ROOM_SECRETS_PER_OWNER=4096
 ROOM_WORKSPACES=${SEALED_ROOM_WORKSPACES:-0}
@@ -317,6 +316,9 @@ ROOM_SEALED_SECRETS=${SEALED_ROOM_SEALED_SECRETS:-0}
 ROOM_SEALED_EXEC=${SEALED_ROOM_SEALED_EXEC:-0}
 ROOM_GUEST_INGRESS=${SEALED_ROOM_GUEST_INGRESS:-0}
 # ROOM_HOTEL_NAME is not set here: guest-boot.sh exports it from fw_cfg (opt/cathedral/hotel-name).
+# SEALED_LINK_GUEST_IP is not set here either: guest-boot.sh exports it from the link
+# sealed-link.sh checked (fw_cfg opt/cathedral/link). install.sh sources this file,
+# so the listen addresses resolve then; unset, the install stops.
 EOF
 if [ -n "$INGRESS_ZONE" ]; then
   cat >> "$R/opt/room-kit/room.env" <<EOF
@@ -324,7 +326,7 @@ if [ -n "$INGRESS_ZONE" ]; then
 # certificate from the ACME directory over DNS-01 through the broker.
 ROOM_INGRESS_ZONE=$INGRESS_ZONE
 ROOM_INGRESS_BROKER_URL=$INGRESS_BROKER_URL
-ROOM_INGRESS_TLS_LISTEN=$SEALED_GUEST_IP:$INGRESS_TLS_PORT
+ROOM_INGRESS_TLS_LISTEN=\${SEALED_LINK_GUEST_IP:?}:$INGRESS_TLS_PORT
 ROOM_INGRESS_PUBLIC_PORT=$INGRESS_PUBLIC_PORT
 ROOM_ACME_DIRECTORY=$ACME_DIRECTORY
 EOF
@@ -334,7 +336,7 @@ if [ "$MINER" = 1 ]; then
 # Miner hotel: guest TLS on its own key, plain HTTP for /room/attestation only,
 # the hotel key only through POST /room/hotel-key signed by one of these keys.
 ROOM_MINER=1
-ROOM_RECEIPTS_TLS_LISTEN=$SEALED_GUEST_IP:$MINER_TLS_PORT
+ROOM_RECEIPTS_TLS_LISTEN=\${SEALED_LINK_GUEST_IP:?}:$MINER_TLS_PORT
 ROOM_HOTEL_KEY_INSTALL_SIGNERS="$MINER_SIGNERS"
 EOF
 fi
@@ -349,8 +351,9 @@ if [ $DEBUG = 1 ]; then
   install -d -m 0700 "$R/root/.ssh"
   echo "$SEALED_DEBUG_SSH_PUBKEY" > "$R/root/.ssh/authorized_keys"
   chmod 0600 "$R/root/.ssh/authorized_keys"
-  printf 'ListenAddress %s\nPasswordAuthentication no\nPermitRootLogin prohibit-password\n' "$SEALED_GUEST_IP" \
-    > "$R/etc/ssh/sshd_config.d/10-sealed-debug.conf"
+  printf 'PasswordAuthentication no\nPermitRootLogin prohibit-password\n' > "$R/etc/ssh/sshd_config.d/10-sealed-debug.conf"
+  # ListenAddress is the per-hotel guest IP: sealed-link.sh writes it at boot.
+  ln -sfn /run/sealed-link/sshd-listen.conf "$R/etc/ssh/sshd_config.d/11-sealed-listen.conf"
   mkdir -p "$R/etc/systemd/system/ssh.service.d"
   # Ubuntu's unit runs "sshd -t" first and the build removes host keys, so
   # reset the list: make keys, then check the config.
@@ -376,9 +379,9 @@ printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
 python3 - "$OUT" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" \
-  "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" "$DATA_WS" "$SEALED_HOST_IP" "$SEALED_GUEST_IP" <<'EOF'
+  "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" "$DATA_WS" <<'EOF'
 import hashlib, json, os, sys
-out, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws, host_ip, guest_ip = sys.argv[1:]
+out, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws = sys.argv[1:]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.join(out, p), "rb") as f:
@@ -395,8 +398,6 @@ if miner == "1":  # a config hotel's manifest keeps its old fields only
 if data_ws:  # likewise: only a build with the persistent data volume names it
     m["data_volume"] = {"format": "luks2", "cipher": "aes-xts-plain64", "key": "snp-derived",
                         "root_key": "vcek", "guest_field_select": 9, "mixes_host_data": True, "holds": ["workspaces"]}
-if (host_ip, guest_ip) != ("10.215.0.1", "10.215.0.2"):  # a per-hotel link (AB#432): in the initrd, so name it
-    m["link"] = {"host_ip": host_ip, "guest_ip": guest_ip}
 json.dump(m, open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
 EOF
 ln -sfn "$STAMP" "$SEALED_DIR/images/current"

@@ -61,6 +61,9 @@ else
   FW_CFG=(-fw_cfg "name=opt/cathedral/room-api-key,file=$SEALED_API_KEY_FILE")
 fi
 FW_CFG+=(-fw_cfg "name=opt/cathedral/hotel-name,string=$SEALED_NAME")
+# The link (AB#432): per hotel, so outside the measured image. guest-link.sh checks it
+# in the guest with the same guest-constants.sh rules sourced above.
+FW_CFG+=(-fw_cfg "name=opt/cathedral/link,string=$SEALED_HOST_IP $SEALED_GUEST_IP")
 exec /usr/bin/qemu-system-x86_64 -no-user-config -nodefaults -name "sealed-$SEALED_NAME" \
   -enable-kvm -cpu "$SEALED_CPU_MODEL" -smp "$SEALED_VCPUS" -m "${SEALED_MEM_GIB}G" \
   -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \

@@ -1465,7 +1465,7 @@ CONFIG_GUARD = """table inet sealed_guard {
   chain input {
     type filter hook input priority -10; policy accept;
     iifname "uplink" ct state established,related accept
-    iifname "uplink" ip saddr 10.215.0.1 tcp dport 18090 accept
+    iifname "uplink" ip saddr @SEALED_HOST_IP@ tcp dport 18090 accept
     @RULES@
     iifname "uplink" drop
   }
@@ -1500,7 +1500,7 @@ def _guest_config(host: FakeHost, debug: bool, **sealed: str) -> tuple[subproces
 def test_build_config_hotel_guard_and_room_env_have_no_miner_lines(host: FakeHost, debug: bool) -> None:
     proc, root = _guest_config(host, debug)
     assert proc.returncode == 0, proc.stderr
-    ssh = 'iifname "uplink" ip saddr 10.215.0.1 tcp dport 22 accept' if debug else ""
+    ssh = 'iifname "uplink" ip saddr @SEALED_HOST_IP@ tcp dport 22 accept' if debug else ""
     assert (root / "etc" / "sealed-guard.nft").read_text() == CONFIG_GUARD.replace("@RULES@", ssh)
     env = (root / "opt" / "room-kit" / "room.env").read_text()
     assert "ROOM_MINER" not in env and "ROOM_HOTEL_NAME" not in env.replace("# ROOM_HOTEL_NAME is not set here", "")
@@ -1512,10 +1512,10 @@ def test_build_miner_hotel_opens_its_https_port_and_pins_the_signers(host: FakeH
     assert proc.returncode == 0, proc.stderr
     rules = 'iifname "uplink" tcp dport 18443 accept'
     if debug:
-        rules = 'iifname "uplink" ip saddr 10.215.0.1 tcp dport 22 accept\n    ' + rules
+        rules = 'iifname "uplink" ip saddr @SEALED_HOST_IP@ tcp dport 22 accept\n    ' + rules
     assert (root / "etc" / "sealed-guard.nft").read_text() == CONFIG_GUARD.replace("@RULES@", rules)
     env = (root / "opt" / "room-kit" / "room.env").read_text()
-    assert env.endswith(f'ROOM_MINER=1\nROOM_RECEIPTS_TLS_LISTEN=10.215.0.2:18443\n'
+    assert env.endswith(f'ROOM_MINER=1\nROOM_RECEIPTS_TLS_LISTEN=${{SEALED_LINK_GUEST_IP:?}}:18443\n'
                         f'ROOM_HOTEL_KEY_INSTALL_SIGNERS="{MINER_SIGNER}"\n')
 
 

@@ -1,16 +1,18 @@
-# Link settings of the sealed guest image (sourced by build-guest.sh,
-# launch-guest.sh, host-net.sh and install-sealed.sh AFTER sealed.env).
-# They are inside the measured initrd. The hotel name is NOT here; it reaches
-# the guest through fw_cfg (opt/cathedral/hotel-name), unmeasured.
+# Link settings of the sealed guest (sourced by build-guest.sh, launch-guest.sh,
+# host-net.sh and install-sealed.sh AFTER sealed.env, and by guest-link.sh in the
+# guest). The hotel name is NOT here; it reaches the guest through fw_cfg
+# (opt/cathedral/hotel-name), unmeasured.
 #
 # Host IP, guest IP and guest MAC: per hotel (AB#432). Several guests on one
 # host need one /30 each, so SEALED_HOST_IP, SEALED_GUEST_IP and
 # SEALED_GUEST_MAC in sealed.env win; unset, they are 10.215.0.1, 10.215.0.2
-# and 52:54:00:5e:a1:ed. A hotel's measurement depends on them, so it is stable
-# per hotel (same kit, same sealed.env, same measurement), and hotels on the
-# defaults share one measurement per build. The MAC follows sealed.env as
-# before #467, so an older image started by a newer launch-guest.sh (a
-# rollback) still finds its uplink. DNS stays an image constant.
+# and 52:54:00:5e:a1:ed. None of them is in the measured image: the pair goes
+# to the guest in fw_cfg (opt/cathedral/link) and guest-link.sh checks it there
+# with sealed_link_check below; the MAC is only on the QEMU command line (the
+# guest names its one virtio NIC by driver). Two hotels of one build share one
+# measurement, whatever their links. The MAC still follows sealed.env, so an
+# older image (one that matched its .link by MAC) started by a newer
+# launch-guest.sh (a rollback) still finds its uplink. DNS stays an image constant.
 SEALED_LINK_HALF=0
 if [ -n "${SEALED_HOST_IP:-}" ] && [ -z "${SEALED_GUEST_IP:-}" ]; then SEALED_LINK_HALF=1; fi
 if [ -z "${SEALED_HOST_IP:-}" ] && [ -n "${SEALED_GUEST_IP:-}" ]; then SEALED_LINK_HALF=1; fi
