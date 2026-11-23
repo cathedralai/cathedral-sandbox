@@ -83,11 +83,34 @@ def _ledger(tmp_path, monkeypatch, *, secrets: bool = True, sealed: bool = True)
     return ledger, asked, root
 
 
+MARK_NS = 1_795_000_000_000_000_000
+
+
+# Every Api and front a test starts, closed after it. Left open they keep their sockets until the
+# process ends, and the suite's later select()-based tests (room-kit terminal) run past 1024 fds.
+_SERVERS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _close_servers():
+    yield
+    while _SERVERS:
+        server = _SERVERS.pop()
+        server.shutdown()
+        server.server_close()
+
+
 class Api:
-    """The room API behind the front. Records every call; a secret route must never reach it."""
+    """The room API behind the front. Records every call; a secret route must never reach it.
+
+    The front's sealed-mark call (AB#791) is kept apart in marks: it carries no envelope.
+    mark_answer is its (status, body).
+    """
 
     def __init__(self) -> None:
         self.seen: list[tuple[str, str, bytes]] = []
+        self.marks: list[tuple[str, str, bytes]] = []
+        self.mark_answer: tuple[int, bytes] | None = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -98,23 +121,31 @@ class Api:
 
             def answer(self):
                 n = int(self.headers.get("Content-Length") or 0)
-                outer.seen.append((self.command, self.path, self.rfile.read(n) if n else b""))
-                self.send_response(200)
-                self.send_header("Content-Length", "2")
+                call = (self.command, self.path, self.rfile.read(n) if n else b"")
+                status, out = 200, b"{}"
+                if self.path.endswith("/sealed-mark"):
+                    outer.marks.append(call)
+                    status, out = outer.mark_answer or (200, json.dumps({"sealed_since_ns": MARK_NS}).encode())
+                else:
+                    outer.seen.append(call)
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(out)))
                 self.end_headers()
-                self.wfile.write(b"{}")
+                self.wfile.write(out)
 
             do_GET = do_POST = do_DELETE = answer  # noqa: N815
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        Thread(target=self.server.serve_forever, daemon=True).start()
+        Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        _SERVERS.append(self.server)
         self.port = self.server.server_address[1]
 
 
 def _front(ledger):
     api = Api()
     server = rr.Server(("127.0.0.1", 0), ledger, api.port, 1, KEY, "/nonexistent.sock", pool_scan=False)
-    Thread(target=server.serve_forever, daemon=True).start()
+    Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    _SERVERS.append(server)
     return server.server_address[1], api
 
 
@@ -798,3 +829,55 @@ def test_the_api_profile_mounts_secrets_only_with_the_flag(flag, expected) -> No
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, check=True).stdout
     lines = [ln for ln in out.splitlines() if ln.startswith("CATHEDRAL_SEALED_SECRETS_DIR=")]
     assert lines == ([expected] if expected else [])
+
+
+# ---------------------------------------------------------------- AB#791 the room's log switch point
+
+def test_the_api_is_marked_before_the_first_secret_lands_and_the_receipt_names_it(tmp_path, monkeypatch) -> None:
+    ledger, _, root = _ledger(tmp_path, monkeypatch)
+    room = _room(ledger, root)
+    port, api = _front(ledger)
+    status, headers, body = _post(port, room, _seal(ledger, room))
+    assert status == 200, body
+    assert [(m, p) for m, p, _ in api.marks] == [("POST", f"/v1/sandboxes/{room}/sealed-mark")]
+    assert VALUE not in b"".join(b for _, _, b in api.marks)
+    assert _receipt(headers)["statement"]["entrypoint_log_withheld_from_ns"] == MARK_NS
+
+
+@pytest.mark.parametrize("answer", [
+    (500, b'{"error":{"code":"internal","message":"x"}}'),
+    (200, b"{}"),
+    (200, b'{"sealed_since_ns":"soon"}'),
+    (404, b'{"error":{"code":"route_not_found","message":"no such route"}}'),
+])
+def test_no_secret_lands_without_a_mark(tmp_path, monkeypatch, answer) -> None:
+    """A room API that did not take the mark would keep serving the room's log: the write is refused."""
+    ledger, _, root = _ledger(tmp_path, monkeypatch)
+    room = _room(ledger, root)
+    port, api = _front(ledger)
+    api.mark_answer = answer
+    status, _headers, body = _post(port, room, _seal(ledger, room))
+    assert (status, _code(body)) == (502, "sealed_secret_mark_failed")
+    assert list((root / room).iterdir()) == []
+
+
+def test_a_mark_for_a_room_the_api_does_not_have_is_404(tmp_path, monkeypatch) -> None:
+    ledger, _, root = _ledger(tmp_path, monkeypatch)
+    room = _room(ledger, root)
+    port, api = _front(ledger)
+    api.mark_answer = (404, b'{"error":{"code":"sandbox_not_found","message":"x"}}')
+    status, _headers, body = _post(port, room, _seal(ledger, room))
+    assert (status, _code(body)) == (404, "sealed_secret_room_not_found")
+    assert list((root / room).iterdir()) == []
+
+
+@pytest.mark.parametrize("path", ["/v1/sandboxes/sbx_0123456789ab/sealed-mark",
+                                  "/v1/sandboxes/sbx_0123456789ab/sealed%2Dmark",
+                                  "/v1/sandboxes/sbx_0123456789ab/sealed-mark;x"])
+def test_no_caller_reaches_the_mark_route(tmp_path, monkeypatch, path) -> None:
+    ledger, _, root = _ledger(tmp_path, monkeypatch)
+    _room(ledger, root)
+    port, api = _front(ledger)
+    status, _headers, body = _request(port, "POST", path, b"{}")
+    assert (status, _code(body)) == (404, "route_not_found")
+    assert api.marks == [] and api.seen == []
