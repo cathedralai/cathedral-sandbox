@@ -262,20 +262,16 @@ func (b *broker) checkFresh(ctx context.Context, h *hotel, t freshTarget) error 
 	case status != 200:
 		return fmt.Errorf("POST /room/attest answered %d", status)
 	}
-	var ans struct {
-		Report string `json:"report_b64"`
-	}
-	if json.Unmarshal(raw, &ans) != nil || ans.Report == "" {
-		return errors.New("the fresh answer has no report_b64")
-	}
-	report, err := base64.StdEncoding.DecodeString(ans.Report)
-	if err != nil || len(report) < snpReportMinLen {
-		return errors.New("the fresh report is not a 1184-byte SNP report")
+	report, canon, err := freshAnswerReport(raw)
+	if err != nil {
+		return err
 	}
 	if err := checkFreshFields(report, want, t, b.sealedMeasurements()); err != nil {
 		return err
 	}
-	amd, err := b.runAMDVerifier(ctx, raw, []string{"--fresh-report", "", "--report-data-hex", hex.EncodeToString(want)}, 1,
+	// The verifier gets canon, built from the bytes just checked, never the
+	// hotel's raw answer, so both sides check the same report.
+	amd, err := b.runAMDVerifier(ctx, canon, []string{"--fresh-report", "", "--report-data-hex", hex.EncodeToString(want)}, 1,
 		freshSlotAcquire(freshVerifierWait))
 	var nv verifierNoVerdict
 	switch {
@@ -284,7 +280,25 @@ func (b *broker) checkFresh(ctx context.Context, h *hotel, t freshTarget) error 
 	case err != nil:
 		return err
 	}
-	return checkGenoaTCBFloor(ans.Report, amd, b.cfg.MinGenoaSNPSPL, b.cfg.MinGenoaMicrocodeSPL)
+	return checkGenoaTCBFloor(base64.StdEncoding.EncodeToString(report), amd, b.cfg.MinGenoaSNPSPL, b.cfg.MinGenoaMicrocodeSPL)
+}
+
+// freshAnswerReport reads the report out of a POST /room/attest answer and
+// returns it with canon, the answer the verifier must check: one key, the
+// same report.
+func freshAnswerReport(raw []byte) (report, canon []byte, err error) {
+	var ans struct {
+		Report string `json:"report_b64"`
+	}
+	if json.Unmarshal(raw, &ans) != nil || ans.Report == "" {
+		return nil, nil, errors.New("the fresh answer has no report_b64")
+	}
+	report, err = base64.StdEncoding.DecodeString(ans.Report)
+	if err != nil || len(report) < snpReportMinLen {
+		return nil, nil, errors.New("the fresh report is not a 1184-byte SNP report")
+	}
+	canon, _ = json.Marshal(map[string]string{"report_b64": base64.StdEncoding.EncodeToString(report)})
+	return report, canon, nil
 }
 
 // checkFreshFields compares a fresh report with the value sent and the
