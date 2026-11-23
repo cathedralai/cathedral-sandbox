@@ -489,8 +489,9 @@ type broker struct {
 	requireAttestationNoted sync.Once
 
 	// Durable client state (state.go).
-	savedUUIDs map[string]string // broker room id -> client id, from the state file
-	dirty      atomic.Bool
+	savedUUIDs      map[string]string // broker room id -> client id, from the state file
+	savedUUIDGuests map[string]string // broker room id -> saved client identity owner
+	dirty           atomic.Bool
 
 	// guestRooms is guest id -> hotel id -> hotel-local room id. It keeps
 	// rooms after they leave the hotel list, so a guest can still read their
@@ -537,7 +538,14 @@ func (b *broker) byBID(bid string) *room {
 // register gives a room its client UUID. Caller holds b.mu.
 func (b *broker) register(rm *room) {
 	if rm.uuid == "" {
-		// After a restart, a room keeps the client id it had (state.go).
+		// A pool-labelled room may be a claim that could not be replayed.
+		// Only reuse an identity recorded as the pool's own. Old state has
+		// no owner: rotate that private pool id once, rather than exposing a
+		// customer's claim id. Complete claim replay sets rm.uuid itself.
+		if rm.guest == poolGuestID && b.savedUUIDGuests[rm.id] != poolGuestID {
+			delete(b.savedUUIDs, rm.id)
+		}
+		// Ordinary rooms keep the existing legacy-state behavior.
 		if u := b.savedUUIDs[rm.id]; u != "" && b.byUUID[u] == nil {
 			rm.uuid = u
 			delete(b.savedUUIDs, rm.id)
@@ -545,6 +553,7 @@ func (b *broker) register(rm *room) {
 			rm.uuid = newUUID()
 		}
 	}
+	delete(b.savedUUIDGuests, rm.id)
 	b.byUUID[rm.uuid] = rm
 	b.markDirty()
 	if rm.h != nil {
