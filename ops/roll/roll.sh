@@ -141,15 +141,50 @@ try:
 except Exception:
     print("? ?")'
 }
-# restart_ok [capacity]: a guest restart may run only on a hotel the broker's hotel document reads as
-# drained, with 0 rooms in use at the broker (creates in flight included) and 0 live rooms on the hotel.
-# With "capacity", the capacity view must read drain=True as well (the recovery rollback). Prints why not.
+# The broker's restart guard (AB#875, broker/restart_guard.go): one line, "ok", "refused <reasons>",
+# "absent" (404 that is not a broker error: no guard route), "notfound" (404 hotel_not_found: a broker
+# from before the guard reads "<hotel>/restart-check" as a hotel id, or the hotel is unknown) or
+# "unknown <why>".
+restart_check() {
+  curl -s -m 20 -w '\n%{http_code}' -H "Authorization: Bearer $(opkey)" "$BROKER/v1/broker/hotels/$HOTEL/restart-check" |
+    python3 -I -c '
+import json, sys
+raw = sys.stdin.read().rsplit("\n", 1)
+code = raw[-1].strip() if len(raw) == 2 else ""
+try:
+    d = json.loads(raw[0])
+except Exception:
+    d = None
+err = (d or {}).get("error") if isinstance(d, dict) else None
+if code == "200" and isinstance(d, dict) and d.get("restart_ok") is True:
+    print("ok")
+elif code == "409" and isinstance(err, dict) and err.get("code") == "restart_refused":
+    print("refused " + "; ".join((d.get("check") or {}).get("reasons") or ["no reason given"]))
+elif code == "404" and isinstance(err, dict) and err.get("code") == "hotel_not_found":
+    print("notfound")
+elif code == "404" and not isinstance(err, dict):
+    print("absent")
+else:
+    print("unknown http=" + (code or "none"))'
+}
+# restart_ok [capacity]: a guest restart may run only when the broker's restart guard says ok and the
+# hotel's own room list shows 0 live rooms. A broker from before the guard (notfound while the hotel
+# document still reads, or absent) falls back to that document (drain=true, rooms_in_use=0, creates in
+# flight included); an unknown hotel reads "? ?" there and refuses. With "capacity", the capacity
+# view must read drain=True as well (the recovery rollback). Prints why not.
 restart_ok() {
-  local up adm meas dr=True sl fr bd bn r
+  local up adm meas dr=True sl fr g bd bn r
   if [ "${1:-}" = capacity ]; then read -r up adm meas dr sl fr <<< "$(hotel_state)"; fi
-  read -r bd bn <<< "$(broker_busy)"; r=$(rooms)
-  if [ "$dr" = True ] && [ "$bd" = True ] && [ "$bn" = 0 ] && [ "$r" = 0 ]; then return 0; fi
-  echo "drain=$dr hotel_drain=$bd broker_rooms_in_use=$bn hotel_rooms=$r"; return 1
+  g=$(restart_check); r=$(rooms)
+  case "$g" in
+    ok) bd=True bn=0 ;;
+    absent|notfound) read -r bd bn <<< "$(broker_busy)"
+      if [ "$dr" = True ] && [ "$bd" = True ] && [ "$bn" = 0 ] && [ "$r" = 0 ]; then return 0; fi
+      echo "drain=$dr hotel_drain=$bd broker_rooms_in_use=$bn hotel_rooms=$r (broker has no restart guard)"; return 1 ;;
+    *) echo "drain=$dr restart_guard=[$g] hotel_rooms=$r"; return 1 ;;
+  esac
+  if [ "$dr" = True ] && [ "$r" = 0 ]; then return 0; fi
+  echo "drain=$dr restart_guard=ok hotel_rooms=$r"; return 1
 }
 # "<live_rooms> <max_rooms> <public_open>" from the public Escape Open endpoint.
 escape_open() {

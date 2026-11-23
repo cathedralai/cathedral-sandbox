@@ -31,6 +31,7 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   */v1/broker/capacity) cat "$F/capacity.json" ;;
+  */restart-check) echo "GET restart-check" >> "$F/calls.log"; cat "$F/restart.json"; printf '\n%s' "$(cat "$F/restart.code")" ;;
   */v1/broker/hotels/*) if [ "$method" = GET ]; then echo "GET hotel" >> "$F/calls.log"; cat "$F/hotel.json"; exit 0; fi
     echo "$method $url $data" >> "$F/calls.log"
     # patch_codes: one answer per PATCH, in order (000 = timeout); then patch_code; then 200
@@ -130,6 +131,10 @@ def env(tmp_path):
     (fake / "rooms.txt").write_text("0")
     # GET /v1/broker/hotels/<id>: the broker's own view before a guest restart (AB#875)
     (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 0}))
+    # GET .../restart-check: absent by default (a broker from before the guard), so the tests above
+    # exercise the hotel document fallback; the guard tests below set it.
+    (fake / "restart.json").write_text(json.dumps({"error": {"code": "hotel_not_found", "message": "no hotel x"}}))
+    (fake / "restart.code").write_text("404")  # what a broker from before the guard answers
     (fake / "check.out").write_text(CHECK_OK)
     (fake / "install.out").write_text("current now new\nRESULT=installed\n")
     (fake / "attestation.json").write_text(attestation())
@@ -857,4 +862,94 @@ def test_resume_from_drained_waits_for_zero_in_use_at_the_broker(env):
     r = run(e, "apply", HOTEL)
     assert r.returncode == 1
     assert "broker_rooms_in_use=1" in r.stdout, r.stdout
+    assert "ssh install" not in calls(fake)
+
+
+
+def guard(fake, code, body):
+    (fake / "restart.code").write_text(str(code))
+    (fake / "restart.json").write_text(body if isinstance(body, str) else json.dumps(body))
+
+
+GUARD_OK = {"hotel": HOTEL, "restart_ok": True, "drain": True, "rooms": 0, "reasons": []}
+REFUSED = {"error": {"code": "restart_refused", "message": "x"},
+           "check": {"restart_ok": False, "reasons": ["the room count is not known (no good room list from the hotel)"]}}
+
+
+def test_install_runs_when_the_restart_guard_says_ok(env):
+    e, fake, home = env
+    guard(fake, 200, GUARD_OK)
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 7}))  # not read
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    c = calls(fake)
+    assert c.index("GET restart-check") < c.index("ssh install"), c
+    assert "GET hotel" not in c
+
+
+@pytest.mark.parametrize("code, body, why", [
+    (409, REFUSED, "room count is not known"),
+    (200, {"restart_ok": False}, "unknown http=200"),
+    (200, "not json", "unknown http=200"),
+    (500, {"error": {"code": "x"}}, "unknown http=500"),
+    (401, {"error": {"code": "unauthorized"}}, "unknown http=401"),
+])
+def test_install_refused_unless_the_guard_says_ok(env, code, body, why):
+    e, fake, home = env
+    guard(fake, code, body)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert why in r.stdout, r.stdout
+    c = calls(fake)
+    assert "ssh install" not in c and "GET hotel" not in c, c
+
+
+def test_guard_ok_still_needs_zero_rooms_on_the_hotel(env):
+    e, fake, home = env
+    guard(fake, 200, GUARD_OK)
+    (fake / "rooms.txt").write_text("0")
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
+    # preflight reads rooms=0; make the hotel show a room only after the drain
+    ssh = fake.parent / "bin" / "ssh"
+    ssh.write_text(ssh.read_text().replace('n=$(cat "$F/rooms.txt")',
+        'n=$(cat "$F/rooms.txt"); grep -q "PATCH" "$F/calls.log" 2>/dev/null && n=1'))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "restart_guard=ok hotel_rooms=1" in r.stdout, r.stdout
+    assert "ssh install" not in calls(fake)
+
+
+def test_rollback_needs_the_guard_too(env):
+    e, fake, home = env
+    guard(fake, 409, REFUSED)
+    (fake / "capacity.json").write_text(capacity(NEW, drain=True))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=stuck_drained\nSTUCK_FROM=installed\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\n"
+        f"PLAN_SHA={plan_sha(home)}\n")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "ssh rollback" not in calls(fake)
+    assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+
+def test_old_broker_falls_back_to_the_hotel_document(env):
+    # A broker from before the guard: 404 hotel_not_found for "<hotel>/restart-check", hotel document reads.
+    e, fake, home = env
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 1}))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "broker_rooms_in_use=1" in r.stdout and "no restart guard" in r.stdout, r.stdout
+    assert "ssh install" not in calls(fake)
+
+
+@pytest.mark.parametrize("restart_body", [{"error": {"code": "hotel_not_found"}}, "<html>404</html>"])
+def test_unknown_hotel_or_missing_route_refuses_when_the_hotel_document_does_not_read(env, restart_body):
+    e, fake, home = env
+    guard(fake, 404, restart_body)
+    (fake / "hotel.json").write_text(json.dumps({"error": {"code": "hotel_not_found"}}))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "hotel_drain=None" in r.stdout or "hotel_drain=?" in r.stdout, r.stdout
     assert "ssh install" not in calls(fake)
