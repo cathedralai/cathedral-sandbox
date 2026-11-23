@@ -901,14 +901,14 @@ New customer keys, new hotels and new measurements need no restart.
 POST /v1/broker/config/reload   operator key   {"sha256": "<sha256 of the config file>"}
 ```
 
-- The broker reads its config file again and checks it exactly as a start does. `thin-broker -check-config -config <file>` runs the same checks with no side effect (exit 0 or 1).
+- The broker reads its config file again and runs the start's config checks on it. `thin-broker -check-config -config <file>` runs the same checks with no side effect (exit 0 or 1). Not covered (checked only at start; a reload cannot change them anyway): `listen`, `uncertain_create_hold_seconds`, `usage_meter_every_seconds`, `ready_rooms`.
 - The file is compared with the last file applied, not with live state, so a runtime PATCH stays unless the file changed that field.
 - Applied live: a new guest; a guest's `key_sha256` / `next_key_sha256` (the old hash stops at once); each guest limit the file changed; `sealed_measurements`, `sealed_host_data`, `miner_hotkey_caps`, `miner_max_hotels`; a new hotel; a config hotel's `drain`.
 - Anything else (a removed guest or hotel, any other field) answers 409 `needs_restart` naming each field, and nothing changes. A wrong sha256 answers 409 `config_changed`; a file that would not start answers 400 `invalid_config`.
-- A measurement that leaves the list refuses its hotels at once; every gated hotel is checked again under the new lists.
+- A measurement that leaves the list refuses its hotels at once; every gated hotel is checked again under the new lists. A removed `sealed_host_data` entry applies at the hotel's next successful check.
 - The answer lists ids and counts only, never a key or hash.
 
-A config hotel's runtime `PATCH {"drain": ...}` is kept in `state_dir/hotel-drains.json` and survives a restart, unless the file's own `drain` changed since (the file wins).
+A config hotel's runtime `PATCH {"drain": ...}` is kept in `state_dir/hotel-drains.json` and survives a restart, unless the file's own `drain` changed since (the file wins). The PATCH needs `state_dir` writable: on a full disk it is refused rather than kept in memory only. A file that does not parse is kept aside as `.corrupt-<time>` with an ops alert; its drains must be set again.
 
 ## Hotels at runtime
 

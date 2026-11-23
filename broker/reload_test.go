@@ -524,3 +524,30 @@ func TestReloadedHotelStopsWithTheLoops(t *testing.T) {
 		t.Fatal("a reloaded hotel's sync loop ran on after the loops were cancelled")
 	}
 }
+
+// A drains file that does not parse is kept aside before a PATCH can
+// overwrite it, and the broker still starts (#685 review).
+func TestCorruptDrainsFileIsKeptAside(t *testing.T) {
+	c := reloadBase(t, t.TempDir())
+	rg := newReloadRig(t, c)
+	patchDrain(t, rg.b, "h1", true)
+	path := filepath.Join(c.StateDir, drainsFile)
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := loadBroker(rg.path)
+	if err != nil {
+		t.Fatalf("a corrupt drains file stopped the start: %v", err)
+	}
+	aside, _ := filepath.Glob(path + ".corrupt-*")
+	if len(aside) != 1 {
+		t.Fatalf("corrupt drains file not kept aside: %v", aside)
+	}
+	if raw, _ := os.ReadFile(aside[0]); string(raw) != "{not json" {
+		t.Fatalf("kept aside %q", raw)
+	}
+	patchDrain(t, b2, "h1", true)
+	if raw, _ := os.ReadFile(aside[0]); string(raw) != "{not json" {
+		t.Fatal("a PATCH overwrote the kept copy")
+	}
+}
