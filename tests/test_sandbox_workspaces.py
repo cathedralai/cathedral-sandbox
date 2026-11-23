@@ -392,3 +392,71 @@ def test_local_copier_does_not_follow_symlinks(tmp_path) -> None:
     assert copied.is_symlink()
     store.delete("o", "repo")
     assert (outside / "host-file").read_text() == "host"
+
+
+def test_meta_is_synced_before_and_after_the_rename(tmp_path, monkeypatch) -> None:
+    # AB#598: a sealed guest restart is a power cut. meta.json and its directory entries must be
+    # on disk before the API answers, or the workspace is hidden after the restart.
+    import os
+
+    synced: list[str] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(os.readlink(f"/proc/self/fd/{fd}"))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    store = WorkspaceStore(tmp_path / "ws", LocalCopier(), check_mount=False)
+    store.create("owner-a", "proj")
+    owner_dir = next((tmp_path / "ws").iterdir())
+    ws = owner_dir / "proj"
+    assert str(ws / "meta.json.tmp") in synced  # file content, before the rename
+    assert str(ws) in synced  # the rename itself
+    assert str(owner_dir) in synced and str(tmp_path / "ws") in synced  # the new directories
+    assert json.loads((ws / "meta.json").read_text())["name"] == "proj"
+
+
+
+def test_version_files_are_synced_before_the_version_is_listed(tmp_path, monkeypatch) -> None:
+    # Bugbot on #695: meta.json lists a version durably, so the copied files must be on disk first.
+    # The copy holds room files the API user cannot open, so the store flushes with os.sync().
+    import os
+
+    store = WorkspaceStore(tmp_path / "ws", LocalCopier(), check_mount=False)
+    store.create("owner-a", "proj")
+    events: list[str] = []
+    real_sync, real_save = os.sync, WorkspaceStore._save_meta
+
+    def sync():
+        events.append("sync")
+        return real_sync()
+
+    def save(self, path, meta):
+        events.append("save:" + str(len(meta.get("versions", []))))
+        return real_save(self, path, meta)
+
+    monkeypatch.setattr(os, "sync", sync)
+    monkeypatch.setattr(WorkspaceStore, "_save_meta", save)
+    store.version("owner-a", "proj")
+    assert "sync" in events[: events.index("save:1")]
+
+
+def test_version_sync_does_not_open_room_files(tmp_path, monkeypatch) -> None:
+    # A room file the API cannot open (root, 0600) must not fail the version.
+    import os
+
+    store = WorkspaceStore(tmp_path / "ws", LocalCopier(), check_mount=False)
+    store.create("owner-a", "proj")
+    data = store.mount("owner-a", "proj", "room-1")
+    (data / "secret").write_text("x")
+    store.unmount("owner-a", "proj", "room-1")
+    real_open = os.open
+
+    def no_room_files(p, *a, **k):
+        if "versions" in str(p) and not os.path.isdir(p):
+            raise PermissionError(13, "Permission denied", str(p))
+        return real_open(p, *a, **k)
+
+    monkeypatch.setattr(os, "open", no_room_files)
+    assert store.version("owner-a", "proj")["version"] == 1

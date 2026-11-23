@@ -165,6 +165,14 @@ class DockerCopier:
         self._run("clear", None, dst)
 
 
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _not_found(name: str) -> SandboxOpError:
     return SandboxOpError("workspace_not_found", 404, f"no workspace {name}")
 
@@ -276,9 +284,15 @@ class WorkspaceStore:
             raise _not_found(name) from None
 
     def _save_meta(self, path: Path, meta: dict[str, Any]) -> None:
+        # Durable before it is visible: a sealed guest restart is a power cut, and an unsynced
+        # rename leaves an empty meta.json that hides the workspace (AB#598 restart proof, 23 Nov).
         tmp = path / "meta.json.tmp"
-        tmp.write_text(json.dumps(meta, sort_keys=True))
+        with open(tmp, "w") as f:
+            f.write(json.dumps(meta, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path / "meta.json")
+        _fsync_dir(path)
 
     def _doc(self, owner: str, name: str, meta: dict[str, Any]) -> dict[str, Any]:
         rooms = sorted(h for h in self._mounts.get((owner, name), ()) if h != "rollback")
@@ -310,6 +324,8 @@ class WorkspaceStore:
             path.mkdir(mode=0o700, exist_ok=True)
             (path / "data").mkdir(mode=0o755, exist_ok=True)
             (path / "versions").mkdir(mode=0o700, exist_ok=True)
+            _fsync_dir(path.parent)  # the new workspace and owner entries survive a power cut too
+            _fsync_dir(path.parent.parent)
             meta = {"name": name, "created_at": _now(), "versions": [], "next_version": 1}
             if self.quota is not None:
                 # data/ only, while it is empty and ours: what rooms write. meta.json
@@ -453,6 +469,11 @@ class WorkspaceStore:
             self._save_meta(path, meta)
         try:
             self.copier.copy(path / "data", vdir)
+            # The version is listed durably below, so its files must be on disk first: a rollback
+            # to a version whose files a power cut emptied would replace data/ with nothing. The
+            # copy holds room files the API user cannot open (root, 0600), so flush the whole
+            # filesystem instead of opening them; it runs outside the lock.
+            os.sync()
         except Exception:
             shutil.rmtree(vdir, ignore_errors=True)
             raise
@@ -482,6 +503,7 @@ class WorkspaceStore:
             self._mounts.setdefault((owner, name), set()).add("rollback")
         try:
             self.copier.replace(path / "versions" / str(version), path / "data")
+            os.sync()  # the answer says rolled back: data/ must be on disk before it goes out
         finally:
             with self._lock:
                 self._release(owner, name, "rollback")
