@@ -133,8 +133,8 @@ def env(tmp_path):
     (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 0}))
     # GET .../restart-check: absent by default (a broker from before the guard), so the tests above
     # exercise the hotel document fallback; the guard tests below set it.
-    (fake / "restart.json").write_text("404 page not found")
-    (fake / "restart.code").write_text("404")
+    (fake / "restart.json").write_text(json.dumps({"error": {"code": "hotel_not_found", "message": "no hotel x"}}))
+    (fake / "restart.code").write_text("404")  # what a broker from before the guard answers
     (fake / "check.out").write_text(CHECK_OK)
     (fake / "install.out").write_text("current now new\nRESULT=installed\n")
     (fake / "attestation.json").write_text(attestation())
@@ -892,7 +892,6 @@ def test_install_runs_when_the_restart_guard_says_ok(env):
     (409, REFUSED, "room count is not known"),
     (200, {"restart_ok": False}, "unknown http=200"),
     (200, "not json", "unknown http=200"),
-    (404, {"error": {"code": "hotel_not_found"}}, "unknown http=404"),
     (500, {"error": {"code": "x"}}, "unknown http=500"),
     (401, {"error": {"code": "unauthorized"}}, "unknown http=401"),
 ])
@@ -932,3 +931,25 @@ def test_rollback_needs_the_guard_too(env):
     assert r.returncode == 1
     assert "ssh rollback" not in calls(fake)
     assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+
+def test_old_broker_falls_back_to_the_hotel_document(env):
+    # A broker from before the guard: 404 hotel_not_found for "<hotel>/restart-check", hotel document reads.
+    e, fake, home = env
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 1}))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "broker_rooms_in_use=1" in r.stdout and "no restart guard" in r.stdout, r.stdout
+    assert "ssh install" not in calls(fake)
+
+
+@pytest.mark.parametrize("restart_body", [{"error": {"code": "hotel_not_found"}}, "<html>404</html>"])
+def test_unknown_hotel_or_missing_route_refuses_when_the_hotel_document_does_not_read(env, restart_body):
+    e, fake, home = env
+    guard(fake, 404, restart_body)
+    (fake / "hotel.json").write_text(json.dumps({"error": {"code": "hotel_not_found"}}))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "hotel_drain=None" in r.stdout or "hotel_drain=?" in r.stdout, r.stdout
+    assert "ssh install" not in calls(fake)
