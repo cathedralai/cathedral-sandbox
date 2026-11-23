@@ -73,7 +73,7 @@ func (b *broker) handleMeter(w http.ResponseWriter, r *http.Request, id, action 
 		return
 	}
 	b.mu.Lock()
-	g := b.guests[id]
+	g := b.guestByID(id)
 	b.mu.Unlock()
 	// The ready-room pool guest (pool.go) is the broker's own: its rooms are
 	// never a customer's, so the meter neither lists nor freezes them.

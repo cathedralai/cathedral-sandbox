@@ -785,7 +785,7 @@ func (b *broker) handleAllowance(w http.ResponseWriter, r *http.Request, id stri
 	case "GET":
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		g := b.guests[id]
+		g := b.guestByID(id)
 		if g == nil {
 			writeErr(w, 404, "guest_not_found", "no guest "+id)
 			return
@@ -835,7 +835,7 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 	b.allow.saveMu.Lock()
 	defer b.allow.saveMu.Unlock()
 	b.mu.Lock()
-	g := b.guests[id]
+	g := b.guestByID(id)
 	if g == nil {
 		b.mu.Unlock()
 		writeErr(w, 404, "guest_not_found", "no guest "+id)

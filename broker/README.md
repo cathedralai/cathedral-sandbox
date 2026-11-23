@@ -893,6 +893,23 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
   (the room→guest mapping is persisted, so a reload does not expose another
   guest's receipts).
 
+## Live config reload (AB#946)
+
+New customer keys, new hotels and new measurements need no restart.
+
+```
+POST /v1/broker/config/reload   operator key   {"sha256": "<sha256 of the config file>"}
+```
+
+- The broker reads its config file again and checks it exactly as a start does. `thin-broker -check-config -config <file>` runs the same checks with no side effect (exit 0 or 1).
+- The file is compared with the last file applied, not with live state, so a runtime PATCH stays unless the file changed that field.
+- Applied live: a new guest; a guest's `key_sha256` / `next_key_sha256` (the old hash stops at once); each guest limit the file changed; `sealed_measurements`, `sealed_host_data`, `miner_hotkey_caps`, `miner_max_hotels`; a new hotel; a config hotel's `drain`.
+- Anything else (a removed guest or hotel, any other field) answers 409 `needs_restart` naming each field, and nothing changes. A wrong sha256 answers 409 `config_changed`; a file that would not start answers 400 `invalid_config`.
+- A measurement that leaves the list refuses its hotels at once; every gated hotel is checked again under the new lists.
+- The answer lists ids and counts only, never a key or hash.
+
+A config hotel's runtime `PATCH {"drain": ...}` is kept in `state_dir/hotel-drains.json` and survives a restart, unless the file's own `drain` changed since (the file wins).
+
 ## Hotels at runtime
 
 With `operator_key_sha256` (SHA-256 of the operator key) and `state_dir` in

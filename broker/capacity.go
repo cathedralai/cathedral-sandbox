@@ -386,9 +386,9 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			"sealed_admission":     "on",
 			"sealed_admission_off": off,
 			"amd_verifier":         b.cfg.AMDVerifier != nil,
-			"sealed_measurements":  append([]string{}, b.cfg.SealedMeasurements...),
-			"miner_hotkey_caps":    b.cfg.MinerHotkeyCaps,
-			"miner_max_hotels":     b.cfg.MinerMaxHotels,
+			"sealed_measurements":  append([]string{}, b.sealedMeasurements()...),
+			"miner_hotkey_caps":    b.minerHotkeyCaps(),
+			"miner_max_hotels":     b.minerMaxHotels(),
 			"miner_tls_pin":        true,
 			// Miner probation (probation.go): 0 is off.
 			"miner_probation_seconds":        b.cfg.MinerProbationSeconds,

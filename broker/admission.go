@@ -197,7 +197,7 @@ func (b *broker) needsAttestation(h *hotel) bool {
 // admitted reports whether h passed admission. Health is h.ok, checked by
 // admissibleFree; this is the attestation part. Caller holds b.mu.
 func (b *broker) admitted(h *hotel, now time.Time) bool {
-	if strictAttestation(h) && len(b.cfg.SealedMeasurements) == 0 {
+	if strictAttestation(h) && len(b.sealedMeasurements()) == 0 {
 		return false
 	}
 	// Older state may hold a hotel that joined unsealed (before AB#776).
@@ -281,7 +281,7 @@ type attestFetchErr struct{ error }
 
 // checkAttestation fetches and checks h's attestation. It does not lock.
 func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, error) {
-	if strictAttestation(h) && len(b.cfg.SealedMeasurements) == 0 {
+	if strictAttestation(h) && len(b.sealedMeasurements()) == 0 {
 		return admission{}, errors.New(strictKind(h) + " needs a nonempty sealed_measurements allowlist")
 	}
 	var att struct {
@@ -293,7 +293,7 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	if err != nil || status != 200 || json.Unmarshal(raw, &att) != nil {
 		return admission{}, attestFetchErr{errors.New("the hotel did not answer GET /room/attestation")}
 	}
-	res, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.cfg.SealedMeasurements, b.cfg.SealedHostData)
+	res, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.sealedMeasurements(), b.sealedHostData())
 	if err != nil {
 		return res, err
 	}
@@ -362,7 +362,7 @@ func verifyMinerTLSBinding(rawBinding []byte, peerSPKI string) error {
 // verifyMinerBootstrap checks a keyless HTTPS attestation before the broker
 // constructs any client that holds the hotel key.
 func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI string) error {
-	if len(b.cfg.SealedMeasurements) == 0 {
+	if len(b.sealedMeasurements()) == 0 {
 		return errors.New("a guest TLS hotel needs a nonempty sealed_measurements allowlist")
 	}
 	var att struct {
@@ -373,7 +373,7 @@ func (b *broker) verifyMinerBootstrap(ctx context.Context, raw []byte, peerSPKI 
 	if json.Unmarshal(raw, &att) != nil {
 		return errors.New("guest attestation is not JSON")
 	}
-	if _, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.cfg.SealedMeasurements, b.cfg.SealedHostData); err != nil {
+	if _, err := verifyAttestation(att.Binding, att.BindingSHA, att.Report, b.sealedMeasurements(), b.sealedHostData()); err != nil {
 		return err
 	}
 	if err := verifyMinerTLSBinding(att.Binding, peerSPKI); err != nil {
@@ -585,8 +585,13 @@ func (b *broker) syncAdmission(ctx context.Context, h *hotel, healthOK bool) {
 	if !due {
 		return
 	}
+	gen := b.admGen.Load()
 	res, err := b.checkAttestation(ctx, h)
 	b.mu.Lock()
-	b.noteAttestation(h, res, err, time.Now())
+	// A reload changed the admission lists while this check ran with the
+	// old ones: drop it; checkedAt was cleared, so the next tick checks again.
+	if b.admGen.Load() == gen {
+		b.noteAttestation(h, res, err, time.Now())
+	}
 	b.mu.Unlock()
 }

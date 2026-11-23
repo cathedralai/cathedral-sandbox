@@ -236,7 +236,7 @@ func (b *broker) sealEscapePlant(ctx context.Context, h *hotel, req escapePlantR
 // path reuses checkAttestation / verifyAMDChain and fails closed if those
 // checks have not passed.
 func (b *broker) escapeReceiptKey(ctx context.Context, h *hotel) ([]byte, string, error) {
-	if b.cfg.AMDVerifier == nil || len(b.cfg.SealedMeasurements) == 0 {
+	if b.cfg.AMDVerifier == nil || len(b.sealedMeasurements()) == 0 {
 		return nil, "", errUnverifiedAttest
 	}
 	b.mu.Lock()
@@ -250,7 +250,7 @@ func (b *broker) escapeReceiptKey(ctx context.Context, h *hotel) ([]byte, string
 	if needs && !admitted {
 		return nil, "", errNotAdmitted
 	}
-	if len(stored) == ed25519.PublicKeySize && amdOK && inFold(b.cfg.SealedMeasurements, measurement) {
+	if len(stored) == ed25519.PublicKeySize && amdOK && inFold(b.sealedMeasurements(), measurement) {
 		return stored, bindingSHA, nil
 	}
 	res, err := b.checkAttestation(ctx, h)
@@ -263,7 +263,7 @@ func (b *broker) escapeReceiptKey(ctx context.Context, h *hotel) ([]byte, string
 	if res.amd == nil || res.amdBinding != res.bindingSHA || res.bindingSHA == "" {
 		return nil, "", errUnverifiedAttest
 	}
-	if !inFold(b.cfg.SealedMeasurements, res.measurement) {
+	if !inFold(b.sealedMeasurements(), res.measurement) {
 		return nil, "", errUnverifiedAttest
 	}
 	return res.receiptKey, res.bindingSHA, nil

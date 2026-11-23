@@ -308,7 +308,7 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	g := b.guests[id]
+	g := b.guestByID(id)
 	if g == nil {
 		writeErr(w, 404, "guest_not_found", "no guest "+id)
 		return

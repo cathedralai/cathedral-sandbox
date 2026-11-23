@@ -130,7 +130,7 @@ func (c *acmeDNSConfig) acmeRecordName(hotelID string) string {
 // acmeHotelKey is the stored receipt key and binding of h when they are
 // trusted now, else nil. Caller must not hold b.mu.
 func (b *broker) acmeHotelKey(h *hotel) (ed25519.PublicKey, string) {
-	if b.cfg.AMDVerifier == nil || len(b.cfg.SealedMeasurements) == 0 || !h.cfg.Sealed {
+	if b.cfg.AMDVerifier == nil || len(b.sealedMeasurements()) == 0 || !h.cfg.Sealed {
 		return nil, ""
 	}
 	b.mu.Lock()
@@ -140,7 +140,7 @@ func (b *broker) acmeHotelKey(h *hotel) (ed25519.PublicKey, string) {
 	}
 	bindingSHA := h.adm.bindingSHA
 	amdOK := h.adm.amd != nil && h.adm.amdBinding == bindingSHA && bindingSHA != ""
-	if len(h.adm.receiptKey) != ed25519.PublicKeySize || !amdOK || !inFold(b.cfg.SealedMeasurements, h.adm.measurement) {
+	if len(h.adm.receiptKey) != ed25519.PublicKeySize || !amdOK || !inFold(b.sealedMeasurements(), h.adm.measurement) {
 		return nil, ""
 	}
 	return append(ed25519.PublicKey(nil), h.adm.receiptKey...), bindingSHA
