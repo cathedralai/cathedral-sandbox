@@ -1,114 +1,86 @@
-# AB#709: allowlist start-command for sealed rooms
+# AB#709: allowlisted image startup for sealed rooms
 
-Status: spec for Eng ACK. No code in this PR. Nothing in `cathedral/` changes until this is accepted, because any change there is a new measurement and a re-seal roll of every hotel.
+Status, 23 Nov 2026: **hotel support is implemented; Desktop integration and live acceptance remain open**. This document reconciles the original spec (#449) with the implementation in #455/#457/#458. It does not enable a template, change an image pin or authorize a hotel roll.
 
-## Problem
+## Source baseline
 
-- A sealed room always boots as `sleep infinity`. The API never sends a start command, so the hotel falls back to its default.
-- A template that needs a process (Desktop, AB#699) is started by a second step: the API runs `desktop-up` inside the room with an exec after the room runs, with retries from a background sweep (`polariscomputer` `polaris/services/cathedral_agent_templates.py`: `ensure_started`, `sweep_starts`, `START_SAFETY_SECONDS`, `START_SWEEP_LIMIT`).
-- Three review rounds on AB#699 found races in that step (double starts, stale retries, lost or mislabelled receipts). They are fixed with a flock inside the room, but the API now supervises a process over a network.
-- Any customer image with its own service has the same gap: nothing starts it.
-- Goal: a room created from an image starts that image's declared command, within rules we set, as one step with the room. Then the Desktop sweep in the API is deleted.
+This is a source audit, not a production readback:
 
-## Current code (cathedral-sandbox main, 939751f era; line numbers at b17d9fe)
+| Repository | Inspected commit | Relevant source |
+|---|---|---|
+| cathedral-sandbox | `9cd4e941d3dfffe7c8e36b516321b80adbfa0a28` | `cathedral/start_commands.py`, `sandbox_guest.py`, `sandbox_server.py`; `room-kit/room_receipts.py`, `verify_receipts.py` |
+| [polariscomputer](https://github.com/bigailabs/polariscomputer/tree/5dfbe02639579f8d14e3fc66596a4679a39fa4eb) | `5dfbe02639579f8d14e3fc66596a4679a39fa4eb` | `polaris/services/cathedral_broker_sealed.py`, `cathedral_agent_templates.py`, `cathedral_sandboxes.py` |
+| [cathedral-desktop](https://github.com/cathedralai/cathedral-desktop/tree/ca6bede0bcbceb2646cd08dd682b67414d1fc621) | `ca6bede0bcbceb2646cd08dd682b67414d1fc621` | `Dockerfile`, `desktop/desktop-up` |
 
-- The hotel already carries a start command, but only as a request field:
-  - `cathedral/sandbox_server.py:133` reads `payload["entrypoint"]`, else `("sleep", "infinity")`.
-  - `cathedral/sandbox_api.py:566` (`CreateSandboxRequest.entrypoint`, default `("sleep", "infinity")`) and `:623` (only checks it is a non-empty list of strings).
-  - `cathedral/sandbox_guest.py:1875` picks the argv: `None` for DinD, the request's entrypoint if set, else `sleep infinity`.
-  - `cathedral/sandbox_guest.py:807-811` builds `docker run ... <image> <argv>` (or `<image> sleep infinity`). The argv is appended after the image, so it replaces the image's CMD but an image ENTRYPOINT stays and receives it as arguments.
-  - `cathedral/sandbox_guest.py:1902-1911` refuses a room whose process ended at once (`entrypoint_exited`, 400).
-- Nothing allowlists that field. On the sealed lane it is never set: `polaris/services/cathedral_broker_sealed.py:586-600` (`broker_body`) builds the body without `entrypoint`. The broker does not read the field (no match in `broker/*.go`), it forwards the body.
-- The create receipt covers the field only by hash: `room-kit/room_receipts.py:2245-2270` records `customer_request_sha256` over the whole body, `image` and `image_digest`. It does not name the command.
-- The tunables list states the command is fixed: `cathedral/tee_box/tunables.py:84` and `:148` ("the entrypoint (`sleep infinity`)"). That text becomes wrong when this ships.
-- The original reason for `sleep infinity` is not documented. Believed to be uniformity (every room looks the same to exec, files and pause), not security. To confirm with the author before ACK.
-- Exec, files and pause are independent of the main process: exec is `docker exec` (`sandbox_guest.py:897`), pause is `docker pause` (`:1030`).
+## What works in the hotel source
 
-## Proposal
+`POST /v1/sandboxes` accepts `start: "image"`. The hotel reads the inspected image's Docker `ENTRYPOINT` followed by `CMD` and checks the exact digest/argv pair against `cathedral/start_commands.json`. A nonmatching pair is refused, with no fallback to a sleeping room.
 
-### Rule
+The allowlist has version 1 and entries shaped as:
 
-- Default is unchanged: a create that does not ask for the image's start command runs `sleep infinity`.
-- A create may ask for it with a new body field `start: "image"`. The hotel then reads the image's own `ENTRYPOINT` + `CMD` (from the local image config after the digest import it already does) as the start argv.
-- The hotel starts it only when the pair (image digest, start argv) is on the allowlist. Otherwise it refuses the create (see codes). It never falls back silently to `sleep infinity` when `start: "image"` was asked, so a customer never gets a room without the service they asked for.
-- A request `entrypoint` together with `start: "image"` is refused (one source of truth).
-- DinD images keep their fixed dockerd command; `start: "image"` on a DinD image is refused.
+```json
+{"version": 1, "entries": [{"image_digest": "sha256:<64 hex>", "argv": ["service", "--foreground"], "note": "reviewed service"}]}
+```
 
-### Allowlist format
+There are no glob or prefix matches. `image_digest_for_allowlist` uses the first valid inspected `RepoDigests` entry, falling back to the image ID. The Docker run itself uses the validated immutable image **ID**, not the mutable reference. The ID must be valid; an explicitly requested image's ownership is checked again against that ID before running it. Changing a tag after inspection cannot replace the image that runs.
 
-- One JSON file inside the measured guest image: `cathedral/start_commands.json`. Measured with the guest, so changing it is a re-seal roll like any code change.
-- Shape:
-  ```
-  {"version": 1,
-   "entries": [
-     {"image_digest": "sha256:<64 hex>", "argv": ["/usr/local/bin/room-init"], "note": "desktop"}
-   ]}
-  ```
-- Match is exact: digest equal, argv equal element by element. No globs, no argv[0]-only match, no regex.
-- Digest-pinned, not tag-pinned, so a retagged image cannot change what starts. The digest is the one the receipt already records (`image_digest`).
-- Launch entries: the Desktop image (`cathedral_desktop_image` pin) with the argv `desktop-up --tunnel` equivalent. Agent room images stay on the default until someone asks.
-- Customer images: not on the list at launch, so they are refused. Opening that is a separate decision (see open questions).
+`start_commands_path` selects the configured path, then the installed file, then the package file. Missing or invalid allowlist data prevents provider startup. The production rollout must verify which file was installed and covered by the admitted guest build; the source-tree existence test alone does not prove that deployment fact.
 
-### Receipts
+### Default compatibility is narrower than “everything runs sleep”
 
-- The create receipt gains `start_command` (argv, or null for the default) and `start_command_sha256`, computed by the guest from what it ran, not copied from the API. Same pattern as `network_policy_sha256` (`room_receipts.py:2262-2270`).
-- The verifier treats an absent field as `sleep infinity` for old receipts.
+Without `start: "image"`, the existing path remains:
 
-### What changes for exec, files, pause, delete
+- Ordinary requests default to the argv `sleep infinity`.
+- A request can already supply `entrypoint`; the API's `broker_body` now forwards normalized entrypoints (AB#424).
+- These argv values replace Docker CMD, but do not discard an image ENTRYPOINT. They are not an attestation that the effective process is always `sleep`.
+- DinD retains its fixed dockerd command and refuses image startup.
 
-- Exec and files: unchanged, they use `docker exec` into the same container. A service in the main process shares the room's memory and pids budget with the customer's execs; no new limit in this spec.
-- Pause: `docker pause` freezes the service too. On resume the service continues; no restart. Documented, no code.
-- Main process exits later (crash): the room is gone like any room whose main process ends today (`sandbox_guest.py:2094`, `room_lost`). Documented, not changed.
-- Main process exits at once: existing `entrypoint_exited` refusal, with the start command named in the message.
-- Idle and lifetime: unchanged.
+The allowlist governs the opt-in image-start path. It is not an allowlist for all commands a customer can run through entrypoint or exec. Unlisted customer images cannot use image startup; allowing more pairs requires separate review.
 
-### API side (polariscomputer, follow-up PR after ACK)
+### Refusals
 
-- `broker_body` sends `start: "image"` for templates whose image is on the list (Desktop).
-- Delete from `cathedral_agent_templates.py`: `ensure_started`, `sweep_starts`, `_run_attempt`, `sign_attempt`, `START_*` constants, the `autostart` tuple, the reconcile call (`cathedral_sandboxes.py:3091-3093`) and the `template_start_view`.
-- Order: hotel change ships and rolls first. The API change flips only after every hotel runs the new measurement, because an old hotel ignores `start` and would run `sleep infinity` with no start step left.
+| Code | Status | Condition |
+|---|---|---|
+| `invalid_start` | 400 | Non-null `start` other than `image` |
+| `start_conflict` | 400 | `start: "image"` and an `entrypoint` field in the request |
+| `start_unsupported_image` | 400 | Image startup requested for DinD |
+| `start_command_unavailable` | 400 | No usable image ENTRYPOINT/CMD |
+| `start_command_not_allowed` | 400 | Digest/argv pair not allowed |
+| `image_id_unavailable` | 409 | No valid immutable image ID to run |
+| `image_not_owned` | 403 | The ID about to run is not owned by the caller |
+| `entrypoint_exited` | 400 | Existing immediate-exit detection reports the process ended |
 
-## Refusal codes
+These are hotel-side conditions. API passthrough and customer refusal wording still need integration tests; this table does not assert that the public API preserves every status/code today.
 
-All 4xx, unbilled, answered by the hotel and passed through by the API:
+## Receipt meaning
 
-| Code | When |
-|------|------|
-| `start_command_not_allowed` | `start: "image"` and the (digest, argv) pair is not on the list |
-| `start_command_unavailable` | image has no ENTRYPOINT or CMD, or the config cannot be read |
-| `start_conflict` | `start: "image"` together with a request `entrypoint` |
-| `start_unsupported_image` | `start: "image"` on a DinD image |
-| `entrypoint_exited` | existing: the process ended at once |
+For image startup, the provider returns the inspected argv and its canonical JSON SHA-256. For other modes it returns null fields. The receipt front includes `start_command` and `start_command_sha256` on create statements, using the successful response's argv and recomputing its hash.
 
-## Tests the hotel PR will add
+The Python and Go verifiers check field type and hash consistency when present. Null command requires an absent/null hash. An absent command is skipped for compatibility. **Absent or null fields do not prove `sleep infinity`, an allowlist match, or even a successful create.** Custom entrypoints, DinD, old producers and failed creates must not be relabelled as sleeping rooms. The existing verifier comments that call absence “the default” are shorthand, not an additional verification rule.
 
-- Default create: no `start`, argv is `sleep infinity` (pins old behavior).
-- `start: "image"`, listed digest and argv: container runs exactly that argv; create receipt carries `start_command` and a matching `start_command_sha256`.
-- Listed digest, different argv (image rebuilt with another CMD): `start_command_not_allowed`.
-- Unlisted digest: `start_command_not_allowed`, no container left behind, no network pool slot leaked.
-- Same tag, different digest: refused (tag is not the key).
-- Image with no ENTRYPOINT/CMD: `start_command_unavailable`.
-- `start` with `entrypoint`: `start_conflict`. `start` with a DinD image: `start_unsupported_image`.
-- Listed argv that exits at once: `entrypoint_exited`.
-- Allowlist file: malformed JSON, unknown version, non-sha256 digest, empty argv each fail guest startup (fail closed, not "allow all").
-- Exec, file write, pause and resume against a room whose main process is a long-running service.
-- Receipt verifier: new receipt verifies; old receipt without the field verifies as `sleep infinity`.
-- Guest measurement test: the allowlist file is part of what the measured image hash covers.
+A complete image-start proof needs a successful signed create statement, the expected command/hash, the image evidence and the admitted guest measurement/allowlist. Hash consistency alone is insufficient. Preserve old receipt bytes and historical template-start evidence; do not backfill a command that was never recorded.
 
-## Out of scope
+## Desktop still has three integration gaps
 
-- Customer-supplied or customer-owned allowlist entries.
-- Restart policies, health checks, supervising several processes, logs of the main process.
-- Per-service resource limits inside a room.
-- Desktop image content, the tunnel, and its privacy note.
-- Site copy and docs outside this repo.
-- The re-seal roll itself (a separate card once code merges).
+1. **Image declaration and allowlist are not aligned.** The inspected Desktop Dockerfile declares `CMD ["sleep", "infinity"]`; `desktop-up` supports `--foreground`, but that is not its image CMD. The hotel allowlist instead names `desktop-up --tunnel --foreground`. Its digest also differs from the pin in [the prefetch runbook](../../ops/roll/PREFETCH_DESKTOP.md). That runbook records a registry refusal for the allowlist digest on 16 Nov; this audit did not repeat that network check or inspect today's production image. Correcting the digest alone would not align the declared command.
+2. **The API does not request image startup.** `broker_body` forwards `entrypoint`, not `start: "image"`. Desktop still has the locked exec autostart command, `ensure_started`, `sweep_starts` and `template_start_view`.
+3. **No live cutover proof is attached here.** Source merges do not establish that every eligible hotel carries the correct allowlist, that the configured Desktop image matches it, or that Desktop becomes usable without a follow-up start exec.
 
-## Open questions
+The current API command also passes the sandbox ID through `--room` and requires a fresh, nonempty `/work/desktop.json`. The image-start implementation must preserve room identity and readiness. The foreground script currently marks local state ready even if no tunnel URL was obtained, so process liveness alone cannot replace the API's link-readiness check. Retain the existing tunnel privacy disclosure.
 
-- Why `sleep infinity` originally? If it was for uniformity only, this spec is safe. Needs the author's word.
-- ENTRYPOINT is kept by docker today when an argv is appended. With `start: "image"` we pass no argv and let docker run ENTRYPOINT+CMD; reading both from the image config and also pinning the pair in the list means the match is on the effective command. Confirm that reading both is the intended definition of "the image's start command".
-- Do we open customer images later, and by what proof: owner-signed entries (see `room-kit/owner_sign.py`), or a build receipt that names the CMD? Not needed for AB#699.
-- Should `start_command` go in the signed create receipt, or in the room's attested state only? This spec says the receipt.
-- One flag `start: "image"` or a template-level default for listed images? Flag keeps old API clients unchanged.
-- Roll order for mixed hotels: is it acceptable that API keeps the Desktop sweep until the last hotel rolls?
+## Ordered implementation and rollout
+
+These are required gates for the remaining work, not completed steps. SpockChaser owns implementation; Mr Spock coordinates image publication, admitted measurements, hotel selection and rollout; Reviewbot checks the changes and proof.
+
+1. **Build a compatible Desktop image.** Declare a long-running command, preserve room identity without a variable allowlisted argv (for example through validated create environment), and distinguish link readiness from process liveness. Test local startup failure and shutdown behavior. Publish and inspect the resulting immutable image; record its real digest, ID, ENTRYPOINT and CMD before proposing the corresponding allowlist entry. Do not substitute the old prefetch pin by assumption.
+2. **Align the hotel build.** Update the allowlist with that exact inspected pair. Review the new measured build and perform the coordinated re-seal/prefetch. Prove every hotel eligible for image-start requests has the required build, or implement an explicit broker eligibility constraint first. An unknown field can be ignored by an older hotel, so sending `start: "image"` without that gate is unsafe.
+3. **Wire the API with an explicit startup mode.** Record the selected mode on each created Desktop sandbox. Send `start: "image"` only for the verified image/fleet combination and do not also send `entrypoint`. Preserve sandbox identity, existing network/privacy rules and observable readiness/failure state. Refuse an unsupported combination; do not retry it as an ordinary sleep-and-exec create.
+4. **Retire the old path without stranding existing rooms.** Image-start rooms must never enter the exec starter or retry sweep. Existing legacy rooms may still have a pending start attempt, so their recovery must remain correct through the cutover. Once no legacy room needs it, remove the runtime autostart/sweep/attempt code and its reconcile call. Preserve historical audit data and compatibility reads as needed.
+5. **Run acceptance on an owned test room.** Record the deployed API, Desktop image and guest measurement. One create must produce a usable Desktop/link with no subsequent start exec. Verify the signed create receipt and image/command binding; test wrong argv/digest, mixed-fleet exclusion and startup failure. Exercise exec/files plus pause/resume while the service runs. A create receipt is evidence of startup, not continued service health.
+6. **Rollback through the same boundary.** Stop new image-start creates before removing their image or eligible hotel build. Do not reinterpret already-created image-start rooms as legacy rooms or run the old starter against them. Restore legacy creation only with its matching image and starter path.
+
+## Validation and completion
+
+The existing `tests/test_ab709_start_command.py` covers provider defaults, matching/mismatching pairs, immutable-ID pinning and ownership races, parsing and allowlist validation using FakeDocker. Its shipped-file check proves file presence and parsing, not image publication, guest measurement coverage or a live Desktop. The Go verifier's `TestStartCommandRule` checks receipt hash rules with synthetic receipts.
+
+AB#709 remains open until the image, hotel rollout and API cutover are verified together, the Desktop starts with create, and the redundant runtime starter is removed safely. A spec merge or passing provider unit suite is not completion evidence.
