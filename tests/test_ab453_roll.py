@@ -31,7 +31,8 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   */v1/broker/capacity) cat "$F/capacity.json" ;;
-  */v1/broker/hotels/*) echo "$method $url $data" >> "$F/calls.log"
+  */v1/broker/hotels/*) if [ "$method" = GET ]; then echo "GET hotel" >> "$F/calls.log"; cat "$F/hotel.json"; exit 0; fi
+    echo "$method $url $data" >> "$F/calls.log"
     # patch_codes: one answer per PATCH, in order (000 = timeout); then patch_code; then 200
     code=""; if [ -s "$F/patch_codes" ]; then code=$(head -1 "$F/patch_codes"); sed -i 1d "$F/patch_codes"; fi
     printf '%s' "${code:-$(cat "$F/patch_code" 2>/dev/null || echo 200)}" ;;
@@ -127,6 +128,8 @@ def env(tmp_path):
     (fake / "open.json").write_text(json.dumps({"live_rooms": 0, "max_rooms": 0, "public_open": True}))
     (fake / "pins.txt").write_text("33 True True\n")
     (fake / "rooms.txt").write_text("0")
+    # GET /v1/broker/hotels/<id>: the broker's own view before a guest restart (AB#875)
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 0}))
     (fake / "check.out").write_text(CHECK_OK)
     (fake / "install.out").write_text("current now new\nRESULT=installed\n")
     (fake / "attestation.json").write_text(attestation())
@@ -796,3 +799,62 @@ def test_preflight_reads_a_missing_images_current_as_empty(host):
     assert r.returncode == 1
     assert "host: current= booted=old unit=active" in r.stdout, r.stdout
     no_mutation(fake)
+
+
+
+# AB#875: a guest restart needs the broker's word too. A create queued or in flight at the broker is
+# not in the hotel's room list yet; the install restarts the guest, so it must wait for 0 there.
+@pytest.mark.parametrize("hotel_doc, why", [
+    ({"id": HOTEL, "drain": True, "rooms_in_use": 1}, "broker_rooms_in_use=1"),
+    ({"id": HOTEL, "drain": False, "rooms_in_use": 0}, "hotel_drain=False"),
+    ({"id": HOTEL, "drain": True}, "broker_rooms_in_use=?"),
+    ({"id": HOTEL, "drain": True, "rooms_in_use": True}, "broker_rooms_in_use=?"),
+    ("not json", "hotel_drain=?"),
+])
+def test_install_waits_for_zero_rooms_in_use_at_the_broker(env, hotel_doc, why):
+    e, fake, home = env
+    (fake / "hotel.json").write_text(hotel_doc if isinstance(hotel_doc, str) else json.dumps(hotel_doc))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert why in r.stdout, r.stdout
+    c = calls(fake)
+    assert "ssh install" not in c, c
+    patches = [x.split()[-2:] for x in c if x.startswith("PATCH")]
+    assert patches == [['{"drain":', 'true}'], ['{"drain":', 'false}']], c  # drained, then undrained
+
+
+def test_install_runs_once_the_broker_reads_zero_in_use(env):
+    e, fake, home = env
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    c = calls(fake)
+    assert c.index("GET hotel") < c.index("ssh install"), c
+    assert "creates in flight included" in r.stdout
+
+
+def test_stuck_install_resume_waits_for_zero_in_use_at_the_broker_before_rollback(env):
+    e, fake, home = env
+    (fake / "capacity.json").write_text(capacity(NEW, drain=True))
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 1}))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=stuck_drained\nSTUCK_FROM=installed\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\n"
+        f"PLAN_SHA={plan_sha(home)}\n")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "broker_rooms_in_use=1" in r.stdout, r.stdout
+    assert "ssh rollback" not in calls(fake)
+    assert patches(fake) == []
+    assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_resume_from_drained_waits_for_zero_in_use_at_the_broker(env):
+    # A roll killed after the drain resumes at PHASE=drained and goes straight to the pre-install gate.
+    e, fake, home = env
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 1}))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=drained\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "broker_rooms_in_use=1" in r.stdout, r.stdout
+    assert "ssh install" not in calls(fake)
