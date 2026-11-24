@@ -257,6 +257,10 @@ func (b *broker) reloadConfig(wantSHA string) (reloadSummary, error) {
 	}
 	b.hotelsMutationMu.Lock() // one reload at a time, and none during a join, PATCH or leave
 	defer b.hotelsMutationMu.Unlock()
+	if b.selfServe != nil { // no self-serve PUT or DELETE while the key index is rebuilt (self_serve.go)
+		b.selfServe.mu.Lock()
+		defer b.selfServe.mu.Unlock()
+	}
 	raw, err := os.ReadFile(b.cfgPath)
 	if err != nil {
 		return sum, &reloadErr{500, "config_unreadable", "cannot read the config file"}
@@ -333,7 +337,20 @@ func (b *broker) reloadConfig(wantSHA string) (reloadSummary, error) {
 	for id := range newGuests {
 		if _, inOld := oldGuests[id]; !inOld && b.guests[id] != nil {
 			b.mu.Unlock()
-			return sum, &reloadErr{409, "guest_exists", "guest " + id + " already exists in the broker; nothing was applied"}
+			what := "already exists in the broker"
+			if b.guests[id].selfServe {
+				what = "is a self-serve guest (self_serve.go)"
+			}
+			return sum, &reloadErr{409, "guest_exists", "guest " + id + " " + what + "; nothing was applied"}
+		}
+	}
+	selfKeys := b.selfServeKeysLocked()
+	for _, gc := range nc.Guests {
+		for _, k := range []string{gc.KeySHA256, gc.NextKeySHA256, gc.ViewTokenSHA256} {
+			if g := selfKeys[strings.ToLower(k)]; k != "" && g != nil {
+				b.mu.Unlock()
+				return sum, &reloadErr{409, "key_in_use", "guest " + gc.ID + ": a key hash is the key of self-serve guest " + g.cfg.ID + "; nothing was applied"}
+			}
 		}
 	}
 	// The new key index: every hash of the new file, each on the guest that
@@ -356,6 +373,9 @@ func (b *broker) reloadConfig(wantSHA string) (reloadSummary, error) {
 		if g.cfg.ID == poolGuestID {
 			keys[k] = g // not in the file
 		}
+	}
+	for k, g := range selfKeys {
+		keys[k] = g // not in the file either (self_serve.go)
 	}
 
 	// 3. Apply, all under b.mu: a create sees the old config or the new one.

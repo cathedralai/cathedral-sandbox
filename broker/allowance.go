@@ -8,7 +8,7 @@
 //
 // The ledger sends and reads the allowance with the operator key:
 //
-//	PUT /v1/broker/guests/<id>/allowance  {"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib", optional "stop"}
+//	PUT /v1/broker/guests/<id>/allowance  {"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib", optional "stop", optional "refusal"}
 //	GET /v1/broker/guests/<id>/allowance  the allowance, live rooms, the lease seconds left and the last stop
 //
 // "stop" (AB#948, allowance_stop.go) freezes the guest's running rooms after
@@ -42,7 +42,10 @@
 //   - 402 allowance_lease_expired when the lease is older than lease_seconds,
 //     or there is none;
 //   - 402 allowance_exhausted when the live rooms plus the new ones would pass
-//     the cap (an extension: when the live rooms pass the cap).
+//     the cap (an extension: when the live rooms pass the cap). When the
+//     stored allowance carries "refusal" (insufficient_balance,
+//     account_suspended or key_disabled), that code answers instead, with a
+//     plain message; unset, as before.
 //
 // Live rooms of a metered guest are its creates in flight, every room the
 // broker still holds for it (rooms being removed included, until the sync
@@ -123,6 +126,18 @@ type guestAllowance struct {
 	MaxTTLSeconds int       `json:"max_ttl_seconds"`
 	MaxMemoryGiB  int       `json:"max_memory_gib"`
 	LedgerSeenAt  time.Time `json:"ledger_seen_at"` // broker clock at the PUT
+	// Refusal (optional) is the ledger's reason for a cap refusal: one of
+	// allowanceRefusals. Set, a create, extension or thaw refused for the cap
+	// answers 402 with it instead of allowance_exhausted.
+	Refusal string `json:"refusal,omitempty"`
+}
+
+// allowanceRefusals are the refusal codes an allowance may carry, with the
+// message each answers.
+var allowanceRefusals = map[string]string{
+	"insufficient_balance": "Your Cathedral balance cannot cover a room. Add credit at https://cathedral.computer/console or with Gamma, then retry.",
+	"account_suspended":    "Your Cathedral account is suspended, so this key cannot start or extend rooms. Contact Cathedral support.",
+	"key_disabled":         "This key is disabled. Get a new key from your Cathedral account, then retry.",
 }
 
 // fresh reports whether the lease holds at now. A ledger_seen_at after now
@@ -140,6 +155,9 @@ func (a *guestAllowance) fresh(now time.Time) bool {
 // too; it never opens anything.
 func (a *guestAllowance) usable() bool {
 	if a.Issue < 0 || a.Cap < 0 || a.LeaseSeconds < 0 || a.MaxTTLSeconds < 0 || a.MaxTTLSeconds > maxAllowanceTTLSeconds || a.MaxMemoryGiB < 0 {
+		return false
+	}
+	if _, ok := allowanceRefusals[a.Refusal]; a.Refusal != "" && !ok {
 		return false
 	}
 	return a.LeaseSeconds == 0 || (a.Issue >= 1 && a.MaxTTLSeconds >= 1 && a.MaxMemoryGiB >= 1)
@@ -306,6 +324,9 @@ func (b *broker) allowanceRefusalLocked(g *guestState, n int, now time.Time) (*a
 		return &apiErr{402, "allowance_lease_expired", "this key is sold out right now; try again shortly"}, allowanceLeaseRetry
 	}
 	if live := b.meteredLiveLocked(g); live+n > a.Cap {
+		if msg, ok := allowanceRefusals[a.Refusal]; ok {
+			return &apiErr{402, a.Refusal, msg}, 0 // the ledger said why
+		}
 		if a.Cap == 0 {
 			// The ledger sends cap 0 for no credit, a disabled key, a debt or
 			// too many unreadable readings, and the PUT carries no reason, so
@@ -842,12 +863,14 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 		// Stop freezes the guest's running rooms after the answer
 		// (allowance_stop.go).
 		Stop *allowanceStop `json:"stop"`
+		// Refusal is the code a cap refusal answers (allowanceRefusals).
+		Refusal *string `json:"refusal"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil || dec.More() {
-		writeErr(w, 400, "invalid_json", "body must be one JSON object with issue, cap, lease_seconds, max_ttl_seconds and max_memory_gib, all whole numbers, and an optional stop {\"reason\"}")
+		writeErr(w, 400, "invalid_json", "body must be one JSON object with issue, cap, lease_seconds, max_ttl_seconds and max_memory_gib, all whole numbers, an optional stop {\"reason\"} and an optional refusal")
 		return
 	}
 	bad := ""
@@ -864,6 +887,11 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 		bad = fmt.Sprintf("max_ttl_seconds must be between 1 and %d", maxAllowanceTTLSeconds)
 	case *req.MaxMemoryGiB < 1:
 		bad = "max_memory_gib must be 1 or more"
+	}
+	if req.Refusal != nil {
+		if _, ok := allowanceRefusals[*req.Refusal]; !ok {
+			bad = "refusal must be insufficient_balance, account_suspended or key_disabled"
+		}
 	}
 	if bad != "" {
 		writeErr(w, 400, "invalid_allowance", bad)
@@ -912,6 +940,9 @@ func (b *broker) putAllowance(w http.ResponseWriter, r *http.Request, id string)
 	}
 	a := &guestAllowance{Issue: *req.Issue, Cap: *req.Cap, LeaseSeconds: *req.LeaseSeconds,
 		MaxTTLSeconds: *req.MaxTTLSeconds, MaxMemoryGiB: *req.MaxMemoryGiB, LedgerSeenAt: time.Now()}
+	if req.Refusal != nil {
+		a.Refusal = *req.Refusal
+	}
 	next := make(map[string]*guestAllowance, len(b.allow.byGuest)+1)
 	for k, v := range b.allow.byGuest {
 		next[k] = v
@@ -972,6 +1003,9 @@ func (b *broker) allowanceViewLocked(g *guestState, now time.Time) map[string]an
 		"max_ttl_seconds": a.MaxTTLSeconds, "max_memory_gib": a.MaxMemoryGiB, "ledger_seen_at": seen,
 		"live_rooms": b.meteredLiveLocked(g), "lease_fresh": a.fresh(now), "lease_seconds_left": left,
 		"recount_pending": b.recountPendingLocked(g),
+	}
+	if a.Refusal != "" {
+		view["refusal"] = a.Refusal
 	}
 	b.addStopViewLocked(g, view)
 	return view

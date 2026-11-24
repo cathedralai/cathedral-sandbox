@@ -283,6 +283,9 @@ type config struct {
 	// (pool_settings.go); refused unless everything is on 127.0.0.1.
 	ReadyRooms                 *readyRoomsConfig `json:"ready_rooms,omitempty"`
 	ReadyRoomsUnsealedForTests bool              `json:"ready_rooms_unsealed_for_tests,omitempty"`
+	// SelfServe turns on self-serve metered guests (self_serve.go, AB#894):
+	// the API registers a key hash per account at runtime. Absent: off.
+	SelfServe *selfServeConfig `json:"self_serve,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -465,6 +468,9 @@ type guestState struct {
 	limits   guestLimits // from the config; an operator can change them at runtime (guests.go)
 	pending  int         // rooms admitted and not yet placed or failed
 	admits   []time.Time // admitted rooms in the last 60 s, for max_creates_per_minute
+	// selfServe: a self-serve guest (self_serve.go), not from the config
+	// file. Set when the guest is built; never changes.
+	selfServe bool
 }
 
 type broker struct {
@@ -544,6 +550,10 @@ type broker struct {
 	guestsMu sync.RWMutex
 	admGen   atomic.Uint64
 	drains   map[string]drainRecord
+
+	// selfServe: the self-serve guests (self_serve.go). nil: no self_serve
+	// config.
+	selfServe *selfServeState
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -656,6 +666,11 @@ func loadBroker(path string) (*broker, error) {
 	if err := b.loadConfigLends(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
 	}
+	// After the config file guests (the file wins an id) and before the
+	// allowances (a self-serve guest is metered).
+	if err := b.loadSelfServe(); err != nil {
+		return nil, fmt.Errorf("state: %w", err)
+	}
 	if err := b.loadAllowances(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
 	}
@@ -734,6 +749,9 @@ func validateTopConfig(c config) error {
 		if id == "" || strings.Contains(id, ".") {
 			return fmt.Errorf("config: terminal_hotels entry %q must be a hotel id (non-empty, no dot)", id)
 		}
+	}
+	if err := validateSelfServe(c); err != nil {
+		return err
 	}
 	switch c.SealedAdmission {
 	case "", "on":
@@ -3280,6 +3298,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p == "/v1/broker/config/reload" && b.isOperator(r) {
 		b.handleConfigReload(w, r) // AB#946
+		return
+	}
+	if p == "/v1/broker/self-serve" || strings.HasPrefix(p, "/v1/broker/self-serve/") {
+		b.handleSelfServe(w, r, strings.TrimPrefix(p, "/v1/broker/self-serve")) // operator key only (self_serve.go)
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
