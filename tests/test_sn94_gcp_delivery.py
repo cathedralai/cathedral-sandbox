@@ -6,7 +6,9 @@ import base64
 import copy
 import importlib.util
 import json
+import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +26,21 @@ from cathedral.validator_access import (
     sign_validator_access_snapshot,
     verify_validator_access_snapshot,
 )
+
+_REAL_RUN = subprocess.run
+
+
+def _this_thread_only(fake):
+    """subprocess.run is process-wide: a background thread left by another test (the receipts
+    front's health loop runs pgrep every second) must keep the real run, not reach the fake."""
+    owner = threading.current_thread()
+
+    def run(*args, **kwargs):
+        if threading.current_thread() is not owner:
+            return _REAL_RUN(*args, **kwargs)
+        return fake(*args, **kwargs)
+
+    return run
 
 
 def _load_script(name: str, filename: str) -> ModuleType:
@@ -153,7 +170,7 @@ def test_plan_is_no_write_and_fully_bounded(capsys, monkeypatch):
     monkeypatch.setattr(
         publisher.subprocess,
         "run",
-        lambda *args, **kwargs: pytest.fail("plan contacted an external command"),
+        _this_thread_only(lambda *args, **kwargs: pytest.fail("plan contacted an external command")),
     )
 
     assert publisher.main(["plan"]) == 0
@@ -211,7 +228,7 @@ def test_primary_only_plan_is_no_write_and_names_only_uid124_primary(
     monkeypatch.setattr(
         publisher.subprocess,
         "run",
-        lambda *args, **kwargs: pytest.fail("plan contacted an external command"),
+        _this_thread_only(lambda *args, **kwargs: pytest.fail("plan contacted an external command")),
     )
 
     assert publisher.main(["plan-primary-only"]) == 0
@@ -1224,7 +1241,7 @@ def test_partial_cloud_write_error_reports_confirmed_and_ambiguous_state(
     monkeypatch.setattr(
         publisher.subprocess,
         "run",
-        lambda command, **_kwargs: observed.append(command),
+        _this_thread_only(lambda command, **_kwargs: observed.append(command)),
     )
     with pytest.raises(publisher.PublisherError) as refused:
         publisher.publish_once(
@@ -1399,7 +1416,7 @@ def test_primary_only_provision_refuses_the_fixed_secondary(monkeypatch):
     monkeypatch.setattr(
         publisher.subprocess,
         "run",
-        lambda *_args, **_kwargs: pytest.fail("secondary guard reached a cloud write"),
+        _this_thread_only(lambda *_args, **_kwargs: pytest.fail("secondary guard reached a cloud write")),
     )
 
     with pytest.raises(publisher.PublisherError, match="fixed UID124 VM name"):
@@ -1461,7 +1478,7 @@ def test_primary_only_core_never_creates_or_updates_the_secondary(tmp_path, monk
     monkeypatch.setattr(
         publisher.subprocess,
         "run",
-        lambda command, **_kwargs: cloud_commands.append(command),
+        _this_thread_only(lambda command, **_kwargs: cloud_commands.append(command)),
     )
 
     publisher.provision(
