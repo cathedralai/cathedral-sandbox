@@ -234,6 +234,9 @@ def _http(method: str, url: str, body: dict | None = None, headers: dict | None 
         except ValueError:
             code = "error"
         raise RegistryError(exc.code, code) from None
+    except (urllib.error.URLError, OSError, ValueError):
+        # Timeout, refused connection or a non-JSON answer: the request may still have landed.
+        raise RegistryError(502, "registry_unreachable") from None
 
 
 class RegistryClient:
@@ -264,7 +267,8 @@ class VolumeAgent:
         self.gateway = gateway_url.rstrip("/")
         self.restic = restic
         self.cache_dir = cache_dir
-        # volume_id -> {"lease": lease_doc, "head": head_doc, "generation": int, "head_sha256": str}
+        # volume_id -> {"lease": lease_doc, "generation": int, "head_sha256": str, "target": str,
+        #               "pending": commit_doc or None}. Set only once the head is restored into target.
         self.mounts: dict[str, dict] = {}
 
     def _env(self, volume_id: str, token: dict) -> dict:
@@ -279,8 +283,7 @@ class VolumeAgent:
         return subprocess.run([self.restic, *args], env=env, cwd=cwd, capture_output=True, text=True,
                               timeout=RESTIC_TIMEOUT_SECONDS)
 
-    def _token(self, volume_id: str) -> dict:
-        lease = self.mounts[volume_id]["lease"]
+    def _token(self, volume_id: str, lease: dict) -> dict:
         return self.registry.subtoken(volume_id, self.signer.subtoken_request(lease))
 
     def attach(self, grant: dict, target: str) -> dict:
@@ -297,12 +300,13 @@ class VolumeAgent:
         if lease.get("base_generation") != head["generation"] or lease.get("base_sha256") != head["head_sha256"]:
             raise VolumeRefused("lease_not_at_head")
         self.keys.password(volume_id)
+        # The mount is published only after the restore succeeds: a commit from an empty or half-restored
+        # workspace would become the new head. A re-attach drops the old mount for the same reason.
+        self.mounts.pop(volume_id, None)
         Path(target).mkdir(parents=True, exist_ok=True)
-        self.mounts[volume_id] = {"lease": grant["lease"], "generation": head["generation"],
-                                  "head_sha256": head["head_sha256"], "target": target}
         restored = None
         if head_commit is not None:
-            env = self._env(volume_id, self._token(volume_id))
+            env = self._env(volume_id, self._token(volume_id, grant["lease"]))
             snapshot = head_commit["restic_snapshot_id"]
             config = self._restic(env, "--no-lock", "cat", "config", "--json")
             if config.returncode != 0 or json.loads(config.stdout).get("id") != head_commit["restic_repo_id"]:
@@ -312,6 +316,8 @@ class VolumeAgent:
             if out.returncode != 0:
                 raise VolumeRefused("restore_failed")
             restored = {"generation": head["generation"], "restic_snapshot_id": snapshot}
+        self.mounts[volume_id] = {"lease": grant["lease"], "generation": head["generation"],
+                                  "head_sha256": head["head_sha256"], "target": target, "pending": None}
         return {"volume_id": volume_id, "generation": head["generation"], "restored": restored}
 
     def commit(self, volume_id: str) -> dict:
@@ -319,7 +325,11 @@ class VolumeAgent:
         mount = self.mounts.get(volume_id)
         if mount is None:
             raise VolumeRefused("volume_not_attached")
-        env = self._env(volume_id, self._token(volume_id))
+        if mount["pending"] is not None:
+            # The last post got no answer. Resend that exact commit: the registry answers an exact resend
+            # of its head with the same head, while a fresh backup at the same generation is refused.
+            return self._post(volume_id, mount, mount["pending"])
+        env = self._env(volume_id, self._token(volume_id, mount["lease"]))
         config = self._restic(env, "--no-lock", "cat", "config", "--json")
         if config.returncode != 0:
             if mount["generation"] != 0:
@@ -331,13 +341,29 @@ class VolumeAgent:
         repo_id = json.loads(config.stdout)["id"]
         # The lock removal is refused (no delete on a guest token); the snapshot is stored first.
         backup = self._restic(env, "backup", "--json", "--host", "cathedral-volume", ".", cwd=mount["target"])
+        # Exit 3 still stores a snapshot, but some files were unreadable: never commit an incomplete one.
+        if backup.returncode != 0:
+            raise VolumeRefused("backup_failed")
         summary = [json.loads(line) for line in backup.stdout.splitlines() if '"summary"' in line]
         if not summary or not SNAPSHOT_ID_RE.fullmatch(summary[-1].get("snapshot_id", "")):
             raise VolumeRefused("backup_failed")
         commit = self.signer.sign_commit(mount["lease"], generation=mount["generation"] + 1,
                                          parent_sha256=mount["head_sha256"], restic_repo_id=repo_id,
                                          restic_snapshot_id=summary[-1]["snapshot_id"])
-        head = self.registry.commit(volume_id, commit)
+        return self._post(volume_id, mount, commit)
+
+    def _post(self, volume_id: str, mount: dict, commit: dict) -> dict:
+        mount["pending"] = commit
+        try:
+            head = self.registry.commit(volume_id, commit)
+        except RegistryError as exc:
+            if exc.status < 500:
+                mount["pending"] = None  # a definite refusal: this commit never lands
+            raise
+        except VolumeRefused:
+            mount["pending"] = None
+            raise
+        mount["pending"] = None
         volume_chain._check_signed(head, volume_chain.HEAD_SCHEMA, self.signer.registry_keys,
                                    "head_not_signed_by_registry")
         if head["statement"]["head_sha256"] != statement_sha256(commit):

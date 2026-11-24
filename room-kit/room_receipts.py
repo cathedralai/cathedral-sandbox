@@ -5495,6 +5495,29 @@ class TLSServer(Server):
             conn.close()
 
 
+def start_volumes(ledger, env):
+    """The guest volume agent's routes (AB#789, ROOM_VOLUMES=1), or None: a failure never stops the front."""
+    if env.get("ROOM_VOLUMES") != "1":
+        return None
+    if not ledger.sealed:
+        print("room-receipts: ROOM_VOLUMES=1 ignored: level 1 has no SNP report to bind the lease", flush=True)
+        return None
+    # The cathedral package the room API runs; only a guest with volumes on loads it here.
+    if "/opt/pool-room/src" not in sys.path:
+        sys.path.insert(0, "/opt/pool-room/src")
+    try:
+        from cathedral import volume_agent
+        volumes = volume_agent.from_env(ledger.key, ledger.binding, env)
+    except Exception as exc:  # noqa: BLE001 the hotel keeps serving rooms with volumes off
+        # ImportError (an API tarball without the agent), RuntimeError or KeyError (config),
+        # VolumeRefused restic_not_pinned, OSError: volumes off, as guest ingress does in main().
+        print(f"room-receipts: volumes NOT serving: {type(exc).__name__}: {exc}", flush=True)
+        return None
+    print(f"room-receipts: volumes on: install key {volumes.agent.keys.public_b64}, restic "
+          f"{volume_agent.RESTIC_VERSION}", flush=True)
+    return volumes
+
+
 def main() -> int:
     env = os.environ
     host, port = env["ROOM_RECEIPTS_LISTEN"].rsplit(":", 1)
@@ -5560,17 +5583,7 @@ def main() -> int:
         except (ValueError, OSError) as exc:
             # The hotel keeps serving rooms; expose goes to the API (501) as with the flag off.
             print(f"room-receipts: guest ingress NOT serving: {exc}", flush=True)
-    volumes = None
-    if env.get("ROOM_VOLUMES") == "1":
-        if not ledger.sealed:
-            print("room-receipts: ROOM_VOLUMES=1 ignored: level 1 has no SNP report to bind the lease", flush=True)
-        else:
-            # The cathedral package the room API runs; only a guest with volumes on loads it here.
-            sys.path.insert(0, "/opt/pool-room/src")
-            from cathedral import volume_agent
-            volumes = volume_agent.from_env(ledger.key, ledger.binding, env)
-            print(f"room-receipts: volumes on: install key {volumes.agent.keys.public_b64}, restic "
-                  f"{volume_agent.RESTIC_VERSION}", flush=True)
+    volumes = start_volumes(ledger, env)
     if miner is None:
         srv = Server((host, int(port)), *args, look_seconds=look or None, **reaper)
         srv.volumes = volumes
