@@ -86,12 +86,19 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # AB#791). The only change to cathedral/ since 82016c3. room_receipts.py in the same kit calls that mark,
 # so the kit and the API must move together. Same make-dist.sh; the 82016c3 tarball rebuilds to its pinned
 # sha bdbb1359... with the same tool.
+# Pinned 2026-11-24 to e4cd94b: main after #717 (400 for non-object labels on create), #716 (guest volume
+# agent, cathedral/volume_agent.py and volume_gateway.py, AB#789; room_receipts.py imports volume_agent from
+# this tarball, so without this pin ROOM_VOLUMES=1 stays off), #718 (attached volumes committed on a timer with
+# the signed head as receipt, AB#825), #728 (start_commands.json row for the published Desktop image d1a0e45c,
+# AB#709) and #729 (network_capability on create; TUN only on a dedicated hotel with ROOM_ALLOW_TUN=1, which the
+# kit does not set). e4cd94b is the last change to cathedral/ on main. Same make-dist.sh; the de28030 tarball
+# rebuilds to its pinned sha 683b27a1... with the same tool.
 # Pinned 2026-11-24 for the guest volume agent (AB#789, fetched only with ROOM_VOLUMES=1): restic 0.19.1,
 # the sha256 of restic_0.19.1_linux_amd64.bz2 from the release's SHA256SUMS (also cathedral/volume_agent.py).
 RESTIC_VERSION=0.19.1
 RESTIC_URL=https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
 RESTIC_SHA256=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
-CATHEDRAL_COMMIT=de28030
-CATHEDRAL_TARBALL=dist/cathedral-de28030.tar.gz
-CATHEDRAL_TARBALL_SHA256=683b27a1181db2397a576a67561751288359f7ca325a64b6f6bcef071635bf9f
+CATHEDRAL_COMMIT=e4cd94b
+CATHEDRAL_TARBALL=dist/cathedral-e4cd94b.tar.gz
+CATHEDRAL_TARBALL_SHA256=595f8ad7c1d43940c8b0830cc6f2579a249e6994851f17240eaa370aae38fe01
 PROBE_IMAGE=alpine:3.20
