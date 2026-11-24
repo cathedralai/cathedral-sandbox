@@ -523,6 +523,15 @@ class SlotSupervisor:
             self.alert("measurement_mismatch",
                        f"guest measurement {got} differs from images/current {want}")
 
+    def still_tracked_launch(self) -> bool:
+        """True when the guest answers now with the binding and REPORT_ID this supervisor tracks."""
+        status, doc = self.fetch("/room/attestation")
+        if status != 200 or not isinstance(doc, dict):
+            return False
+        if doc.get("binding_sha256") != self.launch.binding_sha256:
+            return False
+        return report_id_of(doc.get("report_b64")) == self.launch.report_id
+
     def serve_retire_requests(self) -> None:
         """Act on the broker's retire requests the channel dropped in run/escape-retire/."""
         for report, binding in read_requests(self.slot):
@@ -536,9 +545,14 @@ class SlotSupervisor:
                 self.retire("broker_destroy")
                 return
             if launch.report_id is not None:
-                # One unit runs one guest, and it is another launch.
-                write_stopped(self.slot, report, binding, "not_running", self.clock())
-                self.log("retire_not_running", report_id=report, running=launch.report_id)
+                # One unit runs one guest. Confirm the request's launch is not it only on a
+                # fresh attestation of the launch we track: the unit can restart on its own
+                # (Restart=on-failure) into a launch we have not seen yet, which may be the
+                # one the broker wants destroyed. Anything else waits; the binding check
+                # retires an unknown launch.
+                if self.still_tracked_launch():
+                    write_stopped(self.slot, report, binding, "not_running", self.clock())
+                    self.log("retire_not_running", report_id=report, running=launch.report_id)
                 continue
             unit_state, pid = self.unit_status()
             if unit_state in ("inactive", "failed") and pid == 0:

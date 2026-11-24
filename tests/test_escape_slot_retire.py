@@ -145,6 +145,22 @@ def test_an_unknown_running_launch_waits_instead_of_guessing(slot_rig):
     assert systemctl.mutating() == []
 
 
+def test_a_unit_that_restarted_on_its_own_is_never_confirmed_not_running(slot_rig):
+    """Restart=on-failure: the unit runs a launch the supervisor has not seen. A destroy of
+    that launch must not be confirmed as not running (Codex P1 on #724)."""
+    sup, guest, systemctl, _c, broker, _ = slot_rig
+    sup.step()
+    tracked = sup.launch.report_id
+    guest.relaunch()  # systemd restarted the unit; the supervisor still tracks the old launch
+    new = report_id(guest.boot)
+    assert new != tracked
+    broker.retire[new] = guest.binding
+    channel(sup, broker)
+    sup.serve_retire_requests()
+    assert not stopped_file(sup, new).exists()
+    assert channel(sup, broker) == 0 and broker.confirmed == []
+
+
 def test_the_supervisors_own_retire_also_leaves_a_stopped_record(slot_rig):
     sup, guest, _s, clock, broker, _ = slot_rig
     sup.step()
