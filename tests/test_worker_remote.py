@@ -1228,10 +1228,23 @@ def test_saturated_class_pool_returns_503_before_body_framing():
             unblock.set()
             holder.join(timeout=5.0)
 
-        assert _raw_http_status(srv.port, b"") == 411
-        assert _raw_http_status(srv.port, b"Content-Length: nope\r\n") == 400
-        assert _raw_http_status(srv.port, b"Content-Length: 999999\r\n") == 413
-        assert _raw_http_status(srv.port, b"Transfer-Encoding: chunked\r\n") == 400
+        # The handler frees its class slot only after it has sent the answer
+        # (the finally around _handle_post), so a client that has its answer
+        # can ask again a moment before the slot is back. With one slot the
+        # next request then met 503: about 1 run in 40 here, and on main's CI.
+        # Framing is what this half checks, so wait out that moment.
+        def framed(headers: bytes) -> int:
+            deadline = time.monotonic() + 5.0
+            while True:
+                status = _raw_http_status(srv.port, headers)
+                if status != 503 or time.monotonic() > deadline:
+                    return status
+                time.sleep(0.01)
+
+        assert framed(b"") == 411
+        assert framed(b"Content-Length: nope\r\n") == 400
+        assert framed(b"Content-Length: 999999\r\n") == 413
+        assert framed(b"Transfer-Encoding: chunked\r\n") == 400
 
 
 def test_total_request_deadline_ends_a_trickled_body():
