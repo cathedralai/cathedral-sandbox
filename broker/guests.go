@@ -313,6 +313,12 @@ func (b *broker) patchGuest(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, 404, "guest_not_found", "no guest "+id)
 		return
 	}
+	if g.selfServe {
+		// Its settings are forced (self_serve.go); max_rooms goes through
+		// PUT /v1/broker/self-serve/<id>.
+		writeErr(w, 409, "self_serve_guest", "guest "+id+" is a self-serve guest: change max_rooms with PUT /v1/broker/self-serve/"+id+"; nothing changed")
+		return
+	}
 	if req.MaxRooms != nil {
 		g.limits.MaxRooms = *req.MaxRooms
 	}

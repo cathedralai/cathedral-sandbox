@@ -173,6 +173,58 @@ limits without a restart:
 | `PATCH /v1/broker/guests/<id>` | Sets `max_rooms`, `max_creates_per_minute`, `default_sealed`, `hotels`, `policy` (`"policy": null` removes it) and `own_hosts_only`. `max_rooms: 0` and `hotels: []` get 400: in config they mean 1,000 rooms and every non-miner hotel. A bad policy gets 400 `invalid_policy`. |
 
 A runtime change stays in memory. A restart goes back to the config file.
+A PATCH of a self-serve guest gets 409 `self_serve_guest` (below).
+
+### Self-serve guests (AB#894)
+
+The optional top-level `self_serve` block lets the Polaris API give every
+customer a direct broker key without a config file change (`self_serve.go`):
+
+```json
+"self_serve": {"id_prefix": "acct-", "max_rooms_ceiling": 50, "max_creates_per_minute": 120, "policy": {"prefer": [...], "allow": [...], "deny": [...]}}
+```
+
+Absent: off, and the routes below answer 404. It needs `state_dir`. The
+policy is checked like a guest policy. A change to the block needs a restart.
+
+| Route (operator key) | What it does |
+|---|---|
+| `PUT /v1/broker/self-serve/<id>` | Body `{"key_sha256": "<hex>", "max_rooms": n}`, `max_rooms` 1 to `max_rooms_ceiling`. Creates the guest (201), or replaces its key or `max_rooms` (200). A new key stops the old one at once; the rooms stay the guest's. Answer: `{"id", "max_rooms", "revoked", "active_rooms", "created_at", "created", "key_changed", "max_creates_per_minute", "max_rooms_ceiling"}` (the last two are the block's). |
+| `DELETE /v1/broker/self-serve/<id>` | Revokes the key: it leaves the key index at once. The guest and its rooms stay (still metered until they end); a later PUT re-keys it. A DELETE of a guest already revoked writes the file again, so its 200 always means the revoke survives a restart. Unknown id: 404 `guest_not_found`. |
+| `GET /v1/broker/self-serve` | `{"guests": [{"id", "max_rooms", "revoked", "active_rooms", "created_at"}]}`. Never a hash. |
+
+Every self-serve guest is forced: `metered: true` (closed until the ledger
+sends an allowance), not postpaid, no `hotels` list, the block's `policy`,
+`own_hosts_only` and `default_sealed` false, and the block's
+`max_creates_per_minute`. A hotel `reserved_for` another guest stays out of
+its reach whatever the policy names.
+
+Refusals: an id that does not start with `id_prefix` or does not match
+`^[a-z0-9-]{6,64}$` gets 400 `invalid_guest_id`; the id of a config file
+guest (const included), the pool guest or the fresh guest gets 409
+`guest_exists`; a key hash that is another guest's key, next key or view
+token, or the operator, operator read, meter or miner enrollment key, gets
+409 `key_in_use`. Bad `key_sha256`: 400 `invalid_key_sha256`; bad
+`max_rooms`: 400 `invalid_limit`.
+
+The guests are kept in `state_dir/self-serve-guests.json` (mode 0600,
+temporary file, fsync, rename, directory fsync) before a PUT or DELETE
+answers. A PUT whose write fails answers 500 `state_write_failed` and
+changes nothing. A DELETE whose write fails still revokes the key in memory
+and answers 500 `state_write_failed`: send it again, or a restart brings the
+key back. At start the file loads after the config file guests and before
+the allowances. An entry whose id is now a config file guest's is skipped
+with a log line (the file wins) and kept in the file with its key cleared,
+so it cannot come back if that file guest goes; a key hash already taken
+revokes that entry. Such changes are written back at start. A file that does not
+parse is moved aside (`.corrupt-<time>`) and the broker starts with no
+self-serve guests: those keys do not work until the API sends them again.
+A live reload keeps every self-serve key in the key index it builds; a
+reload that adds a file guest with a self-serve id gets 409 `guest_exists`,
+and one whose guest key is a self-serve key gets 409 `key_in_use`.
+`reserved_for` in the config file must name a config file guest; an operator
+can still reserve a hotel for a self-serve guest at runtime (hotel PATCH or
+join), which only narrows who else may use that hotel.
 
 ### Meter routes (AB#890)
 
@@ -504,7 +556,7 @@ guest that is not metered behaves as before.
 
 | Route (operator key) | What it does |
 |---|---|
-| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. Optional `"stop": {"reason": "account_suspended" \| "abuse"}` (AB#948): see "Allowance stop" below. |
+| `PUT /v1/broker/guests/<id>/allowance` | Body `{"issue", "cap", "lease_seconds", "max_ttl_seconds", "max_memory_gib"}`, all whole numbers: `issue` 1 or more and above the stored one, `cap` 0 or more, `max_ttl_seconds` 1 to 172,800, the others 1 or more. Stamps `ledger_seen_at` with the broker clock, writes `state_dir/guest-allowances.json` (temporary file, fsync, rename, directory fsync; mode 0600), then applies and answers the stored allowance. Bad body: 400. Unknown guest: 404. Guest not metered in the config: 409 `guest_not_metered`, nothing changes. Issue at or below the stored one: 409 `stale_allowance`, nothing changes. A write that fails at any step: 500 `state_write_failed`, and the guest is closed (cap 0, no lease, the new issue kept) until a later PUT is saved. Optional `"stop": {"reason": "account_suspended" \| "abuse"}` (AB#948): see "Allowance stop" below. Optional `"refusal": "insufficient_balance" \| "account_suspended" \| "key_disabled"` (AB#894): stored with the allowance (the file stays version 1; absent when unset) and shown in the GET; another value gets 400 `invalid_allowance`. |
 | `GET /v1/broker/guests/<id>/allowance` | The allowance, `live_rooms`, `lease_fresh`, `lease_seconds_left` and `recount_pending`; once a stop was sent since the broker started, also `stop_running` and `last_stop` (`null` while the first pass runs, else `{"at", "reason", "frozen": n, "failed": {room id: code}, "hotel_errors": [hotel ids]}`; a code is the hotel's error code for that room's freeze, `unavailable` when the hotel did not answer, or `hotel_not_found` when the guest can no longer reach the hotel; the stop log line names each room as `id=code`). A guest that is not metered: `{"metered": false, "live_rooms"}`. |
 
 A metered create, and each lifetime extension of a metered room, is refused:
@@ -514,6 +566,7 @@ A metered create, and each lifetime extension of a metered room, is refused:
 | 503 `allowance_recount`, `Retry-After: 5` | Until every hotel the guest may use (or has had rooms on) has answered one room list since the broker started or the hotel joined: its rooms there are not counted yet. |
 | 402 `allowance_lease_expired`, `Retry-After: 30` | `now - ledger_seen_at > lease_seconds`, or no allowance yet. The message says the key is sold out right now. |
 | 402 `allowance_exhausted` | Live rooms plus the new ones would pass `cap` (an extension: the live rooms pass it). `cap` may be 0. At cap 0 the message says the key's allowance is 0 and to check the account's balance and status: the ledger sends cap 0 for more than a lack of credit. |
+| 402 `insufficient_balance`, `account_suspended` or `key_disabled` | As `allowance_exhausted` (creates, extensions and thaws), when the stored allowance carries that `refusal`. The message is plain: for `insufficient_balance`, "Your Cathedral balance cannot cover a room. Add credit at https://cathedral.computer/console or with Gamma, then retry." Unset: `allowance_exhausted` as before. |
 
 Live rooms are the guest's creates in flight, every room the broker still
 holds for it (rooms being removed included, until the sync loop lets them
