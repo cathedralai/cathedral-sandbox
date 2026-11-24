@@ -106,18 +106,25 @@ def test_idle_workers_end_after_the_idle_time() -> None:
 
 
 def test_server_close_ends_the_workers() -> None:
-    base = _workers()
     server = _serve(hold=0.1)
-    port = server.server_address[1]
-    with ThreadPoolExecutor(8) as pool:
-        assert all(s == 200 for s, _ in pool.map(lambda _: _get(port), range(8)))
-    assert _workers() > base
-    server.shutdown()
-    server.server_close()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and _workers() > base:
-        time.sleep(0.05)
-    assert _workers() == base
+    try:
+        port = server.server_address[1]
+        with ThreadPoolExecutor(8) as pool:
+            assert all(s == 200 for s, _ in pool.map(lambda _: _get(port), range(8)))
+        # Other servers' workers may exit during this test. Check this server's
+        # actual threads, not a process-wide count or the reset _workers counter.
+        workers = [t for t in threading.enumerate()
+                   if getattr(getattr(t, "_target", None), "__self__", None) is server]
+        assert workers
+        server.shutdown()
+        server.server_close()
+        deadline = time.monotonic() + 5
+        for worker in workers:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        assert not any(worker.is_alive() for worker in workers)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_a_failed_thread_start_leaves_nothing_queued(monkeypatch) -> None:
