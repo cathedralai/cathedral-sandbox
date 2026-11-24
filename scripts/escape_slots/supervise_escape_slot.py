@@ -16,8 +16,20 @@ What it does, every poll (default 5 s):
 - retires a launch that served an attempt: systemctl stop, confirm QEMU is
   gone, delete scratch.raw, systemctl start (launch-guest.sh makes a new one).
 
-What it never does: create or touch a room, call the broker, send anything
-but GET to the guest, rebuild the image. Do not run install-sealed.sh on a slot
+Broker destroy (AB#683 escape-destroy): the broker retires a launch when the
+API's attempt cleanup asks, and the slot's net-check timer carries that to
+this host (--retire-channel, one shot per timer run; see
+write-escape-units.sh). The channel drops one request file per launch in
+run/escape-retire/; the supervisor retires the launch if it is the one
+running, and writes <report_id>.stopped once the unit is stopped with
+MainPID 0 and scratch is deleted (for every retire, its own included). A
+requested launch that is not the running one is not running (one unit, one
+guest), so it is recorded stopped at once. The channel posts each stopped
+record back to the broker, which only then answers "destroyed".
+
+What it never does: create or touch a room, send anything but GET to the
+guest, rebuild the image. Only the --retire-channel one shot calls the
+broker, and only its own slot's escape-retire route. Do not run install-sealed.sh on a slot
 while its supervisor runs; it restarts the unit and moves images/current.
 
 "Used" is decided from the guest's own receipt chain. Every action a player
@@ -36,6 +48,7 @@ Live systemctl calls need CATHEDRAL_ESCAPE_SLOT_LIVE_OK=yes.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -54,6 +67,11 @@ LIVE_ENV = "CATHEDRAL_ESCAPE_SLOT_LIVE_OK"
 DEFAULT_GUEST_URL = "http://10.215.0.2:18090"  # room-kit/sealed/guest-constants.sh
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,58}$")  # launch-guest.sh SEALED_NAME rule
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+RETIRE_REQUEST_SCHEMA = "cathedral.escape.retire_request/v1"  # broker escape_destroy.go
+RETIRE_CONFIRM_SCHEMA = "cathedral.escape.retire_confirm/v1"
+SNP_REPORT_ID = slice(0x140, 0x160)  # AMD SEV-SNP ABI ATTESTATION_REPORT REPORT_ID
+SNP_REPORT_MIN_LEN = 0x4A0
+STOPPED_KEEP = 64  # stopped records kept for late broker requests
 # The room API reaps a room within GC_GRACE_SECONDS of its expires_at
 # (cathedral/sandbox_api.py). A room still listed past that plus a margin is stuck.
 ROOM_GC_GRACE_SECONDS = 300
@@ -91,6 +109,10 @@ class SlotConfig:
     @property
     def expected_measurement_file(self) -> Path:
         return self.sealed_dir / "images" / "current" / "expected-measurement"
+
+    @property
+    def retire_dir(self) -> Path:
+        return self.sealed_dir / "run" / "escape-retire"
 
 
 def parse_sealed_env(path: Path) -> dict:
@@ -185,6 +207,7 @@ class Launch:
     started_at: float
     state: str = "booting"
     binding_sha256: str | None = None
+    report_id: str | None = None  # SNP REPORT_ID of this launch, from /room/attestation
     used: bool = False
     fresh_at: float | None = None
     in_use_at: float | None = None
@@ -202,6 +225,62 @@ def _expiry(room: dict) -> float | None:
         return datetime.fromisoformat(raw).timestamp()
     except ValueError:
         return None
+
+
+def report_id_of(report_b64) -> str | None:
+    """REPORT_ID of an SEV-SNP report, or None (missing, malformed, all zeros)."""
+    if not isinstance(report_b64, str):
+        return None
+    try:
+        report = base64.b64decode(report_b64, validate=True)
+    except ValueError:
+        return None
+    if len(report) < SNP_REPORT_MIN_LEN:
+        return None
+    rid = report[SNP_REPORT_ID]
+    return rid.hex() if any(rid) else None
+
+
+def _write_json(path: Path, doc: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="ascii") as handle:
+        json.dump(doc, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        doc = json.loads(path.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def write_stopped(slot: SlotConfig, report: str, binding: str, reason: str, at: float) -> None:
+    _write_json(slot.retire_dir / f"{report}.stopped",
+                {"report_id": report, "binding_sha256": binding, "reason": reason, "stopped_at": round(at, 3)})
+    kept = sorted(slot.retire_dir.glob("*.stopped"), key=lambda p: p.stat().st_mtime)
+    for old in kept[:-STOPPED_KEEP]:
+        old.unlink(missing_ok=True)
+
+
+def read_requests(slot: SlotConfig) -> list:
+    """(report_id, binding_sha256) of each well-formed request file."""
+    out = []
+    if not slot.retire_dir.is_dir():
+        return out
+    for path in sorted(slot.retire_dir.glob("*.request")):
+        doc = _read_json(path)
+        if doc is None:
+            continue
+        report, binding = doc.get("report_id"), doc.get("binding_sha256")
+        if (isinstance(report, str) and HEX64.fullmatch(report) and path.stem == report
+                and isinstance(binding, str) and HEX64.fullmatch(binding)):
+            out.append((report, binding))
+    return out
 
 
 class SlotSupervisor:
@@ -281,6 +360,9 @@ class SlotSupervisor:
         self.slot.scratch.unlink(missing_ok=True)
         if self.slot.scratch.exists():
             die(f"could not delete {self.slot.scratch}")
+        if self.launch.report_id and self.launch.binding_sha256:
+            # Stopped, MainPID 0, scratch gone: the broker may now say destroyed.
+            write_stopped(self.slot, self.launch.report_id, self.launch.binding_sha256, reason, self.clock())
         if self.slot.serial_log.is_file():
             # QEMU overwrites serial.log each boot; keep the last launch's for boot timing.
             os.replace(self.slot.serial_log, self.slot.serial_log.with_name("serial.prev.log"))
@@ -310,6 +392,7 @@ class SlotSupervisor:
     # ------------------------------------------------------------ one poll
 
     def step(self) -> None:
+        self.serve_retire_requests()
         launch = self.launch
         if launch.state == "retiring":
             if self.clock() >= self.hold_until:
@@ -348,7 +431,9 @@ class SlotSupervisor:
         if launch.binding_sha256 is None:
             launch.binding_sha256 = binding
             self.check_measurement()
-        elif binding != launch.binding_sha256:
+        elif launch.report_id is None:
+            self.read_report_id()  # the first read failed; a destroy waits on it
+        if binding != launch.binding_sha256:
             # The receipts front restarted inside the guest and lost its chain.
             # Whatever happened before is no longer visible: never hand this out.
             launch.used = True
@@ -409,9 +494,23 @@ class SlotSupervisor:
                   + ROOM_EXPIRY_MARGIN_SECONDS):
                 self.retire("room_past_expiry")
 
+    def read_report_id(self, status=None, doc=None) -> None:
+        """Learn this launch's REPORT_ID from an attestation of its own binding."""
+        if status is None:
+            status, doc = self.fetch("/room/attestation")
+        if status != 200 or not isinstance(doc, dict):
+            return
+        if doc.get("binding_sha256") != self.launch.binding_sha256:
+            return  # not this launch's attestation: the binding check retires it
+        report = report_id_of(doc.get("report_b64"))
+        if report is not None:
+            self.launch.report_id = report
+            self.log("launch_report", report_id=report)
+
     def check_measurement(self) -> None:
         """Alert when the guest is not the build in images/current (install-sealed.sh ran?)."""
         status, doc = self.fetch("/room/attestation")
+        self.read_report_id(status, doc)
         got = None
         if status == 200 and isinstance(doc, dict) and isinstance(doc.get("binding"), dict):
             got = doc["binding"].get("measurement")
@@ -424,6 +523,43 @@ class SlotSupervisor:
             self.alert("measurement_mismatch",
                        f"guest measurement {got} differs from images/current {want}")
 
+    def still_tracked_launch(self) -> bool:
+        """True when the guest answers now with the binding and REPORT_ID this supervisor tracks."""
+        status, doc = self.fetch("/room/attestation")
+        if status != 200 or not isinstance(doc, dict):
+            return False
+        if doc.get("binding_sha256") != self.launch.binding_sha256:
+            return False
+        return report_id_of(doc.get("report_b64")) == self.launch.report_id
+
+    def serve_retire_requests(self) -> None:
+        """Act on the broker's retire requests the channel dropped in run/escape-retire/."""
+        for report, binding in read_requests(self.slot):
+            if (self.slot.retire_dir / f"{report}.stopped").is_file():
+                continue
+            launch = self.launch
+            if launch.state == "retiring":
+                return  # the stop in progress writes its own record
+            if launch.report_id == report:
+                launch.used = True
+                self.retire("broker_destroy")
+                return
+            if launch.report_id is not None:
+                # One unit runs one guest. Confirm the request's launch is not it only on a
+                # fresh attestation of the launch we track: the unit can restart on its own
+                # (Restart=on-failure) into a launch we have not seen yet, which may be the
+                # one the broker wants destroyed. Anything else waits; the binding check
+                # retires an unknown launch.
+                if self.still_tracked_launch():
+                    write_stopped(self.slot, report, binding, "not_running", self.clock())
+                    self.log("retire_not_running", report_id=report, running=launch.report_id)
+                continue
+            unit_state, pid = self.unit_status()
+            if unit_state in ("inactive", "failed") and pid == 0:
+                write_stopped(self.slot, report, binding, f"unit_{unit_state}", self.clock())
+                self.log("retire_not_running", report_id=report, running=None)
+            # Otherwise the running launch is not known yet: wait for its attestation.
+
     def run(self, poll_seconds: float, max_polls: int = 0) -> None:
         self.log("start", unit=self.slot.unit)
         polls = 0
@@ -431,6 +567,111 @@ class SlotSupervisor:
             self.step()
             polls += 1
             time.sleep(poll_seconds)
+
+
+# ---------------------------------------------------------------- retire channel
+
+Request = Callable[[str, str, "bytes | None"], "tuple[int | None, dict | None]"]
+
+
+def broker_url_of(sealed_env: Path) -> str:
+    """SEALED_BROKER_URL: plain https origin, from the slot's own sealed.env (no built-in list)."""
+    env = parse_sealed_env(sealed_env)
+    if env.get("SEALED_ESCAPE_SLOT") != "1":
+        die("SEALED_ESCAPE_SLOT=1 is not set: this host is not a fresh slot")
+    url = env.get("SEALED_BROKER_URL", "")
+    if not re.fullmatch(r"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?", url):
+        die("SEALED_BROKER_URL must be an https origin (no path, user, query)")
+    return url
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # never carry the hotel key elsewhere
+        return None
+
+
+def broker_requester(broker_url: str, key_file: Path, timeout: float = 10.0) -> Request:
+    key = key_file.read_text(encoding="ascii").strip()
+    if not key:
+        die("hotel key file is empty")
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    def request(method: str, path: str, body: bytes | None) -> tuple:
+        headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(broker_url + path, data=body, method=method, headers=headers)
+        try:
+            with opener.open(req, timeout=timeout) as answer:
+                status, raw = answer.status, answer.read(65536)
+        except urllib.error.HTTPError as exc:
+            return exc.code, None
+        except (OSError, ValueError):
+            return None, None
+        try:
+            return status, json.loads(raw)
+        except ValueError:
+            return status, None
+
+    return request
+
+
+def retire_channel(slot: SlotConfig, request: Request, *, wait_seconds: float = 150.0,
+                   poll_seconds: float = 2.0, clock: Callable[[], float] = time.monotonic,
+                   sleep: Callable[[float], None] = time.sleep,
+                   out: Callable[[str], None] = lambda line: print(line, flush=True)) -> int:
+    """One net-check run: pull retires, hand them to the supervisor, confirm the stops.
+
+    Returns the number of stops confirmed. A launch not stopped within
+    wait_seconds is left for the next timer run; the broker keeps answering
+    "pending" (never "destroyed") until its confirm arrives.
+    """
+    path = f"/v1/broker/hotels/{slot.name}/escape-retire"
+
+    def log(action: str, **fields) -> None:
+        out(json.dumps({"schema": SCHEMA, "slot": slot.name, "action": action, **fields}, sort_keys=True))
+
+    status, doc = request("GET", path, None)
+    if (status != 200 or not isinstance(doc, dict) or doc.get("schema") != RETIRE_REQUEST_SCHEMA
+            or doc.get("slot") != slot.name or not isinstance(doc.get("retire"), list)):
+        log("channel_unreadable", status=status)
+        return 0
+    wanted = {}
+    for item in doc["retire"]:
+        report = item.get("report_id") if isinstance(item, dict) else None
+        binding = item.get("binding_sha256") if isinstance(item, dict) else None
+        if isinstance(report, str) and HEX64.fullmatch(report) and isinstance(binding, str) and HEX64.fullmatch(binding):
+            wanted[report] = binding
+    slot.retire_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for stale in slot.retire_dir.glob("*.request"):
+        if stale.stem not in wanted:
+            stale.unlink(missing_ok=True)  # confirmed, or no longer asked
+    for report, binding in wanted.items():
+        target = slot.retire_dir / f"{report}.request"
+        if not target.exists():
+            _write_json(target, {"report_id": report, "binding_sha256": binding})
+            log("retire_requested", report_id=report)
+    confirmed, deadline = 0, clock() + wait_seconds
+    pending = dict(wanted)
+    while pending:
+        for report, binding in list(pending.items()):
+            stopped = _read_json(slot.retire_dir / f"{report}.stopped")
+            if stopped is None or stopped.get("binding_sha256") != binding:
+                continue
+            body = json.dumps({"schema": RETIRE_CONFIRM_SCHEMA, "slot": slot.name, "report_id": report,
+                               "binding_sha256": binding, "state": "stopped"}, sort_keys=True).encode()
+            code, _ = request("POST", path, body)
+            log("retire_confirmed" if code == 200 else "retire_confirm_failed", report_id=report, status=code)
+            if code == 200:
+                confirmed += 1
+                (slot.retire_dir / f"{report}.request").unlink(missing_ok=True)
+            del pending[report]  # a failed post is retried on the next timer run
+        if not pending or clock() >= deadline:
+            break
+        sleep(poll_seconds)
+    for report in pending:
+        log("retire_waiting", report_id=report)
+    return confirmed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -445,12 +686,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fresh-max-age", type=float, default=6 * 3600)
     parser.add_argument("--max-attempt-seconds", type=float, default=4 * 3600)
     parser.add_argument("--max-polls", type=int, default=0, help="0 = run until stopped")
+    parser.add_argument("--retire-channel", action="store_true",
+                        help="one net-check run of the broker retire channel, then exit")
+    parser.add_argument("--channel-wait-seconds", type=float, default=150.0)
     return parser
 
 
 def main(argv: list | None = None) -> int:
     args = build_parser().parse_args(argv)
     slot = load_slot(args.sealed_env)
+    if args.retire_channel:
+        url = broker_url_of(args.sealed_env)
+        retire_channel(slot, broker_requester(url, slot.key_file), wait_seconds=args.channel_wait_seconds)
+        return 0
     supervisor = SlotSupervisor(
         sealed_env=args.sealed_env,
         fetch=http_fetcher(args.guest_url, slot.key_file),

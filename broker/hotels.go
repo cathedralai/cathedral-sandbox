@@ -341,6 +341,12 @@ func validURL(s string) bool {
 }
 
 func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id string) {
+	// The fresh slot's host pulls retires and confirms stops with the slot's
+	// own hotel key, not an administration key (escape_destroy.go).
+	if hotelID, action, ok := strings.Cut(id, "/"); ok && action == "escape-retire" && hotelID != "" {
+		b.handleEscapeRetire(w, r, hotelID)
+		return
+	}
 	operator := b.isOperator(r)
 	enroller := !operator && b.isMinerEnroller(r)
 	if !operator && !enroller {
@@ -354,6 +360,14 @@ func (b *broker) handleHotelAdmin(w http.ResponseWriter, r *http.Request, id str
 			return
 		}
 		b.handleRestartCheck(w, hotelID)
+		return
+	}
+	if hadAction && action == "escape-destroy" && hotelID != "" && r.Method == "POST" {
+		if !operator {
+			writeErr(w, 403, "enroller_scope", "miner enrollment cannot destroy Escape launches")
+			return
+		}
+		b.handleEscapeDestroy(w, r, hotelID)
 		return
 	}
 	if hadAction && action == "escape-nonce" && hotelID != "" && r.Method == "POST" {
