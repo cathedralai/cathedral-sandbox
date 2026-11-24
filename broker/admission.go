@@ -215,6 +215,9 @@ func (b *broker) admitted(h *hotel, now time.Time) bool {
 	if h.installNeeded() {
 		return false // the guest has no hotel key yet: every keyed call would answer 401
 	}
+	if b.escapeLaunchRetiredLocked(h.cfg.ID, h.adm.reportID) {
+		return false // escape-destroy retired this launch: no create lands on it (escape_destroy.go)
+	}
 	if !b.needsAttestation(h) {
 		return true
 	}
@@ -552,6 +555,9 @@ func (b *broker) chipHolder(h *hotel, chip string, now time.Time) *hotel {
 func (b *broker) noteAttestation(h *hotel, res admission, err error, now time.Time) error {
 	was := b.admitted(h, now)
 	h.adm.checkedAt = now
+	if err == nil {
+		err = b.noteEscapeLaunch(h, res, now) // a retired fresh slot launch never passes again
+	}
 	if err == nil && res.chipFull != "" {
 		if o := b.chipHolder(h, res.chipFull, now); o != nil {
 			err = errChipInUse{other: o.cfg.ID, chip: res.chipID}

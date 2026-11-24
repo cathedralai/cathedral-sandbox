@@ -485,6 +485,8 @@ type broker struct {
 	loopsCtx         atomic.Pointer[context.Context] // the sync loops' context from main; nil in tests (loopsContext)
 	freshReplays     freshReplays                    // AB#683 fresh creates by attempt and launch (escape_fresh_create.go)
 	freshEnforcement freshGuestGuarantees            // AB#683 guarantees this broker enforces, set at start from cfg (fresh_guest.go)
+	escSlots         map[string]*escapeSlotState     // AB#683 fresh slot launches and destroys by hotel (escape_destroy.go); guarded by mu
+	escDestroyWait   time.Duration                   // escape-destroy wait for the host's stop; 0: defaultEscapeDestroyWait
 	terminalWSIdle   time.Duration                   // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
@@ -681,6 +683,10 @@ func loadBroker(path string) (*broker, error) {
 	b.fileCfg.Store(&fc)
 	// The lend state in state_dir wins over reserved_for in the config file.
 	if err := b.loadConfigLends(); err != nil {
+		return nil, fmt.Errorf("state: %w", err)
+	}
+	// Retired fresh slot launches stay refused across a restart (escape_destroy.go).
+	if err := b.loadEscapeSlots(); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
 	}
 	// After the config file guests (the file wins an id) and before the
