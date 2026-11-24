@@ -21,6 +21,14 @@ Pieces:
   restores nothing.
 - commit: a sub-token for this mount, restic backup of the workspace, sign generation head + 1,
   post. The registry refuses anything but head + 1 from the current holder.
+- timer commit (AB#825): CommitTimer commits every attached volume whose workspace changed, every
+  ROOM_VOLUME_COMMIT_SECONDS (default 300, 0 = off). The receipt of a commit is the
+  registry-signed head it returns (cathedral_volume_head_v1), kept per volume and read with
+  GET /room/volume-status. A volume the registry ended (shredded, or its lease handed to another
+  boot) is detached, and a shredded one's key is dropped from memory.
+- key mode (AB#825): the guest does not care who sealed the key. By default the API holds it and
+  seals it to this boot (POST /v1/cathedral/volumes/{id}/key-envelope); with a customer-held key
+  the owner seals it with seal_volume_key. Both arrive as the same envelope at /room/volume-key.
 """
 
 from __future__ import annotations
@@ -64,6 +72,11 @@ KEY_HKDF_INFO = b"cathedral.volume-key.v1"
 SNAPSHOT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 HTTP_TIMEOUT_SECONDS = 30
 RESTIC_TIMEOUT_SECONDS = 3600
+COMMIT_SECONDS_DEFAULT = 300
+COMMIT_SECONDS_MIN = 30
+COMMIT_SECONDS_MAX = 86400
+# Registry refusals after which this boot can never commit the volume again: detach it.
+DETACH_CODES = frozenset({"volume_shredded", "lease_not_current"})
 
 
 def _b64d(value) -> bytes:
@@ -278,6 +291,13 @@ class VolumeAgent:
         # volume because two volumes may be attached to the same workspace.
         self._lock = threading.Lock()
 
+    def detach(self, volume_id: str, *, forget_key: bool = False) -> None:
+        """Stop committing a volume. forget_key also drops its restic password from guest memory."""
+        with self._lock:
+            self.mounts.pop(volume_id, None)
+            if forget_key:
+                self.keys.passwords.pop(volume_id, None)
+
     def _env(self, volume_id: str, token: dict) -> dict:
         parts = urlsplit(self.gateway)
         url = (f"rest:{parts.scheme}://volume:{volume_gateway.encode_token(token)}@{parts.netloc}"
@@ -328,7 +348,8 @@ class VolumeAgent:
                 raise VolumeRefused("restore_failed")
             restored = {"generation": head["generation"], "restic_snapshot_id": snapshot}
         self.mounts[volume_id] = {"lease": grant["lease"], "generation": head["generation"],
-                                  "head_sha256": head["head_sha256"], "target": target, "pending": None}
+                                  "head_sha256": head["head_sha256"], "target": target, "pending": None,
+                                  "fingerprint": workspace_fingerprint(target) if head_commit is not None else None}
         return {"volume_id": volume_id, "generation": head["generation"], "restored": restored}
 
     def commit(self, volume_id: str) -> dict:
@@ -344,6 +365,8 @@ class VolumeAgent:
             # The last post got no answer. Resend that exact commit: the registry answers an exact resend
             # of its head with the same head, while a fresh backup at the same generation is refused.
             return self._post(volume_id, mount, mount["pending"])
+        # Taken before the backup: a file written during it changes the fingerprint, so the next tick commits.
+        fingerprint = workspace_fingerprint(mount["target"])
         env = self._env(volume_id, self._token(volume_id, mount["lease"]))
         config = self._restic(env, "--no-lock", "cat", "config", "--json")
         if config.returncode != 0:
@@ -365,7 +388,18 @@ class VolumeAgent:
         commit = self.signer.sign_commit(mount["lease"], generation=mount["generation"] + 1,
                                          parent_sha256=mount["head_sha256"], restic_repo_id=repo_id,
                                          restic_snapshot_id=summary[-1]["snapshot_id"])
+        mount["pending_fingerprint"] = fingerprint
         return self._post(volume_id, mount, commit)
+
+    def commit_if_changed(self, volume_id: str) -> dict | None:
+        """The timer's commit: None when the workspace is as it was at the last commit or restore."""
+        with self._lock:
+            mount = self.mounts.get(volume_id)
+            if mount is None:
+                raise VolumeRefused("volume_not_attached")
+            if mount["pending"] is None and workspace_fingerprint(mount["target"]) == mount["fingerprint"]:
+                return None
+            return self._commit(volume_id)
 
     def _post(self, volume_id: str, mount: dict, commit: dict) -> dict:
         mount["pending"] = commit
@@ -385,7 +419,95 @@ class VolumeAgent:
             raise VolumeRefused("head_not_our_commit")
         mount["generation"] = head["statement"]["generation"]
         mount["head_sha256"] = head["statement"]["head_sha256"]
+        mount["fingerprint"] = mount.pop("pending_fingerprint", None)
         return head
+
+
+def workspace_fingerprint(target: str) -> str:
+    """Digest of every path, type, size and mtime under target: a cheap "did anything change" check."""
+    digest = hashlib.sha256()
+    root = Path(target)
+    if not root.is_dir():
+        return ""
+    for path in sorted(root.rglob("*")):
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        digest.update(f"{path.relative_to(root)}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
+def commit_seconds(value) -> int:
+    """ROOM_VOLUME_COMMIT_SECONDS: empty is the default, 0 is off, else COMMIT_SECONDS_MIN..MAX."""
+    if value in (None, ""):
+        return COMMIT_SECONDS_DEFAULT
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError("ROOM_VOLUME_COMMIT_SECONDS must be an integer") from None
+    if seconds != 0 and not COMMIT_SECONDS_MIN <= seconds <= COMMIT_SECONDS_MAX:
+        raise RuntimeError(f"ROOM_VOLUME_COMMIT_SECONDS must be 0 or {COMMIT_SECONDS_MIN}..{COMMIT_SECONDS_MAX}")
+    return seconds
+
+
+class CommitTimer:
+    """Commit every attached volume on a timer (AB#825). The signed head each commit returns is its receipt.
+
+    One tick commits the volumes one after another under the agent's lock, so a tick never races an
+    attach or a manual commit. A failed tick leaves the volume attached and tries again next tick
+    (a lost registry answer is resent as the same commit), except after DETACH_CODES.
+    """
+
+    def __init__(self, agent: VolumeAgent, interval_seconds: int, now=time.time):
+        self.agent = agent
+        self.interval = interval_seconds
+        self.now = now
+        self.status: dict[str, dict] = {}
+        self._status_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def tick(self) -> None:
+        for volume_id in list(self.agent.mounts):
+            entry = {"checked_at": int(self.now())}
+            try:
+                head = self.agent.commit_if_changed(volume_id)
+            except (VolumeRefused, RegistryError) as refused:
+                entry["last_error"] = refused.code
+                if refused.code in DETACH_CODES:
+                    self.agent.detach(volume_id, forget_key=refused.code == "volume_shredded")
+                    entry["detached"] = True
+            except Exception as exc:  # noqa: BLE001 one volume's failure never stops the timer
+                entry["last_error"] = type(exc).__name__
+            else:
+                if head is not None:
+                    entry.update(receipt=head, generation=head["statement"]["generation"],
+                                 committed_at=entry["checked_at"])
+            with self._status_lock:
+                previous = self.status.get(volume_id, {})
+                # Keep the last receipt across ticks that found nothing to commit or failed.
+                keep = {k: previous[k] for k in ("receipt", "generation", "committed_at") if k in previous}
+                self.status[volume_id] = {**keep, **entry}
+
+    def snapshot(self) -> dict:
+        with self._status_lock:
+            return json.loads(json.dumps(self.status))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.tick()
+
+    def start(self) -> "CommitTimer":
+        if self.interval > 0 and self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="volume-commit-timer", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
 
 
 class FrontRoutes:
@@ -396,15 +518,17 @@ class FrontRoutes:
         POST /room/volume-lease-request     bearer: {"volume_id"} -> the signed lease request
         POST /room/volume-attach            bearer: {"grant", "workspace"} -> verify chain, restore
         POST /room/volume-commit            bearer: {"volume_id"} -> back up, sign head + 1, post
+        GET  /room/volume-status            bearer: the timer's last receipt and error per volume
     """
 
     PATHS = ("/room/volume-key-install-key", "/room/volume-key", "/room/volume-lease-request",
-             "/room/volume-attach", "/room/volume-commit")
+             "/room/volume-attach", "/room/volume-commit", "/room/volume-status")
     WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}(/[A-Za-z0-9_.-]{1,128}){0,3}$")
 
-    def __init__(self, agent: VolumeAgent, workspace_root: str):
+    def __init__(self, agent: VolumeAgent, workspace_root: str, timer: CommitTimer | None = None):
         self.agent = agent
         self.workspace_root = Path(workspace_root)
+        self.timer = timer
 
     def _workspace(self, name) -> str:
         if not isinstance(name, str) or not self.WORKSPACE_RE.fullmatch(name) or ".." in name.split("/"):
@@ -417,6 +541,13 @@ class FrontRoutes:
                 if method != "GET":
                     return 405, {"error": "method_not_allowed"}
                 return 200, self.agent.keys.install_key_document()
+            if path == "/room/volume-status":
+                if not authorized:
+                    return 401, {"error": "unauthorized"}
+                if method != "GET":
+                    return 405, {"error": "method_not_allowed"}
+                return 200, {"interval_seconds": self.timer.interval if self.timer else 0,
+                             "volumes": self.timer.snapshot() if self.timer else {}}
             if method != "POST":
                 return 405, {"error": "method_not_allowed"}
             if not authorized:
@@ -448,9 +579,11 @@ def from_env(ledger_key: Ed25519PrivateKey, binding: dict, env) -> FrontRoutes:
     keys = [k for k in env.get("ROOM_VOLUME_REGISTRY_KEYS", "").split(",") if k]
     if not keys:
         raise RuntimeError("ROOM_VOLUMES=1 needs ROOM_VOLUME_REGISTRY_KEYS")
+    interval = commit_seconds(env.get("ROOM_VOLUME_COMMIT_SECONDS"))
     signer = HolderSigner(ledger_key, binding, keys)
     cache = env.get("ROOM_VOLUME_CACHE_DIR") or tempfile.mkdtemp(prefix="volume-cache-")
     agent = VolumeAgent(signer, VolumeKeys(signer), RegistryClient(env["ROOM_VOLUME_REGISTRY_URL"]),
                         env["ROOM_VOLUME_GATEWAY_URL"], env.get("ROOM_VOLUME_RESTIC", "/opt/pool-room/bin/restic"),
                         cache)
-    return FrontRoutes(agent, env.get("ROOM_VOLUME_WORKSPACES", "/srv/sealed-data/workspaces"))
+    return FrontRoutes(agent, env.get("ROOM_VOLUME_WORKSPACES", "/srv/sealed-data/workspaces"),
+                       CommitTimer(agent, interval).start())
