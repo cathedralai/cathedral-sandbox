@@ -1705,15 +1705,23 @@ func claimPercentiles(ds []time.Duration) (p50, p95, mx time.Duration) {
 // M3 measures that one.
 func TestClaimJournalTimingOnThisDisk(t *testing.T) {
 	var mu sync.Mutex
-	var batches, compactions []claimJournalTiming
+	var batches []claimJournalTiming
+	// The writer acks a compaction (finish) before it reports its timing (note),
+	// so the test waits for the timing here instead of reading a slice that may
+	// still be empty. Indexing an empty slice under mu panicked with mu held and
+	// left the writer blocked in observe until the 10 min go test timeout.
+	compacted := make(chan claimJournalTiming, 1)
 	o := claimJournalOptions{observe: func(tm claimJournalTiming) {
+		if tm.Compaction {
+			select {
+			case compacted <- tm:
+			default:
+			}
+			return
+		}
 		mu.Lock()
 		defer mu.Unlock()
-		if tm.Compaction {
-			compactions = append(compactions, tm)
-		} else {
-			batches = append(batches, tm)
-		}
+		batches = append(batches, tm)
 	}}
 	j := openTestClaimJournal(t, t.TempDir(), o)
 	body := func(id string) claimRecord {
@@ -1775,9 +1783,12 @@ func TestClaimJournalTimingOnThisDisk(t *testing.T) {
 	if err := claimAck(t, j.compact(snap)); err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	c := compactions[len(compactions)-1]
-	mu.Unlock()
+	var c claimJournalTiming
+	select {
+	case c = <-compacted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("compaction timing was never reported")
+	}
 	t.Logf("claim journal timing, %s: compaction to a new generation of 1,000 records (%d bytes, replacing 1,200 records): %v",
 		label, j.size(), c.Total.Round(time.Microsecond))
 }
