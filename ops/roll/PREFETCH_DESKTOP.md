@@ -20,10 +20,12 @@ Image: `ghcr.io/cathedralai/cathedral-desktop@sha256:e128515e1cf4c7648a50412832a
 It must equal Railway Polaris Cloud / production `CATHEDRAL_DESKTOP_IMAGE`
 and the digest on the live catalogue Desktop entry. Check before the step.
 Image-start hotels (AB#709): `cathedral/start_commands.json` allows
+`ghcr.io/cathedralai/cathedral-desktop@sha256:20f01a7562ed9ec894dbb6fb8904ff92b64d9b6c810d5bd3307fa063c2e2ec72`
+(desktop main 3a7bbe71, tunnel retry at boot, AB#709),
 `ghcr.io/cathedralai/cathedral-desktop@sha256:aa77f9197555ff4500d22150eedc44801f54471ded1796e0b340d643e9ff67a7`
 (desktop main d8308c70, TigerVNC default, AB#956) and
 `ghcr.io/cathedralai/cathedral-desktop@sha256:d1a0e45cf1aeca6d1eb2ec0295296cd5db29c229284d80e88085065abcc8cbe9`
-(desktop c0e4ac06), both with CMD `desktop-up --tunnel --foreground`. A hotel
+(desktop c0e4ac06), all with CMD `desktop-up --tunnel --foreground`. A hotel
 whose kit carries that allowlist and is listed in
 `CATHEDRAL_DESKTOP_IMAGE_START_HOTELS` also gets the image named by
 `CATHEDRAL_DESKTOP_IMAGE_START_PIN` prefetched with the same steps. The legacy pin above

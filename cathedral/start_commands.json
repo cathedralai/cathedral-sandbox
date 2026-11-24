@@ -10,6 +10,11 @@
       "image_digest": "sha256:aa77f9197555ff4500d22150eedc44801f54471ded1796e0b340d643e9ff67a7",
       "argv": ["desktop-up", "--tunnel", "--foreground"],
       "note": "cathedral-desktop d8308c70 (desktop PR31, TigerVNC default + step, publish run 45452464513) (AB#956); same argv as d1a0e45c, which stays until no pinned room uses it"
+    },
+    {
+      "image_digest": "sha256:20f01a7562ed9ec894dbb6fb8904ff92b64d9b6c810d5bd3307fa063c2e2ec72",
+      "argv": ["desktop-up", "--tunnel", "--foreground"],
+      "note": "cathedral-desktop 3a7bbe71 (desktop PR32, quick tunnel retry until room egress opens, publish run 45485629321) (AB#709); same argv as aa77f919 and d1a0e45c, which stay until no pinned room uses them"
     }
   ]
 }
