@@ -1361,6 +1361,11 @@ go build -o thin-broker .
 ./thin-broker -config /etc/thin-broker/config.json
 ```
 
+On a host, run it with `thin-broker.service` (in this directory) as the
+`thinbroker` user. Its `StateDirectory` makes `/var/lib/thin-broker/amd-kds`
+(the `amd_verifier` `kds_cache`) owned by `thinbroker` on every start: a cache
+dir owned by root fails every new chip's join with 422.
+
 Put a TLS proxy (for example Caddy) in front of `listen`. Reach hotel APIs
 on a private path (an SSH tunnel per hotel, or a private network). Hotel
 APIs must not be public.
