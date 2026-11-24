@@ -535,6 +535,8 @@ class WorkspaceSpec:
 
 # ---------------------------------------------------------------- §3.1 / §3.4 / §3.5 create
 def _validated_labels(labels: Mapping[str, str]) -> Mapping[str, str]:
+    # A JSON null or list for labels is a caller error (400), never an AttributeError (500).
+    _require(isinstance(labels, Mapping), "invalid_label", "labels must map string keys to string values")
     for key, value in labels.items():
         _require(
             isinstance(key, str) and _LABEL_KEY_RE.fullmatch(key) is not None,

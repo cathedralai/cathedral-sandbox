@@ -288,6 +288,15 @@ def test_bulk_delete_without_label_rejected(app: SandboxApplication) -> None:
     assert r.status == 400 and json.loads(r.body)["error"]["code"] == "invalid_label"
 
 
+@pytest.mark.parametrize("labels", [None, ["job"], "job=x", 3])
+def test_create_with_labels_not_an_object_is_a_400(app: SandboxApplication, labels) -> None:
+    # Found by tests/test_round6_properties.py: "labels": null reached labels.items() (500).
+    payload = {"image": "repo/tool:latest", "resources": {"vcpu": 1, "memory_gib": 2, "disk_gib": 5},
+               "labels": labels}
+    r = app.dispatch("POST", "/v1/sandboxes", AUTH, json.dumps(payload).encode())
+    assert r.status == 400 and json.loads(r.body)["error"]["code"] == "invalid_label"
+
+
 # ------------------------------------------------------------------ §3.5 snapshot / fork
 def test_snapshot_operation_and_lookup(app: SandboxApplication) -> None:
     sid = _create(app)
