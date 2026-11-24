@@ -225,3 +225,9 @@ def test_validate_idempotency_key_raises_only_contract_errors(key) -> None:
         api.validate_idempotency_key(key)
     except api.SandboxContractError:
         pass
+
+
+@pytest.mark.parametrize("labels", [None, [], ["a"], "x", 3])
+def test_non_object_labels_are_a_400(labels) -> None:
+    with pytest.raises(API_400):
+        _create_request({"image": "python:3.12", "labels": labels})

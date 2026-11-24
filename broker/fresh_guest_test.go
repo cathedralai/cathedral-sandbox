@@ -9,26 +9,38 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
-// implementedForTest stands in for a future build that enforces every
-// guarantee, so the advertisement shape can be tested now.
-var implementedForTest = freshGuestGuarantees{DurableSingleUse: true, ExpectedBinding: true, AttemptBoundPlant: true, Recovery: freshGuestRecovery}
+// The chain's sealed_measurements (newChain) holds both: freshKitMeasurement
+// stands for a guest kit built with #671 #672 #676 and is listed in
+// escape_fresh_measurements; olderKitMeasurement is a sealed kit that is not.
+var (
+	freshKitMeasurement = strings.Repeat("ab", 48)
+	olderKitMeasurement = strings.Repeat("22", 48)
+)
 
-func withEnforcement(t *testing.T, f freshGuestGuarantees) {
-	t.Helper()
-	old := freshGuestEnforcement
-	freshGuestEnforcement = f
-	t.Cleanup(func() { freshGuestEnforcement = old })
+// attestKit marks hotel id admitted now by an AMD-verified attestation of
+// launch measurement m, as checkAttestation leaves it.
+func attestKit(tc *testChain, id, m string) {
+	tc.b.mu.Lock()
+	defer tc.b.mu.Unlock()
+	h := tc.b.hotelByID(id)
+	binding := sha("binding-" + id)
+	h.adm.measurement, h.adm.bindingSHA = m, binding
+	h.adm.amd, h.adm.amdBinding = map[string]any{"product": "Genoa", "ark_sha256": testARKPin}, binding
+	h.adm.attestedAt = time.Now()
 }
 
 // freshChain is newChain with guest g1 opted in on slots and limited to hotels,
-// and hotel "a" labelled escape=true. It restarts the broker so the opt-in goes
-// through the config loader.
+// hotel "a" labelled escape=true, escape_fresh_measurements listing the fresh
+// kit, and every hotel attested with it. It restarts the broker so the opt-in
+// and the kit list go through the config loader.
 func freshChain(t *testing.T, hotels, slots []string) *testChain {
 	t.Helper()
 	tc := newChain(t)
 	rewriteConfig(t, tc, func(c *config) {
+		c.EscapeFreshMeasurements = []string{freshKitMeasurement}
 		c.Guests[0].Hotels = hotels
 		c.Guests[0].EscapeFreshGuest = &freshGuestConfig{Slots: slots}
 		for i := range c.Hotels {
@@ -38,7 +50,16 @@ func freshChain(t *testing.T, hotels, slots []string) *testChain {
 		}
 	})
 	tc.start(t)
+	for _, h := range tc.b.hotelList() {
+		attestKit(tc, h.cfg.ID, freshKitMeasurement)
+	}
 	return tc
+}
+
+func setEnforcement(tc *testChain, f freshGuestGuarantees) {
+	tc.b.mu.Lock()
+	tc.b.freshEnforcement = f
+	tc.b.mu.Unlock()
 }
 
 func rewriteConfig(t *testing.T, tc *testChain, edit func(*config)) {
@@ -77,8 +98,11 @@ func quotaWithHeaders(t *testing.T, tc *testChain, key string) (int, map[string]
 // The exact document the API parser accepts (polariscomputer #2069
 // fresh_guests.py parse_capability).
 func TestFreshGuestAdvertisedWhenOnAndImplemented(t *testing.T) {
-	withEnforcement(t, implementedForTest)
 	tc := freshChain(t, []string{"a", "b"}, []string{"a"})
+	all := freshGuestGuarantees{DurableSingleUse: true, ExpectedBinding: true, AttemptBoundPlant: true, Recovery: freshGuestRecovery}
+	if tc.b.freshEnforcement != all {
+		t.Fatalf("enforcement from config = %+v, want %+v", tc.b.freshEnforcement, all)
+	}
 	status, doc, hdr := quotaWithHeaders(t, tc, "key1")
 	if status != 200 {
 		t.Fatalf("quota: %d %v", status, doc)
@@ -105,10 +129,12 @@ func TestFreshGuestAdvertisedWhenOnAndImplemented(t *testing.T) {
 	}
 }
 
-// Default off: no opt-in, no extension, even on a build that implements it.
+// Default off: no opt-in, no extension, even with a fresh kit listed.
 func TestFreshGuestAbsentWhenOff(t *testing.T) {
-	withEnforcement(t, implementedForTest)
 	tc := newChain(t)
+	rewriteConfig(t, tc, func(c *config) { c.EscapeFreshMeasurements = []string{freshKitMeasurement} })
+	tc.start(t)
+	attestKit(tc, "a", freshKitMeasurement)
 	for _, key := range []string{"key1", "key2"} {
 		status, doc, hdr := quotaWithHeaders(t, tc, key)
 		if status != 200 {
@@ -123,16 +149,32 @@ func TestFreshGuestAbsentWhenOff(t *testing.T) {
 	}
 }
 
-// The opt-in is not a declaration: this build enforces none of the guarantees,
-// so a configured guest gets nothing. Each missing guarantee alone withholds it.
-func TestFreshGuestAbsentUntilBuildImplementsIt(t *testing.T) {
-	if freshGuestEnforcement.complete() {
-		t.Fatal("this build claims fresh guest enforcement; AB#683 has not implemented it")
+// The opt-in is not a declaration: with no fresh kit listed the broker claims
+// nothing, so a configured guest gets nothing. Each missing guarantee alone
+// withholds it.
+func TestFreshGuestAbsentWithoutAFreshKit(t *testing.T) {
+	if got := freshGuestEnforcementFor(config{}); got.complete() || got != (freshGuestGuarantees{}) {
+		t.Fatalf("enforcement with no escape_fresh_measurements = %+v, want none", got)
 	}
-	tc := freshChain(t, []string{"a"}, []string{"a"})
+	tc := newChain(t)
+	rewriteConfig(t, tc, func(c *config) {
+		c.Guests[0].Hotels = []string{"a"}
+		c.Guests[0].EscapeFreshGuest = &freshGuestConfig{Slots: []string{"a"}}
+		for i := range c.Hotels {
+			if c.Hotels[i].ID == "a" {
+				c.Hotels[i].Labels = map[string]string{escapeHotelLabel: escapeHotelWant}
+			}
+		}
+	})
+	tc.start(t)
+	attestKit(tc, "a", freshKitMeasurement)
+	if tc.b.freshEnforcement.complete() {
+		t.Fatal("a broker with no escape_fresh_measurements claims fresh guest enforcement")
+	}
 	if _, doc, _ := quotaWithHeaders(t, tc, "key1"); doc["escape_fresh_guest"] != nil {
-		t.Fatalf("advertised by a build without enforcement: %v", doc["escape_fresh_guest"])
+		t.Fatalf("advertised with no fresh kit listed: %v", doc["escape_fresh_guest"])
 	}
+	tc2 := freshChain(t, []string{"a"}, []string{"a"})
 	partial := []freshGuestGuarantees{
 		{ExpectedBinding: true, AttemptBoundPlant: true, Recovery: freshGuestRecovery},
 		{DurableSingleUse: true, AttemptBoundPlant: true, Recovery: freshGuestRecovery},
@@ -141,17 +183,81 @@ func TestFreshGuestAbsentUntilBuildImplementsIt(t *testing.T) {
 		{DurableSingleUse: true, ExpectedBinding: true, AttemptBoundPlant: true, Recovery: "retry"},
 	}
 	for i, p := range partial {
-		freshGuestEnforcement = p
-		_, doc, _ := quotaWithHeaders(t, tc, "key1")
-		freshGuestEnforcement = freshGuestGuarantees{}
-		if doc["escape_fresh_guest"] != nil {
+		setEnforcement(tc2, p)
+		if _, doc, _ := quotaWithHeaders(t, tc2, "key1"); doc["escape_fresh_guest"] != nil {
 			t.Fatalf("partial %d advertised: %v", i, doc["escape_fresh_guest"])
 		}
 	}
 }
 
+// A slot is advertised only while its hotel is attested now, by the AMD
+// chain, with a listed fresh kit that is still sealed. Each failure alone
+// withdraws it; a passing control proves the chain advertises otherwise.
+func TestFreshGuestSlotNeedsAnAttestedFreshKit(t *testing.T) {
+	cases := map[string]func(tc *testChain, h *hotel){
+		"older sealed kit":             func(tc *testChain, h *hotel) { h.adm.measurement = olderKitMeasurement },
+		"never attested":               func(tc *testChain, h *hotel) { h.adm = admission{} },
+		"no AMD chain":                 func(tc *testChain, h *hotel) { h.adm.amd = nil },
+		"AMD chain of a stale binding": func(tc *testChain, h *hotel) { h.adm.amdBinding = sha("older binding") },
+		"no binding":                   func(tc *testChain, h *hotel) { h.adm.bindingSHA = "" },
+		"not admitted": func(tc *testChain, h *hotel) {
+			h.cfg.SealedAdmission = ""
+			h.adm.attestedAt = time.Now().Add(-time.Hour)
+		},
+		"dropped from sealed_measurements by a reload": func(tc *testChain, h *hotel) {
+			tc.b.adml.Store(&admissionLists{measurements: []string{olderKitMeasurement}})
+		},
+	}
+	for name, edit := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc := freshChain(t, []string{"a"}, []string{"a"})
+			if _, doc, _ := quotaWithHeaders(t, tc, "key1"); doc["escape_fresh_guest"] == nil {
+				t.Fatal("control: not advertised before the change")
+			}
+			tc.b.mu.Lock()
+			h := tc.b.hotelByID("a")
+			h.cfgMu.Lock()
+			edit(tc, h)
+			h.cfgMu.Unlock()
+			tc.b.mu.Unlock()
+			if _, doc, _ := quotaWithHeaders(t, tc, "key1"); doc["escape_fresh_guest"] != nil {
+				t.Fatalf("advertised: %v", doc["escape_fresh_guest"])
+			}
+		})
+	}
+}
+
+// escape_fresh_measurements is checked at load: lower case 96 hex, no
+// repeats, and each in sealed_measurements; -check-config agrees.
+func TestFreshGuestMeasurementsRefusedAtLoad(t *testing.T) {
+	cases := map[string][]string{
+		"upper case": {strings.ToUpper(freshKitMeasurement)},
+		"short":      {freshKitMeasurement[:94]},
+		"not hex":    {strings.Repeat("zz", 48)},
+		"padded":     {" " + freshKitMeasurement},
+		"repeated":   {freshKitMeasurement, freshKitMeasurement},
+		"not sealed": {strings.Repeat("cd", 48)},
+	}
+	for name, list := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc := newChain(t)
+			rewriteConfig(t, tc, func(c *config) { c.EscapeFreshMeasurements = list })
+			if _, err := loadBroker(tc.cfgPath); !errors.Is(err, errFreshMeasurements) {
+				t.Fatalf("load: %v, want escape_fresh_measurements refusal", err)
+			}
+			if err := checkConfigFile(tc.cfgPath); !errors.Is(err, errFreshMeasurements) {
+				t.Fatalf("check-config: %v, want escape_fresh_measurements refusal", err)
+			}
+		})
+	}
+	tc := newChain(t)
+	rewriteConfig(t, tc, func(c *config) { c.EscapeFreshMeasurements = []string{freshKitMeasurement} })
+	if _, err := loadBroker(tc.cfgPath); err != nil {
+		t.Fatalf("valid list refused: %v", err)
+	}
+}
+
 func TestFreshGuestAuthRequired(t *testing.T) {
-	withEnforcement(t, implementedForTest)
 	tc := freshChain(t, []string{"a"}, []string{"a"})
 	for _, key := range []string{"", "wrong-key", "view1"} {
 		status, doc, _ := quotaWithHeaders(t, tc, key)
@@ -167,7 +273,6 @@ func TestFreshGuestAuthRequired(t *testing.T) {
 // Every answer is computed now: removing the slot from the guest's hotels at
 // runtime, or a policy, withdraws it on the next read.
 func TestFreshGuestUncachedAcrossRuntimeChange(t *testing.T) {
-	withEnforcement(t, implementedForTest)
 	tc := freshChain(t, []string{"a", "b"}, []string{"a"})
 	if _, doc, _ := quotaWithHeaders(t, tc, "key1"); doc["escape_fresh_guest"] == nil {
 		t.Fatal("not advertised before the change")
@@ -178,22 +283,21 @@ func TestFreshGuestUncachedAcrossRuntimeChange(t *testing.T) {
 	if _, doc, _ := quotaWithHeaders(t, tc, "key1"); doc["escape_fresh_guest"] != nil {
 		t.Fatalf("still advertised after the slot left the guest's hotels: %v", doc["escape_fresh_guest"])
 	}
-	// And a downgraded build (enforcement withdrawn) stops at once.
 	if status, _ := tc.call(t, "operator-key", "PATCH", "/v1/broker/guests/g1", map[string]any{"hotels": []string{"a", "b"}}); status != 200 {
 		t.Fatal("patch back")
 	}
 	if _, doc, _ := quotaWithHeaders(t, tc, "key1"); doc["escape_fresh_guest"] == nil {
 		t.Fatal("not advertised after the slot came back")
 	}
-	freshGuestEnforcement = freshGuestGuarantees{}
+	// And a re-attestation with an older kit stops it at once.
+	attestKit(tc, "a", olderKitMeasurement)
 	if _, doc, _ := quotaWithHeaders(t, tc, "key1"); doc["escape_fresh_guest"] != nil {
-		t.Fatalf("advertised after enforcement was withdrawn: %v", doc["escape_fresh_guest"])
+		t.Fatalf("advertised after the hotel came back on an older kit: %v", doc["escape_fresh_guest"])
 	}
 }
 
 // A slot must be a sealed hotel labelled escape=true; "b" has no label.
 func TestFreshGuestSlotMustBeEscapeHotel(t *testing.T) {
-	withEnforcement(t, implementedForTest)
 	tc := freshChain(t, []string{"a", "b"}, []string{"a", "b"})
 	_, doc, _ := quotaWithHeaders(t, tc, "key1")
 	fg, _ := doc["escape_fresh_guest"].(map[string]any)
