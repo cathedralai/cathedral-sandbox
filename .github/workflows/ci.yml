@@ -1,8 +1,18 @@
 name: CI
 
 on:
+  # Branches get CI through their pull request; push runs only for main, so one
+  # PR push no longer starts two identical runs (push + pull_request).
   push:
+    branches: [main]
   pull_request:
+
+# A new push to a PR cancels that PR's older runs. Main is never cancelled: each
+# main commit gets its own group (sha suffix), so a newer main push cannot
+# replace a pending main run either, and release checks always find a run per sha.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.ref == 'refs/heads/main' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
