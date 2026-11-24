@@ -24,9 +24,11 @@ The SNP report behind a binding is checked by the existing verifier
 (verify_receipts.py) before grant() is called; grant() checks that the binding it
 is given is a sealed binding and names the holder key.
 
-This module is the contract. VolumeRegistry keeps state in memory; the control
-plane's persistent registry, the guest's volume agent, restic and the storage
-sub-tokens are later phases (docs/SEALED_DATA_VOLUME.md).
+This module is the contract. VolumeRegistry keeps state in memory. The control
+plane's persistent registry is polariscomputer's /v1/cathedral/volumes (AB#790);
+the guest's volume agent, pinned restic and the lease-holder signing route are
+volume_agent.py, and the sub-token check per storage request is volume_gateway.py
+(AB#789).
 """
 
 from __future__ import annotations
