@@ -636,8 +636,12 @@ Built for AB#825 (stacked on AB#789 and AB#790, flags off):
   changed (path, size, mtime digest taken before the backup). The receipt is
   the registry-signed head the commit returns, kept per volume and read at
   `GET /room/volume-status` (bearer). A lost answer is resent as the same
-  commit next tick. `volume_shredded` detaches the volume and drops its key
-  from memory; `lease_not_current` detaches it and keeps the key.
+  commit next tick. An unchanged volume still asks the registry for a
+  sub-token each tick, so a shred or handover is seen without a write:
+  `volume_shredded` detaches the volume and drops its key from memory;
+  `lease_not_current` detaches it and keeps the key. An expired lease pauses
+  commits (`lease_expired` in the status) until the owner renews it (900 s
+  lease by default).
 - Key mode and the mounted shred route (polariscomputer, AB#790 registry):
   `key_mode` `cathedral` (default) keeps a random 32-byte key per volume,
   wrapped at rest (`CATHEDRAL_VOLUME_KEY_WRAP_KEY`), sealed only to the live

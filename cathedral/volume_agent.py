@@ -385,14 +385,19 @@ class VolumeAgent:
         return self._post(volume_id, mount, commit)
 
     def commit_if_changed(self, volume_id: str) -> dict | None:
-        """The timer's commit: None when the workspace is as it was at the last commit or restore."""
+        """The timer's commit: None when the workspace is as it was at the last commit or restore.
+
+        An unchanged volume still asks the registry for a sub-token (signed, cheap, no backup), so a
+        shred or a lease handover is seen on the next tick even when nobody writes to the workspace.
+        """
         with self._lock:
             mount = self.mounts.get(volume_id)
             if mount is None:
                 raise VolumeRefused("volume_not_attached")
-            if mount["pending"] is None and workspace_fingerprint(mount["target"]) == mount["fingerprint"]:
-                return None
             try:
+                if mount["pending"] is None and workspace_fingerprint(mount["target"]) == mount["fingerprint"]:
+                    self._token(volume_id, mount["lease"])
+                    return None
                 return self._commit(volume_id)
             except (VolumeRefused, RegistryError) as refused:
                 # Detach under the same lock as the refused commit, so a re-attach that wins the lock
@@ -437,7 +442,9 @@ def workspace_fingerprint(target: str) -> str:
         except OSError:
             continue
         # fsencode: a valid Linux name need not be UTF-8 (surrogate escapes would not encode).
-        digest.update(os.fsencode(path.relative_to(root)) + f"\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+        # ctime too: a same-size write that restores its mtime still moves ctime.
+        digest.update(os.fsencode(path.relative_to(root))
+                      + f"\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\0{st.st_ctime_ns}\n".encode())
     return digest.hexdigest()
 
 
@@ -459,7 +466,10 @@ class CommitTimer:
 
     One tick commits the volumes one after another under the agent's lock, so a tick never races an
     attach or a manual commit. A failed tick leaves the volume attached and tries again next tick
-    (a lost registry answer is resent as the same commit), except after DETACH_CODES.
+    (a lost registry answer is resent as the same commit), except after DETACH_CODES. An expired
+    lease is not terminal: ticks report lease_expired and commit nothing until the owner renews it
+    (POST /v1/cathedral/volumes/{id}/lease, same holder), so the owner renews within the lease time
+    (900 s by default) to keep timer commits going.
     """
 
     def __init__(self, agent: VolumeAgent, interval_seconds: int, now=time.time):

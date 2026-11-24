@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -120,6 +121,56 @@ def test_shredded_volume_is_detached_and_its_key_dropped(monkeypatch, tmp_path):
     assert len(world.restic.calls) == calls
 
 
+class RefusingTokens(Refusing):
+    def subtoken(self, volume_id, request_doc):
+        raise va.RegistryError(self.status, self.code)
+
+
+@pytest.mark.parametrize("status,code,key_kept", [(410, "volume_shredded", False), (409, "lease_not_current", True)])
+def test_idle_volume_still_sees_shred_and_handover(monkeypatch, tmp_path, status, code, key_kept):
+    world, agent, workspace, timer = _attached(monkeypatch, tmp_path)
+    timer.tick()  # generation 1; the workspace is now unchanged
+    agent.registry = RefusingTokens(world.client, status, code)
+    backups = world.restic.verbs().count("backup")
+    timer.tick()
+    assert "vol1" not in agent.mounts and ("vol1" in agent.keys.passwords) is key_kept
+    assert timer.snapshot()["vol1"]["last_error"] == code
+    assert world.restic.verbs().count("backup") == backups
+
+
+def test_idle_tick_only_asks_for_a_token(monkeypatch, tmp_path):
+    world, agent, workspace, timer = _attached(monkeypatch, tmp_path)
+    timer.tick()
+    calls = len(world.restic.calls)
+    timer.tick()
+    assert len(world.restic.calls) == calls and world.head_generation() == 1
+
+
+def test_tick_waits_for_a_commit_in_progress(monkeypatch, tmp_path):
+    world, agent, workspace, timer = _attached(monkeypatch, tmp_path)
+    (workspace / "notes.txt").write_text("manual")
+    stub, entered, release = world.restic, threading.Event(), threading.Event()
+
+    def first_backup_blocks(env, *args, cwd=None):
+        if "backup" in args and not entered.is_set():
+            entered.set()
+            release.wait(10)
+        return stub(env, *args, cwd=cwd)
+
+    agent._restic = first_backup_blocks
+    manual = threading.Thread(target=agent.commit, args=("vol1",))
+    manual.start()
+    assert entered.wait(10)
+    tick = threading.Thread(target=timer.tick)
+    tick.start()
+    tick.join(0.3)
+    assert tick.is_alive()  # waits on the agent lock instead of backing up the same volume twice
+    release.set()
+    manual.join(10)
+    tick.join(10)
+    assert world.head_generation() == 1 and world.restic.verbs().count("backup") == 1
+
+
 def test_lease_moved_elsewhere_detaches_but_keeps_key(monkeypatch, tmp_path):
     world, agent, workspace, timer = _attached(monkeypatch, tmp_path)
     agent.registry = Refusing(world.client, 409, "lease_not_current")
@@ -159,6 +210,17 @@ def test_fingerprint_handles_non_utf8_names(tmp_path):
     first = va.workspace_fingerprint(str(tmp_path))
     (tmp_path / name).write_text("changed")
     assert first and va.workspace_fingerprint(str(tmp_path)) != first
+
+
+def test_fingerprint_sees_a_same_size_write_with_its_mtime_put_back(tmp_path):
+    path = tmp_path / "f.txt"
+    path.write_text("aaaa")
+    st = path.stat()
+    first = va.workspace_fingerprint(str(tmp_path))
+    time.sleep(0.01)
+    path.write_text("bbbb")
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert va.workspace_fingerprint(str(tmp_path)) != first
 
 
 def test_one_volume_crashing_does_not_stop_the_others(monkeypatch, tmp_path):
