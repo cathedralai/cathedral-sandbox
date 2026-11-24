@@ -1130,6 +1130,11 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) 
 		if exclude[h] || !pl.allows(h) || !b.diskFits(h, pl.diskGiB) {
 			continue
 		}
+		// require_chip_id is a hard constraint: a hotel on another chip never gets weight,
+		// so neither preferWarm nor the soft preferChip fallback can place the room there.
+		if pl.requireChipID && !strings.EqualFold(h.adm.chipFull, pl.preferChipID) {
+			continue
+		}
 		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
 			weight[i] = h.weight(f)
 			total += weight[i]
