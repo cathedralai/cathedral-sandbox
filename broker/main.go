@@ -381,7 +381,7 @@ type hotel struct {
 	healthLate   bool            // ok only because room calls answer; health is late
 	lastOK       time.Time       // last good /room/health answer
 	downSince    time.Time       // when ok last went false; zero while ok
-	lastAnswer   atomic.Int64    // unix ns of the last room call the hotel answered (status < 500)
+	lastAnswer   atomic.Int64    // unix ns of the last eligible room reply (status < 500, excluding 401/403)
 	healthMs     float64         // duration of the last /room/health call
 	pinCheckedAt time.Time       // last keyless guest TLS check (syncGuestPin)
 	pinErr       string          // why the last guest TLS check failed; "" after a pin
@@ -1028,9 +1028,10 @@ func (h *hotel) doHeadersMax(ctx context.Context, base, method, path string, que
 		release()
 		return 0, nil, nil, noop, errAnswerTooLarge
 	}
-	if err == nil && resp.StatusCode < 500 {
-		// The hotel answers room calls. syncHotel keeps it "answering" while
-		// these continue, even when its health endpoint is slow under load.
+	if err == nil && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		// Room replies keep a previously healthy hotel answering when health
+		// is slow under load. Auth refusals cannot extend that fallback: a
+		// keyless guest answers 401 too. Preserve any earlier eligible answer.
 		h.lastAnswer.Store(time.Now().UnixNano())
 	}
 	return resp.StatusCode, resp.Header, out, release, err

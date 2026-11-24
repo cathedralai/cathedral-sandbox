@@ -501,10 +501,9 @@ func TestConfigHotelKeyInstallRefusalsKeepTheHotelOut(t *testing.T) {
 }
 
 // AB#896: the come-up pulls (catalog prewarm, guest prefetch replay) wait for
-// the hotel key install. A guest without the key answers health 401, but a
-// room call it answers counts as an answer (any status under 500, a 401 too),
-// so syncHotel can see an installer hotel come up while the guest holds no
-// key. Every pull would answer 401 then, and nothing would start them again.
+// the hotel key install. Recent good health can keep a hotel up during the
+// grace period even when a rebooted guest has no key yet. Auth refusals must
+// not extend that grace; pulls wait until the key is installed.
 
 // prewarmInstallHotel is installHotel with prewarm_catalog set to on.
 func prewarmInstallHotel(t *testing.T, tc *testChain, signerFile string, g *installGuest, on bool) *hotel {
@@ -515,19 +514,23 @@ func prewarmInstallHotel(t *testing.T, tc *testChain, signerFile string, g *inst
 	return installHotel(t, tc, signerFile, g)
 }
 
-// upWithoutKey brings h up while the guest refuses the key install: the first
-// sync pins, is refused and finds health 401 (down); then a guest call to a
-// room there answers 401, and the next sync counts the hotel up on it.
-func upWithoutKey(t *testing.T, tc *testChain, g *installGuest, h *hotel) {
+// upWithRecentHealthBeforeKeyInstall brings h up on its recent valid health
+// check while the guest refuses the key install. The 401 room reply must not
+// refresh lastAnswer; the existing health grace is what keeps the hotel up.
+func upWithRecentHealthBeforeKeyInstall(t *testing.T, tc *testChain, g *installGuest, h *hotel) {
 	t.Helper()
 	ctx := context.Background()
 	g.mu.Lock()
 	g.refuse = "install_not_fresh"
 	g.mu.Unlock()
 	tc.b.syncHotel(ctx, h)
-	setHotel(tc, h.cfg.ID, func(h *hotel) { h.lastOK = time.Now().Add(-time.Minute) }) // health answered before this boot
+	setHotel(tc, h.cfg.ID, func(h *hotel) { h.lastOK = time.Now() }) // recent health before this boot
+	previous := h.lastAnswer.Load()
 	if status, _, _, err := h.do(ctx, "GET", "/v1/sandboxes/r1", nil, nil, 5*time.Second); err != nil || status != 401 {
 		t.Fatalf("room call to the keyless guest: %d %v", status, err)
+	}
+	if h.lastAnswer.Load() != previous {
+		t.Fatal("401 refreshed lastAnswer")
 	}
 	tc.b.syncHotel(ctx, h)
 	tc.b.mu.Lock()
@@ -594,7 +597,7 @@ func TestCatalogPrewarmWaitsForALateKeyInstall(t *testing.T) {
 	tc := newChainState(t, t.TempDir())
 	g := newInstallGuest(t, "ct", signer)
 	h := prewarmInstallHotel(t, tc, signerFile, g, true)
-	upWithoutKey(t, tc, g, h)
+	upWithRecentHealthBeforeKeyInstall(t, tc, g, h)
 	time.Sleep(200 * time.Millisecond) // a pull started at the come-up would run in the background
 	if refused, pulled := g.prefetches(); refused != 0 || len(pulled) != 0 {
 		t.Fatalf("come-up before the install: %d prefetches answered 401, pulls %v; want none", refused, pulled)
@@ -625,7 +628,7 @@ func TestGuestReplayWaitsForALateKeyInstall(t *testing.T) {
 	h := prewarmInstallHotel(t, tc, signerFile, g, false)
 	// g1 prefetched guestImage on ct before the guest rebooted.
 	setHotel(tc, "ct", func(h *hotel) { h.guestWant = map[string]map[string]time.Time{"g1": {guestImage: time.Now()}} })
-	upWithoutKey(t, tc, g, h)
+	upWithRecentHealthBeforeKeyInstall(t, tc, g, h)
 	time.Sleep(200 * time.Millisecond)
 	if refused, pulled := g.prefetches(); refused != 0 || len(pulled) != 0 {
 		t.Fatalf("come-up before the install: %d prefetches answered 401, pulls %v; want none", refused, pulled)
@@ -658,7 +661,7 @@ func TestHeldCatalogPullUsesTheScratchReadAfterTheInstall(t *testing.T) {
 	h := prewarmInstallHotel(t, tc, signerFile, g, true)
 	before := 99.0
 	setHotel(tc, "ct", func(h *hotel) { h.roomDataPct = &before }) // the scratch before the guest rebooted
-	upWithoutKey(t, tc, g, h)
+	upWithRecentHealthBeforeKeyInstall(t, tc, g, h)
 	installNow(t, tc, g, h)
 	pulledOnce(t, tc, g, h, catalogPulls(t, h))
 	tc.b.mu.Lock()
@@ -676,7 +679,7 @@ func TestHeldCatalogPullSkipsAFullScratch(t *testing.T) {
 	g := newInstallGuest(t, "ct", signer)
 	g.reportsScratch(99)
 	h := prewarmInstallHotel(t, tc, signerFile, g, true)
-	upWithoutKey(t, tc, g, h)
+	upWithRecentHealthBeforeKeyInstall(t, tc, g, h)
 	installNow(t, tc, g, h)
 	waitFor(t, "the full-scratch skip of "+warmImage, func() bool {
 		tc.b.mu.Lock()
@@ -837,4 +840,42 @@ func TestSealedOnlyAdmissionRequiresCurrentHotelKeyInstall(t *testing.T) {
 	if !tc.b.admitted(h, time.Now()) {
 		t.Fatal("restored sealed hotel was not admitted")
 	}
+}
+
+// A previously healthy hotel cannot be kept up by repeated room-call 401s
+// after the health grace has elapsed. Successful late installation recovers it.
+func TestKeylessRoomAnswersDoNotKeepHotelUp(t *testing.T) {
+	signerFile, signer, _ := installSeedFile(t, 0o600)
+	tc := newChainState(t, t.TempDir())
+	g := newInstallGuest(t, "ct", signer)
+	h := prewarmInstallHotel(t, tc, signerFile, g, true)
+	g.mu.Lock()
+	g.refuse = "install_not_fresh"
+	g.mu.Unlock()
+	tc.b.syncHotel(context.Background(), h)
+	stale := time.Now().Add(-time.Minute)
+	setHotel(tc, h.cfg.ID, func(h *hotel) { h.lastOK, h.ok = stale, true })
+	h.lastAnswer.Store(stale.UnixNano())
+	for i := 0; i < 2; i++ {
+		status, _, _, err := h.do(context.Background(), "GET", "/v1/sandboxes/r1", nil, nil, 5*time.Second)
+		if err != nil || status != http.StatusUnauthorized {
+			t.Fatalf("keyless room call: status=%d err=%v", status, err)
+		}
+		tc.b.syncHotel(context.Background(), h)
+		setHotel(tc, h.cfg.ID, func(h *hotel) {
+			if h.ok || h.healthLate {
+				t.Errorf("401 kept hotel up: ok=%t late=%t", h.ok, h.healthLate)
+			}
+		})
+	}
+	if refused, pulled := g.prefetches(); refused != 0 || len(pulled) != 0 {
+		t.Fatalf("pulls before install: refused=%d pulled=%v", refused, pulled)
+	}
+	installNow(t, tc, g, h)
+	setHotel(tc, h.cfg.ID, func(h *hotel) {
+		if !h.ok || h.healthLate {
+			t.Errorf("successful install did not recover health: ok=%t late=%t", h.ok, h.healthLate)
+		}
+	})
+	pulledOnce(t, tc, g, h, catalogPulls(t, h))
 }
