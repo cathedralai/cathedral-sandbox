@@ -29,28 +29,36 @@ import (
 
 // guestTLSServer is a sealed guest on guest TLS: its certificate can change
 // (a reboot makes a new key), it serves its attestation without a key, and it
-// records which certificate was showing whenever a request carried a bearer.
+// records the TLS handshake certificate for every request carrying a bearer.
 type guestTLSServer struct {
-	t      *testing.T
-	srv    *httptest.Server
-	mu     sync.Mutex
-	cert   tls.Certificate
-	leaf   *x509.Certificate
-	att    []byte
-	keyed  map[string]int // SPKI hex of the showing certificate -> keyed requests
-	apiKey string
+	t             *testing.T
+	srv           *httptest.Server
+	mu            sync.Mutex
+	cert          tls.Certificate
+	leaf          *x509.Certificate
+	att           []byte
+	keyed         map[string]int    // SPKI hex of the handshake certificate -> keyed requests
+	handshakePins map[string]string // remote connection address -> served certificate SPKI
+	apiKey        string
 }
 
-func newGuestTLSServer(t *testing.T, apiKey string) *guestTLSServer {
+func newGuestTLSServer(t *testing.T, apiKey string, beforeRequest ...func()) *guestTLSServer {
 	t.Helper()
-	g := &guestTLSServer{t: t, keyed: map[string]int{}, apiKey: apiKey}
+	g := &guestTLSServer{t: t, keyed: map[string]int{}, handshakePins: map[string]string{}, apiKey: apiKey}
 	g.rotate()
-	g.srv = httptest.NewUnstartedServer(g)
+	g.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(beforeRequest) != 0 {
+			beforeRequest[0]()
+		}
+		g.ServeHTTP(w, r)
+	}))
 	// GetConfigForClient runs on every handshake (httptest fills Certificates,
 	// which GetCertificate alone would not override for an IP address).
-	g.srv.TLS = &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+	g.srv.TLS = &tls.Config{GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
+		own := sha256.Sum256(g.leaf.RawSubjectPublicKeyInfo)
+		g.handshakePins[hello.Conn.RemoteAddr().String()] = hex.EncodeToString(own[:])
 		return &tls.Config{Certificates: []tls.Certificate{g.cert}}, nil
 	}}
 	g.srv.StartTLS()
@@ -110,9 +118,14 @@ func (g *guestTLSServer) keyedOn(spki string) int {
 func (g *guestTLSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Authorization") != "" {
 		g.mu.Lock()
-		own := sha256.Sum256(g.leaf.RawSubjectPublicKeyInfo)
-		g.keyed[hex.EncodeToString(own[:])]++
+		// Rotation can race a handler already authenticated on the old TLS
+		// connection. Attribute it to that handshake, not the current leaf.
+		pin := g.handshakePins[r.RemoteAddr]
+		g.keyed[pin]++
 		g.mu.Unlock()
+		if pin == "" {
+			g.t.Error("keyed request has no recorded TLS handshake")
+		}
 	}
 	if r.URL.Path == "/room/attestation" {
 		g.mu.Lock()
@@ -488,5 +501,65 @@ func TestGuestTLSJoinRefusesAnAttestedNameThatIsNotTheHotelID(t *testing.T) {
 	}
 	if tc.b.hotelByID("joined") != nil || g.keyedOn(g.spki()) != 0 {
 		t.Fatal("mismatched join left a hotel or sent the key")
+	}
+}
+
+// An old authenticated connection can finish after the fixture rotates.
+func TestGuestTLSKeyedRequestAttributionAcrossRotation(t *testing.T) {
+	entered, release, served := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	g := newGuestTLSServer(t, guestTLSKey, func() {
+		once.Do(func() { close(entered); <-release })
+	})
+	// Release before httptest cleanup, including on failure.
+	var unblock sync.Once
+	defer unblock.Do(func() { close(release) })
+	first := g.spki()
+	h := newHotel(hotelConfig{ID: "test", API: g.srv.URL, Health: g.srv.URL,
+		Sealed: true, GuestTLS: true, TLSSPKISHA256: first}, guestTLSKey)
+	defer h.client.CloseIdleConnections()
+	defer h.ctl.CloseIdleConnections()
+	go func() {
+		defer close(served)
+		_, _, _, _ = h.do(context.Background(), "GET", "/v1/status", nil, nil, 5*time.Second)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request never reached the old TLS connection")
+	}
+	g.rotate()
+	second := g.spki()
+	unblock.Do(func() { close(release) })
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old request did not finish")
+	}
+	// Client cancellation can finish before the server handler counts the request.
+	deadline := time.Now().Add(5 * time.Second)
+	for g.keyedOn(first)+g.keyedOn(second) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if g.keyedOn(first) != 1 || g.keyedOn(second) != 0 {
+		t.Fatalf("old connection charged to wrong key: old=%d new=%d", g.keyedOn(first), g.keyedOn(second))
+	}
+	if _, _, _, err := h.do(context.Background(), "GET", "/v1/status", nil, nil, time.Second); err == nil {
+		t.Fatal("old pin accepted the new certificate")
+	}
+	if g.keyedOn(second) != 0 {
+		t.Fatal("new certificate received key before being pinned")
+	}
+	// A real bearer on the new certificate must still be counted.
+	pin, err := decodePin(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.guestPin.Store(&pin)
+	if _, _, _, err := h.do(context.Background(), "GET", "/v1/status", nil, nil, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if g.keyedOn(second) != 1 {
+		t.Fatalf("new connection not counted: %d", g.keyedOn(second))
 	}
 }
