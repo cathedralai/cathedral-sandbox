@@ -235,9 +235,9 @@ type config struct {
 	// admission is true and URL is set, prefer Cathedral's published sealed
 	// hotels list for measurement membership; fall back to sealed_measurements
 	// if the list cannot be loaded.
-	SignedMeasurementsURL       string                           `json:"signed_measurements_url,omitempty"`
-	SignedMeasurementsAdmission bool                             `json:"signed_measurements_admission,omitempty"`
-	SignedMeasurementsPins      map[string]signedMeasurementPin  `json:"signed_measurements_pins,omitempty"` // key_id -> pin; empty uses sealed-hotels-local-1 default
+	SignedMeasurementsURL       string                          `json:"signed_measurements_url,omitempty"`
+	SignedMeasurementsAdmission bool                            `json:"signed_measurements_admission,omitempty"`
+	SignedMeasurementsPins      map[string]signedMeasurementPin `json:"signed_measurements_pins,omitempty"` // key_id -> pin; empty uses sealed-hotels-local-1 default
 	// EscapeFreshMeasurements lists the launch measurements of guest kits
 	// that enforce the AB#683 fresh guest guarantees (room-kit with #671,
 	// #672 and #676). Each must also be in sealed_measurements. Only a hotel
