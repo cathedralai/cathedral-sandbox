@@ -1286,12 +1286,23 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		// may have queued for its slot past a refused or expired attestation,
 		// a lapsed fresh proof (a miner hotel, fresh_attest.go), or a leave.
 		// Give the slot back and place the create again.
-		if now := time.Now(); h.leaving || !b.admitted(h, now) || !b.freshAttestOK(h, now) {
+		now := time.Now()
+		stale := h.leaving || !b.admitted(h, now) || !b.freshAttestOK(h, now)
+		// A fresh create (AB#683) was pinned against the hotel's attestation
+		// at that time. While it waited, the hotel may have re-attested on
+		// another kit or binding (noteAttestation replaces h.adm), and an
+		// older kit ignores the fresh headers: check both again before send.
+		freshStale := pl.fresh != nil && (!b.freshKitAttested(h, now) || h.adm.bindingSHA != pl.fresh.binding)
+		if stale || freshStale {
 			h.queued--
 			g.queued--
 			h.holdDisk(pl, -1)
 			b.mu.Unlock()
 			<-h.sem
+			if pl.fresh != nil {
+				// Its one hotel no longer qualifies: refuse, never re-place.
+				return finish(freshUnavailable(pl.fresh))
+			}
 			continue
 		}
 		gone, doomed := ctx.Err() != nil, b.tombstoned(g.cfg.ID, labels, tRecv)

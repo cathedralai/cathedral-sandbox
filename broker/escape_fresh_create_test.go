@@ -577,3 +577,92 @@ func TestFreshCreateWithNoFreshKitListedIsRefusedUnsent(t *testing.T) {
 	}
 	noHotelCreate(t, seen)
 }
+
+// The pinned hotel re-attests while the fresh create waits for its slot
+// (AB#683 HOLD on #719). The kit and binding checked at pin time are checked
+// again before send: an older kit or another binding refuses with nothing
+// sent, and an unchanged hotel still gets the create.
+func TestFreshCreateRechecksTheKitAfterTheSlotWait(t *testing.T) {
+	newBinding := sha("relaunched binding")
+	cases := []struct {
+		name   string
+		edit   func(h *hotel)
+		refuse bool
+	}{
+		{"unchanged kit and binding", nil, false},
+		{"older kit, same binding", func(h *hotel) { h.adm.measurement = olderKitMeasurement }, true},
+		{"fresh kit, new binding", func(h *hotel) { h.adm.bindingSHA, h.adm.amdBinding = newBinding, newBinding }, true},
+		{"older kit, new binding", func(h *hotel) {
+			h.adm.measurement = olderKitMeasurement
+			h.adm.bindingSHA, h.adm.amdBinding = newBinding, newBinding
+		}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc, seen := freshCreateChain(t)
+			h := tc.b.hotelByID("b")
+			for i := 0; i < cap(h.sem); i++ {
+				h.sem <- struct{}{}
+			}
+			done := make(chan freshAnswer, 1)
+			go func() {
+				a, err := freshPostCtx(context.Background(), tc, "key1", freshCreateBody(), defaultAssign().headers(), nil)
+				if err != nil {
+					t.Error(err)
+				}
+				done <- a
+			}()
+			// Pinned and queued for b's slot.
+			for deadline := time.Now().Add(5 * time.Second); ; {
+				tc.b.mu.Lock()
+				q := h.queued
+				tc.b.mu.Unlock()
+				if q == 1 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the fresh create never queued on its hotel")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if c.edit != nil {
+				tc.b.mu.Lock()
+				c.edit(h)
+				attested := tc.b.admitted(h, time.Now())
+				tc.b.mu.Unlock()
+				if !attested {
+					t.Fatal("the re-attested hotel must still be admitted, or the test proves nothing")
+				}
+			}
+			<-h.sem // one slot frees
+			var ans freshAnswer
+			select {
+			case ans = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the fresh create did not answer after its slot freed")
+			}
+			if c.refuse {
+				if ans.status != 503 || errCode(ans.doc) != "escape_fresh_hotel_unavailable" {
+					t.Fatalf("re-attested hotel: %d %v", ans.status, ans.doc)
+				}
+				noHotelCreate(t, seen)
+			} else {
+				if ans.status != 202 || ans.doc["hotel"] != "b" {
+					t.Fatalf("unchanged hotel: %d %v", ans.status, ans.doc)
+				}
+				if n := freshHotelCreates(seen); n["b"] != 1 || n["a"]+n["c"] != 0 {
+					t.Fatalf("unchanged hotel creates: %v", n)
+				}
+			}
+			for deadline := time.Now().Add(5 * time.Second); len(h.sem) != cap(h.sem)-1; {
+				if time.Now().After(deadline) {
+					t.Fatalf("slot not given back: %d of %d held", len(h.sem), cap(h.sem))
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			for i := 0; i < cap(h.sem)-1; i++ {
+				<-h.sem
+			}
+		})
+	}
+}

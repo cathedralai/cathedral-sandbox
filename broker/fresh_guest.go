@@ -31,8 +31,10 @@
 //  3. A slot is advertised only while its hotel is admitted now and its
 //     AMD-verified measurement is in both escape_fresh_measurements and the
 //     live sealed_measurements (freshKitAttested). The create pin
-//     (escape_fresh_create.go pinFresh) refuses any other hotel unsent, so an
-//     older kit that would ignore the fresh headers never gets a fresh create.
+//     (escape_fresh_create.go pinFresh) refuses any other hotel unsent, and
+//     createOne checks the kit and the expected binding again after the slot
+//     wait, so an older kit that would ignore the fresh headers never gets a
+//     fresh create.
 //
 // Each answer is computed from current state (runtime hotel PATCH, hotel
 // labels) and sent with Cache-Control: no-store. A slot that is no longer an
