@@ -280,6 +280,23 @@ the token and its check are built, enforcement on Hippius (AB#394) is not), the 
 persistent registry, and the live proof: a workspace written on one sealed
 hotel restores on another host.
 
+### Turning synced volumes on in a sealed build (AB#789)
+
+`build-guest.sh` writes the volume agent's settings into the measured
+`room.env` only when `sealed.env` sets `SEALED_ROOM_VOLUMES=1`:
+
+| sealed.env | room.env | Check before the build |
+|---|---|---|
+| `SEALED_ROOM_VOLUMES` | `ROOM_VOLUMES=1` | 0 or 1; 1 needs `SEALED_DATA_GIB > 0` |
+| `SEALED_ROOM_VOLUME_REGISTRY_URL` | `ROOM_VOLUME_REGISTRY_URL` | https, lower-case host, no login, query or trailing slash |
+| `SEALED_ROOM_VOLUME_GATEWAY_URL` | `ROOM_VOLUME_GATEWAY_URL` | same |
+| `SEALED_ROOM_VOLUME_REGISTRY_KEYS` | `ROOM_VOLUME_REGISTRY_KEYS` | 1 to 4 comma-separated base64 Ed25519 public keys |
+| `SEALED_ROOM_VOLUME_COMMIT_SECONDS` | `ROOM_VOLUME_COMMIT_SECONDS` | empty, 0 or 30..86400 |
+
+All five are measured, so a guest trusts only the registry keys and origins
+its measurement names. With `SEALED_ROOM_VOLUMES` 0 or unset no volume line is
+written and the `room.env` bytes (and the measurement) are as before.
+
 ## Still not covered
 
 - **Integrity and freshness (tracked separately, see AB#396).** XTS has no
