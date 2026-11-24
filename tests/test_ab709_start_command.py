@@ -314,3 +314,11 @@ def test_shipped_allowlist_lists_both_desktop_images_with_one_argv() -> None:
     desktop_argv = ("desktop-up", "--tunnel", "--foreground")
     assert argv_by_digest["sha256:aa77f9197555ff4500d22150eedc44801f54471ded1796e0b340d643e9ff67a7"] == desktop_argv
     assert argv_by_digest["sha256:d1a0e45cf1aeca6d1eb2ec0295296cd5db29c229284d80e88085065abcc8cbe9"] == desktop_argv
+
+
+def test_shipped_allowlist_lists_the_tunnel_retry_image_with_the_same_argv() -> None:
+    """AB#709: the desktop #32 image (tunnel retry at boot) joins the list with the shared argv."""
+    allow = load_start_commands(Path(__file__).resolve().parents[1] / "cathedral" / "start_commands.json")
+    argv_by_digest = {e.image_digest: tuple(e.argv) for e in allow.entries}
+    desktop_argv = ("desktop-up", "--tunnel", "--foreground")
+    assert argv_by_digest["sha256:20f01a7562ed9ec894dbb6fb8904ff92b64d9b6c810d5bd3307fa063c2e2ec72"] == desktop_argv
