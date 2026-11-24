@@ -216,3 +216,20 @@ func TestSS58KnownKey(t *testing.T) {
 		t.Fatalf("got %x, want %s", key, want)
 	}
 }
+
+func TestOversizedHotkeyRefusedFast(t *testing.T) {
+	f, h, body, method, path, nonce := firstValid(t)
+	long := make([]byte, 1<<20)
+	for i := range long {
+		long[i] = '2'
+	}
+	h.Set(HeaderHotkey, string(long))
+	start := time.Now()
+	_, err := verifierAt(f.ServiceHotkey, nonce).Verify(h, body, method, path)
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("got %v, want ErrMalformed", err)
+	}
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Fatalf("oversized hotkey took %v; it must be refused before decoding", d)
+	}
+}

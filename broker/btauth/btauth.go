@@ -266,12 +266,19 @@ func verifySignature(scheme string, payload, sig []byte, pub [32]byte) (bool, er
 	return false, fail(ErrUnsupported, "unsupported signature scheme")
 }
 
+const maxSS58Length = 50
+
 const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 // SS58PublicKey decodes a 32-byte account address and checks its checksum
 // (blake2b-512 over "SS58PRE" + prefix + key, first two bytes).
 func SS58PublicKey(addr string) ([32]byte, error) {
 	var key [32]byte
+	// A 32-byte account is at most 50 Base58 characters (2-byte prefix). Refuse
+	// longer input before decoding: Base58 decoding is quadratic in length.
+	if len(addr) > maxSS58Length {
+		return key, errors.New("address too long")
+	}
 	raw, err := base58Decode(addr)
 	if err != nil {
 		return key, err
