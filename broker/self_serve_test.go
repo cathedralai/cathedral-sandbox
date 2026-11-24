@@ -78,7 +78,8 @@ func ssKeyWorks(t *testing.T, tc *testChain, key string) bool {
 func TestSelfServeCreateRotateRevoke(t *testing.T) {
 	tc := selfServeChain(t, nil)
 	doc := tc.putSelfServe(t, ssID, ssBody("ss-key-1", 2), 201)
-	if doc["created"] != true || doc["key_changed"] != true || doc["revoked"] != false || doc["max_rooms"] != 2.0 {
+	if doc["created"] != true || doc["key_changed"] != true || doc["revoked"] != false || doc["max_rooms"] != 2.0 ||
+		doc["max_creates_per_minute"] != 120.0 || doc["max_rooms_ceiling"] != 5.0 {
 		t.Fatalf("create answer %v", doc)
 	}
 	if strings.Contains(string(mustMarshal(doc)), sha("ss-key-1")) {
@@ -393,6 +394,93 @@ func TestSelfServeFileGuestWinsAnIDAtStart(t *testing.T) {
 	raw, _ := os.ReadFile(filepath.Join(tc.b.cfg.StateDir, selfServeFile))
 	if !strings.Contains(string(raw), ssID) || !strings.Contains(string(raw), "acct-other0001") {
 		t.Fatalf("file after a save %s", raw)
+	}
+	if strings.Contains(string(raw), sha("ss-key-1")) {
+		t.Fatalf("a skipped entry kept its key hash: %s", raw)
+	}
+	// The file guest goes: the old self-serve key does not come back.
+	ssEdit(t, tc, func(c *config) { c.Guests = c.Guests[:len(c.Guests)-1] })
+	if ssKeyWorks(t, tc, "ss-key-1") {
+		t.Fatal("a skipped entry's key came back")
+	}
+	if g := tc.b.guestByID(ssID); g == nil || !g.selfServe {
+		t.Fatalf("guest %s after the file guest left: %+v", ssID, g)
+	}
+	tc.putSelfServe(t, ssID, ssBody("ss-key-4", 1), 200)
+	if !ssKeyWorks(t, tc, "ss-key-4") {
+		t.Fatal("re-key after the file guest left")
+	}
+}
+
+// At start an entry whose key hash is already taken (a config file guest's,
+// or an earlier self-serve entry's) is revoked, and the file says so.
+func TestSelfServeDuplicateKeyIsRevokedAtStart(t *testing.T) {
+	tc := selfServeChain(t, nil)
+	path := filepath.Join(tc.b.cfg.StateDir, selfServeFile)
+	doc := selfServeFileDoc{Version: 1, Guests: map[string]selfServeEntry{
+		"acct-dup000a": {KeySHA256: sha("dup"), MaxRooms: 1},
+		"acct-dup000b": {KeySHA256: strings.ToUpper(sha("dup")), MaxRooms: 1},
+		"acct-file001": {KeySHA256: sha("key1"), MaxRooms: 1},
+		"acct-good001": {KeySHA256: sha("good"), MaxRooms: 1},
+	}}
+	raw, _ := json.Marshal(doc)
+	if err := os.MkdirAll(tc.b.cfg.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tc.restart(t)
+	if g := tc.b.guestFromKey(keyedRequest("dup")); g == nil || g.cfg.ID != "acct-dup000a" {
+		t.Fatalf("dup key reaches %+v, want acct-dup000a (loaded first)", g)
+	}
+	if g := tc.b.guestFromKey(keyedRequest("key1")); g == nil || g.cfg.ID != "g1" {
+		t.Fatalf("key1 reaches %+v, want the config file guest g1", g)
+	}
+	if !ssKeyWorks(t, tc, "good") {
+		t.Fatal("an entry with its own key was revoked")
+	}
+	revoked := map[string]bool{}
+	for _, e := range tc.listSelfServe(t) {
+		m := e.(map[string]any)
+		revoked[m["id"].(string)] = m["revoked"].(bool)
+	}
+	if !revoked["acct-dup000b"] || !revoked["acct-file001"] || revoked["acct-dup000a"] || revoked["acct-good001"] {
+		t.Fatalf("revoked %v", revoked)
+	}
+	var f selfServeFileDoc
+	raw, _ = os.ReadFile(path)
+	if err := json.Unmarshal(raw, &f); err != nil || f.Guests["acct-dup000b"].KeySHA256 != "" || f.Guests["acct-file001"].KeySHA256 != "" || f.Guests["acct-dup000a"].KeySHA256 != sha("dup") {
+		t.Fatalf("file after start %s", raw)
+	}
+}
+
+// A DELETE whose write fails answers 500; a retry writes again, so its 200
+// means a restart keeps the revoke.
+func TestSelfServeRevokeRetryIsDurable(t *testing.T) {
+	tc := selfServeChain(t, nil)
+	tc.putSelfServe(t, ssID, ssBody("ss-key-1", 1), 201)
+	tmp := filepath.Join(tc.b.cfg.StateDir, selfServeFile+".tmp")
+	if err := os.Mkdir(tmp, 0o700); err != nil { // the temporary file cannot be opened
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/self-serve/"+ssID, nil); status != 500 || errCode(doc) != "state_write_failed" {
+			t.Fatalf("DELETE %d while the write fails: %d %v", i, status, doc)
+		}
+		if ssKeyWorks(t, tc, "ss-key-1") {
+			t.Fatal("the key works after a failed revoke")
+		}
+	}
+	if err := os.Remove(tmp); err != nil {
+		t.Fatal(err)
+	}
+	if status, doc := tc.call(t, "operator-key", "DELETE", "/v1/broker/self-serve/"+ssID, nil); status != 200 || doc["revoked"] != true {
+		t.Fatalf("DELETE after the repair: %d %v", status, doc)
+	}
+	tc.restart(t)
+	if ssKeyWorks(t, tc, "ss-key-1") {
+		t.Fatal("the revoked key works after a restart")
 	}
 }
 

@@ -189,16 +189,15 @@ policy is checked like a guest policy. A change to the block needs a restart.
 
 | Route (operator key) | What it does |
 |---|---|
-| `PUT /v1/broker/self-serve/<id>` | Body `{"key_sha256": "<hex>", "max_rooms": n}`, `max_rooms` 1 to `max_rooms_ceiling`. Creates the guest (201), or replaces its key or `max_rooms` (200). A new key stops the old one at once; the rooms stay the guest's. Answer: `{"id", "max_rooms", "revoked", "active_rooms", "created_at", "created", "key_changed"}`. |
-| `DELETE /v1/broker/self-serve/<id>` | Revokes the key: it leaves the key index at once. The guest and its rooms stay (still metered until they end); a later PUT re-keys it. Unknown id: 404 `guest_not_found`. |
+| `PUT /v1/broker/self-serve/<id>` | Body `{"key_sha256": "<hex>", "max_rooms": n}`, `max_rooms` 1 to `max_rooms_ceiling`. Creates the guest (201), or replaces its key or `max_rooms` (200). A new key stops the old one at once; the rooms stay the guest's. Answer: `{"id", "max_rooms", "revoked", "active_rooms", "created_at", "created", "key_changed", "max_creates_per_minute", "max_rooms_ceiling"}` (the last two are the block's). |
+| `DELETE /v1/broker/self-serve/<id>` | Revokes the key: it leaves the key index at once. The guest and its rooms stay (still metered until they end); a later PUT re-keys it. A DELETE of a guest already revoked writes the file again, so its 200 always means the revoke survives a restart. Unknown id: 404 `guest_not_found`. |
 | `GET /v1/broker/self-serve` | `{"guests": [{"id", "max_rooms", "revoked", "active_rooms", "created_at"}]}`. Never a hash. |
 
 Every self-serve guest is forced: `metered: true` (closed until the ledger
 sends an allowance), not postpaid, no `hotels` list, the block's `policy`,
 `own_hosts_only` and `default_sealed` false, and the block's
 `max_creates_per_minute`. A hotel `reserved_for` another guest stays out of
-its reach whatever the policy names, and `reserved_for` can only name a
-config file guest.
+its reach whatever the policy names.
 
 Refusals: an id that does not start with `id_prefix` or does not match
 `^[a-z0-9-]{6,64}$` gets 400 `invalid_guest_id`; the id of a config file
@@ -215,12 +214,17 @@ changes nothing. A DELETE whose write fails still revokes the key in memory
 and answers 500 `state_write_failed`: send it again, or a restart brings the
 key back. At start the file loads after the config file guests and before
 the allowances. An entry whose id is now a config file guest's is skipped
-with a log line (the file wins) and kept in the file. A file that does not
+with a log line (the file wins) and kept in the file with its key cleared,
+so it cannot come back if that file guest goes; a key hash already taken
+revokes that entry. Such changes are written back at start. A file that does not
 parse is moved aside (`.corrupt-<time>`) and the broker starts with no
 self-serve guests: those keys do not work until the API sends them again.
 A live reload keeps every self-serve key in the key index it builds; a
 reload that adds a file guest with a self-serve id gets 409 `guest_exists`,
 and one whose guest key is a self-serve key gets 409 `key_in_use`.
+`reserved_for` in the config file must name a config file guest; an operator
+can still reserve a hotel for a self-serve guest at runtime (hotel PATCH or
+join), which only narrows who else may use that hotel.
 
 ### Meter routes (AB#890)
 

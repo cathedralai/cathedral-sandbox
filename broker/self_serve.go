@@ -16,14 +16,17 @@
 // the ledger sends an allowance), not postpaid, no hotels list, the block's
 // policy, own_hosts_only and default_sealed false, the block's creates per
 // minute. A hotel reserved_for another guest is out of its reach whatever the
-// policy names (guestState.tierOf), and no hotel can be reserved for it (the
-// config file's reserved_for must name a config file guest).
+// policy names (guestState.tierOf). The config file's reserved_for must name
+// a config file guest; an operator can still reserve a hotel for a
+// self-serve guest at runtime (hotel PATCH or join), which only narrows who
+// else may use that hotel.
 //
 // The guests are kept in state_dir/self-serve-guests.json (0600, temporary
 // file, fsync, rename, directory fsync) before a PUT or DELETE answers. They
 // load at start after the config file guests and before the allowances. An
 // entry whose id is now a config file guest's is skipped (the file wins) and
-// kept in the file. A file that does not parse is moved aside and the broker
+// kept in the file with its key cleared, so it cannot come back if that file
+// guest goes. A file that does not parse is moved aside and the broker
 // starts with none: those keys do not work until the API sends them again.
 package main
 
@@ -172,17 +175,22 @@ func (b *broker) loadSelfServe() error {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	changed := false // an entry was revoked or skipped here: write the file again
 	for _, id := range ids {
 		e := f.Guests[id]
 		e.ID = id
 		switch {
 		case sc.idProblem(id) != "" || reservedGuestID(id):
 			log.Printf("%s: guest %s skipped: the id does not fit self_serve.id_prefix %q", path, id, sc.IDPrefix)
+			e.KeySHA256 = "" // never comes back on its own: a PUT re-keys it
 			b.selfServe.skipped[id] = e
+			changed = true
 			continue
 		case b.guests[id] != nil:
 			log.Printf("%s: guest %s skipped: a config file guest has this id (the file wins)", path, id)
+			e.KeySHA256 = "" // never comes back on its own: a PUT re-keys it
 			b.selfServe.skipped[id] = e
+			changed = true
 			continue
 		}
 		if e.MaxRooms < 1 || e.MaxRooms > sc.MaxRoomsCeiling {
@@ -193,10 +201,10 @@ func (b *broker) loadSelfServe() error {
 			e.KeySHA256 = strings.ToLower(e.KeySHA256)
 			if !validKeyHash(e.KeySHA256) {
 				log.Printf("%s: guest %s: the key hash is not a SHA-256 hex digest; the guest is revoked", path, id)
-				e.KeySHA256 = ""
+				e.KeySHA256, changed = "", true
 			} else if why := b.keyHashTakenLocked(e.KeySHA256, id); why != "" {
 				log.Printf("%s: guest %s: its key hash is %s; the guest is revoked", path, id, why)
-				e.KeySHA256 = ""
+				e.KeySHA256, changed = "", true
 			}
 		}
 		ep := &e
@@ -205,6 +213,12 @@ func (b *broker) loadSelfServe() error {
 		b.selfServe.entries[id] = ep
 		if ep.KeySHA256 != "" {
 			b.byKey[ep.KeySHA256] = g
+		}
+	}
+	if changed {
+		// Write the cleared keys now, so a later start cannot load them.
+		if err := b.saveSelfServe(b.selfServe.entries, b.selfServe.skipped); err != nil {
+			log.Printf("%s: the revoked and skipped entries were not written: %v; they stay revoked in memory", path, err)
 		}
 	}
 	return nil
@@ -434,6 +448,8 @@ func (b *broker) putSelfServe(w http.ResponseWriter, r *http.Request, id string)
 	b.mu.Unlock()
 	view["created"] = created
 	view["key_changed"] = keyChanged
+	view["max_creates_per_minute"] = sc.MaxCreatesPerMinute
+	view["max_rooms_ceiling"] = sc.MaxRoomsCeiling
 	status := 200
 	if created {
 		status = 201
@@ -455,8 +471,16 @@ func (b *broker) deleteSelfServe(w http.ResponseWriter, id string) {
 		return
 	}
 	if old.KeySHA256 == "" {
+		// Already revoked in memory, maybe by a DELETE whose write failed:
+		// write again, so a 200 always means a restart keeps the revoke.
+		entries, skipped := b.selfServe.copyEntriesLocked(), b.selfServe.skipped
 		view := b.selfServeViewLocked(old)
 		b.mu.Unlock()
+		if err := b.saveSelfServe(entries, skipped); err != nil {
+			log.Printf("self-serve guest %s: revoke not written: %v; revoked in memory only", id, err)
+			writeErr(w, 500, "state_write_failed", "the key is revoked now, but "+selfServeFile+" was not written, so a restart would bring it back; send the DELETE again")
+			return
+		}
 		writeJSON(w, 200, view)
 		return
 	}
