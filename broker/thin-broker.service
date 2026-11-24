@@ -1,0 +1,24 @@
+# systemd unit for the thin broker (install as /etc/systemd/system/thin-broker.service).
+[Unit]
+Description=Central booking (thin broker in front of the hotels)
+After=network-online.target
+[Service]
+User=thinbroker
+Group=thinbroker
+# The AMD chain verifier (amd_chain.go) runs as thinbroker and writes VCEKs to
+# kds_cache. A cache dir made by root (for example by running
+# verify_receipts.py by hand) makes every new chip's join fail with 422 on a
+# PermissionError (AB#947). "+" runs this as root, so the dir is owned by
+# thinbroker on every start, whoever made it.
+ExecStartPre=+/usr/bin/install -d -o thinbroker -g thinbroker -m 0700 /var/lib/thin-broker/amd-kds
+ExecStart=/usr/local/bin/thin-broker -config /etc/thin-broker/config.json
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StateDirectory=thin-broker
+[Install]
+WantedBy=multi-user.target
