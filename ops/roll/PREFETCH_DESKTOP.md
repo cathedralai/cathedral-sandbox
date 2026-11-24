@@ -19,7 +19,15 @@ Image: `ghcr.io/cathedralai/cathedral-desktop@sha256:e128515e1cf4c7648a50412832a
 
 It must equal Railway Polaris Cloud / production `CATHEDRAL_DESKTOP_IMAGE`
 and the digest on the live catalogue Desktop entry. Check before the step.
-Note: cathedral/start_commands.json:5 carries a different digest (`...ac002da4a2b5b118...`, no manifest on ghcr, 404 on 16 Nov). The pin above answers 200 on an anonymous manifest fetch. Do not copy the digest from that file.
+Image-start hotels (AB#709): `cathedral/start_commands.json` allows
+`ghcr.io/cathedralai/cathedral-desktop@sha256:aa77f9197555ff4500d22150eedc44801f54471ded1796e0b340d643e9ff67a7`
+(desktop main d8308c70, TigerVNC default, AB#956) and
+`ghcr.io/cathedralai/cathedral-desktop@sha256:d1a0e45cf1aeca6d1eb2ec0295296cd5db29c229284d80e88085065abcc8cbe9`
+(desktop c0e4ac06), both with CMD `desktop-up --tunnel --foreground`. A hotel
+whose kit carries that allowlist and is listed in
+`CATHEDRAL_DESKTOP_IMAGE_START_HOTELS` also gets the image named by
+`CATHEDRAL_DESKTOP_IMAGE_START_PIN` prefetched with the same steps. The legacy pin above
+stays for every other Desktop create until the fleet cutover.
 
 Keep the pin unless a new image is published from an `image-v*` tag on main;
 then update this file in the same PR that changes the pin.

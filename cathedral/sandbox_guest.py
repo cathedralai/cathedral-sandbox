@@ -2995,24 +2995,26 @@ class DockerGuestProvider:
         )
 
     def _dedicated_room(self, request: CreateSandboxRequest) -> bool:
-        """True when this create is on a dedicated hotel (one customer)."""
-        if os.environ.get("CATHEDRAL_HOTEL_TENANCY", "").strip().lower() == "dedicated":
-            return True
-        labels = request.labels or {}
-        return str(labels.get("cathedral.tenancy") or "").strip().lower() == "dedicated"
+        """True when this hotel is dedicated (one customer). Hotel config only: a request label
+        must never decide tenancy, since any customer can set its own labels."""
+        return os.environ.get("CATHEDRAL_HOTEL_TENANCY", "").strip().lower() == "dedicated"
 
     def _run_args_for(self, request: CreateSandboxRequest, tunables_args: Iterable[str] = ()) -> tuple[str, ...]:
-        """Docker run extras: TUN (Q5) and optional in-room /dev/sev-guest (Q4) on dedicated."""
+        """Docker run extras: TUN (URnetwork Q5) only on a dedicated hotel that allows it.
+
+        No room gets /dev/sev-guest: with it a room could derive the hotel's sealed-data key
+        (SNP_GET_DERIVED_KEY) and get reports in the boot-binding shape (AB#392). In-room
+        attestation needs a design decision first; the API's per-sandbox attestation route
+        asks the hotel instead.
+        """
         args = list(tunables_args)
-        dedicated = self._dedicated_room(request)
         if request.network_capability == "tun":
-            # Dedicated SKU, or ops override ROOM_ALLOW_TUN=1.
-            if not dedicated and os.environ.get("ROOM_ALLOW_TUN") != "1":
+            if not (self._dedicated_room(request) and os.environ.get("ROOM_ALLOW_TUN") == "1"):
                 raise SandboxOpError(
                     "tun_requires_dedicated",
                     403,
-                    "network_capability=tun needs a dedicated hotel "
-                    "(label cathedral.tenancy=dedicated or CATHEDRAL_HOTEL_TENANCY=dedicated)",
+                    "network_capability=tun needs a dedicated hotel that allows TUN "
+                    "(CATHEDRAL_HOTEL_TENANCY=dedicated and ROOM_ALLOW_TUN=1)",
                 )
             if not Path("/dev/net/tun").exists():
                 raise SandboxOpError(
@@ -3021,25 +3023,6 @@ class DockerGuestProvider:
                     "/dev/net/tun is not present on this hotel",
                 )
             args.extend(["--cap-add=NET_ADMIN", "--device=/dev/net/tun:/dev/net/tun"])
-        # URnetwork Q4: in-guest SNP reports with caller-chosen REPORT_DATA. Only on
-        # dedicated hotels (shared rooms must not share /dev/sev-guest).
-        want_sev = (
-            dedicated
-            and (
-                str((request.labels or {}).get("cathedral.attestation_device") or "").strip().lower()
-                == "sev_guest"
-                or os.environ.get("ROOM_EXPOSE_SEV_GUEST") == "1"
-            )
-        )
-        if want_sev:
-            sev = Path("/dev/sev-guest")
-            if not sev.exists():
-                raise SandboxOpError(
-                    "sev_guest_missing",
-                    503,
-                    "/dev/sev-guest is not present on this dedicated hotel",
-                )
-            args.extend([f"--device={sev}:/dev/sev-guest"])
         return tuple(args)
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
