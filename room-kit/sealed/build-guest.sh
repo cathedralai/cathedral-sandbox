@@ -112,6 +112,42 @@ if [ "$DATA_GIB" != 0 ]; then
   DATA_WS=/srv/sealed-data/workspaces
 fi
 
+# Synced volumes (AB#789, docs/SEALED_DATA_VOLUME.md): SEALED_ROOM_VOLUMES=1 turns on the
+# guest volume agent. The switch, the registry and gateway origins and the registry keys are
+# in the measured room.env, so a guest only trusts the registry its measurement names. 0 or
+# unset writes no volume line, so a hotel that does not set it builds the same room.env bytes
+# as before. Checked before the long build.
+# >>> synced volumes (tests/test_ab789_sealed_room_env_volumes.py runs this block)
+VOLUMES=${SEALED_ROOM_VOLUMES:-0}
+case "$VOLUMES" in 0|1) ;; *) echo "SEALED_ROOM_VOLUMES must be 0 or 1" >&2; exit 1 ;; esac
+VOLUME_ENV=""
+if [ "$VOLUMES" = 1 ]; then
+  [ -n "$DATA_WS" ] || { echo "SEALED_ROOM_VOLUMES=1 needs the data volume (SEALED_DATA_GIB > 0): volumes sync its workspaces" >&2; exit 1; }
+  for var in SEALED_ROOM_VOLUME_REGISTRY_URL SEALED_ROOM_VOLUME_GATEWAY_URL; do
+    if ! [[ "${!var:-}" =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?(/[A-Za-z0-9._~-]+)*$ ]]; then
+      echo "SEALED_ROOM_VOLUMES=1 needs $var: an https URL (lower-case host, optional port and path, no login, query or trailing slash)" >&2; exit 1
+    fi
+  done
+  # 1 to 4 base64 Ed25519 public keys (raw 32 bytes), comma-separated as volume_agent.from_env reads them.
+  VOLUME_KEYS=$(python3 -c '
+import base64, sys
+keys = sys.argv[1].split(",")
+ok = 1 <= len(keys) <= 4 and all(k and len(base64.b64decode(k, validate=True)) == 32
+                                 and base64.b64encode(base64.b64decode(k)).decode() == k for k in keys)
+print(",".join(dict.fromkeys(keys)) if ok else "")' "${SEALED_ROOM_VOLUME_REGISTRY_KEYS:-}" 2>/dev/null || true)
+  [ -n "$VOLUME_KEYS" ] || { echo "SEALED_ROOM_VOLUMES=1 needs SEALED_ROOM_VOLUME_REGISTRY_KEYS: 1 to 4 comma-separated base64 Ed25519 public keys" >&2; exit 1; }
+  COMMIT_SECONDS=${SEALED_ROOM_VOLUME_COMMIT_SECONDS:-}
+  if [ -n "$COMMIT_SECONDS" ] && ! [[ "$COMMIT_SECONDS" =~ ^(0|[1-9][0-9]{1,4})$ && ( "$COMMIT_SECONDS" = 0 || ( "$COMMIT_SECONDS" -ge 30 && "$COMMIT_SECONDS" -le 86400 ) ) ]]; then
+    echo "SEALED_ROOM_VOLUME_COMMIT_SECONDS must be empty, 0 or 30..86400" >&2; exit 1
+  fi
+  VOLUME_ENV="ROOM_VOLUMES=1
+ROOM_VOLUME_REGISTRY_URL=$SEALED_ROOM_VOLUME_REGISTRY_URL
+ROOM_VOLUME_GATEWAY_URL=$SEALED_ROOM_VOLUME_GATEWAY_URL
+ROOM_VOLUME_REGISTRY_KEYS=$VOLUME_KEYS
+ROOM_VOLUME_COMMIT_SECONDS=$COMMIT_SECONDS"
+fi
+# <<< synced volumes
+
 B=$SEALED_DIR/build
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$SEALED_DIR/images/$STAMP
@@ -320,6 +356,11 @@ ROOM_GUEST_INGRESS=${SEALED_ROOM_GUEST_INGRESS:-0}
 # sealed-link.sh checked (fw_cfg opt/cathedral/link). install.sh sources this file,
 # so the listen addresses resolve then; unset, the install stops.
 EOF
+if [ -n "$VOLUME_ENV" ]; then
+  { echo "# Synced volumes (AB#789): install.sh fetches the pinned restic and the receipts front runs the"
+    echo "# guest volume agent against this registry and gateway, trusting only these registry keys."
+    echo "$VOLUME_ENV"; } >> "$R/opt/room-kit/room.env"
+fi
 if [ -n "$INGRESS_ZONE" ]; then
   cat >> "$R/opt/room-kit/room.env" <<EOF
 # Preview URL ingress (AB#422): the front serves HTTPS here with the guest-made key,
