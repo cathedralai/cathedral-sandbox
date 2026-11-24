@@ -21,10 +21,18 @@
 //  1. The guest opts in, default off: "escape_fresh_guest": {"slots": [...]}
 //     in its config entry. Every slot must be in the guest's explicit "hotels"
 //     list (no policy, no absent list meaning "all").
-//  2. freshGuestEnforcement reports every guarantee implemented. It is a
-//     compiled-in fact of this build, not config: each field turns true only in
-//     the change that implements and tests that guarantee. Today none is, so a
-//     live broker never advertises, whatever its config says.
+//  2. The broker reports every guarantee enforced, from its config at start
+//     (freshGuestEnforcementFor). Three of the four rest on the guest kit
+//     (room-kit room_receipts.py: #671 #672 #676), so they hold only for a
+//     hotel whose attested launch measurement is one the operator listed in
+//     escape_fresh_measurements: the measurements of guest kits built with
+//     that code. An empty list (the default) enforces nothing, and a live
+//     broker never advertises, whatever its guest config says.
+//  3. A slot is advertised only while its hotel is admitted now and its
+//     AMD-verified measurement is in both escape_fresh_measurements and the
+//     live sealed_measurements (freshKitAttested). The create pin
+//     (escape_fresh_create.go pinFresh) refuses any other hotel unsent, so an
+//     older kit that would ignore the fresh headers never gets a fresh create.
 //
 // Each answer is computed from current state (runtime hotel PATCH, hotel
 // labels) and sent with Cache-Control: no-store. A slot that is no longer an
@@ -35,8 +43,8 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"regexp"
+	"time"
 )
 
 const (
@@ -65,11 +73,74 @@ func (f freshGuestGuarantees) complete() bool {
 	return f.DurableSingleUse && f.ExpectedBinding && f.AttemptBoundPlant && f.Recovery == freshGuestRecovery
 }
 
-// freshGuestEnforcement is what this build implements. None of it is yet
-// (AB#683: the durable dispatch and the guest kit enforcement are follow-ups).
-// Do not set a field true without the code and tests that make it so. Tests
-// replace this value to exercise the advertisement.
-var freshGuestEnforcement = freshGuestGuarantees{}
+// freshGuestEnforcementFor is what a broker started on c enforces. The broker
+// halves are code in this build: the plant forward and its strict shape
+// (escape_nonce.go, #671), the create pin, header forward and same request
+// replay (escape_fresh_create.go, #677). The guest halves are the kit's: the
+// durable attempt and launch reservation before dispatch (#676), the expected
+// launch and binding check (#676), the one plant into the attempt's own live
+// room (#671 #672), and the durable refusal of a repeat after a broker
+// restart (#676). They are enforced only on a hotel running a listed kit, so
+// none is claimed without escape_fresh_measurements.
+func freshGuestEnforcementFor(c config) freshGuestGuarantees {
+	if len(c.EscapeFreshMeasurements) == 0 {
+		return freshGuestGuarantees{}
+	}
+	return freshGuestGuarantees{
+		DurableSingleUse:  true,
+		ExpectedBinding:   true,
+		AttemptBoundPlant: true,
+		Recovery:          freshGuestRecovery,
+	}
+}
+
+var errFreshMeasurements = errors.New("escape_fresh_measurements")
+
+// measurementHexRE is a SEV-SNP launch measurement (48 bytes), lower case.
+var measurementHexRE = regexp.MustCompile(`^[0-9a-f]{96}$`)
+
+// validateFreshMeasurements checks escape_fresh_measurements in every config
+// file read (start, -check-config, reload): each a lower case 96 hex launch
+// measurement, no repeats.
+func validateFreshMeasurements(c config) error {
+	seen := map[string]bool{}
+	for _, m := range c.EscapeFreshMeasurements {
+		if !measurementHexRE.MatchString(m) {
+			return fmt.Errorf("config: %w: %q is not a 96 character lower case hex launch measurement", errFreshMeasurements, m)
+		}
+		if seen[m] {
+			return fmt.Errorf("config: %w: %s... appears twice", errFreshMeasurements, m[:16])
+		}
+		seen[m] = true
+	}
+	return nil
+}
+
+// checkFreshMeasurementsSealed is the start check: each fresh kit is also in
+// sealed_measurements, since a kit the gate refuses is no fresh kit. Not
+// applied on a reload, so a reload can still withdraw a measurement at once;
+// freshKitAttested reads the live list.
+func checkFreshMeasurementsSealed(c config) error {
+	for _, m := range c.EscapeFreshMeasurements {
+		if !inFold(c.SealedMeasurements, m) {
+			return fmt.Errorf("config: %w: %s... is not in sealed_measurements", errFreshMeasurements, m[:16])
+		}
+	}
+	return nil
+}
+
+// freshKitAttested: h runs a guest kit that enforces the fresh guarantees, as
+// far as the broker can know now. h is admitted, its measurement came from an
+// AMD-verified attestation of its current binding, and that measurement is in
+// escape_fresh_measurements and still in the live sealed_measurements (a
+// reload can drop it). Caller holds b.mu.
+func (b *broker) freshKitAttested(h *hotel, now time.Time) bool {
+	a := h.adm
+	if a.measurement == "" || a.bindingSHA == "" || a.amd == nil || a.amdBinding != a.bindingSHA {
+		return false
+	}
+	return b.admitted(h, now) && inFold(b.cfg.EscapeFreshMeasurements, a.measurement) && inFold(b.sealedMeasurements(), a.measurement)
+}
 
 var errFreshGuestConfig = errors.New("escape_fresh_guest")
 
@@ -103,9 +174,6 @@ func validateFreshGuestConfig(gc guestConfig) error {
 			return bad(fmt.Sprintf("slot %q is not in the guest's hotels", s))
 		}
 	}
-	if !freshGuestEnforcement.complete() {
-		log.Printf("guest %s: escape_fresh_guest configured, but this broker build does not implement fresh guest enforcement; not advertised (AB#683)", gc.ID)
-	}
 	return nil
 }
 
@@ -113,20 +181,21 @@ func validateFreshGuestConfig(gc guestConfig) error {
 // the broker must not advertise. Caller holds b.mu (lim is g.limits under it).
 func (b *broker) freshGuestAdvertisement(g *guestState, lim guestLimits) map[string]any {
 	fg := g.cfg.EscapeFreshGuest
-	if fg == nil || !freshGuestEnforcement.complete() || lim.Policy != nil {
+	if fg == nil || !b.freshEnforcement.complete() || lim.Policy != nil {
 		return nil
 	}
 	allowed := map[string]bool{}
 	for _, h := range lim.Hotels {
 		allowed[h] = true
 	}
+	now := time.Now()
 	slots := []string{}
 	for _, s := range fg.Slots {
 		if !allowed[s] {
 			continue // removed by a runtime PATCH
 		}
 		h := b.hotelByID(s)
-		if h == nil || !h.cfg.Sealed || !h.isEscape() {
+		if h == nil || !h.cfg.Sealed || !h.isEscape() || !b.freshKitAttested(h, now) {
 			continue
 		}
 		slots = append(slots, s)

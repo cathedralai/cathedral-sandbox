@@ -231,6 +231,13 @@ type config struct {
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
 	SealedMeasurements []string `json:"sealed_measurements,omitempty"` // a gated hotel's measurement must be one of these; empty refuses every gated hotel
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`    // non-empty: its HOST_DATA must be one of these
+	// EscapeFreshMeasurements lists the launch measurements of guest kits
+	// that enforce the AB#683 fresh guest guarantees (room-kit with #671,
+	// #672 and #676). Each must also be in sealed_measurements. Only a hotel
+	// attested with one of these is a fresh slot (fresh_guest.go). Empty, the
+	// default: no fresh guest capability is advertised and no fresh create is
+	// sent. A change needs a restart.
+	EscapeFreshMeasurements []string `json:"escape_fresh_measurements,omitempty"`
 	// An optional Genoa SNP firmware component floor. Zero leaves it unset
 	// until patched hosts are available. It does not prove the OEM PI fix.
 	MinGenoaSNPSPL int `json:"min_genoa_snp_spl,omitempty"`
@@ -477,6 +484,7 @@ type broker struct {
 	cfg              config
 	loopsCtx         atomic.Pointer[context.Context] // the sync loops' context from main; nil in tests (loopsContext)
 	freshReplays     freshReplays                    // AB#683 fresh creates by attempt and launch (escape_fresh_create.go)
+	freshEnforcement freshGuestGuarantees            // AB#683 guarantees this broker enforces, set at start from cfg (fresh_guest.go)
 	terminalWSIdle   time.Duration                   // idle close of a terminal socket; 0: defaultTerminalWSIdle (terminal_ws.go)
 	mu               sync.Mutex
 	hset             atomic.Pointer[hotelSet] // hotels; replaced as a whole when one joins or leaves (hotels.go)
@@ -604,11 +612,20 @@ func loadBroker(path string) (*broker, error) {
 	if err := validateTopConfig(c); err != nil {
 		return nil, err
 	}
+	if err := checkFreshMeasurementsSealed(c); err != nil {
+		return nil, err
+	}
 	alerts, err := newAlerter(c.Alerts)
 	if err != nil {
 		return nil, err
 	}
 	b := &broker{cfgPath: path, cfg: c, alerts: alerts, guests: map[string]*guestState{}, byKey: map[string]*guestState{}, byUUID: map[string]*room{}, compat: newCompat(), answers: newAnswerPool(), nexec: newNativeExecs(), shares: map[string]*liveShare{}, started: time.Now()}
+	b.freshEnforcement = freshGuestEnforcementFor(c)
+	for _, gc := range c.Guests {
+		if gc.EscapeFreshGuest != nil && !b.freshEnforcement.complete() {
+			log.Printf("guest %s: escape_fresh_guest configured, but escape_fresh_measurements is empty: no fresh guest kit is known, not advertised (AB#683)", gc.ID)
+		}
+	}
 	var optedIn []string // require_attestation hotels, for one deprecation line
 	for _, hc := range c.Hotels {
 		h, err := prepareConfigHotel(c, hc)
@@ -686,6 +703,9 @@ func loadBroker(path string) (*broker, error) {
 // validateTopConfig is the start's check of the config file's top-level
 // fields. A live reload (reload.go) runs it on the new file too.
 func validateTopConfig(c config) error {
+	if err := validateFreshMeasurements(c); err != nil {
+		return err
+	}
 	if err := refusePlaintextEscapeNonce(c.EscapeNonceAllowPlaintext); err != nil {
 		return err
 	}

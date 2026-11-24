@@ -26,6 +26,8 @@ var (
 // c is an ordinary hotel. Every create the hotels get is recorded with its
 // headers. g1 (the API guest) holds the #659 fresh guest capability on a and b,
 // with hotels a, b and c; so do the guests in alsoOptIn. g2 otherwise has none.
+// escape_fresh_measurements lists the fresh kit, and a and b are attested with
+// it (AMD-verified, their own bindings).
 func freshCreateChain(t *testing.T, alsoOptIn ...string) (*testChain, *ownerSeen) {
 	t.Helper()
 	return freshCreateChainWith(t, nil, alsoOptIn...)
@@ -42,6 +44,10 @@ func freshCreateChainWith(t *testing.T, edit func(*config), alsoOptIn ...string)
 		optIn[id] = true
 	}
 	rewriteConfig(t, tc, func(c *config) {
+		c.EscapeFreshMeasurements = []string{freshKitMeasurement}
+		if !inFold(c.SealedMeasurements, freshKitMeasurement) {
+			c.SealedMeasurements = append(c.SealedMeasurements, freshKitMeasurement, olderKitMeasurement)
+		}
 		for i := range c.Guests {
 			if optIn[c.Guests[i].ID] {
 				c.Guests[i].Hotels = []string{"a", "b", "c"}
@@ -59,7 +65,9 @@ func freshCreateChainWith(t *testing.T, edit func(*config), alsoOptIn ...string)
 		h.cfgMu.Lock()
 		enableEscapeHotel(h)
 		h.cfgMu.Unlock()
-		h.adm.bindingSHA = binding
+		h.adm.bindingSHA, h.adm.measurement = binding, freshKitMeasurement
+		h.adm.amd, h.adm.amdBinding = map[string]any{"product": "Genoa", "ark_sha256": testARKPin}, binding
+		h.adm.attestedAt = time.Now()
 	}
 	tc.b.mu.Unlock()
 	return tc, seen
@@ -523,6 +531,49 @@ func TestFreshCreateSlotRemovedAtRuntimeIsRefusedUnsent(t *testing.T) {
 	ans := freshPost(t, tc, freshCreateBody(), defaultAssign().headers(), nil)
 	if ans.status != 403 || errCode(ans.doc) != "escape_fresh_not_enabled" {
 		t.Fatalf("slot left the guest's hotels: %d %v", ans.status, ans.doc)
+	}
+	noHotelCreate(t, seen)
+}
+
+// The hotel of the expected binding must run a listed fresh guest kit: an
+// older kit would ignore both headers and make an unfenced room. Refused
+// unsent, on the hotel's own kit only (the other slot still works).
+func TestFreshCreateOnAHotelWithoutAFreshKitIsRefusedUnsent(t *testing.T) {
+	cases := map[string]func(h *hotel){
+		"older sealed kit":             func(h *hotel) { h.adm.measurement = olderKitMeasurement },
+		"no AMD chain":                 func(h *hotel) { h.adm.amd = nil },
+		"AMD chain of a stale binding": func(h *hotel) { h.adm.amdBinding = sha("older binding") },
+	}
+	for name, edit := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc, seen := freshCreateChain(t)
+			tc.b.mu.Lock()
+			edit(tc.b.hotelByID("b"))
+			tc.b.mu.Unlock()
+			ans := freshPost(t, tc, freshCreateBody(), defaultAssign().headers(), nil)
+			if ans.status != 409 || errCode(ans.doc) != "escape_fresh_kit_unverified" {
+				t.Fatalf("hotel without a fresh kit: %d %v", ans.status, ans.doc)
+			}
+			noHotelCreate(t, seen)
+			a := defaultAssign()
+			a.attempt, a.report, a.binding = "attempt-2", "launch-2", freshBindingA
+			if ok := freshPost(t, tc, freshCreateBody(), a.headers(), nil); ok.status != 202 || ok.doc["hotel"] != "a" {
+				t.Fatalf("control on the fresh kit: %d %v", ok.status, ok.doc)
+			}
+		})
+	}
+}
+
+// With no escape_fresh_measurements the broker enforces nothing, so it sends
+// no fresh create at all, even to an opted-in guest on an attested hotel.
+func TestFreshCreateWithNoFreshKitListedIsRefusedUnsent(t *testing.T) {
+	tc, seen := freshCreateChainWith(t, func(c *config) { c.EscapeFreshMeasurements = nil })
+	if tc.b.freshEnforcement.complete() {
+		t.Fatal("enforcement claimed with no escape_fresh_measurements")
+	}
+	ans := freshPost(t, tc, freshCreateBody(), defaultAssign().headers(), nil)
+	if ans.status != 409 || errCode(ans.doc) != "escape_fresh_kit_unverified" {
+		t.Fatalf("no fresh kit listed: %d %v", ans.status, ans.doc)
 	}
 	noHotelCreate(t, seen)
 }
