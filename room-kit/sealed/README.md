@@ -150,6 +150,26 @@ openssl genpkey -algorithm ed25519 -out owner.pem          # the owner, on their
 python3 owner_sign.py --key owner.pem --public --raw-out owner.pub
 ```
 
+### Dedicated guest TUN (AB#938)
+
+For an owner-bound sealed guest that needs TUN, build with
+`SEALED_HOTEL_TENANCY=dedicated` and `SEALED_ROOM_ALLOW_TUN=1`.
+These settings enter the measured `room.env`; the installer passes them to
+both the loopback API and the receipt front. The build also loads the guest
+kernel's `tun` module. Shared builds default to TUN off.
+
+Launch with `SEALED_OWNER_PUBKEY_FILE` as above. If the configured dedicated
+guest has no valid owner binding in its SNP report, the front refuses startup,
+including on an unsealed host. It cannot silently fall back to shared tenancy.
+Creates still need the owner's signature. TUN exposes only `/dev/net/tun`
+with `NET_ADMIN`, never `/dev/sev-guest`.
+
+This dedicates the sealed guest to one owner, not the physical server. It is
+not a rollout or availability claim. Use separate capacity without customer
+work; approve and pin the new measurement before live testing. Acceptance
+must verify the owner-bound attestation, unsigned-create rejection, TUN/UDP,
+renewal and shared-pool refusal on that exact build.
+
 ### The trust chain
 
 1. **AMD signs the report.** The verifier checks ARK, ASK, VCEK and the report

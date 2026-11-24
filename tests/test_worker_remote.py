@@ -1228,10 +1228,18 @@ def test_saturated_class_pool_returns_503_before_body_framing():
             unblock.set()
             holder.join(timeout=5.0)
 
-        assert _raw_http_status(srv.port, b"") == 411
-        assert _raw_http_status(srv.port, b"Content-Length: nope\r\n") == 400
-        assert _raw_http_status(srv.port, b"Content-Length: 999999\r\n") == 413
-        assert _raw_http_status(srv.port, b"Transfer-Encoding: chunked\r\n") == 400
+        assert not holder.is_alive()
+        for headers, expected in (
+            (b"", 411),
+            (b"Content-Length: nope\r\n", 400),
+            (b"Content-Length: 999999\r\n", 413),
+            (b"Transfer-Encoding: chunked\r\n", 400),
+        ):
+            # Reading response bytes does not wait for do_POST's finally to
+            # release the class permit. Prove cleanup before testing framing
+            # with an empty pool; the saturated checks above stay unchanged.
+            _wait_for_active_connections(srv, 0)
+            assert _raw_http_status(srv.port, headers) == expected
 
 
 def test_total_request_deadline_ends_a_trickled_body():

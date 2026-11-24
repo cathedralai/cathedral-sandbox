@@ -1684,6 +1684,14 @@ class Ledger:
         self.sealed_env = SealedEnv() if secrets is not None else None
         # Raw Ed25519 owner key on a dedicated sealed machine, else None (no gate).
         self.owner_key: bytes | None = None
+        # Measured dedicated/TUN configuration may never silently serve shared
+        # or fall back to the unsealed hotel chain when launch inputs are absent.
+        self.requires_owner = (
+            os.environ.get("CATHEDRAL_HOTEL_TENANCY") == "dedicated"
+            or os.environ.get("ROOM_ALLOW_TUN") == "1"
+        )
+        if self.requires_owner and tsm_provider() != "sev_guest":
+            raise OwnerBindingError("dedicated configuration requires an SNP owner binding")
         if tsm_provider() == "sev_guest":
             self._init_sealed(hotel, store)
         elif miner is not None:
@@ -1733,6 +1741,8 @@ class Ledger:
         # Before any key or binding exists: a dedicated machine whose fw_cfg
         # owner HOST_DATA does not name raises here and never serves.
         owner = owner_tenancy(facts["host_data"])
+        if self.requires_owner and owner is None:
+            raise OwnerBindingError("dedicated configuration requires an SNP owner binding")
         self.binding = {
             "schema": BINDING_SCHEMA,
             "hotel": hotel,
