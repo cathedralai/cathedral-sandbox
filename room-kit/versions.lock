@@ -81,7 +81,12 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # Pinned 2026-11-23 to 82016c3: main after #705 (exec on a frozen room answers 409 sandbox_frozen before any
 # work, AB#948). The only change to cathedral/ since 1e79d18, so the one non-const re-seal carries #697 and #705.
 # Same make-dist.sh; the 1e79d18 tarball rebuilds to its pinned sha 9f4a3d4d... with the same tool.
-CATHEDRAL_COMMIT=82016c3
-CATHEDRAL_TARBALL=dist/cathedral-82016c3.tar.gz
-CATHEDRAL_TARBALL_SHA256=bdbb135944a54df5860036c1d1a41d24572adf7010f41997d34cd7f534429d2b
+# Pinned 2026-11-24 to de28030: main after #707 (the entrypoint log is withheld per room from its first
+# sealed secret or sealed exec; the API records the switch point at POST /v1/sandboxes/<room>/sealed-mark,
+# AB#791). The only change to cathedral/ since 82016c3. room_receipts.py in the same kit calls that mark,
+# so the kit and the API must move together. Same make-dist.sh; the 82016c3 tarball rebuilds to its pinned
+# sha bdbb1359... with the same tool.
+CATHEDRAL_COMMIT=de28030
+CATHEDRAL_TARBALL=dist/cathedral-de28030.tar.gz
+CATHEDRAL_TARBALL_SHA256=683b27a1181db2397a576a67561751288359f7ca325a64b6f6bcef071635bf9f
 PROBE_IMAGE=alpine:3.20
