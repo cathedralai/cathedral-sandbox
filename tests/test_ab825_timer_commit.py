@@ -134,6 +134,33 @@ def test_other_refusals_keep_the_volume_attached(monkeypatch, tmp_path):
     assert "vol1" in agent.mounts and timer.snapshot()["vol1"]["last_error"] == "lease_expired"
 
 
+def test_refusal_never_detaches_a_mount_attached_after_it(monkeypatch, tmp_path):
+    world, agent, workspace, timer = _attached(monkeypatch, tmp_path)
+    agent.registry = Refusing(world.client, 409, "lease_not_current")
+    real = agent.commit_if_changed
+    replacement = dict(agent.mounts["vol1"], lease={"new": True})
+
+    def commit_then_reattach(volume_id):
+        try:
+            return real(volume_id)
+        finally:
+            # The refused commit already let go of the lock: a re-attach publishes a new mount now.
+            assert volume_id not in agent.mounts
+            agent.mounts[volume_id] = replacement
+
+    monkeypatch.setattr(agent, "commit_if_changed", commit_then_reattach)
+    timer.tick()
+    assert agent.mounts["vol1"] is replacement and timer.snapshot()["vol1"]["detached"] is True
+
+
+def test_fingerprint_handles_non_utf8_names(tmp_path):
+    name = os.fsdecode(b"bad-\xff-name")
+    (tmp_path / name).write_text("x")
+    first = va.workspace_fingerprint(str(tmp_path))
+    (tmp_path / name).write_text("changed")
+    assert first and va.workspace_fingerprint(str(tmp_path)) != first
+
+
 def test_one_volume_crashing_does_not_stop_the_others(monkeypatch, tmp_path):
     world, agent, workspace, timer = _attached(monkeypatch, tmp_path)
     agent.mounts["vol0"] = dict(agent.mounts["vol1"])

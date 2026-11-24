@@ -291,13 +291,6 @@ class VolumeAgent:
         # volume because two volumes may be attached to the same workspace.
         self._lock = threading.Lock()
 
-    def detach(self, volume_id: str, *, forget_key: bool = False) -> None:
-        """Stop committing a volume. forget_key also drops its restic password from guest memory."""
-        with self._lock:
-            self.mounts.pop(volume_id, None)
-            if forget_key:
-                self.keys.passwords.pop(volume_id, None)
-
     def _env(self, volume_id: str, token: dict) -> dict:
         parts = urlsplit(self.gateway)
         url = (f"rest:{parts.scheme}://volume:{volume_gateway.encode_token(token)}@{parts.netloc}"
@@ -399,7 +392,16 @@ class VolumeAgent:
                 raise VolumeRefused("volume_not_attached")
             if mount["pending"] is None and workspace_fingerprint(mount["target"]) == mount["fingerprint"]:
                 return None
-            return self._commit(volume_id)
+            try:
+                return self._commit(volume_id)
+            except (VolumeRefused, RegistryError) as refused:
+                # Detach under the same lock as the refused commit, so a re-attach that wins the lock
+                # next is never removed by this refusal.
+                if refused.code in DETACH_CODES and self.mounts.get(volume_id) is mount:
+                    del self.mounts[volume_id]
+                    if refused.code == "volume_shredded":
+                        self.keys.passwords.pop(volume_id, None)
+                raise
 
     def _post(self, volume_id: str, mount: dict, commit: dict) -> dict:
         mount["pending"] = commit
@@ -434,7 +436,8 @@ def workspace_fingerprint(target: str) -> str:
             st = path.lstat()
         except OSError:
             continue
-        digest.update(f"{path.relative_to(root)}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+        # fsencode: a valid Linux name need not be UTF-8 (surrogate escapes would not encode).
+        digest.update(os.fsencode(path.relative_to(root)) + f"\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
     return digest.hexdigest()
 
 
@@ -476,7 +479,6 @@ class CommitTimer:
             except (VolumeRefused, RegistryError) as refused:
                 entry["last_error"] = refused.code
                 if refused.code in DETACH_CODES:
-                    self.agent.detach(volume_id, forget_key=refused.code == "volume_shredded")
                     entry["detached"] = True
             except Exception as exc:  # noqa: BLE001 one volume's failure never stops the timer
                 entry["last_error"] = type(exc).__name__
