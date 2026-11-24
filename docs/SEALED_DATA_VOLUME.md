@@ -624,22 +624,44 @@ A volume with no accepted commit cannot be shredded yet (`nothing_to_shred`):
 the log format has no shred entry without a head. Packs a guest uploaded before
 its first commit was accepted are left to prune.
 
+AB#825 decisions (Fred, 24 Nov): Hippius holds the sealed volume storage
+(small test bucket first); Cathedral holds the volume key by default, a
+customer-held key is an option.
+
+Built for AB#825 (stacked on AB#789 and AB#790, flags off):
+
+- Timer commit (this repo, `cathedral/volume_agent.py` `CommitTimer`): every
+  `ROOM_VOLUME_COMMIT_SECONDS` (default 300, 0 off, else 30..86400; a bad value
+  keeps volumes off) the front commits each attached volume whose workspace
+  changed (path, size, mtime digest taken before the backup). The receipt is
+  the registry-signed head the commit returns, kept per volume and read at
+  `GET /room/volume-status` (bearer). A lost answer is resent as the same
+  commit next tick. An unchanged volume still asks the registry for a
+  sub-token each tick, so a shred or handover is seen without a write:
+  `volume_shredded` detaches the volume and drops its key from memory;
+  `lease_not_current` detaches it and keeps the key. An expired lease pauses
+  commits (`lease_expired` in the status) until the owner renews it (900 s
+  lease by default).
+- Key mode and the mounted shred route (polariscomputer, AB#790 registry):
+  `key_mode` `cathedral` (default) keeps a random 32-byte key per volume,
+  wrapped at rest (`CATHEDRAL_VOLUME_KEY_WRAP_KEY`), sealed only to the live
+  lease holder's volume-key-install key
+  (`POST /v1/cathedral/volumes/{id}/key-envelope`); `customer` keeps no key and
+  the owner seals their own with `seal_volume_key`. The guest takes both at
+  `/room/volume-key`. `POST /v1/cathedral/volumes/{id}/shred` takes this
+  repo's `cathedral_volume_shred_request_v1` body, deletes the key row in the
+  same transaction that marks the volume shredded, ends the lease and returns
+  a registry-signed `cathedral_volume_registry_shred_v1` receipt
+  (`cathedral_key_destroyed` false in customer mode). After it every lease,
+  sub-token, commit, chain and key route answers 410 `volume_shredded`.
+
 Still open for AB#825:
 
-- The mounted shred route on a registry host: needs the persistent registry
-  and its host (AB#395) and a decision on where the registry runs (control
-  plane or broker).
-- A real `destroy_key`: AB#392 volume key install and destroy in the release
-  service.
-- A live restore-after-shred on two sealed hotels: needs the AB#789 agent in a
-  re-seal and a Toby window.
-- The commit every N minutes with a receipt: needs the guest volume agent and
-  pinned restic (AB#789), the registry host (AB#395) and the storage gateway
-  (AB#394). Its receipt is the registry-signed head `accept` returns plus its
-  log entry, not a new schema.
-- The customer-held root key mode: needs a product decision (what the
-  customer holds, how it reaches the guest, what a shred receipt attests in
-  that mode, recovery when the key is lost), then AB#392 and AB#789.
-- The prune runner and the storage gateway that calls
-  `authorize`/`authorize_prune` in front of the bucket (AB#394).
+- Merge and ship: AB#790 (API), AB#789 (sandbox), then these two PRs; prod
+  `CATHEDRAL_VOLUME_KEY_WRAP_KEY` and the registry signing key.
+- The storage gateway in front of the Hippius test bucket (AB#394), and
+  deleting a shredded volume's objects there (prune). Needs the funded
+  bucket's credentials (Fred).
+- A live timer commit and restore-after-shred on two sealed hotels: the AB#789
+  re-seal batch and a Toby window.
 - Who holds the log key (Fred).
