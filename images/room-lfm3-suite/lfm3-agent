@@ -899,7 +899,12 @@ speak_answer() { # answer-file out-file
 # removed whole. Stream hold uses hold_secrets (credentials + non-infra env
 # values of length >= 8) so a FOO=... style secret cannot leak as deltas, while
 # PATH/HOME/MODEL/LFM3_* do not reshape every host's stream.
-read -r -d '' SECRETS_JQ <<'JQ' || true
+# The jq programs below are read with -N, not -d '': on a pipe (a here-document
+# under bash 5.2) read -d '' takes one byte per read(2) call, about 5,100 calls
+# and 55 to 58 ms in a sealed 2 vCPU room before every model request; -N reads
+# in blocks (under 1 ms). -N keeps the last newline, so it is cut to match
+# what -d '' gave (AB#541, 24 Nov 2026).
+IFS= read -r -N 1048576 SECRETS_JQ <<'JQ' || true
 def credentials:
   [$ENV | to_entries[]
    | select(.value | type == "string" and length > 0)
@@ -920,7 +925,7 @@ def hold_secrets:
 def redact($S): reduce $S[] as $v (.; split($v) | join("[redacted]"));
 JQ
 
-read -r -d '' STREAM_JQ <<'JQ' || true
+IFS= read -r -N 1048576 STREAM_JQ <<'JQ' || true
 def toks: ["<tool_call", "</tool_call", "<function=", "<parameter=", "<|", "<think"];
 def chunks: if length == 0 then empty else .[0:1024], (.[1024:] | chunks) end;
 def drain:
@@ -997,7 +1002,7 @@ JQ
 
 # What a tool call may show on the Chat surface (AB#542 section 6): a one-line
 # summary with secrets removed. Applied here, before stdout.
-read -r -d '' SUMMARY_JQ <<'JQ' || true
+IFS= read -r -N 1048576 SUMMARY_JQ <<'JQ' || true
 def u16: explode | map(if . >= 65536 then 2 else 1 end) | add // 0;
 def one_line: explode | reduce .[] as $c ({o: [], p: false};
     if $c < 32 or ($c >= 127 and $c <= 159) then (if .p then . else .o += [32] | .p = true end)
@@ -1019,6 +1024,7 @@ def summarize:
   | {r: ($s != $flat),
      t: (if ($s | u16) > 160 then ($s | .[0:157] | until(u16 <= 157; .[0:(length - 1)])) + "..." else $s end)};
 JQ
+SECRETS_JQ=${SECRETS_JQ%$'\n'} STREAM_JQ=${STREAM_JQ%$'\n'} SUMMARY_JQ=${SUMMARY_JQ%$'\n'}
 
 ev_pick_id() { # the model's call id: the id shown, unique in this turn and safe to match on
   local want=$1
