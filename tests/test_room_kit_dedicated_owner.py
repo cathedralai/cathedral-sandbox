@@ -603,3 +603,24 @@ def test_verifier_fails_a_shared_machine_and_a_level1_hotel(tmp_path, monkeypatc
     level1 = rr.Ledger("room-a", str(tmp_path / "l1"))
     out = _verify(tmp_path, level1.attestation(), [], "--owner-pubkey", pub)
     assert out["verdict"] == "FAIL" and "level 1" in out["reason"]
+
+
+@pytest.mark.parametrize("flag,value", [("CATHEDRAL_HOTEL_TENANCY", "dedicated"), ("ROOM_ALLOW_TUN", "1")])
+@pytest.mark.parametrize("sealed", [True, False])
+def test_measured_dedicated_config_refuses_missing_owner(tmp_path, monkeypatch, flag, value, sealed):
+    monkeypatch.setenv(flag, value)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    if not sealed:
+        monkeypatch.setattr(rr, "tsm_provider", lambda: None)
+    with pytest.raises(rr.OwnerBindingError, match="requires an SNP owner binding"):
+        m.ledger()
+
+
+def test_measured_tun_config_keeps_verified_owner_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("CATHEDRAL_HOTEL_TENANCY", "dedicated")
+    monkeypatch.setenv("ROOM_ALLOW_TUN", "1")
+    m = Machine(tmp_path, monkeypatch)
+    ledger = m.ledger()
+    assert ledger.owner_key == m.pub
+    assert ledger.binding["tenancy"] == "dedicated"
+    assert ledger.report[0x50:0x90] == bytes.fromhex(ledger.binding_sha256) + bytes(32)

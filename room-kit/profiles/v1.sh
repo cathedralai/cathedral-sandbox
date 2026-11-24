@@ -31,6 +31,11 @@ ROOM_CREATES_PER_MINUTE=${ROOM_CREATES_PER_MINUTE:-100}
 CATHEDRAL_DIND_DOCKERD_ARGS="${ROOM_DIND_DOCKERD_ARGS:-}"
 CATHEDRAL_DIND_ENV="${ROOM_DIND_ENV:-}"
 EOV
+  # AB#938: explicit, measured opt-in; the front refuses a missing owner binding.
+  if [ "${CATHEDRAL_HOTEL_TENANCY:-shared}" = dedicated ]; then
+    echo "CATHEDRAL_HOTEL_TENANCY=dedicated"
+    echo "ROOM_ALLOW_TUN=${ROOM_ALLOW_TUN:-0}"
+  fi
   # Persistent workspaces (#305), opt-in. room-data.sh mounts the root
   # nosuid,nodev,noexec.
   if [ "${ROOM_WORKSPACES:-0}" = 1 ]; then

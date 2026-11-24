@@ -19,6 +19,23 @@ source "$(readlink -f "${1:?usage: build-guest.sh sealed.env}")"
 source "$(dirname "$(readlink -f "$0")")/guest-constants.sh"
 log() { echo "[sealed-build] $*"; }
 
+# >>> dedicated TUN (AB#938; checked before any build work)
+TENANCY=${SEALED_HOTEL_TENANCY:-shared}
+ALLOW_TUN=${SEALED_ROOM_ALLOW_TUN:-0}
+case "$TENANCY" in shared|dedicated) ;; *) echo "SEALED_HOTEL_TENANCY must be shared or dedicated" >&2; exit 1 ;; esac
+case "$ALLOW_TUN" in 0|1) ;; *) echo "SEALED_ROOM_ALLOW_TUN must be 0 or 1" >&2; exit 1 ;; esac
+if [ "$ALLOW_TUN" = 1 ] && [ "$TENANCY" != dedicated ]; then
+  echo "SEALED_ROOM_ALLOW_TUN needs SEALED_HOTEL_TENANCY=dedicated" >&2; exit 1
+fi
+DEDICATED_ENV=""
+if [ "$TENANCY" = dedicated ]; then
+  # The receipt front verifies the launch owner against SNP HOST_DATA at boot.
+  # A missing owner key refuses startup; this flag alone cannot grant tenancy.
+  DEDICATED_ENV="CATHEDRAL_HOTEL_TENANCY=dedicated
+ROOM_ALLOW_TUN=$ALLOW_TUN"
+fi
+# <<< dedicated TUN
+
 # Miner hotel (SEALED_MINER=1, README "Miner hotel"): checked before the long
 # build. 0 or unset builds a config hotel; the files below come out as before.
 MINER=${SEALED_MINER:-0}
@@ -213,6 +230,7 @@ xfs
 overlay
 br_netfilter
 EOF
+[ "$ALLOW_TUN" != 1 ] || echo tun >> "$R/etc/modules-load.d/sealed.conf"
 
 DEBUG=0; [ -n "${SEALED_DEBUG_SSH_PUBKEY:-}" ] && DEBUG=1
 # Guest firewall on the uplink: replies, the hotel API from the host, nothing else.
@@ -356,6 +374,7 @@ ROOM_GUEST_INGRESS=${SEALED_ROOM_GUEST_INGRESS:-0}
 # sealed-link.sh checked (fw_cfg opt/cathedral/link). install.sh sources this file,
 # so the listen addresses resolve then; unset, the install stops.
 EOF
+[ -z "$DEDICATED_ENV" ] || { echo; echo "$DEDICATED_ENV"; } >> "$R/opt/room-kit/room.env"
 if [ -n "$VOLUME_ENV" ]; then
   { echo "# Synced volumes (AB#789): install.sh fetches the pinned restic and the receipts front runs the"
     echo "# guest volume agent against this registry and gateway, trusting only these registry keys."
