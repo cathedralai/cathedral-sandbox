@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -57,5 +60,39 @@ func TestHotelThatNeverAnsweredHealthIsNotUpFromRoomCalls(t *testing.T) {
 	setHotel(tc, "b", func(h *hotel) { ok = h.ok })
 	if ok {
 		t.Fatalf("a hotel with no health answer ever must not be up (its slots are unknown)")
+	}
+}
+
+// Authentication refusals must not extend the room-call health fallback.
+func TestRoomAnswerHealthFallbackRejectsAuthenticationFailures(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		refresh bool
+	}{
+		{200, true}, {202, true}, {204, true}, {400, true},
+		{401, false}, {403, false}, {404, true}, {409, true},
+		{429, true}, {500, false}, {503, false},
+	} {
+		status := tc.status
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+			h := newHotel(hotelConfig{ID: "auth-health", API: srv.URL}, "test-key")
+			previous := time.Now().Add(-time.Minute).UnixNano()
+			h.lastAnswer.Store(previous)
+			got, _, _, err := h.do(context.Background(), "GET", "/v1/sandboxes/r1", nil, nil, time.Second)
+			if err != nil || got != status {
+				t.Fatalf("response changed: status=%d err=%v", got, err)
+			}
+			answer := h.lastAnswer.Load()
+			if tc.refresh && answer <= previous {
+				t.Fatalf("eligible reply did not refresh lastAnswer: %d", answer)
+			}
+			if !tc.refresh && answer != previous {
+				t.Fatalf("status %d refreshed lastAnswer: got %d, want %d", status, answer, previous)
+			}
+		})
 	}
 }

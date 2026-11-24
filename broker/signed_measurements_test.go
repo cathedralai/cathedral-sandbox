@@ -191,3 +191,31 @@ func TestPreferChipSoftPrefer(t *testing.T) {
 		t.Fatalf("no match should keep weights: total=%v weight=%v", total, weight)
 	}
 }
+
+// require_chip_id is hard: with the matching hotel full, or another chip's hotel the
+// only one left, pick places nothing rather than on another chip (Codex/Cursor on #729).
+func TestRequireChipIDNeverPlacesOnAnotherChip(t *testing.T) {
+	want := strings.Repeat("aa", 64)
+	b := scaleBroker(t, 2, func(i int, h *hotel) {
+		h.adm.chipFull = map[int]string{0: want, 1: strings.Repeat("bb", 64)}[i]
+	})
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	hard := placement{guest: "g", preferChipID: want, requireChipID: true}
+	for i := 0; i < 200; i++ {
+		if h := b.pick(nil, hard); h == nil || h.cfg.ID != "h000" {
+			t.Fatalf("require_chip_id placed on %v, want h000", h)
+		}
+	}
+	matching := b.hotelList()[0]
+	if b.pick(map[*hotel]bool{matching: true}, hard) != nil {
+		t.Fatal("require_chip_id fell back to another chip when the matching hotel was excluded")
+	}
+	matching.slots = 0
+	if h := b.pick(nil, hard); h != nil {
+		t.Fatalf("require_chip_id placed on %s while the matching hotel was full", h.cfg.ID)
+	}
+	if h := b.pick(nil, placement{guest: "g", preferChipID: want}); h == nil || h.cfg.ID != "h001" {
+		t.Fatalf("soft prefer should fall back to the other chip when the match is full, got %v", h)
+	}
+}
