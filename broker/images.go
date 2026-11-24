@@ -38,6 +38,32 @@ import (
 
 // ---------------------------------------------------------------- hotel choice
 
+var chipIDHex = regexp.MustCompile(`(?i)^[0-9a-f]{128}$`)
+
+// preferChip, when preferChipID is set and at least one weighted hotel matches
+// that CHIP_ID, zeroes the weight of every non-matching hotel (soft prefer).
+func preferChip(hotels []*hotel, weight []float64, total float64, preferChipID string) float64 {
+	if preferChipID == "" || total <= 0 {
+		return total
+	}
+	matchTotal := 0.0
+	for i, h := range hotels {
+		if weight[i] > 0 && strings.EqualFold(h.adm.chipFull, preferChipID) {
+			matchTotal += weight[i]
+		}
+	}
+	if matchTotal <= 0 {
+		return total
+	}
+	for i, h := range hotels {
+		if weight[i] > 0 && !strings.EqualFold(h.adm.chipFull, preferChipID) {
+			total -= weight[i]
+			weight[i] = 0
+		}
+	}
+	return matchTotal
+}
+
 // placement limits where a create can go.
 type placement struct {
 	ids     map[string]bool   // empty: any hotel
@@ -75,6 +101,10 @@ type placement struct {
 	// matches, whatever the guest policy says, so no retry, fallback or
 	// queue move can reach one either.
 	ownHostsOnly bool
+	// preferChipID / requireChipID (URnetwork Q10): soft (or hard) match on
+	// the hotel's admitted SNP CHIP_ID (128 hex).
+	preferChipID  string
+	requireChipID bool
 	// fresh: an AB#683 fresh create (escape_fresh_create.go). only is then
 	// its assigned hotel; the create is sent there once or not at all.
 	fresh *freshCreate
@@ -147,7 +177,7 @@ func (pl placement) allows(h *hotel) bool {
 }
 
 // apply removes the broker fields from a create body and sets the hotel
-// snapshot id.
+// snapshot id. network_capability is left for the hotel (TUN / CapAdd).
 func (pl placement) apply(payload map[string]any) {
 	delete(payload, "hotels")
 	delete(payload, "hotel_labels")
@@ -155,6 +185,8 @@ func (pl placement) apply(payload map[string]any) {
 	delete(payload, "sealed")
 	delete(payload, "placement")
 	delete(payload, "own_hosts_only")
+	delete(payload, "prefer_chip_id")
+	delete(payload, "require_chip_id")
 	if pl.hotelSnap != "" {
 		payload["snapshot_id"] = pl.hotelSnap
 	}
@@ -473,8 +505,37 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		}
 		pl.ownHostsOnly = own
 	}
+	if v, ok := payload["prefer_chip_id"]; ok && v != nil {
+		chip, ok := v.(string)
+		if !ok || !chipIDHex.MatchString(chip) {
+			return pl, &apiErr{400, "invalid_prefer_chip_id", "prefer_chip_id must be 128 hex digits"}
+		}
+		pl.preferChipID = strings.ToLower(chip)
+	}
+	if v, ok := payload["require_chip_id"]; ok && v != nil {
+		req, ok := v.(bool)
+		if !ok {
+			return pl, &apiErr{400, "invalid_require_chip_id", "require_chip_id must be true or false"}
+		}
+		pl.requireChipID = req
+	}
+	if pl.requireChipID && pl.preferChipID == "" {
+		return pl, &apiErr{400, "require_chip_id_needs_prefer", "require_chip_id needs prefer_chip_id"}
+	}
 	_, pl.registryAuth = createRegistryAuth(payload)
 	b.scope(g, &pl)
+	if pl.requireChipID {
+		matched := false
+		for _, h := range b.hotelList() {
+			if pl.selects(h) && strings.EqualFold(h.adm.chipFull, pl.preferChipID) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return pl, &apiErr{409, "chip_id_unavailable", "no matching hotel for prefer_chip_id"}
+		}
+	}
 	for _, h := range b.hotelList() {
 		if pl.selects(h) {
 			return pl, nil

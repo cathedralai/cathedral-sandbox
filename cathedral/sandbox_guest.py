@@ -2989,10 +2989,31 @@ class DockerGuestProvider:
             attach=attach,
             mounts=mounts,
             runtime=tunables[0] if tunables is not None else None,
-            run_args=tunables[1] if tunables is not None else (),
+            run_args=self._run_args_for(request, tunables[1] if tunables is not None else ()),
             default_runtime=self._oci_runtime,
             secrets_dir=secrets_dir,
         )
+
+    def _run_args_for(self, request: CreateSandboxRequest, tunables_args: Iterable[str] = ()) -> tuple[str, ...]:
+        """Docker run extras: tunables plus optional TUN (URnetwork Q5)."""
+        args = list(tunables_args)
+        if request.network_capability == "tun":
+            # Dedicated hotels only in product; hotel ops must set ROOM_ALLOW_TUN=1.
+            if os.environ.get("ROOM_ALLOW_TUN") != "1":
+                raise SandboxOpError(
+                    "tun_not_enabled",
+                    403,
+                    "network_capability=tun needs ROOM_ALLOW_TUN=1 on this hotel "
+                    "(dedicated SKU; CAP_NET_ADMIN + /dev/net/tun)",
+                )
+            if not Path("/dev/net/tun").exists():
+                raise SandboxOpError(
+                    "tun_device_missing",
+                    503,
+                    "/dev/net/tun is not present on this hotel",
+                )
+            args.extend(["--cap-add=NET_ADMIN", "--device=/dev/net/tun:/dev/net/tun"])
+        return tuple(args)
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
         if dind:

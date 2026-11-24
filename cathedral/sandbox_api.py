@@ -580,8 +580,16 @@ class CreateSandboxRequest:
     workspace: WorkspaceSpec | None = None
     # Per-room start-up tunables (cathedral/room_tunables.py). None: the room starts as before.
     tunables: Any = None
+    # URnetwork Q5: "tun" asks for CAP_NET_ADMIN + /dev/net/tun (dedicated hotels;
+    # gated by ROOM_ALLOW_TUN=1 on the hotel). Default / None: ordinary networking.
+    network_capability: str | None = None
 
     def __post_init__(self) -> None:
+        if self.network_capability is not None:
+            cap = str(self.network_capability).strip().lower()
+            _require(cap in {"default", "tun"}, "invalid_network_capability",
+                     'network_capability must be "default" or "tun"')
+            object.__setattr__(self, "network_capability", None if cap == "default" else cap)
         if self.tunables is not None:
             from cathedral.room_tunables import RoomTunablesError, parse_room_tunables
             from cathedral.tee_box.tunables import Tunables

@@ -168,6 +168,7 @@ def _create_request(payload: dict[str, Any]) -> CreateSandboxRequest:
         "workspace": api.WorkspaceSpec.parse(payload.get("workspace")),
         "tunables": payload.get("tunables"),
         "start_image": start == "image",
+        "network_capability": payload.get("network_capability"),
     }
     return CreateSandboxRequest(**kwargs)
 
