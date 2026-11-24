@@ -2989,10 +2989,41 @@ class DockerGuestProvider:
             attach=attach,
             mounts=mounts,
             runtime=tunables[0] if tunables is not None else None,
-            run_args=tunables[1] if tunables is not None else (),
+            run_args=self._run_args_for(request, tunables[1] if tunables is not None else ()),
             default_runtime=self._oci_runtime,
             secrets_dir=secrets_dir,
         )
+
+    def _dedicated_room(self, request: CreateSandboxRequest) -> bool:
+        """True when this hotel is dedicated (one customer). Hotel config only: a request label
+        must never decide tenancy, since any customer can set its own labels."""
+        return os.environ.get("CATHEDRAL_HOTEL_TENANCY", "").strip().lower() == "dedicated"
+
+    def _run_args_for(self, request: CreateSandboxRequest, tunables_args: Iterable[str] = ()) -> tuple[str, ...]:
+        """Docker run extras: TUN (URnetwork Q5) only on a dedicated hotel that allows it.
+
+        No room gets /dev/sev-guest: with it a room could derive the hotel's sealed-data key
+        (SNP_GET_DERIVED_KEY) and get reports in the boot-binding shape (AB#392). In-room
+        attestation needs a design decision first; the API's per-sandbox attestation route
+        asks the hotel instead.
+        """
+        args = list(tunables_args)
+        if request.network_capability == "tun":
+            if not (self._dedicated_room(request) and os.environ.get("ROOM_ALLOW_TUN") == "1"):
+                raise SandboxOpError(
+                    "tun_requires_dedicated",
+                    403,
+                    "network_capability=tun needs a dedicated hotel that allows TUN "
+                    "(CATHEDRAL_HOTEL_TENANCY=dedicated and ROOM_ALLOW_TUN=1)",
+                )
+            if not Path("/dev/net/tun").exists():
+                raise SandboxOpError(
+                    "tun_device_missing",
+                    503,
+                    "/dev/net/tun is not present on this hotel",
+                )
+            args.extend(["--cap-add=NET_ADMIN", "--device=/dev/net/tun:/dev/net/tun"])
+        return tuple(args)
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
         if dind:

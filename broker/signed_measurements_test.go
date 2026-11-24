@@ -1,10 +1,15 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSignedMeasurementsLoadAndAllow(t *testing.T) {
@@ -33,6 +38,10 @@ func TestSignedMeasurementsLoadAndAllow(t *testing.T) {
 	ok, _ = c.allow("other", strings.Repeat("22", 48))
 	if !ok {
 		t.Fatal("expected global measurement allow for unknown hotel id")
+	}
+	hotels := c.hotelsForChip(strings.Repeat("aa", 64))
+	if len(hotels) != 1 || hotels[0] != "owner-hotel" {
+		t.Fatalf("chip index: %v", hotels)
 	}
 }
 
@@ -71,5 +80,142 @@ func TestFetchSignedMeasurementsFile(t *testing.T) {
 	ok, _ := c.allow("h", strings.Repeat("ab", 48))
 	if !ok {
 		t.Fatal("file-backed list should allow")
+	}
+}
+
+func signSealedHotelsDoc(t *testing.T, priv ed25519.PrivateKey, unsigned map[string]any) []byte {
+	t.Helper()
+	msg, err := marshalCanonical(unsigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := ed25519.Sign(priv, msg)
+	doc := map[string]any{}
+	for k, v := range unsigned {
+		doc[k] = v
+	}
+	doc["signature"] = map[string]any{
+		"algorithm":    "ed25519",
+		"value_base64": base64.StdEncoding.EncodeToString(sig),
+	}
+	raw, err := marshalCanonical(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestVerifySignedMeasurementsEd25519(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyID := "test-key-1"
+	pins := map[string]signedMeasurementPin{
+		keyID: {
+			PublicKeyHex: hex.EncodeToString(pub),
+			NotBefore:    "2020-01-01T00:00:00Z",
+			NotAfter:     "2099-01-01T00:00:00Z",
+		},
+	}
+	unsigned := map[string]any{
+		"schema":       signedMeasurementsSchema,
+		"release":      json.Number("1"),
+		"generated_at": "2026-11-24T12:00:00Z",
+		"valid_from":   "2026-11-24T00:00:00Z",
+		"valid_until":  "2026-11-25T00:00:00Z",
+		"key_id":       keyID,
+		"hotels": map[string]any{
+			"h1": map[string]any{
+				"chip_id":      strings.Repeat("ab", 64),
+				"measurements": []any{strings.Repeat("11", 48)},
+			},
+		},
+	}
+	raw := signSealedHotelsDoc(t, priv, unsigned)
+	now, _ := time.Parse(time.RFC3339, "2026-11-24T12:00:00Z")
+	if err := verifySignedMeasurements(raw, pins, now); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	c := &signedMeasurementsCache{}
+	if err := c.load(raw, "test"); err != nil {
+		t.Fatal(err)
+	}
+	ok, _ := c.allow("h1", strings.Repeat("11", 48))
+	if !ok {
+		t.Fatal("verified list should allow")
+	}
+
+	// Tamper: change a measurement after signing.
+	var tampered map[string]any
+	if err := json.Unmarshal(raw, &tampered); err != nil {
+		t.Fatal(err)
+	}
+	hotels := tampered["hotels"].(map[string]any)
+	h1 := hotels["h1"].(map[string]any)
+	h1["measurements"] = []any{strings.Repeat("22", 48)}
+	bad, err := marshalCanonical(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySignedMeasurements(bad, pins, now); err == nil {
+		t.Fatal("tampered document must fail verify")
+	}
+
+	// Wrong key pin.
+	wrongPins := map[string]signedMeasurementPin{
+		keyID: {
+			PublicKeyHex: strings.Repeat("00", 32),
+			NotBefore:    "2020-01-01T00:00:00Z",
+			NotAfter:     "2099-01-01T00:00:00Z",
+		},
+	}
+	if err := verifySignedMeasurements(raw, wrongPins, now); err == nil {
+		t.Fatal("wrong pin must fail verify")
+	}
+}
+
+func TestPreferChipSoftPrefer(t *testing.T) {
+	match := &hotel{adm: admission{chipFull: strings.Repeat("aa", 64)}}
+	other := &hotel{adm: admission{chipFull: strings.Repeat("bb", 64)}}
+	hotels := []*hotel{match, other}
+	weight := []float64{2, 3}
+	total := preferChip(hotels, weight, 5, strings.Repeat("aa", 64))
+	if total != 2 || weight[0] != 2 || weight[1] != 0 {
+		t.Fatalf("soft prefer: total=%v weight=%v", total, weight)
+	}
+	// No match: leave weights alone.
+	weight = []float64{2, 3}
+	total = preferChip(hotels, weight, 5, strings.Repeat("cc", 64))
+	if total != 5 || weight[1] != 3 {
+		t.Fatalf("no match should keep weights: total=%v weight=%v", total, weight)
+	}
+}
+
+// require_chip_id is hard: with the matching hotel full, or another chip's hotel the
+// only one left, pick places nothing rather than on another chip (Codex/Cursor on #729).
+func TestRequireChipIDNeverPlacesOnAnotherChip(t *testing.T) {
+	want := strings.Repeat("aa", 64)
+	b := scaleBroker(t, 2, func(i int, h *hotel) {
+		h.adm.chipFull = map[int]string{0: want, 1: strings.Repeat("bb", 64)}[i]
+	})
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	hard := placement{guest: "g", preferChipID: want, requireChipID: true}
+	for i := 0; i < 200; i++ {
+		if h := b.pick(nil, hard); h == nil || h.cfg.ID != "h000" {
+			t.Fatalf("require_chip_id placed on %v, want h000", h)
+		}
+	}
+	matching := b.hotelList()[0]
+	if b.pick(map[*hotel]bool{matching: true}, hard) != nil {
+		t.Fatal("require_chip_id fell back to another chip when the matching hotel was excluded")
+	}
+	matching.slots = 0
+	if h := b.pick(nil, hard); h != nil {
+		t.Fatalf("require_chip_id placed on %s while the matching hotel was full", h.cfg.ID)
+	}
+	if h := b.pick(nil, placement{guest: "g", preferChipID: want}); h == nil || h.cfg.ID != "h001" {
+		t.Fatalf("soft prefer should fall back to the other chip when the match is full, got %v", h)
 	}
 }

@@ -235,8 +235,9 @@ type config struct {
 	// admission is true and URL is set, prefer Cathedral's published sealed
 	// hotels list for measurement membership; fall back to sealed_measurements
 	// if the list cannot be loaded.
-	SignedMeasurementsURL       string `json:"signed_measurements_url,omitempty"`
-	SignedMeasurementsAdmission bool   `json:"signed_measurements_admission,omitempty"`
+	SignedMeasurementsURL       string                          `json:"signed_measurements_url,omitempty"`
+	SignedMeasurementsAdmission bool                            `json:"signed_measurements_admission,omitempty"`
+	SignedMeasurementsPins      map[string]signedMeasurementPin `json:"signed_measurements_pins,omitempty"` // key_id -> pin; empty uses sealed-hotels-local-1 default
 	// EscapeFreshMeasurements lists the launch measurements of guest kits
 	// that enforce the AB#683 fresh guest guarantees (room-kit with #671,
 	// #672 and #676). Each must also be in sealed_measurements. Only a hotel
@@ -1135,12 +1136,18 @@ func (b *broker) pickIn(exclude map[*hotel]bool, pl placement, mb *minerBudget) 
 		if exclude[h] || !pl.allows(h) || !b.diskFits(h, pl.diskGiB) {
 			continue
 		}
+		// require_chip_id is a hard constraint: a hotel on another chip never gets weight,
+		// so neither preferWarm nor the soft preferChip fallback can place the room there.
+		if pl.requireChipID && !strings.EqualFold(h.adm.chipFull, pl.preferChipID) {
+			continue
+		}
 		if f := b.admissibleFreeIn(h, now, mb); f > 0 {
 			weight[i] = h.weight(f)
 			total += weight[i]
 		}
 	}
 	total = b.preferWarm(hotels, weight, total, pl.image, pl.guest)
+	total = preferChip(hotels, weight, total, pl.preferChipID)
 	if total <= 0 {
 		return nil
 	}
