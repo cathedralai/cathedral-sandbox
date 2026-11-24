@@ -879,11 +879,16 @@ func TestNativeBackgroundExecAdmissionCapKeepsEveryRunningIDOnDisk(t *testing.T)
 		}
 	}
 	n.mu.Unlock()
+	first := tc.b // the broker that still holds the last exec's call to the hotel
 	tc.restart(t)
 	if status, _, doc := tc.rawCall(t, "key1", "GET", "/v1/sandboxes/"+bid+"/execs/run-000", nil); status != 200 || doc["state"] != "lost" {
 		t.Errorf("oldest running exec after restart: %d %v", status, doc)
 	}
 	release()
+	// execChain's cleanup drains only the broker the chain has last. The held exec is the first
+	// broker's: once released it ends and saves into dir, and without this wait that write raced the
+	// TempDir cleanup ("directory not empty", about 1 run in 20 on one CPU).
+	first.drainNativeExecs(5 * time.Second)
 }
 
 func TestNativeBackgroundExecKilledSurvivesPruneAndRestart(t *testing.T) {
