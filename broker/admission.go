@@ -304,6 +304,14 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	if err != nil {
 		return res, err
 	}
+	// URnetwork Q3: optional membership in the published signed sealed-hotels list.
+	if b.cfg.SignedMeasurementsAdmission {
+		b.refreshSignedMeasurements()
+		ok, why := measurementAllowed(h.cfg.ID, res.measurement, b.sealedMeasurements(), true)
+		if !ok {
+			return admission{}, fmt.Errorf("signed measurements: %s", why)
+		}
+	}
 	// Every guest TLS hotel (a miner, or "guest_tls"): the binding must name
 	// the key this broker pinned, and say the hotel key was installed.
 	if h.guestTLS() {
