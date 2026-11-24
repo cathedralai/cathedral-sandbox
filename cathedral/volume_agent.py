@@ -33,6 +33,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -270,6 +271,12 @@ class VolumeAgent:
         # volume_id -> {"lease": lease_doc, "generation": int, "head_sha256": str, "target": str,
         #               "pending": commit_doc or None}. Set only once the head is restored into target.
         self.mounts: dict[str, dict] = {}
+        # The receipts front is a ThreadingHTTPServer, so attach and commit can run at the same time.
+        # One lock covers a whole attach (drop, restore, publish) and a whole commit (backup, sign,
+        # post): a commit that started on the old mount finishes before a re-attach touches the
+        # workspace, and a commit never backs up a restore in progress. One lock rather than one per
+        # volume because two volumes may be attached to the same workspace.
+        self._lock = threading.Lock()
 
     def _env(self, volume_id: str, token: dict) -> dict:
         parts = urlsplit(self.gateway)
@@ -292,6 +299,10 @@ class VolumeAgent:
         ``grant`` is the API's lease answer: volume, commits, head and lease. Nothing is restored
         unless the chain verifies against the pinned registry keys and the head is the one it signed.
         """
+        with self._lock:
+            return self._attach(grant, target)
+
+    def _attach(self, grant: dict, target: str) -> dict:
         lease = self.signer.own_lease(grant.get("lease"))
         volume_id = lease["volume_id"]
         head_commit = volume_chain.verify_chain(grant.get("volume"), grant.get("commits") or [], grant.get("head"),
@@ -322,6 +333,10 @@ class VolumeAgent:
 
     def commit(self, volume_id: str) -> dict:
         """Back up the mount's workspace and commit it at head + 1. Returns the new signed head."""
+        with self._lock:
+            return self._commit(volume_id)
+
+    def _commit(self, volume_id: str) -> dict:
         mount = self.mounts.get(volume_id)
         if mount is None:
             raise VolumeRefused("volume_not_attached")
