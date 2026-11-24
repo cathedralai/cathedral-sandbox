@@ -218,8 +218,11 @@ func checkConfigFile(path string) error {
 	if err != nil {
 		return err
 	}
-	_, _, _, _, err = parseConfigFile(raw)
-	return err
+	c, _, _, _, err := parseConfigFile(raw)
+	if err != nil {
+		return err
+	}
+	return checkFreshMeasurementsSealed(c)
 }
 
 // fields is a JSON object's members, for a field-by-field compare.
