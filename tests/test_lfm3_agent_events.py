@@ -783,3 +783,54 @@ def test_a_model_server_not_on_loopback_is_still_checked_with_curl(model: Stream
     assert types(events) == ["start", "thinking", "delta", "answer"]
     # One curl for /health (no /dev/tcp fast path for this URL) and one for the stream.
     assert log.read_text().split().count("curl") == 2
+
+
+# AB#541: read -d '' from a here-document reads one byte per read(2) call under
+# bash 5.2 (about 5,100 calls, 55 to 58 ms in a sealed 2 vCPU room, 24 Nov 2026),
+# and the agent loaded its three jq programs that way before every model request.
+# They are read with -N now; the programs must be byte for byte what -d '' gave.
+JQ_PROGRAMS = ("SECRETS_JQ", "STREAM_JQ", "SUMMARY_JQ")
+
+
+def _jq_program_block(text: str) -> str:
+    first = text.index("IFS= read -r -N 1048576 SECRETS_JQ <<'JQ' || true\n")
+    strip = "SECRETS_JQ=${SECRETS_JQ%$'\\n'} STREAM_JQ=${STREAM_JQ%$'\\n'} SUMMARY_JQ=${SUMMARY_JQ%$'\\n'}\n"
+    return text[first : text.index(strip) + len(strip)]
+
+
+def _load(block: str, tmp_path: Path, name: str) -> list[str]:
+    seg = tmp_path / name
+    seg.write_text(block)
+    out = []
+    for var in JQ_PROGRAMS:
+        done = subprocess.run(["bash", "-c", f'source "$1"; printf "%s" "${var}"', "x", str(seg)], capture_output=True)
+        assert done.returncode == 0, done.stderr
+        out.append(done.stdout.decode())
+    return out
+
+
+def test_the_jq_programs_load_in_blocks_and_match_the_old_read(tmp_path: Path) -> None:
+    text = AGENT.read_text()
+    assert "read -r -d '' " not in text.replace("# The jq programs below are read with -N, not -d ''", "")
+    block = _jq_program_block(text)
+    assert all(f"IFS= read -r -N 1048576 {v} <<'JQ' || true" in block for v in JQ_PROGRAMS)
+    old = block
+    for var in JQ_PROGRAMS:
+        old = old.replace(f"IFS= read -r -N 1048576 {var} <<'JQ' || true", f"read -r -d '' {var} <<'JQ' || true")
+    old = old[: old.rindex("SECRETS_JQ=${SECRETS_JQ%")]
+    new_values, old_values = _load(block, tmp_path, "new.sh"), _load(old, tmp_path, "old.sh")
+    assert new_values == old_values
+    assert all(v.startswith("def ") and not v.endswith("\n") for v in new_values)
+
+
+@pytest.mark.skipif(not shutil.which("strace"), reason="needs strace")
+def test_loading_the_jq_programs_takes_a_few_reads_not_one_per_byte(tmp_path: Path) -> None:
+    seg = tmp_path / "block.sh"
+    seg.write_text(_jq_program_block(AGENT.read_text()))
+    trace = tmp_path / "trace"
+    argv = ["strace", "-f", "-e", "trace=read", "-o", str(trace), "bash", "-c", 'source "$1"', "x", str(seg)]
+    done = subprocess.run(argv, capture_output=True)
+    if done.returncode != 0:
+        pytest.skip(f"strace cannot trace here: {done.stderr[:200]!r}")
+    reads = sum(1 for line in trace.read_text().splitlines() if " read(" in line or line.startswith("read("))
+    assert reads < 200, reads  # one per byte was about 5,100
