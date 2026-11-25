@@ -5,8 +5,8 @@
 //	GET    /v1/broker/vms/{id}             one VM, merged with its host's status
 //	POST   /v1/broker/vms/{id}/authorize   {"paid_through": <unix seconds>, "generation": n}
 //	POST   /v1/broker/vms/{id}/start       optional {"generation": n}
-//	POST   /v1/broker/vms/{id}/stop
-//	POST   /v1/broker/vms/{id}/reboot
+//	POST   /v1/broker/vms/{id}/stop        {"generation": n}
+//	POST   /v1/broker/vms/{id}/reboot      optional {"generation": n}
 //	DELETE /v1/broker/vms/{id}             {"confirm": "<id>"}
 //
 // The broker runs vm-ctl.sh on the VM host over SSH. The host's
@@ -18,10 +18,14 @@
 // Credit (polariscomputer#2290 rules 3, 5, 6): the host enforces
 // paid_through on its own. The broker keeps the generation of the current
 // run. A stopped VM accepts an authorization only for generation+1, a
-// running one only for its own generation; paid_through never goes down.
-// start needs the generation+1 authorization installed on the host first,
-// then bumps the generation. stop answers the host's stopped_at, the
-// settlement evidence. Nothing here deletes a disk except DELETE with the id
+// running one only for its own; paid_through never goes down within one
+// generation (a new run may be funded for less). start needs the
+// generation+1 authorization installed on the host first, records
+// starting in that generation, and is running once the host confirms; a
+// start whose answer was lost may be repeated. stop names its generation,
+// so a late Stop of an older run never stops a newer one, and answers the
+// host's stopped_at, the settlement evidence. start, stop and reboot pass
+// --generation to the host. Nothing here deletes a disk except DELETE with the id
 // repeated in the body.
 //
 // State: state_dir/vms.json, written with writeFileDurable (drains.go). An
@@ -67,10 +71,11 @@ const (
 
 	vmStateCreating = "creating" // create sent, host answer not confirmed
 	vmStateStopped  = "stopped"
+	vmStateStarting = "starting" // start sent in a new generation, host answer not confirmed
 	vmStateRunning  = "running"
 
 	// Exit codes of vm-ctl.sh the broker maps to 409.
-	vmExitStale  = 3 // authorize: older generation or lower paid_through
+	vmExitStale  = 3 // authorize: older generation or lower paid_through; start/stop/reboot: not the host's generation
 	vmExitUnpaid = 4 // start: now >= paid_through
 
 	vmHostAnswerMax = 256 << 10
@@ -589,8 +594,35 @@ func (b *broker) getVM(w http.ResponseWriter, r *http.Request, id string) {
 		v["host_status_error"] = cerr.code
 	} else {
 		v["host_status"] = doc
+		if s.reconcileStarting(id, doc) {
+			s.mu.Lock()
+			v2 := s.view(rec)
+			s.mu.Unlock()
+			v2["host_status"] = doc
+			v = v2
+		}
 	}
 	writeJSON(w, 200, v)
+}
+
+// reconcileStarting moves a VM whose start answer was lost from starting
+// to running once the host's status says it runs in that generation.
+func (s *vmStore) reconcileStarting(id string, doc map[string]any) bool {
+	gen, ok := doc["generation"].(float64)
+	if !ok || doc["state"] != vmStateRunning {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.recs[id]
+	if rec == nil || s.busy[id] || rec.DesiredState != vmStateStarting || uint64(gen) != rec.Generation || float64(rec.Generation) != gen {
+		return false
+	}
+	rec.DesiredState, rec.LastError = vmStateRunning, ""
+	if err := s.saveLocked(); err != nil {
+		log.Printf("vms: %s not saved after reconciling %s to running: %v", vmsFile, id, err)
+	}
+	return true
 }
 
 // ---------------------------------------------------------------- create
@@ -763,13 +795,17 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 	switch {
 	case rec.DesiredState == vmStateCreating:
 		refuse = "the VM is not created yet"
-	case rec.DesiredState == vmStateRunning && gen != rec.Generation:
+	case (rec.DesiredState == vmStateRunning || rec.DesiredState == vmStateStarting) && gen != rec.Generation:
 		refuse = fmt.Sprintf("a running VM takes only its own generation %d", rec.Generation)
 	case rec.DesiredState == vmStateStopped && gen != rec.Generation+1:
 		// Stop ended the run's authorizations (#2290 rule 5); a start needs the next one.
 		refuse = fmt.Sprintf("a stopped VM takes only generation %d", rec.Generation+1)
-	case gen < rec.AuthorizedGeneration || pt < rec.PaidThrough:
-		refuse = "paid_through and generation never go down"
+	case gen < rec.AuthorizedGeneration:
+		refuse = "generation never goes down"
+	case gen == rec.AuthorizedGeneration && pt < rec.PaidThrough:
+		// Within one run only: a new run may be funded for a shorter window
+		// than the settled run before it.
+		refuse = "paid_through never goes down within a generation"
 	}
 	if refuse != "" {
 		delete(s.busy, id)
@@ -801,6 +837,8 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 	writeJSON(w, 200, s.view(rec))
 }
 
+// startVM starts a stopped VM in the next generation, or repeats a start
+// whose host answer was lost (state starting, same generation).
 func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 	var req struct {
 		Generation *uint64 `json:"generation"`
@@ -815,15 +853,18 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 		s.mu.Unlock()
 		return
 	}
-	next := rec.Generation + 1
+	gen := rec.Generation + 1
+	if rec.DesiredState == vmStateStarting {
+		gen = rec.Generation // a retry: host start is idempotent for this generation
+	}
 	var code, refuse string
 	switch {
-	case rec.DesiredState != vmStateStopped:
+	case rec.DesiredState != vmStateStopped && rec.DesiredState != vmStateStarting:
 		code, refuse = "vm_not_stopped", "only a stopped VM starts (state "+rec.DesiredState+")"
-	case req.Generation != nil && *req.Generation != next:
-		code, refuse = "stale_generation", fmt.Sprintf("the next generation is %d", next)
-	case rec.AuthorizedGeneration != next || rec.PaidThrough <= s.now().Unix():
-		code, refuse = "not_authorized", fmt.Sprintf("authorize generation %d with a paid_through after now first", next)
+	case req.Generation != nil && *req.Generation != gen:
+		code, refuse = "stale_generation", fmt.Sprintf("the generation to start is %d", gen)
+	case rec.AuthorizedGeneration != gen || rec.PaidThrough <= s.now().Unix():
+		code, refuse = "not_authorized", fmt.Sprintf("authorize generation %d with a paid_through after now first", gen)
 	}
 	if refuse != "" {
 		delete(s.busy, id)
@@ -831,30 +872,37 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, 409, code, refuse)
 		return
 	}
-	// Intent first: a start whose answer is lost stays recorded as running
-	// in the new generation, never taken back to stopped.
+	// Intent first: a start whose answer is lost stays starting in the new
+	// generation, and a repeated start finishes it.
 	prev := *rec
-	rec.Generation, rec.DesiredState, rec.StoppedAt = next, vmStateRunning, 0
-	if err := s.saveLocked(); err != nil {
-		*rec = prev
-		delete(s.busy, id)
-		s.mu.Unlock()
-		log.Printf("vms: %s not saved before start of %s: %v", vmsFile, id, err)
-		writeErr(w, 500, "state_not_saved", "the start could not be recorded; nothing was sent to the host")
-		return
+	if rec.DesiredState == vmStateStopped {
+		prev.LastError = ""
+		rec.Generation, rec.DesiredState, rec.StoppedAt = gen, vmStateStarting, 0
+		if err := s.saveLocked(); err != nil {
+			*rec = prev
+			delete(s.busy, id)
+			s.mu.Unlock()
+			log.Printf("vms: %s not saved before start of %s: %v", vmsFile, id, err)
+			writeErr(w, 500, "state_not_saved", "the start could not be recorded; nothing was sent to the host")
+			return
+		}
+	} else {
+		// Retry of a lost start: a refusal goes back to stopped in the
+		// generation before.
+		prev.DesiredState, prev.Generation, prev.LastError = vmStateStopped, gen-1, ""
 	}
 	s.mu.Unlock()
 
-	_, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "start", id)
+	_, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "start", id, "--generation", strconv.FormatUint(gen, 10))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, id)
 	if cerr != nil {
 		if cerr.unknown {
-			rec.LastError = "start: " + cerr.code
+			rec.LastError = "start: " + cerr.code // stays starting
 		} else {
-			*rec = prev // the host refused: still stopped, generation unused
+			*rec = prev // the host refused: stopped, the authorization still usable
 		}
 		if err := s.saveLocked(); err != nil {
 			log.Printf("vms: %s not saved after a failed start of %s: %v", vmsFile, id, err)
@@ -862,14 +910,28 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 		cerr.write(w)
 		return
 	}
-	rec.LastError = ""
+	rec.DesiredState, rec.LastError = vmStateRunning, ""
 	if err := s.saveLocked(); err != nil {
 		log.Printf("vms: %s not saved after start of %s: %v", vmsFile, id, err)
 	}
 	writeJSON(w, 200, s.view(rec))
 }
 
+// stopVM stops the run of the given generation. A Stop for another
+// generation (a late billing outbox delivery) is refused without a host
+// call; a repeated Stop of a stopped run answers its stored stopped_at.
 func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
+	var req struct {
+		Generation *uint64 `json:"generation"`
+	}
+	if !readVMBody(w, r, &req, true) {
+		return
+	}
+	if req.Generation == nil || *req.Generation < 1 {
+		writeErr(w, 400, "generation_required", "the body must be {\"generation\": n}, the run to stop")
+		return
+	}
+	gen := *req.Generation
 	s := b.vms
 	s.mu.Lock()
 	rec, h, ok := s.begin(w, id)
@@ -877,10 +939,24 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 		s.mu.Unlock()
 		return
 	}
-	if rec.DesiredState == vmStateCreating {
+	var code, refuse string
+	switch {
+	case rec.DesiredState == vmStateCreating:
+		code, refuse = "vm_not_created", "the VM is not created yet"
+	case gen != rec.Generation:
+		code, refuse = "stale_generation", fmt.Sprintf("the current generation is %d", rec.Generation)
+	}
+	if refuse != "" {
 		delete(s.busy, id)
 		s.mu.Unlock()
-		writeErr(w, 409, "vm_not_created", "the VM is not created yet")
+		writeErr(w, 409, code, refuse)
+		return
+	}
+	if rec.DesiredState == vmStateStopped && rec.StoppedAt != 0 {
+		delete(s.busy, id)
+		v := s.view(rec)
+		s.mu.Unlock()
+		writeJSON(w, 200, v) // the stored receipt
 		return
 	}
 	// Intent first: once asked to stop, the run takes no more authorizations.
@@ -896,14 +972,21 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	s.mu.Unlock()
 
-	doc, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "stop", id)
+	doc, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "stop", id, "--generation", strconv.FormatUint(gen, 10))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, id)
 	if cerr != nil {
-		rec.LastError = "stop: " + cerr.code // stays stopped in intent; the host decides
+		if cerr.unknown {
+			rec.LastError = "stop: " + cerr.code // stays stopped in intent; repeat the stop
+		} else {
+			rec.DesiredState = prev // the host refused this generation's stop
+		}
 		_ = s.saveLocked()
+		if cerr.code == "stale_authorization" {
+			cerr = &vmCallErr{409, "stale_generation", "the host's current generation is not this one", false}
+		}
 		cerr.write(w)
 		return
 	}
@@ -942,6 +1025,12 @@ func vmUnixField(v any) (int64, bool) {
 }
 
 func (b *broker) rebootVM(w http.ResponseWriter, r *http.Request, id string) {
+	var req struct {
+		Generation *uint64 `json:"generation"`
+	}
+	if !readVMBody(w, r, &req, true) {
+		return
+	}
 	s := b.vms
 	s.mu.Lock()
 	rec, h, ok := s.begin(w, id)
@@ -949,20 +1038,31 @@ func (b *broker) rebootVM(w http.ResponseWriter, r *http.Request, id string) {
 		s.mu.Unlock()
 		return
 	}
-	if rec.DesiredState != vmStateRunning {
+	var code, refuse string
+	switch {
+	case rec.DesiredState != vmStateRunning:
+		code, refuse = "vm_not_running", "only a running VM reboots"
+	case req.Generation != nil && *req.Generation != rec.Generation:
+		code, refuse = "stale_generation", fmt.Sprintf("the current generation is %d", rec.Generation)
+	}
+	if refuse != "" {
 		delete(s.busy, id)
 		s.mu.Unlock()
-		writeErr(w, 409, "vm_not_running", "only a running VM reboots")
+		writeErr(w, 409, code, refuse)
 		return
 	}
+	gen := rec.Generation
 	s.mu.Unlock()
 
-	_, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "reboot", id)
+	_, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "reboot", id, "--generation", strconv.FormatUint(gen, 10))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, id)
 	if cerr != nil {
+		if cerr.code == "stale_authorization" {
+			cerr = &vmCallErr{409, "stale_generation", "the host's current generation is not this one", false}
+		}
 		cerr.write(w)
 		return
 	}
