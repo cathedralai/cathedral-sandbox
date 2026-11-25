@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -42,6 +43,9 @@ NET = ipaddress.IPv4Network("10.216.0.0/16")
 SLOTS = NET.num_addresses // 4
 COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce")
 STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
+# Credit cutoff: a short grace, and every expired VM at once, so one guest that ignores
+# the powerdown cannot keep the next one running past its paid_through.
+CUTOFF_WAIT = int(os.environ.get("VM_CUTOFF_WAIT", "15"))
 
 
 class Refusal(Exception):
@@ -501,7 +505,7 @@ def wait_inactive(name: str, seconds: float) -> bool:
     return not unit_active(name)
 
 
-def stop_locked(name: str, d: Path, reason: str) -> dict:
+def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> dict:
     a = auth_of(d)
     previous = read_json(d / "stop.json", {})
     was_running = unit_active(name)
@@ -513,7 +517,7 @@ def stop_locked(name: str, d: Path, reason: str) -> dict:
         marker = d / "run" / "powerdown-sent"
         marker.touch()
         try:
-            graceful = qmp(name, "system_powerdown") and wait_inactive(name, STOP_WAIT)
+            graceful = qmp(name, "system_powerdown") and wait_inactive(name, STOP_WAIT if wait is None else wait)
             systemctl("stop", unit_name(name))
         finally:
             marker.unlink(missing_ok=True)
@@ -607,21 +611,38 @@ def cmd_list(args: list[str]) -> dict:
 def cmd_enforce(args: list[str]) -> dict:
     parse_opts(args, set(), 0)
     stopped, errors, names = [], [], all_vms()
+
+    def cut(name: str) -> None:
+        d = root() / name
+        try:
+            with Lock(d / ".lock", wait=20):
+                # Re-check under the lock: an authorize may have landed since the scan.
+                if unit_active(name) and paid_refusal(auth_of(d), int(time.time())):
+                    ev = stop_locked(name, d, "paid_through", CUTOFF_WAIT)
+                    stopped.append({"name": name, "stopped_at": ev["stopped_at"], "generation": ev["generation"]})
+        except Refusal as e:
+            errors.append({"name": name, "error": e.error, "detail": e.detail})
+
+    expired = []
     for name in names:
         d = root() / name
         try:
             with Lock(d / ".lock", wait=20):
-                a = auth_of(d)
                 if not unit_active(name):
                     continue
-                if paid_refusal(a, int(time.time())):
-                    ev = stop_locked(name, d, "paid_through")
-                    stopped.append({"name": name, "stopped_at": ev["stopped_at"], "generation": ev["generation"]})
+                if paid_refusal(auth_of(d), int(time.time())):
+                    expired.append(name)
                 else:
                     # A firewall reload may have taken the link rules: put them back.
                     run(str(KIT / "vm-net.sh"), "check", str(d / "vm.env"), check=False)
         except Refusal as e:
             errors.append({"name": name, "error": e.error, "detail": e.detail})
+    # All expired VMs are cut together: the slowest guest bounds the delay, not the sum.
+    threads = [threading.Thread(target=cut, args=(n,)) for n in expired]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     result = {"checked": len(names), "stopped": stopped, "at": int(time.time())}
     if errors:
         result["errors"] = errors

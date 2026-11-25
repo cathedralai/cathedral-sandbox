@@ -63,7 +63,30 @@ port_clash() {
     return 1
   fi
 }
+# IPv6 backstop (also when disable_ipv6 is reset): drop everything to or from the tap.
+v6_rules() { echo "INPUT -i $TAP"; echo "FORWARD -i $TAP"; echo "FORWARD -o $TAP"; }
+v6_up() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  local c m
+  while read -r c m; do
+    ip6tables -C "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null \
+      || ip6tables -I "$c" 1 $m -m comment --comment "$TAG" -j DROP
+  done < <(v6_rules)
+}
+v6_present() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  local c m
+  while read -r c m; do ip6tables -C "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null || return 1; done < <(v6_rules)
+}
+v6_down() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  local c m
+  while read -r c m; do
+    while ip6tables -D "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null; do :; done
+  done < <(v6_rules)
+}
 rules_present() {
+  v6_present || return 1
   iptables -C FORWARD -m comment --comment "$TAG" -j "$FWD" 2>/dev/null \
     && iptables -C INPUT -m comment --comment "$TAG" -j "$IN" 2>/dev/null \
     && masq -C 2>/dev/null && dnat -C PREROUTING 2>/dev/null && dnat -C OUTPUT 2>/dev/null \
@@ -76,7 +99,11 @@ up)
   port_clash
   ip link show "$TAP" >/dev/null 2>&1 || ip tuntap add dev "$TAP" mode tap
   ip addr replace "$VM_HOST_IP/30" dev "$TAP"
+  # No IPv6 on the link: the rules here are IPv4 only, and root in the guest could
+  # otherwise reach this host over the tap's link-local address.
+  sysctl -qw "net.ipv6.conf.$TAP.disable_ipv6=1" 2>/dev/null || true
   ip link set "$TAP" up
+  v6_up
   sysctl -qw net.ipv4.ip_forward=1
   iptables -N "$FWD" 2>/dev/null || iptables -F "$FWD"
   # Answers of the guest's sshd to any client, a private-range one too.
@@ -85,7 +112,11 @@ up)
   iptables -A "$FWD" -i "$TAP" -s "$GUEST" -j ACCEPT
   iptables -A "$FWD" -i "$TAP" -j DROP
   iptables -A "$FWD" -o "$TAP" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-  iptables -A "$FWD" -o "$TAP" -d "$GUEST" -p tcp --dport 22 -m conntrack --ctstate NEW -j ACCEPT
+  # New connections in: only those that came through this VM's own public port DNAT.
+  # A plain "--dport 22 NEW" would also take another VM's or hotel's packets when that
+  # source's chain sits after this one in FORWARD (insert order decides, not policy).
+  iptables -A "$FWD" -o "$TAP" -d "$GUEST" -p tcp --dport 22 -m conntrack --ctstate NEW \
+    -m conntrack --ctstate DNAT --ctorigdstport "$VM_SSH_PORT" -j ACCEPT
   iptables -A "$FWD" -o "$TAP" -j DROP
   iptables -C FORWARD -m comment --comment "$TAG" -j "$FWD" 2>/dev/null || iptables -I FORWARD 1 -m comment --comment "$TAG" -j "$FWD"
   # This host's own services: closed to the guest (only answers to connections the host opened).
@@ -112,6 +143,7 @@ down)
   purge_nat || left=1
   iptables -F "$FWD" 2>/dev/null && iptables -X "$FWD" 2>/dev/null || true
   iptables -F "$IN" 2>/dev/null && iptables -X "$IN" 2>/dev/null || true
+  v6_down
   ip link del "$TAP" 2>/dev/null || true
   if [ "$left" = 1 ]; then
     echo "cathedral-vm: could not delete the nat rules tagged $TAG; check 'iptables -t nat -S'" >&2
