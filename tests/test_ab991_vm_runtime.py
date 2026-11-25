@@ -342,3 +342,19 @@ def test_generation_fences_stop_start_and_reboot(host):
     assert code == 2 and out["error"] == "invalid_generation"
     assert host.ctl("status", "vm1")[1]["state"] == "running"
     assert host.ctl("stop", "vm1", "--generation", "2")[0] == 0
+
+
+def test_stop_cancels_an_authorized_run_that_never_started(host):
+    # Billing cancel between authorize and start: terminal evidence, and the run can never start.
+    host.create()
+    now = int(time.time())
+    assert host.ctl("authorize", "vm1", str(now + 600), "1")[0] == 0
+    code, out = host.ctl("stop", "vm1", "--generation", "1")
+    assert code == 0 and out["was_running"] is False and out["generation"] == 1 and out["stopped_at"] >= now
+    again = host.ctl("stop", "vm1", "--generation", "1")[1]
+    assert again["stopped_at"] == out["stopped_at"]  # same receipt on a repeat
+    code, out = host.ctl("start", "vm1", "--generation", "1")
+    assert code == 3
+    assert host.ctl("status", "vm1")[1]["state"] != "running"
+    assert host.ctl("authorize", "vm1", str(now + 600), "2")[0] == 0
+    assert host.ctl("start", "vm1", "--generation", "2")[0] == 0
