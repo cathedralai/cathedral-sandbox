@@ -71,6 +71,9 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      launch_create_sha256 equal to the binding's bootstrap_sha256.
      --bootstrap-sha256 <hex> (needs --owner-pubkey) fails unless the binding
      is v2 with exactly that digest; without it a v1 machine also passes.
+     A binding with "owner_gate": "open" (AB#962, a dedicated build measured
+     open and launched with no owner key) runs no owner gate: the output names
+     it under attestation.tenancy, and --owner-pubkey fails against it.
   9. sandbox link (AB#389): a create receipt that carries cathedral_sandbox_id
      must carry a lower-case UUID. The output maps each room to the Cathedral
      sandbox id its successful create receipt signed. --cathedral-sandbox <id>
@@ -937,6 +940,8 @@ def verify_owner(att: dict, owner: bytes, bootstrap: str | None = None) -> dict:
     binding = att["binding"]
     need(binding.get("tenancy") == "dedicated",
          f"the binding says tenancy {binding.get('tenancy')!r}, not \"dedicated\": other customers may share this machine")
+    need("owner_gate" not in binding,
+         f"the binding says owner_gate {binding.get('owner_gate')!r}: this machine runs no owner gate and names no owner")
     try:
         named = base64.b64decode(binding.get("owner_ed25519_b64") or "", validate=True)
     except ValueError as exc:
@@ -967,6 +972,19 @@ def verify_owner(att: dict, owner: bytes, bootstrap: str | None = None) -> dict:
     return {"tenancy": "dedicated", "owner_ed25519_b64": base64.b64encode(owner).decode(),
             "manifest_sha256": manifest, "host_data": rep["host_data"], "host_data_version": 2,
             "bootstrap_sha256": named_boot}
+
+
+def verify_owner_gate(att: dict) -> dict | None:
+    """AB#962: a dedicated binding launched open says so; None when it does not."""
+    binding = att["binding"]
+    if "owner_gate" not in binding:
+        return None
+    need(binding["owner_gate"] == "open", f"the binding's owner_gate {binding['owner_gate']!r} is not \"open\"")
+    need(binding.get("tenancy") == "dedicated", "an owner_gate \"open\" binding does not say tenancy \"dedicated\"")
+    need(not {"owner_ed25519_b64", "bootstrap_sha256", "host_data_version"} & set(binding),
+         "an owner_gate \"open\" binding also names an owner")
+    return {"tenancy": "dedicated", "owner_gate": "open", "host_data": binding.get("host_data"),
+            "note": "no owner gate: any create the broker routes here runs; isolation rests on the broker reservation"}
 
 
 def owner_signed_creates(receipts: list[dict], owner: bytes, bootstrap: str | None = None) -> int:
@@ -2917,6 +2935,9 @@ def main() -> int:
                 if isinstance(att["binding"]["guest_ingress"].get("zone"), str):
                     guest_ingress["zone"] = att["binding"]["guest_ingress"]["zone"]
                 attestation_out["guest_ingress"] = guest_ingress
+            open_gate = verify_owner_gate(att)
+            if open_gate is not None:
+                attestation_out["tenancy"] = open_gate
             if owner is not None:
                 attestation_out["owner"] = verify_owner(att, owner, a.bootstrap_sha256)
                 attestation_out["owner"]["signed_creates"] = owner_signed_creates(

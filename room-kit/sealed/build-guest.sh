@@ -27,12 +27,21 @@ case "$ALLOW_TUN" in 0|1) ;; *) echo "SEALED_ROOM_ALLOW_TUN must be 0 or 1" >&2;
 if [ "$ALLOW_TUN" = 1 ] && [ "$TENANCY" != dedicated ]; then
   echo "SEALED_ROOM_ALLOW_TUN needs SEALED_HOTEL_TENANCY=dedicated" >&2; exit 1
 fi
+# AB#962: required (default) adds nothing. open is measured here, never fw_cfg.
+OWNER_GATE=${SEALED_OWNER_GATE:-required}
+case "$OWNER_GATE" in required|open) ;; *) echo "SEALED_OWNER_GATE must be required or open" >&2; exit 1 ;; esac
+if [ "$OWNER_GATE" = open ] && [ "$TENANCY" != dedicated ]; then
+  echo "SEALED_OWNER_GATE=open needs SEALED_HOTEL_TENANCY=dedicated" >&2; exit 1
+fi
 DEDICATED_ENV=""
 if [ "$TENANCY" = dedicated ]; then
   # The receipt front verifies the launch owner against SNP HOST_DATA at boot.
   # A missing owner key refuses startup; this flag alone cannot grant tenancy.
   DEDICATED_ENV="CATHEDRAL_HOTEL_TENANCY=dedicated
 ROOM_ALLOW_TUN=$ALLOW_TUN"
+  # Open: no owner key needed; the binding then says "owner_gate": "open".
+  [ "$OWNER_GATE" != open ] || DEDICATED_ENV="$DEDICATED_ENV
+CATHEDRAL_OWNER_GATE=open"
 fi
 # <<< dedicated TUN
 

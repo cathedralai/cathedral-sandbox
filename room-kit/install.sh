@@ -35,6 +35,11 @@ case "${ROOM_ALLOW_TUN:-0}" in 0|1) ;; *) echo "ROOM_ALLOW_TUN must be 0 or 1" >
 if [ "${ROOM_ALLOW_TUN:-0}" = 1 ] && [ "${CATHEDRAL_HOTEL_TENANCY:-shared}" != dedicated ]; then
   echo "ROOM_ALLOW_TUN requires dedicated tenancy" >&2; exit 1
 fi
+# AB#962: only the measured room.env sets the gate; open needs dedicated tenancy.
+case "${CATHEDRAL_OWNER_GATE:-required}" in required|open) ;; *) echo "CATHEDRAL_OWNER_GATE must be required or open" >&2; exit 1 ;; esac
+if [ "${CATHEDRAL_OWNER_GATE:-required}" = open ] && [ "${CATHEDRAL_HOTEL_TENANCY:-shared}" != dedicated ]; then
+  echo "CATHEDRAL_OWNER_GATE=open requires dedicated tenancy" >&2; exit 1
+fi
 if [ "${CATHEDRAL_HOTEL_TENANCY:-shared}" = dedicated ] && [ "${ROOM_RECEIPTS:-1}" != 1 ]; then
   echo "dedicated tenancy requires ROOM_RECEIPTS=1" >&2; exit 1
 fi
@@ -565,6 +570,7 @@ if [ "${CATHEDRAL_HOTEL_TENANCY:-shared}" = dedicated ]; then
 cat >> "$UNIT_DIR/$ROOM_ID-receipts.service" <<EOF
 Environment=CATHEDRAL_HOTEL_TENANCY=dedicated ROOM_ALLOW_TUN=${ROOM_ALLOW_TUN:-0}
 EOF
+[ "${CATHEDRAL_OWNER_GATE:-required}" != open ] || echo "Environment=CATHEDRAL_OWNER_GATE=open" >> "$UNIT_DIR/$ROOM_ID-receipts.service"
 fi
 if [ "${ROOM_MINER:-0}" = 1 ]; then
 # Miner hotel: HTTPS on a key the front makes; api.key is the guest-internal key;

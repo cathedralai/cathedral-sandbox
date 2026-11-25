@@ -420,7 +420,14 @@ def test_room_operations_other_than_create_are_not_gated(front) -> None:
     assert status == 202 and len(seen) == 1
 
 
-def test_a_shared_machine_has_no_gate(tmp_path, monkeypatch) -> None:
+OPEN_ENV = {"CATHEDRAL_HOTEL_TENANCY": "dedicated", "ROOM_ALLOW_TUN": "1", "CATHEDRAL_OWNER_GATE": "open"}
+
+
+@pytest.mark.parametrize("env", [{}, OPEN_ENV], ids=["shared", "dedicated-open"])
+def test_a_shared_machine_has_no_gate(tmp_path, monkeypatch, env) -> None:
+    # AB#962: a dedicated build measured open and launched without a key has no gate either.
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
     seen: list[bytes] = []
 
     class Api(BaseHTTPRequestHandler):
@@ -627,6 +634,131 @@ def test_measured_tun_config_keeps_verified_owner_gate(tmp_path, monkeypatch):
     assert ledger.owner_key == m.pub
     assert ledger.binding["tenancy"] == "dedicated"
     assert ledger.report[0x50:0x90] == bytes.fromhex(ledger.binding_sha256) + bytes(32)
+
+
+# ---------------------------------------------------------------- AB#962 measured open owner gate
+
+
+def _open_env(monkeypatch, **extra: str) -> None:
+    for k, v in {**OPEN_ENV, **extra}.items():
+        monkeypatch.setenv(k, v)
+
+
+@pytest.mark.parametrize("tun", ["0", "1"])
+def test_open_dedicated_build_serves_without_an_owner_key(tmp_path, monkeypatch, tun) -> None:
+    _open_env(monkeypatch, ROOM_ALLOW_TUN=tun)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    ledger = m.ledger()
+    b = ledger.binding
+    assert ledger.owner_key is None and ledger.bootstrap_sha256 is None
+    assert b["tenancy"] == "dedicated" and b["owner_gate"] == "open"
+    assert not {"owner_ed25519_b64", "manifest_sha256", "bootstrap_sha256", "host_data_version"} & set(b)
+    assert b["host_data"] == m.manifest.hex()  # the shared-form launch
+    assert ledger.report[0x50:0x90] == bytes.fromhex(ledger.binding_sha256) + bytes(32)
+
+
+@pytest.mark.parametrize("gate", [None, "required"])
+def test_required_gate_still_refuses_without_an_owner_key(tmp_path, monkeypatch, gate) -> None:
+    monkeypatch.setenv("CATHEDRAL_HOTEL_TENANCY", "dedicated")
+    monkeypatch.setenv("ROOM_ALLOW_TUN", "1")
+    if gate is None:
+        monkeypatch.delenv("CATHEDRAL_OWNER_GATE", raising=False)
+    else:
+        monkeypatch.setenv("CATHEDRAL_OWNER_GATE", gate)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    with pytest.raises(rr.OwnerBindingError, match="requires an SNP owner binding"):
+        m.ledger()
+
+
+def test_an_owner_key_on_an_open_build_keeps_the_owner_gate(tmp_path, monkeypatch) -> None:
+    _open_env(monkeypatch)
+    m = Machine(tmp_path, monkeypatch)
+    ledger = m.ledger()
+    assert ledger.owner_key == m.pub
+    assert ledger.binding["tenancy"] == "dedicated" and "owner_gate" not in ledger.binding
+    assert base64.b64decode(ledger.binding["owner_ed25519_b64"]) == m.pub
+
+
+def test_an_open_build_still_checks_a_supplied_owner_key(tmp_path, monkeypatch) -> None:
+    _open_env(monkeypatch)
+    m = Machine(tmp_path, monkeypatch, host_data=hashlib.sha256(b"other").digest())
+    with pytest.raises(rr.OwnerBindingError, match="does not commit"):
+        m.ledger()
+
+
+@pytest.mark.parametrize("env", [
+    {"CATHEDRAL_OWNER_GATE": "open"},                                        # open on a shared build
+    {"CATHEDRAL_OWNER_GATE": "Open", "CATHEDRAL_HOTEL_TENANCY": "dedicated"},
+    {"CATHEDRAL_OWNER_GATE": "", "CATHEDRAL_HOTEL_TENANCY": "dedicated"},
+])
+def test_an_invalid_owner_gate_refuses(tmp_path, monkeypatch, env) -> None:
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    with pytest.raises(rr.OwnerBindingError, match="CATHEDRAL_OWNER_GATE"):
+        m.ledger()
+
+
+def test_an_open_build_still_needs_snp(tmp_path, monkeypatch) -> None:
+    _open_env(monkeypatch)
+    Machine(tmp_path, monkeypatch, owner=False)
+    monkeypatch.setattr(rr, "tsm_provider", lambda: None)
+    with pytest.raises(rr.OwnerBindingError, match="requires an SNP owner binding"):
+        rr.Ledger("dedicated-1", str(tmp_path / "l1"))
+
+
+def test_the_host_cannot_open_the_gate(tmp_path, monkeypatch) -> None:
+    # The host's only channels into the guest are fw_cfg and HOST_DATA; neither carries the gate.
+    monkeypatch.setenv("CATHEDRAL_HOTEL_TENANCY", "dedicated")
+    monkeypatch.setenv("ROOM_ALLOW_TUN", "1")
+    monkeypatch.delenv("CATHEDRAL_OWNER_GATE", raising=False)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    for name in ("owner-gate", "CATHEDRAL_OWNER_GATE"):
+        (tmp_path / "fw_cfg" / name).mkdir()
+        (tmp_path / "fw_cfg" / name / "raw").write_bytes(b"open")
+    with pytest.raises(rr.OwnerBindingError, match="requires an SNP owner binding"):
+        m.ledger()
+    # Launch-time scripts never read or pass the gate: only build-guest.sh writes it into the measured room.env.
+    for script in ("launch-guest.sh", "install-sealed.sh", "host-net.sh", "write-units.sh", "guest-boot.sh"):
+        assert "OWNER_GATE" not in (KIT / "sealed" / script).read_text(), script
+
+
+def test_verifier_reports_an_open_dedicated_machine(tmp_path, monkeypatch) -> None:
+    _open_env(monkeypatch)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    att = m.ledger().attestation()
+    out = _verify(tmp_path, att, [], "--expected-measurement", "ab" * 48)
+    assert out["verdict"] == "PASS", out
+    assert out["attestation"]["tenancy"]["tenancy"] == "dedicated"
+    assert out["attestation"]["tenancy"]["owner_gate"] == "open"
+    assert out["attestation"]["tenancy"]["host_data"] == m.manifest.hex()
+    # A shared machine's output is unchanged: no tenancy section.
+    shared = Machine(tmp_path / "shared", monkeypatch, owner=False)
+    monkeypatch.delenv("CATHEDRAL_HOTEL_TENANCY")
+    monkeypatch.delenv("ROOM_ALLOW_TUN")
+    monkeypatch.delenv("CATHEDRAL_OWNER_GATE")
+    out = _verify(tmp_path, shared.ledger().attestation(), [], "--expected-measurement", "ab" * 48)
+    assert out["verdict"] == "PASS" and "tenancy" not in out["attestation"], out
+
+
+def test_verifier_fails_an_owner_check_against_an_open_machine(tmp_path, monkeypatch) -> None:
+    _open_env(monkeypatch)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    out = _verify(tmp_path, m.ledger().attestation(), [], "--owner-pubkey", base64.b64encode(m.pub).decode())
+    assert out["verdict"] == "FAIL" and "owner_gate 'open'" in out["reason"], out
+
+
+@pytest.mark.parametrize("change", [
+    {"owner_gate": "closed"},
+    {"tenancy": "shared"},
+    {"owner_ed25519_b64": "AAAA"},
+])
+def test_verifier_fails_a_malformed_open_binding(tmp_path, monkeypatch, change) -> None:
+    _open_env(monkeypatch)
+    m = Machine(tmp_path, monkeypatch, owner=False)
+    binding = {**m.ledger().binding, **change}
+    out = _verify(tmp_path, _att_for(binding, m), [])
+    assert out["verdict"] == "FAIL" and "owner_gate" in out["reason"], out
 
 
 # ---------------------------------------------------------------- AB#963 bootstrap digest in HOST_DATA (v2)

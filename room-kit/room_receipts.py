@@ -134,6 +134,9 @@ an Ed25519 signature by the owner key over
   "cathedral-owner-<action>-v1\\n" || timestamp || "\\n" || owner_request_sha256
 where owner_request_sha256 is owner_request_sha256(body) below. No key in
 fw_cfg: a shared machine, no gate. The binding says which ("tenancy").
+A dedicated build measured with CATHEDRAL_OWNER_GATE=open (AB#962) and no key
+in fw_cfg serves with no gate; its binding says tenancy "dedicated" and
+"owner_gate": "open".
 
 Canonical JSON: sort_keys, separators (",", ":"), ensure_ascii=False, UTF-8.
 Verify offline with verify_receipts.py.
@@ -1753,11 +1756,21 @@ class Ledger:
         self.bootstrap_sha256: str | None = None
         # Measured dedicated/TUN configuration may never silently serve shared
         # or fall back to the unsealed hotel chain when launch inputs are absent.
-        self.requires_owner = (
+        dedicated = (
             os.environ.get("CATHEDRAL_HOTEL_TENANCY") == "dedicated"
             or os.environ.get("ROOM_ALLOW_TUN") == "1"
         )
-        if self.requires_owner and tsm_provider() != "sev_guest":
+        # AB#962: CATHEDRAL_OWNER_GATE=open comes only from the measured room.env
+        # (build-guest.sh SEALED_OWNER_GATE), never fw_cfg, so the host cannot pick it.
+        # Open: a dedicated build with no owner key serves, and the binding says so.
+        gate = os.environ.get("CATHEDRAL_OWNER_GATE", "required")
+        if gate not in ("required", "open"):
+            raise OwnerBindingError(f"CATHEDRAL_OWNER_GATE is {gate!r}, expected required or open")
+        if gate == "open" and not dedicated:
+            raise OwnerBindingError("CATHEDRAL_OWNER_GATE=open needs the measured dedicated configuration")
+        self.owner_gate_open = gate == "open"
+        self.requires_owner = dedicated and not self.owner_gate_open
+        if dedicated and tsm_provider() != "sev_guest":
             raise OwnerBindingError("dedicated configuration requires an SNP owner binding")
         if tsm_provider() == "sev_guest":
             self._init_sealed(hotel, store)
@@ -1842,7 +1855,13 @@ class Ledger:
         if self.ingress is not None:
             # The same rule for the guest ingress key (AB#422).
             self.binding.update(self.ingress.binding_fields())
+        if owner is None and self.owner_gate_open:
+            # AB#962: dedicated build launched open (HOST_DATA is the shared-form
+            # manifest digest). No owner gate runs; a verifier must see that.
+            self.binding.update({"tenancy": "dedicated", "owner_gate": "open"})
         if owner is not None:
+            # An owner key on an open build: the owner gate runs as on any
+            # dedicated build (stricter, and the binding names the owner).
             # Enough to recompute HOST_DATA from published fields:
             # sha256(domain || manifest_sha256 || owner key) == host_data.
             self.owner_key, manifest, bootstrap = owner
@@ -5639,7 +5658,8 @@ def main() -> int:
         return 2
     if ledger.sealed:
         print(f"room-receipts: binding {ledger.binding_sha256} measurement {ledger.binding['measurement']} "
-              f"tenancy {ledger.binding['tenancy']}", flush=True)
+              f"tenancy {ledger.binding['tenancy']}"
+              + (" owner_gate open" if ledger.binding.get("owner_gate") == "open" else ""), flush=True)
         if ledger.secrets is not None:
             print(f"room-receipts: sealed secrets on: key {ledger.secrets.public_b64} in the binding; "
                   f"room directories under {ledger.secrets.root}", flush=True)
