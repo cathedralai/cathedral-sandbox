@@ -17,8 +17,9 @@ changes first:
   - a missing or null "network" becomes {"mode": "deny_all", "allow": []};
   - a "network" object whose "mode" is missing, null or "" gets mode
     "deny_all" (and "allow": [] when it has no list);
-  - "count" and the placement fields ("hotels", "hotel_labels",
-    "exclude_hotel_labels", "sealed", "placement") are removed;
+  - "count", "create_timeout_seconds" and the placement fields ("hotels",
+    "hotel_labels", "exclude_hotel_labels", "sealed", "placement",
+    "own_hosts_only", "prefer_chip_id", "require_chip_id") are removed;
   - a workspace named "<hotel>.<name>" becomes "<name>";
   - labels gets "broker_guest": <your broker guest id>.
 The broker also adds a random "broker_batch" label; the hotel leaves that
@@ -37,6 +38,16 @@ Usage:
        -H "Authorization: Bearer $KEY" --data @create.json https://<broker>/v1/sandboxes
   owner_sign.py --key owner.pem --public                 # base64, for verify_receipts.py --owner-pubkey
   owner_sign.py --key owner.pem --public --raw-out owner.pub  # 32 raw bytes, for SEALED_OWNER_PUBKEY_FILE
+  owner_sign.py --bootstrap-digest --guest <guest id> --body create.json  # SEALED_BOOTSTRAP_SHA256
+
+Bootstrap (AB#963): a machine launched with SEALED_BOOTSTRAP_SHA256 starts no
+room but the owner-signed create whose launch projection has that sha256. The
+projection is the create as the hotel receives it minus "ttl_seconds",
+"idle_timeout_seconds" and the labels "polaris_sandbox_id",
+"cathedral_sandbox_id" and "broker_batch" (they change per create). Nothing
+else is removed. The image must be pinned by @sha256 digest. Through the
+Cathedral API, take the document from the API's owner request preview: it is
+the hotel form already, so pass it with --hotel-form.
 """
 from __future__ import annotations
 
@@ -50,9 +61,14 @@ import time
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-BROKER_PLACEMENT_FIELDS = ("hotels", "hotel_labels", "exclude_hotel_labels", "sealed", "placement")
+# broker/images.go placement.apply, plus create_timeout_seconds (broker/createdeadline.go).
+BROKER_PLACEMENT_FIELDS = ("hotels", "hotel_labels", "exclude_hotel_labels", "sealed", "placement",
+                           "own_hosts_only", "prefer_chip_id", "require_chip_id", "create_timeout_seconds")
 # Same rule as room_receipts.owner_request_sha256: the only label left out.
 OWNER_UNSIGNED_LABELS = ("broker_batch",)
+# Same rule as room_receipts.launch_projection (AB#963).
+LAUNCH_UNBOUND_FIELDS = ("ttl_seconds", "idle_timeout_seconds")
+LAUNCH_UNBOUND_LABELS = ("polaris_sandbox_id", "cathedral_sandbox_id", "broker_batch")
 
 
 def canonical(doc) -> bytes:
@@ -110,6 +126,19 @@ def owner_request_sha256(doc: dict) -> str:
     return hashlib.sha256(canonical(_whole_numbers(doc))).hexdigest()
 
 
+def bootstrap_sha256(hotel_doc: dict) -> str:
+    """SEALED_BOOTSTRAP_SHA256 for one create in its hotel form (AB#963)."""
+    image = hotel_doc.get("image")
+    if not isinstance(image, str) or "@sha256:" not in image:
+        raise ValueError("the bootstrap image must be a string pinned by @sha256 digest")
+    if not hotel_doc.get("entrypoint") and hotel_doc.get("start") != "image":
+        raise ValueError("name an entrypoint: without one the room runs sleep infinity, not the image")
+    out = {k: v for k, v in hotel_doc.items() if k not in LAUNCH_UNBOUND_FIELDS}
+    if isinstance(out.get("labels"), dict):
+        out["labels"] = {k: v for k, v in out["labels"].items() if k not in LAUNCH_UNBOUND_LABELS}
+    return hashlib.sha256(canonical(_whole_numbers(out))).hexdigest()
+
+
 def sign_create(key: Ed25519PrivateKey, body: bytes, guest: str, now: int | None = None) -> dict[str, str]:
     """The two headers for one create body (bytes as the guest sends them)."""
     ts = str(int(time.time()) if now is None else int(now))
@@ -128,13 +157,30 @@ def load_key(path: str) -> Ed25519PrivateKey:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--key", required=True, help="owner Ed25519 private key, PEM")
+    ap.add_argument("--key", help="owner Ed25519 private key, PEM")
     ap.add_argument("--body", help="create body file (JSON), exactly as sent to the broker")
     ap.add_argument("--guest", help="your broker guest id (the broker_guest label)")
     ap.add_argument("--timestamp", type=int, help="unix seconds (default: now)")
     ap.add_argument("--public", action="store_true", help="print the public key (base64) and exit")
     ap.add_argument("--raw-out", help="with --public: also write the 32 raw public key bytes here")
+    ap.add_argument("--bootstrap-digest", action="store_true",
+                    help="print SEALED_BOOTSTRAP_SHA256 for --body (no key needed)")
+    ap.add_argument("--hotel-form", action="store_true",
+                    help="--body is already the hotel form (the API owner request preview document)")
     a = ap.parse_args()
+    if a.bootstrap_digest:
+        if not a.body or not (a.guest or a.hotel_form):
+            ap.error("--bootstrap-digest needs --body and --guest (or --hotel-form)")
+        with open(a.body, "rb") as f:
+            doc = json.loads(f.read())
+        try:
+            print(bootstrap_sha256(doc if a.hotel_form else hotel_form(doc, a.guest)))
+        except ValueError as exc:
+            print(f"owner_sign: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if not a.key:
+        ap.error("--key is required")
     key = load_key(a.key)
     if a.public:
         raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)

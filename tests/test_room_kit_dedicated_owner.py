@@ -67,7 +67,7 @@ class Machine:
     """One faked sealed guest: owner key, manifest digest, fw_cfg and HOST_DATA."""
 
     def __init__(self, tmp_path: Path, monkeypatch, *, owner: bool = True, host_data: bytes | None = None,
-                 fw_key: bytes | None = None, fw_manifest: bytes | None = None):
+                 fw_key: bytes | None = None, fw_manifest: bytes | None = None, bootstrap: bytes | None = None):
         self.key = Ed25519PrivateKey.generate()
         self.pub = _raw_pub(self.key)
         self.manifest = hashlib.sha256(b'{"schema":"cathedral_sealed_hotel_guest_v1"}').digest()
@@ -77,7 +77,10 @@ class Machine:
             (fw / "owner-pubkey" / "raw").write_bytes(self.pub if fw_key is None else fw_key)
             (fw / "manifest-sha256").mkdir(parents=True)
             (fw / "manifest-sha256" / "raw").write_bytes(self.manifest if fw_manifest is None else fw_manifest)
-            want = rr.dedicated_host_data(self.manifest, self.pub)
+            want = rr.dedicated_host_data(self.manifest, self.pub, bootstrap)
+            if bootstrap is not None:
+                (fw / "bootstrap-sha256").mkdir(parents=True)
+                (fw / "bootstrap-sha256" / "raw").write_bytes(bootstrap)
         else:
             fw.mkdir(parents=True)
             want = self.manifest  # the shared launch: HOST_DATA is the manifest digest
@@ -624,3 +627,254 @@ def test_measured_tun_config_keeps_verified_owner_gate(tmp_path, monkeypatch):
     assert ledger.owner_key == m.pub
     assert ledger.binding["tenancy"] == "dedicated"
     assert ledger.report[0x50:0x90] == bytes.fromhex(ledger.binding_sha256) + bytes(32)
+
+
+# ---------------------------------------------------------------- AB#963 bootstrap digest in HOST_DATA (v2)
+
+BOOT_IMAGE = "docker.io/library/alpine@sha256:" + "4b" * 32
+# The create as the API sends it to the broker (polariscomputer broker_body).
+BOOT_CREATE = {"sealed": True, "hotels": ["dedicated-1"], "placement": "require", "image": BOOT_IMAGE,
+               "entrypoint": ["/bin/sh", "-c", "exec /boot"], "resources": {"vcpu": 2, "memory_gib": 4, "disk_gib": 10},
+               "network": {"mode": "public"}, "ttl_seconds": 3600, "env": {"NODE": "a"},
+               "labels": {"polaris_sandbox_id": "11111111-1111-4111-8111-111111111111",
+                          "cathedral_sandbox_id": "11111111-1111-4111-8111-111111111111",
+                          "job": "cathedral-customer", "polaris_env": "production"}}
+
+
+def _boot_digest(create: dict = BOOT_CREATE) -> str:
+    return osign.bootstrap_sha256(osign.hotel_form(json.loads(json.dumps(create)), GUEST))
+
+
+@pytest.fixture
+def boot_front(tmp_path, monkeypatch):
+    """A dedicated machine launched for BOOT_CREATE (HOST_DATA v2)."""
+    seen: list[tuple[str, str, bytes]] = []
+
+    class Api(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):  # noqa: N802
+            n = int(self.headers.get("Content-Length") or 0)
+            seen.append((self.command, self.path, self.rfile.read(n)))
+            out = json.dumps({"id": f"sbx_{len(seen)}", "state": "running"}).encode()
+            self.send_response(202)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    api = ThreadingHTTPServer(("127.0.0.1", 0), Api)
+    threading.Thread(target=api.serve_forever, daemon=True).start()
+    m = Machine(tmp_path, monkeypatch, bootstrap=bytes.fromhex(_boot_digest()))
+    ledger = m.ledger()
+    server = rr.Server(("127.0.0.1", 0), ledger, api.server_address[1], 1, API_KEY, "/nonexistent.sock", pool_scan=False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_address[1], seen, ledger, m
+    server.shutdown()
+    api.shutdown()
+
+
+def _boot_post(port: int, m: Machine, create: dict, *, sign: bool = True):
+    headers = osign.sign_create(m.key, json.dumps(create).encode(), GUEST) if sign else {}
+    return _post(port, "/v1/sandboxes", _broker_form(create), headers)
+
+
+def test_bootstrap_binding_is_v2_and_recomputable(tmp_path, monkeypatch) -> None:
+    boot = bytes.fromhex(_boot_digest())
+    m = Machine(tmp_path, monkeypatch, bootstrap=boot)
+    ledger = m.ledger()
+    b = ledger.binding
+    assert b["tenancy"] == "dedicated" and b["host_data_version"] == 2 and b["bootstrap_sha256"] == boot.hex()
+    assert b["host_data"] == hashlib.sha256(
+        b"cathedral-dedicated-v2\0" + m.manifest + m.pub + boot).hexdigest()
+    assert ledger.bootstrap_sha256 == boot.hex()
+    assert ledger.report[0x50:0x90] == bytes.fromhex(ledger.binding_sha256) + bytes(32)
+
+
+def test_a_v1_binding_has_no_bootstrap_fields(tmp_path, monkeypatch) -> None:
+    b = Machine(tmp_path, monkeypatch).ledger().binding
+    assert "host_data_version" not in b and "bootstrap_sha256" not in b
+
+
+@pytest.mark.parametrize("case", ["v1_host_data_with_digest", "v2_host_data_without_digest", "other_digest", "short_digest"])
+def test_a_bootstrap_digest_the_report_does_not_name_fails_closed(tmp_path, monkeypatch, case) -> None:
+    boot = bytes.fromhex(_boot_digest())
+    probe = Machine(tmp_path / "probe", monkeypatch)
+    v1 = rr.dedicated_host_data(probe.manifest, probe.pub)
+    if case == "v1_host_data_with_digest":
+        # The host adds a digest the chip never signed: the v1 HOST_DATA does not commit to it.
+        m = Machine(tmp_path, monkeypatch, bootstrap=boot)
+        monkeypatch.setattr(rr, "snp_report", _fake_snp(rr.dedicated_host_data(m.manifest, m.pub)))
+    elif case == "v2_host_data_without_digest":
+        # The host drops the digest file but keeps the v2 HOST_DATA: the guest cannot run as v1.
+        m = Machine(tmp_path, monkeypatch, bootstrap=boot)
+        (tmp_path / "fw_cfg" / "bootstrap-sha256" / "raw").unlink()
+    elif case == "other_digest":
+        m = Machine(tmp_path, monkeypatch, bootstrap=boot)
+        (tmp_path / "fw_cfg" / "bootstrap-sha256" / "raw").write_bytes(bytes(32))
+    else:
+        m = Machine(tmp_path, monkeypatch, bootstrap=boot)
+        (tmp_path / "fw_cfg" / "bootstrap-sha256" / "raw").write_bytes(boot[:31])
+    assert v1 != m.host_data or case == "v1_host_data_with_digest"
+    with pytest.raises(rr.OwnerBindingError):
+        m.ledger()
+
+
+def test_the_signed_bootstrap_create_runs_and_its_receipt_says_so(boot_front) -> None:
+    port, seen, ledger, m = boot_front
+    status, doc, hdrs = _boot_post(port, m, BOOT_CREATE)
+    assert status == 202, doc
+    assert len(seen) == 1
+    st = _receipt(hdrs)["statement"]
+    assert st["launch_bootstrap"] is True and st["launch_create_sha256"] == ledger.bootstrap_sha256
+    assert st["owner_signature_b64"]
+
+
+def test_the_bootstrap_matches_again_with_a_new_sandbox_id_and_lifetime(boot_front) -> None:
+    port, seen, _ledger, m = boot_front
+    again = json.loads(json.dumps(BOOT_CREATE))
+    again["ttl_seconds"] = 86400
+    again["labels"]["polaris_sandbox_id"] = again["labels"]["cathedral_sandbox_id"] = str(uuid.uuid4())
+    assert _boot_post(port, m, again)[0] == 202
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d["env"].update(NODE="b"),
+    lambda d: d.update(entrypoint=["/bin/sh"]),
+    lambda d: d.update(image="docker.io/library/alpine@sha256:" + "5c" * 32),
+    lambda d: d["resources"].update(vcpu=4),
+    lambda d: d.update(network={"mode": "deny_all", "allow": []}),
+    lambda d: d["labels"].update(job="other"),
+    lambda d: d.update(workspace="state"),
+    lambda d: d.update(made_up_field=1),
+])
+def test_an_owner_signed_create_that_is_not_the_bootstrap_is_refused_unsent(boot_front, change) -> None:
+    port, seen, ledger, m = boot_front
+    other = json.loads(json.dumps(BOOT_CREATE))
+    change(other)
+    status, doc, hdrs = _boot_post(port, m, other)
+    assert status == 403
+    err = doc["error"]
+    assert err["code"] == "owner_signature_launch_mismatch"
+    assert err["bootstrap_sha256"] == ledger.bootstrap_sha256
+    assert err["launch_create_sha256"] == _boot_digest(other) != ledger.bootstrap_sha256
+    assert seen == []
+    assert _receipt(hdrs)["statement"]["status"] == 403  # the refusal is receipted
+
+
+def test_the_bootstrap_create_without_the_owner_signature_is_refused(boot_front) -> None:
+    port, seen, _ledger, m = boot_front
+    status, doc, _ = _boot_post(port, m, BOOT_CREATE, sign=False)
+    assert status == 403 and doc["error"]["code"] == "owner_signature_required"
+    assert "bootstrap_sha256" not in doc["error"]  # signature first: a stranger learns nothing
+    assert seen == []
+
+
+def test_a_bootstrap_machine_refuses_a_tag_image_and_any_build(boot_front) -> None:
+    port, seen, _ledger, m = boot_front
+    tagged = {**BOOT_CREATE, "image": "alpine:3.20"}
+    status, doc, _ = _boot_post(port, m, tagged)
+    assert status == 403 and doc["error"]["code"] == "owner_signature_launch_mismatch"
+    build = json.dumps({"dockerfile": "FROM alpine:3.20\n", "tag": "x"}).encode()
+    ts = str(int(time.time()))
+    sig = m.key.sign(f"cathedral-owner-build-v1\n{ts}\n{rr.owner_request_sha256(build)}".encode())
+    status, doc, _ = _post(port, "/v1/images/build", build, {"X-Cathedral-Owner-Timestamp": ts,
+                                                              "X-Cathedral-Owner-Signature": base64.b64encode(sig).decode()})
+    assert status == 403 and doc["error"]["code"] == "owner_signature_launch_mismatch"
+    assert seen == []
+
+
+def test_owner_sign_bootstrap_digest_matches_the_guest(tmp_path) -> None:
+    body = tmp_path / "create.json"
+    body.write_text(json.dumps(BOOT_CREATE))
+    out = subprocess.run([sys.executable, str(KIT / "owner_sign.py"), "--bootstrap-digest", "--guest", GUEST,
+                          "--body", str(body)], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == rr.launch_create_sha256(_broker_form(BOOT_CREATE))
+    hotel = tmp_path / "hotel.json"
+    hotel.write_text(json.dumps(osign.hotel_form(json.loads(json.dumps(BOOT_CREATE)), GUEST)))
+    out2 = subprocess.run([sys.executable, str(KIT / "owner_sign.py"), "--bootstrap-digest", "--hotel-form",
+                           "--body", str(hotel)], capture_output=True, text=True, check=True).stdout.strip()
+    assert out2 == out
+
+
+@pytest.mark.parametrize("create", [{**BOOT_CREATE, "image": "alpine:3.20"},
+                                    {k: v for k, v in BOOT_CREATE.items() if k != "entrypoint"}])
+def test_owner_sign_refuses_a_bootstrap_that_could_not_be_what_runs(create) -> None:
+    with pytest.raises(ValueError):
+        osign.bootstrap_sha256(osign.hotel_form(json.loads(json.dumps(create)), GUEST))
+
+
+def test_owner_sign_drops_what_the_broker_drops() -> None:
+    doc = {**BOOT_CREATE, "own_hosts_only": True, "prefer_chip_id": "ab", "require_chip_id": True,
+           "create_timeout_seconds": 30}
+    assert osign.hotel_form(doc, GUEST) == osign.hotel_form(dict(BOOT_CREATE), GUEST)
+
+
+def test_launch_v2_host_data_is_what_the_guest_and_the_verifier_recompute(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"schema":"cathedral_sealed_hotel_guest_v1","hotel":"dedicated-1"}')
+    owner = _raw_pub(Ed25519PrivateKey.generate())
+    (tmp_path / "owner.pub").write_bytes(owner)
+    boot = _boot_digest()
+    args = [sys.executable, "-c", _launch_program(), str(manifest), str(tmp_path / "owner.pub"),
+            str(tmp_path / "manifest.sha256")]
+    out = subprocess.run(args + [boot, str(tmp_path / "bootstrap.sha256")], capture_output=True, text=True,
+                         check=True).stdout
+    digest = hashlib.sha256(manifest.read_bytes()).digest()
+    assert (tmp_path / "bootstrap.sha256").read_bytes() == bytes.fromhex(boot)
+    assert base64.b64decode(out.strip()) == rr.dedicated_host_data(digest, owner, bytes.fromhex(boot))
+    assert base64.b64decode(out.strip()) == hashlib.sha256(
+        vr.DEDICATED_V2_HOST_DATA_DOMAIN + digest + owner + bytes.fromhex(boot)).digest()
+    # Back to v1: the old digest file goes, so no stale digest reaches the guest.
+    out = subprocess.run(args + ["", str(tmp_path / "bootstrap.sha256")], capture_output=True, text=True,
+                         check=True).stdout
+    assert base64.b64decode(out.strip()) == rr.dedicated_host_data(digest, owner)
+    assert not (tmp_path / "bootstrap.sha256").exists()
+    bad = subprocess.run(args + ["AB" * 32, str(tmp_path / "bootstrap.sha256")], capture_output=True, text=True)
+    assert bad.returncode != 0 and "64 lowercase hex" in bad.stderr
+    text = (KIT / "sealed" / "launch-guest.sh").read_text()
+    assert "name=opt/cathedral/bootstrap-sha256,file=$RUN/bootstrap.sha256" in text
+
+
+def _boot_chain(boot_front) -> tuple[dict, list, Machine, str]:
+    port, _seen, ledger, m = boot_front
+    assert _boot_post(port, m, BOOT_CREATE)[0] == 202
+    other = {**BOOT_CREATE, "env": {"NODE": "z"}}
+    assert _boot_post(port, m, other)[0] == 403  # refused attempts stay in the chain
+    return ledger.attestation(), list(ledger.chain), m, ledger.bootstrap_sha256
+
+
+def test_verifier_passes_a_bootstrap_machine_and_pins_its_digest(boot_front, tmp_path) -> None:
+    att, chain, m, boot = _boot_chain(boot_front)
+    pub = base64.b64encode(m.pub).decode()
+    out = _verify(tmp_path, att, chain, "--owner-pubkey", pub, "--bootstrap-sha256", boot,
+                  "--expected-measurement", "ab" * 48)
+    assert out["verdict"] == "PASS", out
+    owner = out["attestation"]["owner"]
+    assert owner["host_data_version"] == 2 and owner["bootstrap_sha256"] == boot and owner["signed_creates"] == 1
+    out = _verify(tmp_path, att, chain, "--owner-pubkey", pub, "--bootstrap-sha256", "0" * 64)
+    assert out["verdict"] == "FAIL" and "another bootstrap" in out["reason"]
+
+
+def test_verifier_fails_a_v1_machine_when_a_bootstrap_is_pinned(front, tmp_path) -> None:
+    att, chain, m = _signed_chain(front)
+    out = _verify(tmp_path, att, chain, "--owner-pubkey", base64.b64encode(m.pub).decode(),
+                  "--bootstrap-sha256", _boot_digest())
+    assert out["verdict"] == "FAIL" and "host_data_version 1" in out["reason"]
+
+
+def test_verifier_fails_a_bootstrap_machine_create_that_is_not_the_bootstrap(boot_front, tmp_path) -> None:
+    att, chain, m, _boot = _boot_chain(boot_front)
+    key = Ed25519PrivateKey.generate()
+    binding = {**att["binding"], "receipt_key_ed25519_b64": base64.b64encode(_raw_pub(key)).decode()}
+    att2 = _att_for(binding, m)
+    st = {**chain[0]["statement"], "binding_sha256": att2["binding_sha256"],
+          "previous_receipt_sha256": att2["binding_sha256"], "sequence": 1}
+    st.pop("launch_bootstrap")
+    rc = {"statement": st, "signature_b64": base64.b64encode(key.sign(rr.canonical(st))).decode(),
+          "receipt_sha256": rr.sha(rr.canonical(st))}
+    out = _verify(tmp_path, att2, [rc], "--owner-pubkey", base64.b64encode(m.pub).decode())
+    assert out["verdict"] == "FAIL" and "not the bootstrap create" in out["reason"]

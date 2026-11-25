@@ -19,21 +19,42 @@ mkdir -p "$RUN"
 # so every report also names the one owner. The guest gets the key and the manifest
 # digest in fw_cfg, recomputes this value and refuses to serve when its own report
 # differs; it then refuses every create the owner did not sign.
+# Bootstrap (AB#963, SEALED_BOOTSTRAP_SHA256 = 64 hex, needs the owner key): v2,
+# sha256("cathedral-dedicated-v2\0" || manifest sha || owner key || bootstrap sha);
+# the guest then starts no room but the owner-signed create with that digest
+# (owner_sign.py --bootstrap-digest). A new digest is a new HOST_DATA, so a new data key.
 OWNER_FW_CFG=()
+if [ -n "${SEALED_BOOTSTRAP_SHA256:-}" ] && [ -z "${SEALED_OWNER_PUBKEY_FILE:-}" ]; then
+  echo "SEALED_BOOTSTRAP_SHA256 needs SEALED_OWNER_PUBKEY_FILE" >&2; exit 1
+fi
 if [ -n "${SEALED_OWNER_PUBKEY_FILE:-}" ]; then
-  HOST_DATA=$(python3 - "$IMG/manifest.json" "$SEALED_OWNER_PUBKEY_FILE" "$RUN/manifest.sha256" <<'EOF'
-import base64, hashlib, sys
-manifest, key_file, digest_out = sys.argv[1:]
+  HOST_DATA=$(python3 - "$IMG/manifest.json" "$SEALED_OWNER_PUBKEY_FILE" "$RUN/manifest.sha256" \
+    "${SEALED_BOOTSTRAP_SHA256:-}" "$RUN/bootstrap.sha256" <<'EOF'
+import base64, hashlib, os, re, sys
+manifest, key_file, digest_out = sys.argv[1:4]
+bootstrap_hex, bootstrap_out = (sys.argv[4:6] + ["", ""])[:2]
 key = open(key_file, "rb").read()
 if len(key) != 32:
     sys.exit(f"SEALED_OWNER_PUBKEY_FILE {key_file} has {len(key)} bytes; it must hold the 32 raw bytes of an Ed25519 public key")
 digest = hashlib.sha256(open(manifest, "rb").read()).digest()
 open(digest_out, "wb").write(digest)
-print(base64.b64encode(hashlib.sha256(b"cathedral-dedicated-v1\0" + digest + key).digest()).decode())
+if bootstrap_hex:
+    if not re.fullmatch(r"[0-9a-f]{64}", bootstrap_hex):
+        sys.exit("SEALED_BOOTSTRAP_SHA256 must be 64 lowercase hex digits")
+    open(bootstrap_out, "wb").write(bytes.fromhex(bootstrap_hex))
+    value = hashlib.sha256(b"cathedral-dedicated-v2\0" + digest + key + bytes.fromhex(bootstrap_hex)).digest()
+else:
+    if bootstrap_out and os.path.exists(bootstrap_out):
+        os.remove(bootstrap_out)  # a v1 launch never hands the guest an old digest
+    value = hashlib.sha256(b"cathedral-dedicated-v1\0" + digest + key).digest()
+print(base64.b64encode(value).decode())
 EOF
 )
   OWNER_FW_CFG=(-fw_cfg "name=opt/cathedral/owner-pubkey,file=$SEALED_OWNER_PUBKEY_FILE"
                 -fw_cfg "name=opt/cathedral/manifest-sha256,file=$RUN/manifest.sha256")
+  if [ -n "${SEALED_BOOTSTRAP_SHA256:-}" ]; then
+    OWNER_FW_CFG+=(-fw_cfg "name=opt/cathedral/bootstrap-sha256,file=$RUN/bootstrap.sha256")
+  fi
 else
   HOST_DATA=$(python3 -c 'import base64,hashlib,sys;print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$IMG/manifest.json")
 fi

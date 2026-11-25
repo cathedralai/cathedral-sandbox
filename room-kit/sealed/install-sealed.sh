@@ -36,6 +36,11 @@ fi
 if [ -n "${SEALED_OWNER_PUBKEY_FILE:-}" ]; then
   [ "$(stat -c %s "$SEALED_OWNER_PUBKEY_FILE" 2>/dev/null)" = 32 ] || { echo "SEALED_OWNER_PUBKEY_FILE $SEALED_OWNER_PUBKEY_FILE must hold the 32 raw bytes of an Ed25519 public key" >&2; exit 1; }
 fi
+# Bootstrap digest (AB#963): checked before the build so a typo never becomes a dark guest.
+if [ -n "${SEALED_BOOTSTRAP_SHA256:-}" ]; then
+  [ -n "${SEALED_OWNER_PUBKEY_FILE:-}" ] || { echo "SEALED_BOOTSTRAP_SHA256 needs SEALED_OWNER_PUBKEY_FILE" >&2; exit 1; }
+  [[ "$SEALED_BOOTSTRAP_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "SEALED_BOOTSTRAP_SHA256 must be 64 lowercase hex digits (owner_sign.py --bootstrap-digest)" >&2; exit 1; }
+fi
 # Several guests on one host (AB#432): a /30 another interface or hotel uses,
 # or a move of this hotel's link while its guest runs, stops here: before the
 # 10 to 20 minute build and before any installed file changes.
