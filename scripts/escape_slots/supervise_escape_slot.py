@@ -43,6 +43,14 @@ Ordering assumption: the API creates the room before it plants the secret
 (AB683.md P5 step 3 before 6). A plant with no room would read as an ended
 attempt and retire the guest at once, which is the safe direction.
 
+Guest TLS slot (SEALED_MINER=1 with SEALED_ESCAPE_SLOT=1, the chi-escape
+re-seal of 24 Nov): the guest serves the hotel key routes only over HTTPS on
+SEALED_MINER_TLS_PORT, and the broker installs the hotel key in each launch.
+The supervisor then reads https://<SEALED_GUEST_IP>:<SEALED_MINER_TLS_PORT>
+with a copy of the broker's hotel key for this slot in SEALED_API_KEY_FILE
+(the retire channel needs it at the broker too). The broker's own
+hotel_key_install receipt opens every such chain, so it does not count as use.
+
 Live systemctl calls need CATHEDRAL_ESCAPE_SLOT_LIVE_OK=yes.
 """
 from __future__ import annotations
@@ -52,6 +60,7 @@ import base64
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -65,6 +74,14 @@ from pathlib import Path
 SCHEMA = "cathedral_escape_slot_supervise_v1"
 LIVE_ENV = "CATHEDRAL_ESCAPE_SLOT_LIVE_OK"
 DEFAULT_GUEST_URL = "http://10.215.0.2:18090"  # room-kit/sealed/guest-constants.sh
+DEFAULT_MINER_TLS_PORT = "18443"  # room-kit/sealed/build-guest.sh SEALED_MINER_TLS_PORT
+# The broker's hotel key install (room_receipts.py INSTALL_ACTION): signed into the
+# chain of a guest TLS launch before any player can reach it, so it is not use.
+INSTALL_ACTION = "hotel_key_install"
+# Receipts read per poll on a guest TLS slot: enough to see past the install
+# receipts. A full page of installs only is read as used (fail toward retire).
+TLS_RECEIPTS_LIMIT = 16
+IPV4_RE = re.compile(r"^(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(\.(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}$")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,58}$")  # launch-guest.sh SEALED_NAME rule
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 RETIRE_REQUEST_SCHEMA = "cathedral.escape.retire_request/v1"  # broker escape_destroy.go
@@ -93,6 +110,14 @@ class SlotConfig:
     name: str
     sealed_dir: Path
     key_file: Path
+    # Guest TLS slot: the guest's HTTPS origin on the tap; None on a plain slot.
+    tls_guest_url: str | None = None
+
+    @property
+    def receipts_path(self) -> str:
+        if self.tls_guest_url:
+            return f"/room/receipts?limit={TLS_RECEIPTS_LIMIT}"
+        return "/room/receipts?limit=1"
 
     @property
     def unit(self) -> str:
@@ -142,10 +167,21 @@ def load_slot(sealed_env: Path) -> SlotConfig:
     name = env.get("SEALED_NAME", "")
     if not NAME_RE.fullmatch(name):
         die("SEALED_NAME missing or invalid")
-    if env.get("SEALED_MINER", "0") != "0":
-        # A miner hotel serves only /room/attestation on the plain port and
-        # holds no hotel key on the host, so this process cannot read it.
-        die("SEALED_MINER must be 0 on an Escape slot")
+    miner = env.get("SEALED_MINER", "0")
+    tls_guest_url = None
+    if miner == "1" and env.get("SEALED_ESCAPE_SLOT") == "1":
+        # Guest TLS slot: the plain port serves only /room/attestation, so read
+        # the guest over its TLS port on the tap with the slot's hotel key copy.
+        guest_ip = env.get("SEALED_GUEST_IP", "")
+        port = env.get("SEALED_MINER_TLS_PORT", DEFAULT_MINER_TLS_PORT)
+        if not IPV4_RE.fullmatch(guest_ip):
+            die("SEALED_GUEST_IP must be the guest's IPv4 address on a guest TLS slot")
+        if not re.fullmatch(r"[1-9][0-9]{0,4}", port) or int(port) > 65535:
+            die("SEALED_MINER_TLS_PORT must be a TCP port")
+        tls_guest_url = f"https://{guest_ip}:{port}"
+    elif miner != "0":
+        # A miner hotel that is not an Escape slot: the host holds no hotel key.
+        die("SEALED_MINER must be 0 on an Escape slot (or 1 with SEALED_ESCAPE_SLOT=1)")
     if env.get("SEALED_DATA_GIB", "0") != "0":
         # launch-guest.sh makes data.raw on any start when this is set, and a
         # data volume outlives the guest: state would cross attempts.
@@ -158,7 +194,7 @@ def load_slot(sealed_env: Path) -> SlotConfig:
     key_file = Path(env.get("SEALED_API_KEY_FILE", ""))
     if not key_file.is_absolute() or not key_file.is_file():
         die("SEALED_API_KEY_FILE missing or not a file")
-    return SlotConfig(name=name, sealed_dir=sealed_dir, key_file=key_file)
+    return SlotConfig(name=name, sealed_dir=sealed_dir, key_file=key_file, tls_guest_url=tls_guest_url)
 
 
 # ---------------------------------------------------------------- live I/O
@@ -170,13 +206,23 @@ def http_fetcher(guest_url: str, key_file: Path, timeout: float = 5.0) -> Fetch:
     if not key:
         die("hotel key file is empty")
     base = guest_url.rstrip("/")
+    kwargs: dict = {}
+    if base.startswith("https://"):
+        # The guest's TLS key is new each launch and self-signed (its binding
+        # names it). This read crosses only the host's own tap to the guest, the
+        # same path the plain slot reads over HTTP, and the host already holds
+        # the key it sends, so the certificate adds nothing to check here.
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        kwargs["context"] = context
 
     def fetch(path: str) -> tuple:
         request = urllib.request.Request(
             base + path, method="GET", headers={"Authorization": f"Bearer {key}"}
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as answer:
+            with urllib.request.urlopen(request, timeout=timeout, **kwargs) as answer:
                 status, body = answer.status, answer.read()
         except urllib.error.HTTPError as exc:
             return exc.code, None
@@ -405,7 +451,7 @@ class SlotSupervisor:
             self.retire(f"unit_{unit_state}")
             return
 
-        r_status, receipts = self.fetch("/room/receipts?limit=1")
+        r_status, receipts = self.fetch(self.slot.receipts_path)
         s_status, rooms_doc = self.fetch("/v1/sandboxes")
         if r_status in (401, 403) or s_status in (401, 403):
             # Wrong key or a miner image: a config error, not a dead guest.
@@ -440,8 +486,7 @@ class SlotSupervisor:
             self.retire("binding_changed")
             return True
         ids = {r.get("id") if isinstance(r, dict) else None for r in rooms}
-        count = receipts.get("count")
-        chain_used = (isinstance(count, int) and count > 0) or bool(receipts.get("receipts"))
+        chain_used = self.chain_used(receipts)
         if chain_used or rooms:
             launch.used = True
         if launch.state == "booting":
@@ -476,6 +521,21 @@ class SlotSupervisor:
         if launch.empty_polls >= self.empty_polls_to_retire:
             self.retire("attempt_ended")
         return True
+
+    def chain_used(self, receipts: dict) -> bool:
+        count = receipts.get("count")
+        page = receipts.get("receipts")
+        if not self.slot.tls_guest_url:
+            return (isinstance(count, int) and count > 0) or bool(page)
+        if not isinstance(page, list):
+            return isinstance(count, int) and count > 0
+        if len(page) >= TLS_RECEIPTS_LIMIT or (isinstance(count, int) and count > len(page)):
+            return True  # more chain than this page shows: never guess it is only installs
+        for receipt in page:
+            statement = receipt.get("statement") if isinstance(receipt, dict) else None
+            if not isinstance(statement, dict) or statement.get("action") != INSTALL_ACTION:
+                return True
+        return False
 
     def check_clocks(self, answered: bool) -> None:
         launch, now = self.launch, self.clock()
@@ -679,8 +739,9 @@ def build_parser() -> argparse.ArgumentParser:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sealed-env", required=True, type=Path,
                         help="the slot's sealed.env (absolute path)")
-    parser.add_argument("--guest-url", default=DEFAULT_GUEST_URL,
-                        help="where this host reaches the slot's guest port 18090")
+    parser.add_argument("--guest-url", default=None,
+                        help="where this host reaches the slot's guest port 18090 (default "
+                             f"{DEFAULT_GUEST_URL}; a guest TLS slot uses its HTTPS port)")
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--boot-timeout", type=float, default=15 * 60)
     parser.add_argument("--fresh-max-age", type=float, default=6 * 3600)
@@ -701,7 +762,7 @@ def main(argv: list | None = None) -> int:
         return 0
     supervisor = SlotSupervisor(
         sealed_env=args.sealed_env,
-        fetch=http_fetcher(args.guest_url, slot.key_file),
+        fetch=http_fetcher(args.guest_url or slot.tls_guest_url or DEFAULT_GUEST_URL, slot.key_file),
         systemctl=live_systemctl,
         boot_timeout=args.boot_timeout,
         fresh_max_age=args.fresh_max_age,

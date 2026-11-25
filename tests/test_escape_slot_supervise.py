@@ -448,3 +448,119 @@ def test_a_room_after_a_used_chain_with_no_room_retires(rig):
     poll(sup, clock)
     retire = [t for t in transitions(lines) if t.get("state") == "retiring"]
     assert retire and retire[0]["reason"] == "new_room_on_used_launch"
+
+
+# ---------------------------------------------------------------- guest TLS slot (SEALED_MINER=1)
+
+
+class TlsGuest(FakeGuest):
+    """A guest TLS launch: the broker's hotel key install is receipt 1 of every chain."""
+
+    def fetch(self, path: str):
+        if path.startswith("/room/receipts?limit="):
+            self.paths.append(path)
+            if not self.up:
+                return None, None
+            page = [{"statement": {"sequence": 1, "action": es.INSTALL_ACTION}}]
+            page += [{"statement": {"sequence": 2 + n, "action": "create"}} for n in range(self.chain)]
+            limit = int(path.rsplit("=", 1)[1])
+            page = page[:limit]
+            return 200, {"binding_sha256": self.binding, "head": "x", "count": len(page), "receipts": page}
+        return super().fetch(path)
+
+
+@pytest.fixture()
+def tls_rig(tmp_path: Path):
+    env = make_slot(tmp_path, SEALED_MINER="1", SEALED_ESCAPE_SLOT="1", SEALED_GUEST_IP="10.231.78.2")
+    guest = TlsGuest()
+    systemctl = FakeSystemctl(guest, tmp_path / "slot" / "scratch.raw")
+    clock = Clock()
+    lines: list = []
+    sup = es.SlotSupervisor(sealed_env=env, fetch=guest.fetch, systemctl=systemctl,
+                            clock=clock, out=lines.append)
+    return sup, guest, systemctl, clock, lines
+
+
+def test_tls_slot_reads_the_guest_tls_port(tmp_path):
+    slot = es.load_slot(make_slot(tmp_path, SEALED_MINER="1", SEALED_ESCAPE_SLOT="1",
+                                  SEALED_GUEST_IP="10.231.78.2"))
+    assert slot.tls_guest_url == "https://10.231.78.2:18443"
+    slot = es.load_slot(make_slot(tmp_path / "p", SEALED_MINER="1", SEALED_ESCAPE_SLOT="1",
+                                  SEALED_GUEST_IP="10.231.78.2", SEALED_MINER_TLS_PORT="18444"))
+    assert slot.tls_guest_url == "https://10.231.78.2:18444"
+    assert es.load_slot(make_slot(tmp_path / "plain")).tls_guest_url is None
+
+
+@pytest.mark.parametrize("extra, message", [
+    ({"SEALED_MINER": "1"}, "SEALED_MINER"),  # a miner hotel that is not an Escape slot
+    ({"SEALED_MINER": "2", "SEALED_ESCAPE_SLOT": "1"}, "SEALED_MINER"),
+    ({"SEALED_MINER": "1", "SEALED_ESCAPE_SLOT": "1"}, "SEALED_GUEST_IP"),
+    ({"SEALED_MINER": "1", "SEALED_ESCAPE_SLOT": "1", "SEALED_GUEST_IP": "10.0.0.300"}, "SEALED_GUEST_IP"),
+    ({"SEALED_MINER": "1", "SEALED_ESCAPE_SLOT": "1", "SEALED_GUEST_IP": "10.0.0.2",
+      "SEALED_MINER_TLS_PORT": "70000"}, "SEALED_MINER_TLS_PORT"),
+])
+def test_tls_slot_config_refusals(tmp_path, extra, message):
+    with pytest.raises(SystemExit, match=message):
+        es.load_slot(make_slot(tmp_path, **extra))
+
+
+def test_tls_slot_install_receipt_alone_stays_fresh(tls_rig):
+    sup, guest, systemctl, clock, _ = tls_rig
+    poll(sup, clock, times=5)
+    assert sup.launch.state == "fresh" and not sup.launch.used
+    assert systemctl.mutating() == []
+    assert f"/room/receipts?limit={es.TLS_RECEIPTS_LIMIT}" in guest.paths
+
+
+def test_tls_slot_attempt_after_install_is_retired(tls_rig):
+    sup, guest, systemctl, clock, _ = tls_rig
+    poll(sup, clock)
+    guest.chain, guest.rooms = 1, [{"id": "r1"}]
+    poll(sup, clock)
+    assert sup.launch.state == "in_use"
+    guest.rooms = []
+    poll(sup, clock, times=2)
+    assert systemctl.mutating() == ["stop", "start"]
+
+
+def test_tls_slot_full_page_is_read_as_used(tls_rig):
+    sup, guest, _systemctl, clock, _ = tls_rig
+    guest.chain = es.TLS_RECEIPTS_LIMIT  # more than one page
+    poll(sup, clock)
+    assert sup.launch.used
+
+
+def test_tls_slot_page_of_installs_only_but_full_is_used(tls_rig):
+    sup, _guest, _systemctl, _clock, _ = tls_rig
+    full = [{"statement": {"action": es.INSTALL_ACTION}}] * es.TLS_RECEIPTS_LIMIT
+    assert sup.chain_used({"count": len(full), "receipts": full})
+    assert not sup.chain_used({"count": 1, "receipts": full[:1]})
+    assert sup.chain_used({"count": 1, "receipts": [{"no": "statement"}]})
+
+
+def test_http_fetcher_https_reaches_the_tap_guest_without_a_ca(tmp_path, monkeypatch):
+    key = tmp_path / "k"
+    key.write_text("secret\n")
+    seen = []
+
+    class Answer:
+        status = 200
+
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(request, timeout, context=None):
+        seen.append((request.full_url, context))
+        return Answer()
+
+    monkeypatch.setattr(es.urllib.request, "urlopen", fake_urlopen)
+    es.http_fetcher("https://10.231.78.2:18443", key)("/v1/sandboxes")
+    url, context = seen[0]
+    assert url == "https://10.231.78.2:18443/v1/sandboxes"
+    assert context is not None and context.verify_mode == es.ssl.CERT_NONE
