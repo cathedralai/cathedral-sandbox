@@ -129,3 +129,42 @@ func TestOwnerSignatureRefusalIsTheGuestsErrorAndDoesNotRestTheHotel(t *testing.
 		t.Fatalf("signed create after a refusal: %d %v", status, doc)
 	}
 }
+
+// AB#963: a machine launched for one bootstrap create refuses an owner-signed
+// create that is not it, with 403 owner_signature_launch_mismatch and both
+// digests. The broker must hand that to the guest as is (the owner needs the
+// digests) and must not rest the hotel, so the right create goes through next.
+func TestLaunchMismatchReachesTheGuestWithItsDigestsAndDoesNotRestTheHotel(t *testing.T) {
+	const boot, got = "4fb4d33243999e34a934da3c418d8f9e35ae5e48931221ed50c1b4b3e5697064",
+		"c8872cdc31a7b817e80619d90623e2b7ed2f4251035b3d9ea452b69d81e57a20"
+	wrap := func(id string, f *fakeHotel, next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if id == "b" && r.URL.Path == "/v1/sandboxes" && r.Method == "POST" && r.Header.Get("X-Test-Bootstrap") != "1" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(403)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+					"code": "owner_signature_launch_mismatch", "message": "this create is not the bootstrap create",
+					"bootstrap_sha256": boot, "launch_create_sha256": got}})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	tc := r6Chain(t, "", wrap)
+	signed := map[string]string{"X-Cathedral-Owner-Signature": testOwnerSig, "X-Cathedral-Owner-Timestamp": testOwnerTS}
+	status, doc := postWithHeaders(t, tc, "key1", map[string]any{"image": "alpine:3.20", "hotels": []string{"b"}}, signed)
+	if status != 403 || errCode(doc) != "owner_signature_launch_mismatch" {
+		t.Fatalf("launch mismatch: %d %v", status, doc)
+	}
+	e, _ := doc["error"].(map[string]any)
+	if e["bootstrap_sha256"] != boot || e["launch_create_sha256"] != got {
+		t.Fatalf("the guest lost the digests the hotel computed: %v", doc)
+	}
+	h := tc.b.hotelByID("b")
+	tc.b.mu.Lock()
+	resting, failed := !h.backoffUntil.IsZero(), h.failed
+	tc.b.mu.Unlock()
+	if resting || failed != 0 {
+		t.Fatalf("a launch mismatch rested the hotel (backoff %v, failed %d)", resting, failed)
+	}
+}
