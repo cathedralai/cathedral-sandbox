@@ -1195,12 +1195,17 @@ def _list_mode_with_report(tmp_path: Path, product_args: tuple, version: int = 2
 
 
 INSTRUCTION = "cannot tell the product from cpuid family None model None; pass --product"
-NO_LAYOUT_1A = "the report names cpuid family 26 model 1, which has no layout here"
+NO_LAYOUT_1A = "the report names cpuid family 26 model 18, which has no layout here"
 SCENARIOS = [
     # (name, version, family, model, product args, expected: None for PASS, else the reason)
-    ("v3 family 0x1a, --product Milan", 3, 0x1A, 0x01, ("--product", "Milan"), NO_LAYOUT_1A),
-    ("v3 family 0x1a, --product Genoa", 3, 0x1A, 0x01, ("--product", "Genoa"), NO_LAYOUT_1A),
-    ("v3 family 0x1a, no flag", 3, 0x1A, 0x01, (), NO_LAYOUT_1A),
+    # family 0x1A models 0x00 to 0x11 are Turin (AB#938); model 0x12 is past that range
+    ("v3 family 0x1a model 0x12, --product Milan", 3, 0x1A, 0x12, ("--product", "Milan"), NO_LAYOUT_1A),
+    ("v3 family 0x1a model 0x12, --product Genoa", 3, 0x1A, 0x12, ("--product", "Genoa"), NO_LAYOUT_1A),
+    ("v3 family 0x1a model 0x12, no flag", 3, 0x1A, 0x12, (), NO_LAYOUT_1A),
+    ("v3 Turin, --product Milan", 3, 0x1A, 0x01, ("--product", "Milan"),
+     "--product Milan: the report names the product Turin"),
+    ("v3 Turin, --product Genoa", 3, 0x1A, 0x01, ("--product", "Genoa"),
+     "--product Genoa: the report names the product Turin"),
     ("v3 Milan, --product Genoa", 3, 0x19, 0x01, ("--product", "Genoa"),
      "--product Genoa: the report names the product Milan"),
     ("v3 Milan, --product Milan", 3, 0x19, 0x01, ("--product", "Milan"), None),
@@ -1221,6 +1226,7 @@ SCENARIOS = [
     ("v2, --product Milan", 2, 0x19, 0x01, ("--product", "Milan"), None),
     ("v2, --product Genoa", 2, 0x19, 0x01, ("--product", "Genoa"), None),      # nothing in a v2 report can contradict it
     ("v2, --product Rome", 2, 0x19, 0x01, ("--product", "Rome"), "only Milan and Genoa TCB layouts are handled"),
+    ("v2, --product Turin", 2, 0x19, 0x01, ("--product", "Turin"), "only Milan and Genoa TCB layouts are handled"),
     ("v2, no flag", 2, 0x19, 0x01, (), INSTRUCTION),
 ]
 

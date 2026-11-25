@@ -33,7 +33,7 @@ type Options struct {
 	RequireMeasurement bool
 	ARK, ASK, VCEK     []byte
 	ARKPins            []string
-	// Product ("Genoa" or "Milan") overrides the product read from the report
+	// Product ("Genoa", "Milan" or "Turin") overrides the product read from the report
 	// CPUID, which only reports of version 3 and later carry.
 	Product string
 }

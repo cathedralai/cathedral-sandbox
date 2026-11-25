@@ -166,7 +166,7 @@ def run_checks(
     elif gen == "milan":
         add("cpu", WARN, f"{cpu['model_name']} (Milan): apply; not admitted yet (no published Milan measurement)")
     else:
-        add("cpu", WARN, f"{cpu['model_name']} (Turin): apply; not admitted yet (policy and broker verifier lack Turin)")
+        add("cpu", WARN, f"{cpu['model_name']} (Turin): apply; not admitted yet (validator policy lacks Turin)")
 
     # Validators require the SINGLE_SOCKET guest bit by default, and KVM cannot
     # launch such a guest on a host with two or more populated sockets.
