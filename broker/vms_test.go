@@ -701,13 +701,190 @@ func TestVMsStartingCanStopOrReconcile(t *testing.T) {
 	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+c, nil); doc["desired_state"] != "starting" {
 		t.Fatalf("reconciled on another generation: %v", doc)
 	}
-	// A definite refusal on retry goes back to stopped in generation 0.
+	// A refused retry proves nothing about the first attempt: it stays
+	// starting in its generation, with last_error.
 	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"unpaid"}`), vmExitUnpaid, nil }
 	if st, _ := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+c+"/start", nil); st != 409 {
 		t.Fatalf("refused retry: %d", st)
 	}
-	tb.host.answer = nil
-	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+c, nil); doc["desired_state"] != "stopped" || doc["generation"] != float64(0) {
+	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("down") }
+	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+c, nil); doc["desired_state"] != "starting" || doc["generation"] != float64(1) || doc["last_error"] != "start: not_paid" {
 		t.Fatalf("after refused retry: %v", doc)
+	}
+	// The host says it is stopped with that generation closed: stopped,
+	// generation kept, and a Stop of it still asks the host for a receipt.
+	tb.host.answer = func(args []string) ([]byte, int, error) {
+		return []byte(`{"name":"` + c + `","state":"stopped","generation":1,"closed":true}`), 0, nil
+	}
+	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+c, nil); doc["desired_state"] != "stopped" || doc["generation"] != float64(1) {
+		t.Fatalf("reconcile to stopped: %v", doc)
+	}
+	tb.host.answer = nil
+	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+c+"/stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(1900000000) {
+		t.Fatalf("stop after reconcile: %d %v", st, doc)
+	}
+	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+c+"/start", map[string]any{"generation": 1}); st != 409 || vmErrCode(doc) != "stale_generation" {
+		t.Fatalf("start of the closed generation: %d %v", st, doc)
+	}
+	// Host stopped in the same generation, not closed: still unknown.
+	d := lost()
+	tb.host.answer = func(args []string) ([]byte, int, error) {
+		return []byte(`{"name":"` + d + `","state":"stopped","generation":1}`), 0, nil
+	}
+	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+d, nil); doc["desired_state"] != "starting" {
+		t.Fatalf("reconciled an open generation: %v", doc)
+	}
+	// A first attempt the host refuses rolls back to stopped in generation 0.
+	e := tb.create(t, nil)["id"].(string)
+	tb.host.answer = nil
+	tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+e+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
+	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"unpaid"}`), vmExitUnpaid, nil }
+	tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+e+"/start", nil)
+	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("down") }
+	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+e, nil); doc["desired_state"] != "stopped" || doc["generation"] != float64(0) {
+		t.Fatalf("after refused first start: %v", doc)
+	}
+}
+
+func TestVMsStopReceiptOnlyOnceSaved(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	_, base := vmRunning(t, tb)
+	// A directory where the temp file goes makes every save fail.
+	block := filepath.Join(tb.b.cfg.StateDir, vmsFile+".tmp")
+	stop := func() (int, map[string]any) {
+		return tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 1})
+	}
+	if err := os.Mkdir(block, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The intent save fails first: nothing sent to the host.
+	calls := tb.host.count()
+	if st, doc := stop(); st != 500 || tb.host.count() != calls {
+		t.Fatalf("stop with no saves: %d %v", st, doc)
+	}
+	// Intent saved, then the receipt save fails.
+	os.Remove(block)
+	tb.host.answer = func(args []string) ([]byte, int, error) {
+		if args[0] == "stop" {
+			if err := os.Mkdir(block, 0o700); err != nil {
+				t.Error(err)
+			}
+			return []byte(`{"stopped_at":1900000000}`), 0, nil
+		}
+		return []byte(`{"ok":true}`), 0, nil
+	}
+	if st, doc := stop(); st != 500 || vmErrCode(doc) != "state_not_saved" {
+		t.Fatalf("receipt not saved: %d %v", st, doc)
+	}
+	// The repeat answers the cached receipt only after it is on disk.
+	if st, doc := stop(); st != 500 || vmErrCode(doc) != "state_not_saved" {
+		t.Fatalf("repeat with saves failing: %d %v", st, doc)
+	}
+	os.Remove(block)
+	if st, doc := stop(); st != 200 || doc["stopped_at"] != float64(1900000000) {
+		t.Fatalf("repeat once saves work: %d %v", st, doc)
+	}
+	tb2 := loadVMTestBroker(t, tb.cfg)
+	if _, doc := tb2.call(t, "operator-key", "GET", base, nil); doc["stopped_at"] != float64(1900000000) {
+		t.Fatalf("receipt after restart: %v", doc)
+	}
+}
+
+func TestVMsStopCancelsNextRunBeforeStart(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	id, base := vmRunning(t, tb)
+	tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 1})
+	tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 2})
+
+	// A host that does not answer: 502, nothing changes, the cancel may be repeated.
+	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("timeout") }
+	if st, _ := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 2}); st != 502 {
+		t.Fatalf("cancel with host down: %d", st)
+	}
+	tb.host.answer = nil
+	if _, one := tb.call(t, "operator-key", "GET", base, nil); one["generation"] != float64(1) || one["stopped_at"] != float64(1900000000) {
+		t.Fatalf("state after a lost cancel: %v", one)
+	}
+	// Stop of a generation two ahead is still refused.
+	for _, g := range []int{3} {
+		if st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": g}); st != 409 || vmErrCode(doc) != "stale_generation" {
+			t.Fatalf("stop generation %d: %d %v", g, st, doc)
+		}
+	}
+	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"ok":true,"stopped_at":1800000123}`), 0, nil }
+	st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 2})
+	if st != 200 || doc["generation"] != float64(2) || doc["stopped_at"] != float64(1800000123) || doc["desired_state"] != "stopped" {
+		t.Fatalf("cancel: %d %v", st, doc)
+	}
+	tb.host.answer = nil
+	if got := tb.host.last(); strings.Join(got[1:], " ") != "stop "+id+" --generation 2" {
+		t.Fatalf("cancel argv %v", got)
+	}
+	calls := tb.host.count()
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 2}); st != 200 || doc["stopped_at"] != float64(1800000123) {
+		t.Fatalf("repeated cancel: %d %v", st, doc)
+	}
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/start", map[string]any{"generation": 2}); st != 409 || vmErrCode(doc) != "stale_generation" {
+		t.Fatalf("late start of the cancelled run: %d %v", st, doc)
+	}
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 600, "generation": 2}); st != 409 || vmErrCode(doc) != "stale_authorization" {
+		t.Fatalf("late authorize of the cancelled run: %d %v", st, doc)
+	}
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 1}); st != 409 || vmErrCode(doc) != "stale_generation" {
+		t.Fatalf("old run stop after cancel: %d %v", st, doc)
+	}
+	if tb.host.count() != calls {
+		t.Fatal("host called after the cancel")
+	}
+	// The run after it starts normally.
+	tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 600, "generation": 3})
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/start", nil); st != 200 || doc["generation"] != float64(3) {
+		t.Fatalf("start after cancel: %d %v", st, doc)
+	}
+}
+
+func TestVMsCancelWithLostAuthorizeReply(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	id := tb.create(t, nil)["id"].(string)
+	base := "/v1/broker/vms/" + id
+	// The authorize reply was lost: the broker never recorded generation 1,
+	// and the host never got it, so its stop answers exit 3.
+	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("connection reset") }
+	tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
+	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"stale_generation"}`), vmExitStale, nil }
+	st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 1})
+	if st != 200 || doc["generation"] != float64(1) || doc["stopped_at"] != float64(tb.now.Unix()) || doc["desired_state"] != "stopped" {
+		t.Fatalf("cancel with lost authorize: %d %v", st, doc)
+	}
+	tb.host.answer = nil
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/start", map[string]any{"generation": 1}); st != 409 || vmErrCode(doc) != "stale_generation" {
+		t.Fatalf("late start: %d %v", st, doc)
+	}
+	// Closed across a restart too.
+	tb2 := loadVMTestBroker(t, tb.cfg)
+	tb2.now = tb.now
+	if st, _ := tb2.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1}); st != 409 {
+		t.Fatalf("authorize of the cancelled run after restart: %d", st)
+	}
+}
+
+func TestVMsRefusedStartKeepsPreviousReceipt(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	_, base := vmRunning(t, tb)
+	tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 1})
+	tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 2})
+	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"stale_generation"}`), vmExitStale, nil }
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/start", nil); st != 409 || vmErrCode(doc) != "stale_generation" {
+		t.Fatalf("host exit 3 on start: %d %v", st, doc)
+	}
+	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("down") }
+	_, doc := tb.call(t, "operator-key", "GET", base, nil)
+	if doc["desired_state"] != "stopped" || doc["generation"] != float64(1) || doc["stopped_at"] != float64(1900000000) {
+		t.Fatalf("after refused first start: %v", doc)
+	}
+	// The generation-1 receipt still answers without a host call.
+	calls := tb.host.count()
+	if st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(1900000000) || tb.host.count() != calls {
+		t.Fatalf("receipt after refused start: %d %v", st, doc)
 	}
 }

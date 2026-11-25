@@ -610,20 +610,35 @@ func (b *broker) getVM(w http.ResponseWriter, r *http.Request, id string) {
 
 // reconcileStarting moves a VM whose start answer was lost from starting
 // to running once the host's status says it runs in that generation.
+//
+// It moves it to stopped when the host is stopped (or only created) and
+// its generation is another one or closed: that run never runs again. The
+// generation stays consumed and stopped_at stays unset, so a Stop of it
+// still asks the host for a receipt.
 func (s *vmStore) reconcileStarting(id string, doc map[string]any) bool {
 	gen, ok := doc["generation"].(float64)
-	if !ok || doc["state"] != vmStateRunning {
+	state, _ := doc["state"].(string)
+	closed, _ := doc["closed"].(bool)
+	if !ok {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec := s.recs[id]
-	if rec == nil || s.busy[id] || rec.DesiredState != vmStateStarting || uint64(gen) != rec.Generation || float64(rec.Generation) != gen {
+	if rec == nil || s.busy[id] || rec.DesiredState != vmStateStarting {
 		return false
 	}
-	rec.DesiredState, rec.LastError = vmStateRunning, ""
+	same := float64(rec.Generation) == gen
+	switch {
+	case state == vmStateRunning && same:
+		rec.DesiredState, rec.LastError = vmStateRunning, ""
+	case (state == vmStateStopped || state == "created") && (!same || closed):
+		rec.DesiredState = vmStateStopped
+	default:
+		return false
+	}
 	if err := s.saveLocked(); err != nil {
-		log.Printf("vms: %s not saved after reconciling %s to running: %v", vmsFile, id, err)
+		log.Printf("vms: %s not saved after reconciling %s to %s: %v", vmsFile, id, rec.DesiredState, err)
 	}
 	return true
 }
@@ -878,7 +893,8 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 	// Intent first: a start whose answer is lost stays starting in the new
 	// generation, and a repeated start finishes it.
 	prev := *rec
-	if rec.DesiredState == vmStateStopped {
+	retry := rec.DesiredState == vmStateStarting
+	if !retry {
 		prev.LastError = ""
 		rec.Generation, rec.DesiredState, rec.StoppedAt = gen, vmStateStarting, 0
 		if err := s.saveLocked(); err != nil {
@@ -889,10 +905,6 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 			writeErr(w, 500, "state_not_saved", "the start could not be recorded; nothing was sent to the host")
 			return
 		}
-	} else {
-		// Retry of a lost start: a refusal goes back to stopped in the
-		// generation before.
-		prev.DesiredState, prev.Generation, prev.LastError = vmStateStopped, gen-1, ""
 	}
 	s.mu.Unlock()
 
@@ -902,13 +914,20 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 	defer s.mu.Unlock()
 	delete(s.busy, id)
 	if cerr != nil {
-		if cerr.unknown {
-			rec.LastError = "start: " + cerr.code // stays starting
-		} else {
-			*rec = prev // the host refused: stopped, the authorization still usable
+		switch {
+		case !retry && !cerr.unknown:
+			*rec = prev // the host refused the first attempt: stopped, the previous run's stopped_at and the authorization kept
+		default:
+			// Unknown outcome, or a refused retry: the first attempt may
+			// have run, so the generation stays. GET reconciles from host
+			// status, or a Stop of this generation settles it.
+			rec.LastError = "start: " + cerr.code
 		}
 		if err := s.saveLocked(); err != nil {
 			log.Printf("vms: %s not saved after a failed start of %s: %v", vmsFile, id, err)
+		}
+		if cerr.code == "stale_authorization" { // host exit 3: not its authorized generation
+			cerr = &vmCallErr{409, "stale_generation", "the host's current generation is not this one", false}
 		}
 		cerr.write(w)
 		return
@@ -920,9 +939,11 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 	writeJSON(w, 200, s.view(rec))
 }
 
-// stopVM stops the run of the given generation. A Stop for another
-// generation (a late billing outbox delivery) is refused without a host
-// call; a repeated Stop of a stopped run answers its stored stopped_at.
+// stopVM stops the run of the given generation. On a stopped VM, a Stop of
+// generation+1 cancels that run before it started (cancelVMRun). A Stop for
+// any other generation (a late billing outbox delivery) is refused without
+// a host call; a repeated Stop of a stopped run answers its stored
+// stopped_at.
 func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	var req struct {
 		Generation *uint64 `json:"generation"`
@@ -942,6 +963,11 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 		s.mu.Unlock()
 		return
 	}
+	if rec.DesiredState == vmStateStopped && gen == rec.Generation+1 {
+		s.mu.Unlock()
+		b.cancelVMRun(w, r, rec, h, gen)
+		return
+	}
 	var code, refuse string
 	switch {
 	case rec.DesiredState == vmStateCreating:
@@ -956,10 +982,18 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if rec.DesiredState == vmStateStopped && rec.StoppedAt != 0 {
+		// The stored receipt, answered only once it is on disk: the save
+		// after the host's stop may have failed.
+		err := s.saveLocked()
 		delete(s.busy, id)
 		v := s.view(rec)
 		s.mu.Unlock()
-		writeJSON(w, 200, v) // the stored receipt
+		if err != nil {
+			log.Printf("vms: %s not saved for the stop receipt of %s: %v", vmsFile, id, err)
+			writeErr(w, 500, "state_not_saved", "the host stopped the VM but the broker could not record stopped_at; repeat the stop")
+			return
+		}
+		writeJSON(w, 200, v)
 		return
 	}
 	// Intent first: once asked to stop, the run takes no more authorizations.
@@ -1004,6 +1038,46 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	if err := s.saveLocked(); err != nil {
 		log.Printf("vms: %s not saved after stop of %s: %v", vmsFile, id, err)
 		writeErr(w, 500, "state_not_saved", "the host stopped the VM but the broker could not record stopped_at; repeat the stop")
+		return
+	}
+	writeJSON(w, 200, s.view(rec))
+}
+
+// cancelVMRun closes the next run of a stopped VM before it started (its
+// authorization delivered, or its reply lost). The generation is consumed:
+// a late start or authorize of it is refused since the next is gen+1. The
+// host closes it and answers stopped_at; exit 3 means the host never got
+// that authorization, so the run closes at now. A host that does not
+// answer changes nothing and the cancel may be repeated. Caller holds the
+// VM busy (begin), not s.mu.
+func (b *broker) cancelVMRun(w http.ResponseWriter, r *http.Request, rec *vmRecord, h vmHostConfig, gen uint64) {
+	s := b.vms
+	id := rec.ID
+	doc, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "stop", id, "--generation", strconv.FormatUint(gen, 10))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.busy, id)
+	var at int64
+	switch {
+	case cerr != nil && cerr.code == "stale_authorization":
+		at = s.now().Unix()
+	case cerr != nil:
+		cerr.write(w)
+		return
+	default:
+		var ok bool
+		if at, ok = vmUnixField(doc["stopped_at"]); !ok {
+			writeErr(w, 502, "vm_host_bad_answer", "the host's stop answer has no stopped_at")
+			return
+		}
+	}
+	prev := *rec
+	rec.Generation, rec.StoppedAt, rec.LastError = gen, at, ""
+	if err := s.saveLocked(); err != nil {
+		*rec = prev
+		log.Printf("vms: %s not saved after cancel of %s generation %d: %v", vmsFile, id, gen, err)
+		writeErr(w, 500, "state_not_saved", "the run was closed on the host but the broker could not record it; repeat the stop")
 		return
 	}
 	writeJSON(w, 200, s.view(rec))
