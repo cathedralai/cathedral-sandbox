@@ -97,12 +97,16 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 # from cathedral-desktop main d8308c70, AB#956 AB#709; the d1a0e45c row stays). The kit installs no other copy of
 # start_commands.json, so hotels allow aa77f919 only once this pin is sealed. The only change to cathedral/ since
 # e4cd94b. Same make-dist.sh; the e4cd94b tarball rebuilds to its pinned sha 595f8ad7... with the same tool.
+# Pinned 2026-11-24 to 286d643: main after #739 (start_commands.json row for the Desktop image 20f01a75 built
+# from cathedral-desktop main 3a7bbe71, AB#709; the aa77f919 and d1a0e45c rows stay). The kit installs no other copy
+# of start_commands.json, so hotels allow 20f01a75 only once this pin is sealed. The only change to cathedral/ since
+# e48e0b7. Same make-dist.sh; the e48e0b7 tarball rebuilds to its pinned sha 47bd8af0... with the same tool.
 # Pinned 2026-11-24 for the guest volume agent (AB#789, fetched only with ROOM_VOLUMES=1): restic 0.19.1,
 # the sha256 of restic_0.19.1_linux_amd64.bz2 from the release's SHA256SUMS (also cathedral/volume_agent.py).
 RESTIC_VERSION=0.19.1
 RESTIC_URL=https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
 RESTIC_SHA256=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
-CATHEDRAL_COMMIT=e48e0b7
-CATHEDRAL_TARBALL=dist/cathedral-e48e0b7.tar.gz
-CATHEDRAL_TARBALL_SHA256=47bd8af021812139d663ee798f6ec780893362f9e90c94fb47f2c187e202c608
+CATHEDRAL_COMMIT=286d643
+CATHEDRAL_TARBALL=dist/cathedral-286d643.tar.gz
+CATHEDRAL_TARBALL_SHA256=50df5aead4fef5c66fb1fe61410f65db56427023c01848b8b6dad74df5b303ae
 PROBE_IMAGE=alpine:3.20
