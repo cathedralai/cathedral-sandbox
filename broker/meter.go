@@ -117,6 +117,20 @@ func (b *broker) meterRooms(ctx context.Context, g *guestState) ([]map[string]an
 			}
 		}
 	}
+	// g's claimed rooms carry the pool's hotel labels (claims_state.go).
+	claimed, cerrs := b.claimedRoomDocs(ctx, g, url.Values{})
+	for hid, list := range claimed {
+		for _, s := range list {
+			if rm := meterRoom(hid, s); rm != nil {
+				rooms = append(rooms, rm)
+			}
+		}
+	}
+	for hid, e := range cerrs {
+		if _, ok := errs[hid]; !ok {
+			errs[hid] = e
+		}
+	}
 	sort.Slice(rooms, func(i, j int) bool { return rooms[i]["id"].(string) < rooms[j]["id"].(string) })
 	return rooms, errs
 }

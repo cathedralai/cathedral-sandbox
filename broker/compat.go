@@ -785,6 +785,7 @@ func (b *broker) compatRoom(w http.ResponseWriter, r *http.Request, g *guestStat
 		}
 		doc["hotel"] = rm.h.cfg.ID
 		doc["isolation"] = isolationDoc(rm.h, doc)
+		b.claimedView(doc, rm) // a claimed room: the customer's labels and the win time
 		writeJSON(w, 200, compatView(doc, id))
 	case tail == "" && r.Method == "DELETE":
 		c := &capture{hdr: http.Header{}, status: 200}

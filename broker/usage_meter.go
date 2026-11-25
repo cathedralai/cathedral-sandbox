@@ -221,11 +221,12 @@ func (r *usageRun) update(s usageSighting) (turnedNotBillable bool) {
 
 // usageSightingOf is a sighting of a room in h's room map. A registered room
 // is a guest's; one without a client id is being reaped and is not billable.
-// A room of the ready-room pool guest is never billable (design 8.2).
+// A room of the ready-room pool guest is never billable (design 8.2). A
+// claimed room is sighted as its customer's run (rm.runID, claims_state.go).
 func usageSightingOf(h *hotel, rm *room, resources any) usageSighting {
 	vcpu, mem := usageSizeOf(resources)
 	pool := rm.guest == poolGuestID
-	return usageSighting{run: rm.id, guest: rm.guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem, billable: rm.uuid != "" && !pool, pool: pool}
+	return usageSighting{run: rm.runID(), guest: rm.guest, hotel: h.cfg.ID, miner: h.cfg.MinerHotkey, vcpu: vcpu, memGiB: mem, billable: rm.uuid != "" && !pool, pool: pool}
 }
 
 // usageSizeOf reads resources.vcpu and resources.memory_gib as whole
@@ -304,7 +305,10 @@ type usageMeter struct {
 	dir       string
 	every     int64 // seconds
 	minSecond bool  // usage_meter_min_second: a billable run's ended reading rounds up (queueLocked)
-	maxLines  int   // lines per file (usageFileLines; tests lower it)
+	// holdClaimRuns: the claim journal is not read yet (claims_state.go), so
+	// a claim run may still be mapped back to its room: none ends by absence.
+	holdClaimRuns bool
+	maxLines      int // lines per file (usageFileLines; tests lower it)
 	// write appends p to f and makes it durable. Tests replace it to fail.
 	write func(f *os.File, p []byte) error
 	known func(hotelID string) bool // the hotel is in the broker now; nil: every hotel
@@ -564,6 +568,38 @@ func (m *usageMeter) seenLocked(s usageSighting, at time.Time) (turnedNotBillabl
 	return turned && !s.pool
 }
 
+// setHoldClaimRuns turns the claim-run hold on (the journal is not read
+// yet) or off (it was read).
+func (m *usageMeter) setHoldClaimRuns(on bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.holdClaimRuns = on
+	m.mu.Unlock()
+}
+
+// runOpen reports whether run is open: it has readings and no ended one.
+func (m *usageMeter) runOpen(run string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runs[run] != nil
+}
+
+// runEnded reports whether run has its ended reading and the meter still
+// remembers it (usageEndedKeep).
+func (m *usageMeter) runEnded(run string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ended[run] != nil
+}
+
 // end writes the ended reading of a run. confirmed: the broker's own delete
 // removed the room at at, so the time since its last sighting counts, when
 // the gap is short and no answered list since that sighting left the room
@@ -652,7 +688,9 @@ func (m *usageMeter) hotelPass(hotelID string, listed []usageSighting, present m
 		}
 	}
 	for id, r := range m.runs {
-		if endAbsent && r.last.Hotel == hotelID && !present[id] {
+		// A claim run waits for the claim journal's replay: its room may be
+		// the pool's until then (claims_state.go, the late open).
+		if endAbsent && r.last.Hotel == hotelID && !present[id] && !(m.holdClaimRuns && usageClaimRun(id)) {
 			m.endLocked(id, at, false)
 		}
 	}
@@ -1246,7 +1284,7 @@ func (b *broker) usageMeterHotel(h *hotel, listed []usageSighting, at time.Time,
 	}
 	present := make(map[string]bool, len(h.rooms)+len(listed))
 	for _, rm := range h.rooms {
-		present[rm.id] = true
+		present[rm.runID()] = true // a claimed room: its customer's run
 	}
 	for _, s := range listed {
 		present[s.run] = true
@@ -1329,7 +1367,11 @@ func (b *broker) bulkDeleteTargets(ctx context.Context, h *hotel, q url.Values) 
 			match = match && s.Labels[k] == v
 		}
 		if match {
-			t.runs = append(t.runs, h.cfg.ID+"."+s.ID)
+			run := h.cfg.ID + "." + s.ID
+			if rm := h.rooms[s.ID]; rm != nil {
+				run = rm.runID() // a claimed room never matches a guest's label list; kept exact anyway
+			}
+			t.runs = append(t.runs, run)
 			listed = append(listed, b.usageSightingOfListed(h, s.ID, s.Labels, s.Resources))
 		}
 	}
