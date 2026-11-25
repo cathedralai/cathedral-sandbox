@@ -16,12 +16,14 @@ concurrency:
 
 jobs:
   test:
-    name: Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }} (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        # One pytest run took ~30 min; four shards by file size cut PR wait time.
+        shard: [1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -41,7 +43,7 @@ jobs:
       - name: Test
         env:
           CATHEDRAL_TEST_TMPDIR: /var/lib/cathedral-test-tmp
-        run: python -m pytest -q
+        run: python -m pytest -q $(python scripts/ci_shard.py ${{ matrix.shard }} 4)
 
   cross-repository-receipt-contract:
     name: Compute-Distill-Validator receipt contract
