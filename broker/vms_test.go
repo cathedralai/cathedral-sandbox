@@ -888,3 +888,41 @@ func TestVMsRefusedStartKeepsPreviousReceipt(t *testing.T) {
 		t.Fatalf("receipt after refused start: %d %v", st, doc)
 	}
 }
+
+// Cursor on #755: a lost start that GET settled to stopped because the host
+// holds another generation must still get a stop receipt, not 409 forever.
+func TestVMsSettledLostStartGetsAReceipt(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	id := tb.create(t, nil)["id"].(string)
+	tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
+	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("timeout") }
+	tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/start", nil)
+	// The host never got generation 1 (the authorize never reached it).
+	tb.host.answer = func(args []string) ([]byte, int, error) {
+		return []byte(`{"name":"` + id + `","state":"created","generation":0}`), 0, nil
+	}
+	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+id, nil); doc["desired_state"] != "stopped" {
+		t.Fatalf("settle: %v", doc)
+	}
+	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"stale_generation"}`), 3, nil }
+	st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1})
+	if st != 200 || doc["stopped_at"] != float64(tb.now.Unix()) {
+		t.Fatalf("stop of the settled run: %d %v", st, doc)
+	}
+	// Repeat: the stored receipt, no host call.
+	tb.host.answer = func(a []string) ([]byte, int, error) { t.Fatalf("host called for a stored receipt: %v", a); return nil, 0, nil }
+	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(tb.now.Unix()) {
+		t.Fatalf("repeat: %d %v", st, doc)
+	}
+	// A running run whose host refuses the stop as stale keeps the refusal.
+	tb.host.answer = nil
+	b := tb.create(t, nil)["id"].(string)
+	tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+b+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
+	if st, _ := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+b+"/start", nil); st != 200 {
+		t.Fatalf("start b: %d", st)
+	}
+	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"stale_generation"}`), 3, nil }
+	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+b+"/stop", map[string]any{"generation": 1}); st != 409 || vmErrCode(doc) != "stale_generation" {
+		t.Fatalf("running stale stop: %d %v", st, doc)
+	}
+}

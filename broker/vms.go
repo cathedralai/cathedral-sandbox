@@ -1014,6 +1014,12 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, id)
+	if cerr != nil && cerr.code == "stale_authorization" && (prev == vmStateStopped || prev == vmStateStarting) {
+		// A lost start (or one GET settled to stopped) whose generation the host never
+		// holds: that run never ran there, so it closes at now, as cancelVMRun does.
+		// Without this the run stays consumed with no receipt and every Stop is 409.
+		doc, cerr = map[string]any{"stopped_at": float64(s.now().Unix())}, nil
+	}
 	if cerr != nil {
 		if cerr.unknown {
 			rec.LastError = "stop: " + cerr.code // stays stopped in intent; repeat the stop
