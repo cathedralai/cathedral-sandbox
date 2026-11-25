@@ -52,6 +52,13 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      carries an owner signature that verifies with the key. Pair it with
      --expected-measurement: the measurement is what proves the guest runs
      the build whose front refuses creates the owner did not sign.
+     A binding with host_data_version 2 (AB#963, a machine launched for one
+     bootstrap create) is checked against
+     sha256("cathedral-dedicated-v2\0" || manifest_sha256 || key || bootstrap_sha256),
+     and each successful create receipt must carry launch_bootstrap true and
+     launch_create_sha256 equal to the binding's bootstrap_sha256.
+     --bootstrap-sha256 <hex> (needs --owner-pubkey) fails unless the binding
+     is v2 with exactly that digest; without it a v1 machine also passes.
   9. sandbox link (AB#389): a create receipt that carries cathedral_sandbox_id
      must carry a lower-case UUID. The output maps each room to the Cathedral
      sandbox id its successful create receipt signed. --cathedral-sandbox <id>
@@ -235,6 +242,7 @@ INSTALL_PURPOSE = "hotel-key-install"
 HEX64 = re.compile(r"[0-9a-f]{64}")
 ORIGIN_MAX_BYTES = 64 * 1024
 DEDICATED_HOST_DATA_DOMAIN = b"cathedral-dedicated-v1\0"
+DEDICATED_V2_HOST_DATA_DOMAIN = b"cathedral-dedicated-v2\0"
 SANDBOX_LINK_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # room_receipts.py
 ONESHOT_BUNDLE_SCHEMA = "cathedral_oneshot_bundle_v1"
 ONESHOT_RECIPE_SCHEMA = "cathedral_oneshot_recipe_v1"
@@ -747,7 +755,7 @@ def owner_key_bytes(owner_b64: str) -> bytes:
     return key
 
 
-def verify_owner(att: dict, owner: bytes) -> dict:
+def verify_owner(att: dict, owner: bytes, bootstrap: str | None = None) -> dict:
     """The binding and the chip-signed HOST_DATA name this owner (check 8).
 
     Run after verify_attestation, which checks the report against the
@@ -768,14 +776,29 @@ def verify_owner(att: dict, owner: bytes) -> dict:
     except ValueError as exc:
         raise Fail("the binding's manifest_sha256 is not hex") from exc
     rep = parse_report(base64.b64decode(att["report_b64"]))
-    want = hashlib.sha256(DEDICATED_HOST_DATA_DOMAIN + manifest_raw + owner).hexdigest()
-    need(rep["host_data"] == want, "report HOST_DATA does not commit to this owner key and manifest")
+    version = binding.get("host_data_version", 1)
+    need(version in (1, 2), f"the binding's host_data_version {version!r} is not one this verifier knows")
+    if version == 1:
+        need("bootstrap_sha256" not in binding, "a v1 binding names a bootstrap_sha256")
+        need(bootstrap is None, "--bootstrap-sha256 was asked for, but the binding has no bootstrap (host_data_version 1)")
+        want = hashlib.sha256(DEDICATED_HOST_DATA_DOMAIN + manifest_raw + owner).hexdigest()
+        need(rep["host_data"] == want, "report HOST_DATA does not commit to this owner key and manifest")
+        return {"tenancy": "dedicated", "owner_ed25519_b64": base64.b64encode(owner).decode(),
+                "manifest_sha256": manifest, "host_data": rep["host_data"], "host_data_version": 1}
+    named_boot = binding.get("bootstrap_sha256")
+    need(isinstance(named_boot, str) and re.fullmatch(r"[0-9a-f]{64}", named_boot) is not None,
+         "a v2 binding has no 64-hex bootstrap_sha256")
+    need(bootstrap is None or named_boot == bootstrap, "the binding names another bootstrap_sha256")
+    want = hashlib.sha256(DEDICATED_V2_HOST_DATA_DOMAIN + manifest_raw + owner + bytes.fromhex(named_boot)).hexdigest()
+    need(rep["host_data"] == want, "report HOST_DATA does not commit to this owner key, manifest and bootstrap")
     return {"tenancy": "dedicated", "owner_ed25519_b64": base64.b64encode(owner).decode(),
-            "manifest_sha256": manifest, "host_data": rep["host_data"]}
+            "manifest_sha256": manifest, "host_data": rep["host_data"], "host_data_version": 2,
+            "bootstrap_sha256": named_boot}
 
 
-def owner_signed_creates(receipts: list[dict], owner: bytes) -> int:
-    """Every successful create receipt carries a valid owner signature (check 8)."""
+def owner_signed_creates(receipts: list[dict], owner: bytes, bootstrap: str | None = None) -> int:
+    """Every successful create receipt carries a valid owner signature (check 8),
+    and, on a v2 machine (``bootstrap``, the binding's digest), is the bootstrap."""
     key = Ed25519PublicKey.from_public_bytes(owner)
     n = 0
     for rc in receipts:
@@ -790,6 +813,9 @@ def owner_signed_creates(receipts: list[dict], owner: bytes) -> int:
             key.verify(base64.b64decode(sig, validate=True), f"cathedral-owner-create-v1\n{ts}\n{digest}".encode())
         except (InvalidSignature, ValueError) as exc:
             raise Fail(f"receipt {seq}: the owner signature does not verify") from exc
+        if bootstrap is not None:
+            need(st.get("launch_bootstrap") is True and st.get("launch_create_sha256") == bootstrap,
+                 f"receipt {seq}: a create on a bootstrap machine that is not the bootstrap create")
         n += 1
     return n
 
@@ -2486,6 +2512,8 @@ def main() -> int:
     ap.add_argument("--require-sealed", action="store_true",
                     help="fail unless the hotel answers an SEV-SNP binding (run mode accepts it: it always asks for one)")
     ap.add_argument("--owner-pubkey", help="base64 Ed25519 public key: fail unless this is a dedicated machine of this owner")
+    ap.add_argument("--bootstrap-sha256", help="with --owner-pubkey: fail unless the machine was launched for "
+                                               "this bootstrap create digest (HOST_DATA v2, AB#963)")
     ap.add_argument("--save", help="with --broker: write the fetched attestation and receipts here")
     ap.add_argument("--tls-spki-sha256", help="SPKI sha256 of the TLS peer that served the attestation; "
                                               "fails unless the binding names this key")
@@ -2522,6 +2550,8 @@ def main() -> int:
             return 1
         print(json.dumps({"verdict": "PASS", **out}, indent=1))
         return 0
+    if a.bootstrap_sha256 is not None and (not a.owner_pubkey or not re.fullmatch(r"[0-9a-f]{64}", a.bootstrap_sha256)):
+        ap.error("--bootstrap-sha256 needs --owner-pubkey and 64 lowercase hex digits")
     if a.min_genoa_snp_spl is not None and not 1 <= a.min_genoa_snp_spl <= 255:
         ap.error("--min-genoa-snp-spl must be an integer from 1 to 255")
     if a.oneshot:
@@ -2531,7 +2561,7 @@ def main() -> int:
         # an empty string, or a value equal to an old default, is still a flag the caller passed.
         clash = [flag for flag, value in (
             ("--receipts", a.receipts), ("--attestation", a.attestation), ("--broker", a.broker),
-            ("--origin", a.origin), ("--owner-pubkey", a.owner_pubkey), ("--tls-spki-sha256", a.tls_spki_sha256),
+            ("--origin", a.origin), ("--owner-pubkey", a.owner_pubkey), ("--bootstrap-sha256", a.bootstrap_sha256), ("--tls-spki-sha256", a.tls_spki_sha256),
             ("--require-tls", a.require_tls), ("--kds-cache", a.kds_cache), ("--sandbox", a.sandbox),
             ("--hotel", a.hotel), ("--operator-key-file", a.operator_key_file), ("--save", a.save),
             ("--receipt-header", a.receipt_header), ("--cathedral-sandbox", a.cathedral_sandbox),
@@ -2646,8 +2676,9 @@ def main() -> int:
                     guest_ingress["zone"] = att["binding"]["guest_ingress"]["zone"]
                 attestation_out["guest_ingress"] = guest_ingress
             if owner is not None:
-                attestation_out["owner"] = verify_owner(att, owner)
-                attestation_out["owner"]["signed_creates"] = owner_signed_creates(live_receipts, owner)
+                attestation_out["owner"] = verify_owner(att, owner, a.bootstrap_sha256)
+                attestation_out["owner"]["signed_creates"] = owner_signed_creates(
+                    live_receipts, owner, attestation_out["owner"].get("bootstrap_sha256"))
             chain_out = verify_receipts(att, live_receipts, chain_head)
         for bsha in sorted(stale_shas):
             att_old = fetch_archived_binding(a.broker, operator_key, bsha)
@@ -2655,7 +2686,8 @@ def main() -> int:
             if not archived_out.get("attestation_proven"):
                 unproven_archives.append(bsha)
             if owner is not None:
-                owner_signed_creates(groups[bsha], owner)
+                owner_signed_creates(groups[bsha], owner, att_old["binding"].get("bootstrap_sha256")
+                                     if att_old["binding"].get("host_data_version") == 2 else None)
             part = verify_receipts(att_old, groups[bsha], None)
             part["binding_sha256"] = bsha
             archive_chains.append(part)

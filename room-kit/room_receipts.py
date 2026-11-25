@@ -251,6 +251,17 @@ RELEASE_CHALLENGE_FIELDS = frozenset({
 # measured; HOST_DATA (chip-signed, fixed at launch) is what makes them count.
 OWNER_FW_CFG = "/sys/firmware/qemu_fw_cfg/by_name/opt/cathedral"
 DEDICATED_HOST_DATA_DOMAIN = b"cathedral-dedicated-v1\0"
+# AB#963: a dedicated machine launched for one bootstrap create. HOST_DATA v2 =
+# sha256(domain || manifest sha256 || owner key || bootstrap sha256), and the
+# front starts no room whose launch projection digest differs.
+DEDICATED_V2_HOST_DATA_DOMAIN = b"cathedral-dedicated-v2\0"
+LAUNCH_MISMATCH = "owner_signature_launch_mismatch"  # owner_signature_ prefix: the broker never rests the hotel for it
+# What the launch projection leaves out of a create: values that change per
+# create by design (the API's sandbox id labels, the broker's batch label) and
+# lifetime, which the host controls anyway. Every other field and label counts,
+# so a field added later is bound until removed here on purpose.
+LAUNCH_UNBOUND_FIELDS = ("ttl_seconds", "idle_timeout_seconds")
+LAUNCH_UNBOUND_LABELS = ("polaris_sandbox_id", "cathedral_sandbox_id", "broker_batch")
 OWNER_SIGNATURE_HEADER = "X-Cathedral-Owner-Signature"
 OWNER_TIMESTAMP_HEADER = "X-Cathedral-Owner-Timestamp"
 OWNER_MAX_SKEW_SECONDS = 300
@@ -600,9 +611,34 @@ class OwnerBindingError(RuntimeError):
     """fw_cfg names an owner that HOST_DATA does not. The front must not serve."""
 
 
-def dedicated_host_data(manifest_sha256: bytes, owner_key: bytes) -> bytes:
-    """HOST_DATA of a dedicated machine (launch-guest.sh computes the same)."""
-    return hashlib.sha256(DEDICATED_HOST_DATA_DOMAIN + manifest_sha256 + owner_key).digest()
+def dedicated_host_data(manifest_sha256: bytes, owner_key: bytes, bootstrap_sha256: bytes | None = None) -> bytes:
+    """HOST_DATA of a dedicated machine (launch-guest.sh computes the same).
+
+    v1 without a bootstrap digest, v2 (AB#963) with one.
+    """
+    if bootstrap_sha256 is None:
+        return hashlib.sha256(DEDICATED_HOST_DATA_DOMAIN + manifest_sha256 + owner_key).digest()
+    return hashlib.sha256(DEDICATED_V2_HOST_DATA_DOMAIN + manifest_sha256 + owner_key + bootstrap_sha256).digest()
+
+
+def launch_projection(doc: dict) -> dict:
+    """The create minus what LAUNCH_UNBOUND_* names; nothing else is removed."""
+    out = {k: v for k, v in doc.items() if k not in LAUNCH_UNBOUND_FIELDS}
+    if isinstance(out.get("labels"), dict):
+        out["labels"] = {k: v for k, v in out["labels"].items() if k not in LAUNCH_UNBOUND_LABELS}
+    return out
+
+
+def launch_create_sha256(body: bytes) -> str:
+    """Bootstrap digest of a create body exactly as the front received it.
+
+    No broker rewrite is re-applied here: an omitted network would then stand
+    for two policies (deny_all here, public in the room API).
+    """
+    doc = json.loads(body)
+    if not isinstance(doc, dict):
+        raise ValueError("the request body is not a JSON object")
+    return sha(canonical(_whole_numbers(launch_projection(doc))))
 
 
 def _fw_cfg(name: str) -> bytes | None:
@@ -613,8 +649,9 @@ def _fw_cfg(name: str) -> bytes | None:
         return None
 
 
-def owner_tenancy(host_data_hex: str) -> tuple[bytes, bytes] | None:
-    """(owner key, manifest sha256) on a dedicated machine; None on a shared one.
+def owner_tenancy(host_data_hex: str) -> tuple[bytes, bytes, bytes | None] | None:
+    """(owner key, manifest sha256, bootstrap sha256 or None) on a dedicated
+    machine; None on a shared one.
 
     No owner key in fw_cfg: shared. A key that this report's HOST_DATA does
     not commit to raises OwnerBindingError: the host gave the guest an owner
@@ -632,9 +669,13 @@ def owner_tenancy(host_data_hex: str) -> tuple[bytes, bytes] | None:
     manifest = _fw_cfg("manifest-sha256")
     if manifest is None or len(manifest) != 32:
         raise OwnerBindingError("fw_cfg has an owner key but no 32-byte manifest-sha256")
-    if not hmac.compare_digest(dedicated_host_data(manifest, key), bytes.fromhex(host_data_hex)):
-        raise OwnerBindingError("HOST_DATA in the SNP report does not commit to the fw_cfg owner key")
-    return key, manifest
+    bootstrap = _fw_cfg("bootstrap-sha256")
+    if bootstrap is not None and len(bootstrap) != 32:
+        raise OwnerBindingError(f"fw_cfg bootstrap-sha256 is {len(bootstrap)} bytes, expected 32")
+    if not hmac.compare_digest(dedicated_host_data(manifest, key, bootstrap), bytes.fromhex(host_data_hex)):
+        raise OwnerBindingError("HOST_DATA in the SNP report does not commit to the fw_cfg owner key"
+                                + (" and bootstrap digest" if bootstrap is not None else ""))
+    return key, manifest, bootstrap
 
 
 def _whole_numbers(doc):
@@ -709,6 +750,30 @@ def check_owner_signature(owner_key: bytes, action: str, headers, body: bytes | 
         if any(v and v != labels.get("broker_guest") for v in all_values or []):
             return "owner_signature_invalid", "X-Cathedral-Guest differs from the signed broker_guest label", {}
     return None, "", {"owner_request_sha256": digest, "owner_timestamp": int(ts), "owner_signature_b64": b64(sig)}
+
+
+def launch_gate(bootstrap_sha256: str, action: str, body: bytes | None) -> tuple[bytes | None, dict]:
+    """(403 body, {}) unless this owner-signed request is the bootstrap create,
+    else (None, receipt fields). AB#963."""
+    def refuse(message: str, digest: str | None = None) -> tuple[bytes, dict]:
+        err = {"code": LAUNCH_MISMATCH, "message": message, "bootstrap_sha256": bootstrap_sha256}
+        if digest is not None:
+            err["launch_create_sha256"] = digest
+        return canonical({"error": err}), {}
+    if action != "create":
+        return refuse(f"this machine was launched for one bootstrap create; a {action} is refused")
+    try:
+        doc = json.loads(body or b"")
+        digest = launch_create_sha256(body or b"")
+    except (ValueError, RecursionError):
+        return refuse("the create body does not parse")
+    image = doc.get("image")
+    if not isinstance(image, str) or "@sha256:" not in image:
+        # A tag would let the registry change what the bound create runs.
+        return refuse("the bootstrap image must be a string pinned by @sha256 digest", digest)
+    if not hmac.compare_digest(digest, bootstrap_sha256):
+        return refuse("this create is not the bootstrap create named in HOST_DATA", digest)
+    return None, {"launch_bootstrap": True, "launch_create_sha256": digest}
 
 
 def escape_plant_open(ledger: "Ledger") -> bool:
@@ -1684,6 +1749,8 @@ class Ledger:
         self.sealed_env = SealedEnv() if secrets is not None else None
         # Raw Ed25519 owner key on a dedicated sealed machine, else None (no gate).
         self.owner_key: bytes | None = None
+        # AB#963: hex sha256 of the one create this machine was launched for, else None.
+        self.bootstrap_sha256: str | None = None
         # Measured dedicated/TUN configuration may never silently serve shared
         # or fall back to the unsealed hotel chain when launch inputs are absent.
         self.requires_owner = (
@@ -1778,9 +1845,13 @@ class Ledger:
         if owner is not None:
             # Enough to recompute HOST_DATA from published fields:
             # sha256(domain || manifest_sha256 || owner key) == host_data.
-            self.owner_key, manifest = owner
+            self.owner_key, manifest, bootstrap = owner
             self.binding.update({"tenancy": "dedicated", "owner_ed25519_b64": b64(self.owner_key),
                                  "manifest_sha256": manifest.hex()})
+            if bootstrap is not None:
+                # Only with a bootstrap digest: a v1 binding stays byte for byte.
+                self.bootstrap_sha256 = bootstrap.hex()
+                self.binding.update({"host_data_version": 2, "bootstrap_sha256": self.bootstrap_sha256})
         self.binding_sha256 = sha(canonical(self.binding))
         self.report = snp_report(bytes.fromhex(self.binding_sha256) + bytes(32))
         second = report_fields(self.report)
@@ -4452,6 +4523,13 @@ class Handler(BaseHTTPRequestHandler):
         code, msg, fields = check_owner_signature(ledger.owner_key, action, self.headers, body, time.time())
         if code:
             return canonical({"error": {"code": code, "message": msg}}), {}
+        if ledger.bootstrap_sha256 is not None:
+            # AB#963: launched for one create. The signature check ran first, so only the owner learns
+            # the digest of a create that does not match.
+            refusal, launch_fields = launch_gate(ledger.bootstrap_sha256, action, body)
+            if refusal is not None:
+                return refusal, {}
+            fields = {**fields, **launch_fields}
         return None, (fields if action == "create" else {})
 
     def handle_release_proof(self, ledger: "Ledger", body: bytes | None):
