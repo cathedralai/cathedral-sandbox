@@ -63,26 +63,35 @@ port_clash() {
     return 1
   fi
 }
-# IPv6 backstop (also when disable_ipv6 is reset): drop everything to or from the tap.
+# IPv6: the rules here are IPv4 only, so IPv6 must be shut on the tap. Two layers:
+# disable_ipv6 on the tap, and tagged ip6tables DROP rules as a backstop. Either one
+# holding is enough; up fails only when neither can be put in place.
+V6_CONF=${VM_IPV6_CONF_DIR:-/proc/sys/net/ipv6/conf}
 v6_rules() { echo "INPUT -i $TAP"; echo "FORWARD -i $TAP"; echo "FORWARD -o $TAP"; }
-v6_up() {
-  command -v ip6tables >/dev/null 2>&1 || return 0
-  local c m
-  while read -r c m; do
-    ip6tables -C "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null \
-      || ip6tables -I "$c" 1 $m -m comment --comment "$TAG" -j DROP
-  done < <(v6_rules)
-}
-v6_present() {
-  command -v ip6tables >/dev/null 2>&1 || return 0
+v6_off() { [ "$(cat "$V6_CONF/$TAP/disable_ipv6" 2>/dev/null)" = 1 ]; }
+v6_rules_in() {
+  command -v ip6tables >/dev/null 2>&1 || return 1
   local c m
   while read -r c m; do ip6tables -C "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null || return 1; done < <(v6_rules)
 }
+v6_up() {
+  local c m
+  if command -v ip6tables >/dev/null 2>&1; then
+    while read -r c m; do
+      ip6tables -C "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null \
+        || ip6tables -I "$c" 1 $m -m comment --comment "$TAG" -j DROP 2>/dev/null || true
+    done < <(v6_rules)
+  fi
+  v6_present && return 0
+  echo "cathedral-vm: could not shut IPv6 on $TAP (disable_ipv6 and ip6tables both failed)" >&2
+  return 1
+}
+v6_present() { v6_off || v6_rules_in; }
 v6_down() {
   command -v ip6tables >/dev/null 2>&1 || return 0
-  local c m
+  local c m i
   while read -r c m; do
-    while ip6tables -D "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null; do :; done
+    for i in 1 2 3; do ip6tables -D "$c" $m -m comment --comment "$TAG" -j DROP 2>/dev/null || break; done
   done < <(v6_rules)
 }
 rules_present() {

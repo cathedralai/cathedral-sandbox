@@ -653,6 +653,12 @@ def cmd_enforce(args: list[str]) -> dict:
         try:
             with Lock(d / ".lock", wait=20):
                 if not unit_active(name):
+                    # A failed "down" (or a crash) can leave the public SSH forward of a
+                    # stopped VM behind, holding the port. Only for a unit that is really
+                    # down (inactive or failed), never one auto-restarting ("activating").
+                    state = systemctl("show", "-p", "ActiveState", "--value", unit_name(name), check=False).stdout.strip()
+                    if state in ("inactive", "failed"):
+                        run(str(KIT / "vm-net.sh"), "down", str(d / "vm.env"), check=False)
                     continue
                 if paid_refusal(auth_of(d), int(time.time())):
                     expired.append(name)

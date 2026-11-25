@@ -47,7 +47,8 @@ def host(tmp_path, monkeypatch):
     fake = tmp_path / "bin"
     fake.mkdir()
     for name, text in {"systemctl": FAKE_SYSTEMCTL, "qemu-img": FAKE_QEMU_IMG, "cloud-localds": FAKE_LOCALDS,
-                       "ip": FAKE_LOG, "iptables": FAKE_IPTABLES, "sysctl": FAKE_LOG, "flock": FAKE_LOG}.items():
+                       "ip": FAKE_LOG, "iptables": FAKE_IPTABLES, "ip6tables": FAKE_IPTABLES, "sysctl": FAKE_LOG,
+                       "flock": FAKE_LOG, "ss": FAKE_LOG}.items():
         (fake / name).write_text(text)
         (fake / name).chmod(0o755)
     image = tmp_path / "base.img"
@@ -55,7 +56,8 @@ def host(tmp_path, monkeypatch):
     (tmp_path / "id.pub").write_text(KEY + "\n")
     env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", VM_ROOT=str(tmp_path / "vms"),
                SYSTEMD_UNIT_DIR=str(tmp_path / "units"), FAKE_STATE=str(tmp_path / "systemd.json"),
-               VM_STOP_WAIT="1", VM_LOCK_DIR=str(tmp_path / "lock"))
+               VM_STOP_WAIT="1", VM_LOCK_DIR=str(tmp_path / "lock"),
+               VM_IPV6_CONF_DIR=str(tmp_path / "ipv6conf"))
     env.pop("SSH_ORIGINAL_COMMAND", None)
 
     class Host:
@@ -82,6 +84,8 @@ def host(tmp_path, monkeypatch):
                                   capture_output=True, text=True, env=env, timeout=30)
 
         tools = tmp_path / "systemd.json.tools"
+        bin = fake
+        ipv6 = tmp_path / "ipv6conf"
 
     return Host()
 
@@ -289,6 +293,8 @@ def test_from_broker_runs_known_commands_and_takes_the_key_on_stdin(host):
 
 def test_vm_net_up_blocks_private_ranges_and_forwards_only_ssh(host):
     host.create()
+    (host.ipv6 / "cvm0").mkdir(parents=True)  # the fake sysctl writes nothing; the real one sets this
+    (host.ipv6 / "cvm0" / "disable_ipv6").write_text("1\n")
     p = host.run_net("up")
     assert p.returncode == 0, p.stderr
     log = host.tools.read_text()
@@ -297,6 +303,9 @@ def test_vm_net_up_blocks_private_ranges_and_forwards_only_ssh(host):
     assert "--dport 22001 -m addrtype --dst-type LOCAL -m comment --comment cathedral-vm:vm1 -j DNAT --to-destination 10.216.0.2:22" in log
     assert "-I FORWARD 1 -m comment --comment cathedral-vm:vm1 -j CVM-CVM0-FWD" in log
     assert "-t nat -A OUTPUT" in log and "-t nat -A PREROUTING" in log and "MASQUERADE" in log
+    assert "ctorigdstport 22001" in log  # only connections through this VM's own forward
+    assert "-I INPUT 1 -i cvm0 -m comment --comment cathedral-vm:vm1 -j DROP" in log  # IPv6 backstop
+    assert "net.ipv6.conf.cvm0.disable_ipv6=1" in log
     assert host.run_net("down").returncode == 0
     assert "link del cvm0" in host.tools.read_text()
 
@@ -358,3 +367,27 @@ def test_stop_cancels_an_authorized_run_that_never_started(host):
     assert host.ctl("status", "vm1")[1]["state"] != "running"
     assert host.ctl("authorize", "vm1", str(now + 600), "2")[0] == 0
     assert host.ctl("start", "vm1", "--generation", "2")[0] == 0
+
+
+def test_ipv6_shut_needs_one_of_disable_ipv6_or_ip6tables(host):
+    host.create()
+    # ip6tables refuses every change (no ip6 tables module), disable_ipv6 took: the VM still starts.
+    (host.bin / "ip6tables").write_text('#!/bin/sh\nexit 1\n')
+    (host.ipv6 / "cvm0").mkdir(parents=True)
+    (host.ipv6 / "cvm0" / "disable_ipv6").write_text("1\n")
+    p = host.run_net("up")
+    assert p.returncode == 0, p.stderr
+    assert host.run_net("down").returncode == 0
+    # Neither layer holds: refuse to bring the link up.
+    (host.ipv6 / "cvm0" / "disable_ipv6").write_text("0\n")
+    p = host.run_net("up")
+    assert p.returncode != 0 and "could not shut IPv6" in p.stderr
+
+
+def test_enforce_removes_a_stopped_vms_leftover_forward(host):
+    host.create()
+    host.tools.write_text("")
+    assert host.ctl("enforce")[0] == 0
+    log = host.tools.read_text()
+    # The fake iptables logs every call: down deletes the tagged forward chain jump.
+    assert "-D FORWARD -m comment --comment cathedral-vm:vm1 -j CVM-CVM0-FWD" in log
