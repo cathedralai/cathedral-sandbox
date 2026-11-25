@@ -27,6 +27,13 @@ sudo ./install.sh --sealed sealed.env
    - `cmdline`: the kernel command line.
    It writes `manifest.json` with the sha256 of each file and of OVMF. It
    computes the expected launch measurement with `sev-snp-measure` (pinned).
+   With `SEALED_SNAPSHOT` set (AB#383) the packages come from that
+   snapshot.ubuntu.com snapshot, release pocket only; the build writes
+   `packages.lock` (name, version, architecture and archive sha256 of every
+   installed package) next to the image and stops if it differs from
+   `SEALED_PACKAGES_LOCK`. The kernel is the one the lock names, the guest's
+   apt sources are a constant line, and `base_rootfs` in `manifest.json` is
+   the lock's sha256. Unset, the build uses `SEALED_MIRROR` as before.
 4. **Unit** `room-sealed-<name>.service`:
    - `host-net.sh up`: a tap device with a /30, NAT to the internet, own
      iptables chains only.
