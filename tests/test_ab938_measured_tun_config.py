@@ -39,6 +39,10 @@ def test_dedicated_writes_only_validated_literals(tun):
     {"SEALED_HOTEL_TENANCY": "Dedicated"},
     {"SEALED_HOTEL_TENANCY": "dedicated\nROOM_RECEIPTS=0"},
     {"SEALED_HOTEL_TENANCY": "dedicated", "SEALED_ROOM_ALLOW_TUN": "yes"},
+    {"SEALED_OWNER_GATE": "open"},
+    {"SEALED_HOTEL_TENANCY": "shared", "SEALED_OWNER_GATE": "open"},
+    {"SEALED_HOTEL_TENANCY": "dedicated", "SEALED_OWNER_GATE": "Open"},
+    {"SEALED_HOTEL_TENANCY": "dedicated", "SEALED_OWNER_GATE": "open\nROOM_RECEIPTS=0"},
 ])
 def test_invalid_or_shared_tun_stops_before_build(values):
     result = measured_config(**values)
@@ -64,3 +68,20 @@ def test_settings_are_appended_to_measured_room_env_and_tun_module_is_opt_in(tmp
                         f"DEDICATED_ENV={shlex.quote(config.stdout)}\n{room_write}\n{module_write}"], check=True)
         assert room.read_text() == "existing\n\n" + config.stdout + "\n"
         assert modules.read_text() == "existing\n" + ("tun\n" if tun == "1" else "")
+
+
+# AB#962: the owner gate is a measured build input. required (or unset) is today's build byte for byte.
+@pytest.mark.parametrize("tun", ["0", "1"])
+def test_required_owner_gate_adds_nothing(tun):
+    base = measured_config(SEALED_HOTEL_TENANCY="dedicated", SEALED_ROOM_ALLOW_TUN=tun)
+    required = measured_config(SEALED_HOTEL_TENANCY="dedicated", SEALED_ROOM_ALLOW_TUN=tun, SEALED_OWNER_GATE="required")
+    assert base.returncode == required.returncode == 0
+    assert required.stdout == base.stdout == f"CATHEDRAL_HOTEL_TENANCY=dedicated\nROOM_ALLOW_TUN={tun}"
+    assert measured_config(SEALED_OWNER_GATE="required").stdout == ""
+
+
+@pytest.mark.parametrize("tun", ["0", "1"])
+def test_open_owner_gate_is_written_into_the_measured_config(tun):
+    result = measured_config(SEALED_HOTEL_TENANCY="dedicated", SEALED_ROOM_ALLOW_TUN=tun, SEALED_OWNER_GATE="open")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"CATHEDRAL_HOTEL_TENANCY=dedicated\nROOM_ALLOW_TUN={tun}\nCATHEDRAL_OWNER_GATE=open"

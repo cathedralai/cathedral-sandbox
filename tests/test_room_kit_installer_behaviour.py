@@ -1603,11 +1603,25 @@ def test_measured_dedicated_settings_reach_api_and_owner_front(host: FakeHost, t
     assert f'ROOM_ALLOW_TUN="{tun}"\n' in resolved
 
 
+def test_measured_open_owner_gate_reaches_only_the_receipts_front(host: FakeHost) -> None:
+    from test_ab938_measured_tun_config import measured_config
+    measured = measured_config(SEALED_HOTEL_TENANCY="dedicated", SEALED_ROOM_ALLOW_TUN="1", SEALED_OWNER_GATE="open")
+    assert measured.returncode == 0, measured.stderr
+    path = host.room_env()
+    path.write_text(path.read_text() + "\n" + measured.stdout + "\n")
+    proc = host.install(str(path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    unit = host.unit("room-a-receipts.service")
+    assert "Environment=CATHEDRAL_HOTEL_TENANCY=dedicated ROOM_ALLOW_TUN=1\nEnvironment=CATHEDRAL_OWNER_GATE=open\n" in unit
+    assert "CATHEDRAL_OWNER_GATE" not in (host.etc / "api.env").read_text()
+
+
 def test_default_install_does_not_enable_tun(host: FakeHost) -> None:
     _clean_install(host)
     for text in ((host.etc / "api.env").read_text(), host.unit("room-a-receipts.service")):
         assert "CATHEDRAL_HOTEL_TENANCY=" not in text
         assert "ROOM_ALLOW_TUN=" not in text
+        assert "CATHEDRAL_OWNER_GATE=" not in text
 
 
 @pytest.mark.parametrize("values", [
@@ -1615,6 +1629,8 @@ def test_default_install_does_not_enable_tun(host: FakeHost) -> None:
     {"CATHEDRAL_HOTEL_TENANCY": "dedicated", "ROOM_RECEIPTS": "0"},
     {"CATHEDRAL_HOTEL_TENANCY": "dedicated", "ROOM_ALLOW_TUN": "yes"},
     {"CATHEDRAL_HOTEL_TENANCY": "wrong"},
+    {"CATHEDRAL_OWNER_GATE": "open"},
+    {"CATHEDRAL_HOTEL_TENANCY": "dedicated", "CATHEDRAL_OWNER_GATE": "Open"},
 ])
 def test_invalid_dedicated_config_stops_before_service_changes(host: FakeHost, values) -> None:
     proc = host.install(str(host.room_env(**values)))

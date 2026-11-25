@@ -178,6 +178,20 @@ work; approve and pin the new measurement before live testing. Acceptance
 must verify the owner-bound attestation, unsigned-create rejection, TUN/UDP,
 renewal and shared-pool refusal on that exact build.
 
+#### Open owner gate (AB#962)
+
+`SEALED_OWNER_GATE=open` (with `SEALED_HOTEL_TENANCY=dedicated`) builds a
+dedicated guest that may launch without `SEALED_OWNER_PUBKEY_FILE`. It adds
+`CATHEDRAL_OWNER_GATE=open` to the measured `room.env`, so it changes the
+measurement; the host cannot set it through fw_cfg, HOST_DATA or its own
+environment. Launched without a key, HOST_DATA is the shared-form manifest
+digest, no create needs an owner signature, and the binding says
+`"tenancy": "dedicated"` and `"owner_gate": "open"`. Who may place work there
+is then the broker reservation's job, not the guest's. `verify_receipts.py`
+reports it under `attestation.tenancy` and fails `--owner-pubkey` against it.
+An owner key supplied at launch turns the owner gate on as on a `required`
+build. Unset or `required` builds exactly as before.
+
 ### The trust chain
 
 1. **AMD signs the report.** The verifier checks ARK, ASK, VCEK and the report
