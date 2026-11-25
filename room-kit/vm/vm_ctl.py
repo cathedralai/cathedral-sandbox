@@ -250,6 +250,9 @@ def status_of(name: str) -> dict:
         state = "stopped" if (d / "started").exists() else "created"
     return {
         "name": name, "state": state, "generation": a["generation"], "paid_through": a["paid_through"],
+        # True once this generation was stopped or cancelled: it can never run again.
+        # The broker settles a "starting" record it lost the answer for from this.
+        "closed": a["generation"] <= a.get("closed_generation", 0) and a["generation"] > 0,
         "ssh_port": int(env["VM_SSH_PORT"]), "guest_ip": env["VM_GUEST_IP"], "vcpus": int(env["VM_VCPUS"]),
         "mem_gib": int(env["VM_MEM_GIB"]), "disk_gib": int(env["VM_DISK_GIB"]),
     }

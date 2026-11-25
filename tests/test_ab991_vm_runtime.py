@@ -340,6 +340,7 @@ def test_generation_fences_stop_start_and_reboot(host):
     assert host.ctl("authorize", "vm1", str(now + 60), "2")[0] == 0  # shorter window, new run: accepted
     code, out = host.ctl("start", "vm1", "--generation", "1")
     assert code == 3 and out["error"] == "stale_generation"
+    assert host.ctl("status", "vm1")[1]["closed"] is False
     assert host.ctl("start", "vm1", "--generation", "2")[0] == 0
     code, out = host.ctl("stop", "vm1", "--generation", "1")
     assert code == 3 and out["error"] == "stale_generation"
@@ -360,12 +361,14 @@ def test_stop_cancels_an_authorized_run_that_never_started(host):
     assert host.ctl("authorize", "vm1", str(now + 600), "1")[0] == 0
     code, out = host.ctl("stop", "vm1", "--generation", "1")
     assert code == 0 and out["was_running"] is False and out["generation"] == 1 and out["stopped_at"] >= now
+    assert host.ctl("status", "vm1")[1]["closed"] is True
     again = host.ctl("stop", "vm1", "--generation", "1")[1]
     assert again["stopped_at"] == out["stopped_at"]  # same receipt on a repeat
     code, out = host.ctl("start", "vm1", "--generation", "1")
     assert code == 3
     assert host.ctl("status", "vm1")[1]["state"] != "running"
     assert host.ctl("authorize", "vm1", str(now + 600), "2")[0] == 0
+    assert host.ctl("status", "vm1")[1]["closed"] is False
     assert host.ctl("start", "vm1", "--generation", "2")[0] == 0
 
 
