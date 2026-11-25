@@ -399,7 +399,14 @@ A dedicated machine's create receipts also carry `owner_request_sha256`,
   attestation saved at the time (`verify_receipts.py --save`).
 - Broker to guest traffic is plain HTTP on the tap on a config hotel (see
   above). A miner hotel serves HTTPS from the guest; the broker pin is still open.
-- The verifier has no minimum TCB and does not pin the AMD ARK by default.
+- The verifier does not pin the AMD ARK by default and has no minimum TCB
+  unless you give one: `--min-tcb genoa:bl=12,tee=0,snp=30,ucode=88` (with
+  `--ark-sha256`) checks every component of the current, reported, committed
+  and launch TCB, refuses a processor the floor does not name, a report
+  before version 3 and a VMPL other than 0 (AB#968). `--expected-chip-id`
+  pins the chip. A policy that allows a migration agent (bit 18) always
+  fails. The floor does not prove OEM platform firmware fixes beyond the SPL
+  bytes.
 - The broker's own records (placement, queue) are not signed.
 
 ## Miner hotel

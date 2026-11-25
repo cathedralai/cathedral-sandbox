@@ -26,6 +26,18 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      launch SNP TCB components after the AMD chain; it cannot prove the OEM
      PI, mitigation bit or full microcode patch in AMD-SB-3059/3061. It is
      not applied to Milan and refuses Turin (no Turin floor is defined).
+     Optional --min-tcb GEN:bl=N,tee=N,snp=N,ucode=N (AB#968, repeat per
+     generation; today only genoa, CPUID family 0x19 models 0x10 to 0x1F)
+     checks every component of the current, reported, committed and launch
+     TCB; a newer SNP byte does not make up for an older microcode byte, and
+     a processor the floor does not name fails. Under a floor the report must
+     be version 3 or later (CPUID fields) and from VMPL 0. It does not go
+     with --min-genoa-snp-spl. --min-tcb list (the floor of approved list v2)
+     is refused until list v2 is published (plan PR 5). Optional
+     --expected-chip-id HEX pins the report's chip id. Both need the AMD
+     chain and --ark-sha256 (no --skip-amd). The output says tcb_floor: the
+     floor, the generation and every TCB read, or "not checked".
+     Always: a policy that allows a migration agent (bit 18) fails.
   4. receipts: each statement names this binding and the sealed hotel receipt
      schema, receipt_sha256 = sha256(canonical(statement)), the Ed25519
      signature verifies with the binding's receipt key, and the chain links
@@ -117,7 +129,7 @@ caller expects, in eight checks. The AMD certificates come from the file (amd_ce
 --ark-sha256, which run mode requires. Any missing input is a FAIL, never a guess.
 Run mode takes --oneshot, --recipe, --context or --no-context, --run-id, --input-sha256, --input-file,
 --output-file, --expected-measurement, --allowed-measurements, --ark-sha256, --product,
---min-genoa-snp-spl and --require-sealed (which
+--min-genoa-snp-spl, --min-tcb, --expected-chip-id and --require-sealed (which
 changes nothing: run mode always requires an SEV-SNP attestation). These flags are usage errors with exit 2:
 --receipts, --attestation, --broker, --origin, --key-file, --operator-key-file, --hotel, --sandbox,
 --receipt-header, --cathedral-sandbox, --save, --owner-pubkey, --tls-spki-sha256, --require-tls and --kds-cache,
@@ -200,7 +212,8 @@ the report's REPORT_DATA is exactly the 64 bytes given, debug is off in the poli
 verifies under the AMD chain (KDS or --kds-cache, pinned by --ark-sha256, which this mode requires). Nothing
 else in the answer is read: its binding_sha256 and measurement members are unsigned. The output names the
 signed fields (measurement, chip id, REPORT_ID, policy, launch and reported TCB) for the caller to compare
-with what it admitted. It takes only --ark-sha256, --kds-cache and --product; any other flag is exit 2.
+with what it admitted. It refuses a policy with the migration agent bit (18). It takes only --ark-sha256,
+--kds-cache, --product, --min-tcb and --expected-chip-id (checked as in list mode); any other flag is exit 2.
 
 When receipts name a binding_sha256 other than the live attestation, pass --broker and
 --operator-key-file so GET /v1/broker/bindings/<sha> can load each archived binding.
@@ -391,6 +404,85 @@ def product(rep: dict, override: str | None) -> str:
     return shown
 
 
+# --min-tcb (AB#968). A generation is a CPUID family and a published model range, not product()'s "model >= 0x10":
+# Genoa is family 0x19 models 0x10 to 0x1F (every live hotel is 0x11). Bergamo, Siena, Milan and Turin are not
+# named, so a floor fails on them instead of passing unchecked.
+TCB_GENERATIONS = {"genoa": (0x19, range(0x10, 0x20))}
+TCB_COMPONENTS = {"bl": 0, "tee": 1, "snp": 6, "ucode": 7}  # byte offsets in one Milan/Genoa TCB_VERSION
+TCB_COMPONENT_NAMES = {"bl": "boot loader", "tee": "TEE", "snp": "SNP firmware", "ucode": "microcode"}
+TCB_OFFSETS = (("current", 0x38), ("reported", 0x180), ("committed", 0x1E0), ("launch", 0x1F0))
+MIN_TCB_HELP = "GEN:bl=N,tee=N,snp=N,ucode=N, for example genoa:bl=12,tee=0,snp=30,ucode=88"
+MIGRATION_AGENT_BIT = 1 << 18
+CHIP_ID_RE = re.compile(r"[0-9a-f]{128}")
+
+
+def parse_min_tcb(specs: list[str]) -> dict[str, dict[str, int]]:
+    """--min-tcb values to {generation: {component: minimum}}. Every component must be named. Raises ValueError."""
+    floors: dict[str, dict[str, int]] = {}
+    for spec in specs:
+        if spec.strip().lower() == "list":
+            raise ValueError("--min-tcb list takes the floor from approved list v2, which is not published yet "
+                             "(plan PR 5); give the floor as " + MIN_TCB_HELP)
+        generation, colon, body = spec.strip().lower().partition(":")
+        if not colon or not body:
+            raise ValueError(f"--min-tcb {spec!r}: expected {MIN_TCB_HELP}")
+        if generation not in TCB_GENERATIONS:
+            raise ValueError(f"--min-tcb {spec!r}: unknown generation {generation!r} "
+                             f"(known: {', '.join(sorted(TCB_GENERATIONS))})")
+        if generation in floors:
+            raise ValueError(f"--min-tcb names {generation} twice")
+        floor: dict[str, int] = {}
+        for part in body.split(","):
+            name, eq, value = (x.strip() for x in part.partition("="))
+            if not eq or name not in TCB_COMPONENTS or name in floor or not re.fullmatch(r"[0-9]{1,3}", value):
+                raise ValueError(f"--min-tcb {spec!r}: expected {MIN_TCB_HELP}")
+            if int(value) > 255:
+                raise ValueError(f"--min-tcb {spec!r}: {name} must be from 0 to 255")
+            floor[name] = int(value)
+        missing = [name for name in TCB_COMPONENTS if name not in floor]
+        if missing:
+            raise ValueError(f"--min-tcb {spec!r}: name every component ({', '.join(missing)} missing)")
+        floors[generation] = floor
+    return floors
+
+
+def check_tcb_floor(report: bytes, rep: dict, floors: dict[str, dict[str, int]]) -> dict:
+    """The floor on a report whose AMD chain is verified: VMPL 0, CPUID fields present, a named generation, and
+    every component of the current, reported, committed and launch TCB at or above it. A newer SNP byte does not
+    make up for an older microcode byte."""
+    vmpl = int.from_bytes(report[0x30:0x34], "little")
+    need(vmpl == 0, f"TCB floor: the report is from VMPL {vmpl}, not VMPL 0")
+    need(rep["version"] >= 3, f"TCB floor: report version {rep['version']} has no CPUID fields, so the "
+                              "generation is unknown")
+    family, model = rep["cpuid_fam"], rep["cpuid_mod"]
+    cpuid = f"family 0x{family:02x} model 0x{model:02x}"
+    generation = next((name for name, (fam, models) in TCB_GENERATIONS.items()
+                       if family == fam and model in models), None)
+    need(generation is not None and generation in floors,
+         f"TCB floor: the processor (CPUID {cpuid}) is not a generation --min-tcb names")
+    floor = floors[generation]
+    tcbs = {}
+    for tcb_name, offset in TCB_OFFSETS:
+        tcb = report[offset:offset + 8]
+        tcbs[tcb_name] = {name: tcb[index] for name, index in TCB_COMPONENTS.items()}
+        for name, index in TCB_COMPONENTS.items():
+            need(tcb[index] >= floor[name], f"TCB floor: {tcb_name} TCB {TCB_COMPONENT_NAMES[name]} {tcb[index]} "
+                                            f"is below {floor[name]} ({generation})")
+    return {"generation": generation, "cpuid": cpuid, "floor": floor, "vmpl": vmpl,
+            "report_version": rep["version"], "tcbs": tcbs}
+
+
+def check_report_pins(report: bytes, rep: dict, min_tcb: dict | None, expected_chip_id: str | None) -> dict:
+    """--expected-chip-id and --min-tcb on a report whose AMD chain is verified. Returns the output members."""
+    out: dict = {}
+    if expected_chip_id is not None:
+        need(rep["chip_id"].hex() == expected_chip_id, "report chip id differs from --expected-chip-id")
+        out["expected_chip_id"] = "matched"
+    if min_tcb:
+        out["tcb_floor"] = check_tcb_floor(report, rep, min_tcb)
+    return out
+
+
 def fetch(url: str, cache: str, name: str) -> bytes:
     path = os.path.join(cache, name)
     if os.path.exists(path):
@@ -489,7 +581,8 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
 
 
 def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: str,
-                        ark_sha256: str | list[str] | None) -> dict:
+                        ark_sha256: str | list[str] | None, min_tcb: dict | None = None,
+                        expected_chip_id: str | None = None) -> dict:
     """One POST /room/attest answer: REPORT_DATA is the caller's, debug is off, the AMD chain signs the report.
 
     Only the signed report is read. The answer's other members (binding_sha256, measurement) are the hotel's
@@ -506,13 +599,15 @@ def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: s
          "--report-data-hex must be 128 hex characters (64 bytes)")
     need(rep["report_data"] == bytes.fromhex(report_data_hex), "REPORT_DATA is not the value sent")
     need(not rep["policy"] & (1 << 19), "guest policy allows debug")
+    need(not rep["policy"] & MIGRATION_AGENT_BIT, "guest policy allows a migration agent (bit 18)")
     need(bool(ark_sha256), "a fresh report needs --ark-sha256: an unpinned chain proves nothing")
     amd = verify_amd(report, rep, product(rep, prod), cache, ark_sha256)
+    pins = check_report_pins(report, rep, min_tcb, expected_chip_id)
     return {"fresh_report": {"report_data_hex": rep["report_data"].hex(), "measurement": rep["measurement"],
                              "chip_id": rep["chip_id"].hex(), "report_id": report[0x140:0x160].hex(),
                              "policy": hex(rep["policy"]), "launch_tcb": report[0x1F0:0x1F8].hex(),
                              "reported_tcb": rep["reported_tcb"].hex(), "report_version": rep["version"]},
-            "attestation": {"amd": amd}}
+            "attestation": {"amd": amd}, "tcb_floor": pins.pop("tcb_floor", "not checked"), **pins}
 
 
 def is_hotel_level(att: dict) -> bool:
@@ -536,7 +631,8 @@ def verify_hotel_attestation(att: dict) -> dict:
 
 def verify_attestation(att: dict, expected_measurement: str | list[str] | None, prod: str | None, cache: str,
                        ark_sha256: str | list[str] | None, skip_amd: bool, certs: dict | None = None,
-                       min_genoa_snp_spl: int = 0) -> dict:
+                       min_genoa_snp_spl: int = 0, min_tcb: dict | None = None,
+                       expected_chip_id: str | None = None) -> dict:
     binding = att["binding"]
     bsha = sha(canonical(binding))
     need(bsha == att["binding_sha256"], "binding_sha256 does not match the binding")
@@ -549,6 +645,7 @@ def verify_attestation(att: dict, expected_measurement: str | list[str] | None, 
     need(rep["host_data"] == binding["host_data"], "report HOST_DATA differs from the binding")
     need(hex(rep["policy"]) == binding["policy"], "report policy differs from the binding")
     need(not rep["policy"] & (1 << 19), "guest policy allows debug")
+    need(not rep["policy"] & MIGRATION_AGENT_BIT, "guest policy allows a migration agent (bit 18)")
     # A debug build has the same SNP policy but gives the host root SSH into
     # the guest. The flag is on the measured kernel cmdline.
     cmdline = binding.get("kernel_cmdline") or ""
@@ -565,6 +662,9 @@ def verify_attestation(att: dict, expected_measurement: str | list[str] | None, 
            "kernel_cmdline": cmdline}
     if not skip_amd:
         out["amd"] = verify_amd(report, rep, product(rep, prod), cache, ark_sha256, certs)
+    if min_tcb or expected_chip_id is not None:
+        need(not skip_amd and bool(ark_sha256), "--min-tcb and --expected-chip-id need the AMD chain and --ark-sha256")
+        out.update(check_report_pins(report, rep, min_tcb, expected_chip_id))
     if min_genoa_snp_spl:
         need(not skip_amd and out["amd"]["product"] in ("Genoa", "Milan"),
              "Genoa SNP floor requires a verified AMD processor generation")
@@ -2148,7 +2248,8 @@ def verify_oneshot(bundle, recipe: dict, trust: dict, caller: dict) -> dict:
          "check 1: the file holds no AMD certificates (amd_certs)")
     try:
         attestation_out = verify_attestation(att, trust["measurements"], trust.get("product"), "", trust["ark_sha256"],
-                                             False, certs, trust.get("min_genoa_snp_spl", 0))
+                                             False, certs, trust.get("min_genoa_snp_spl", 0),
+                                             min_tcb=trust.get("min_tcb"), expected_chip_id=trust.get("expected_chip_id"))
         chain_out = verify_receipts(att, receipts, None)
         edges = check_snapshot_edges(receipts)
         if edges is not None:
@@ -2463,7 +2564,11 @@ def run_mode(a) -> int:
         caller = {"context": context, "run_id": a.run_id, "input_hashes": hashes, "output_bytes": held}
         out = verify_oneshot(bundle, recipe, {"measurements": list(dict.fromkeys(measurements)),
                                               "ark_sha256": a.ark_sha256, "product": a.product,
-                                              "min_genoa_snp_spl": a.min_genoa_snp_spl or 0}, caller)
+                                              "min_genoa_snp_spl": a.min_genoa_snp_spl or 0,
+                                              "min_tcb": a.min_tcb_floors, "expected_chip_id": a.expected_chip_id},
+                             caller)
+        if a.min_tcb_floors:
+            out["tcb_floor"] = out["attestation"].pop("tcb_floor")
         print(json.dumps(out, indent=1))
         return 0
     except (KeyError, TypeError, AttributeError, IndexError, ValueError, OverflowError, RecursionError):
@@ -2505,6 +2610,12 @@ def main() -> int:
                     help="pin the AMD ARK certificate (sha256 of its DER); repeat to accept any of several")
     ap.add_argument("--min-genoa-snp-spl", type=int, metavar="N",
                     help="require Genoa current/reported/committed/launch SNP TCB components >= N (e.g. 30 for AMD-SB-3059); requires AMD chain")
+    ap.add_argument("--min-tcb", action="append", default=[], metavar="SPEC",
+                    help="TCB floor per generation, for example genoa:bl=12,tee=0,snp=30,ucode=88 (repeat per "
+                         "generation): every component of the current, reported, committed and launch TCB must "
+                         "reach it, and a processor the floor does not name fails; needs --ark-sha256 (AB#968)")
+    ap.add_argument("--expected-chip-id", metavar="HEX",
+                    help="the report's chip id (128 hex) must equal it; needs --ark-sha256 (AB#968)")
     ap.add_argument("--product", help="Milan, Genoa or Turin (default: from the report)")
     ap.add_argument("--kds-cache", help="list mode: where fetched AMD certificates are cached "
                                         "(default ~/.cache/amd-kds)")
@@ -2527,21 +2638,36 @@ def main() -> int:
     ap.add_argument("--fresh-report", help="fresh report mode: an answer of POST /room/attest to check (AB#947)")
     ap.add_argument("--report-data-hex", help="fresh report mode: the 64 bytes (128 hex) sent as REPORT_DATA")
     a = ap.parse_args()
+    try:
+        a.min_tcb_floors = parse_min_tcb(a.min_tcb)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if a.expected_chip_id is not None:
+        a.expected_chip_id = a.expected_chip_id.strip().lower()
+        if not CHIP_ID_RE.fullmatch(a.expected_chip_id):
+            ap.error("--expected-chip-id must be the 64-byte SNP chip id as 128 hex characters")
+    if a.min_tcb and a.min_genoa_snp_spl is not None:
+        ap.error("--min-tcb and --min-genoa-snp-spl do not go together; --min-tcb names the SNP floor itself")
+    if (a.min_tcb or a.expected_chip_id is not None) and (a.skip_amd or not a.ark_sha256):
+        # A floor or chip read from a report no pinned chain signed proves nothing.
+        ap.error("--min-tcb and --expected-chip-id need the AMD chain and --ark-sha256 (no --skip-amd)")
     if a.fresh_report is not None or a.report_data_hex is not None:
         # Fresh report mode reads the signed report and nothing else: every other flag would be a check
         # the caller believes ran.
         clash = [flag for flag, value in vars(a).items()
-                 if flag not in ("fresh_report", "report_data_hex", "ark_sha256", "kds_cache", "product")
+                 if flag not in ("fresh_report", "report_data_hex", "ark_sha256", "kds_cache", "product", "min_tcb",
+                                 "min_tcb_floors", "expected_chip_id")
                  and value is not None and value is not False and value != []]
         if clash:
-            ap.error("--fresh-report takes only --report-data-hex, --ark-sha256, --kds-cache and --product; not "
+            ap.error("--fresh-report takes only --report-data-hex, --ark-sha256, --kds-cache, --product, --min-tcb "
+                     "and --expected-chip-id; not "
                      + ", ".join("--" + f.replace("_", "-") for f in clash))
         if not a.fresh_report or a.report_data_hex is None:
             ap.error("--fresh-report FILE and --report-data-hex HEX go together")
         try:
             out = verify_fresh_report(read_document(a.fresh_report, "fresh report answer"), a.report_data_hex,
                                       a.product, a.kds_cache or os.path.expanduser("~/.cache/amd-kds"),
-                                      a.ark_sha256)
+                                      a.ark_sha256, a.min_tcb_floors, a.expected_chip_id)
         except Fail as exc:
             print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
             return 1
@@ -2636,7 +2762,7 @@ def main() -> int:
         check_receipt_shapes(receipts)
         owner = owner_key_bytes(a.owner_pubkey) if a.owner_pubkey else None
         sealed_asked = (a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product
-                        or a.min_genoa_snp_spl or owner)
+                        or a.min_genoa_snp_spl or owner or a.min_tcb or a.expected_chip_id is not None)
         if is_hotel_level(att) and sealed_asked:
             # A sealed guest whose TSM is missing runs level 1 under the same
             # hotel name. Asking for a measurement means asking for SNP.
@@ -2663,7 +2789,8 @@ def main() -> int:
         else:
             attestation_out = verify_attestation(att, a.expected_measurement, a.product, a.kds_cache,
                                                  a.ark_sha256, a.skip_amd,
-                                                 min_genoa_snp_spl=a.min_genoa_snp_spl or 0)
+                                                 min_genoa_snp_spl=a.min_genoa_snp_spl or 0,
+                                                 min_tcb=a.min_tcb_floors, expected_chip_id=a.expected_chip_id)
             guest_tls = verify_guest_tls(att, peer_spki, require=bool(a.require_tls or a.origin))
             if guest_tls is not None:
                 if a.origin:
@@ -2738,6 +2865,12 @@ def main() -> int:
                "policy_timeline": policy_timeline(receipts), "room_tunables": room_tunables(receipts),
                "room_links": room_links(receipts), "verdict": verdict,
                "checked": checked}
+        if "amd" in attestation_out:
+            # Only a report under a verified AMD chain can carry a floor; level 1 and --skip-amd output is unchanged.
+            out["tcb_floor"] = attestation_out.pop("tcb_floor", "not checked")
+            if archive_chains and (a.min_tcb or a.expected_chip_id is not None):
+                checked += "; the TCB floor and chip id checks cover the live binding only"
+                out["checked"] = checked
         not_proven = []
         if sealed_archive:
             not_proven.append(
