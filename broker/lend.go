@@ -223,11 +223,13 @@ func (c lendChange) applyLend(h *hotel) *apiErr {
 	}
 	if c.lend {
 		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = c.owner, c.reportID, ""
+		h.cfg.ReservationGeneration++ // reserved_for changed (reservations.go, AB#982); the ref stays the owner's
 		log.Printf("hotel %s lent from %s (REPORT_ID %s)", h.cfg.ID, c.owner, short(c.reportID))
 		return nil
 	}
 	log.Printf("hotel %s reclaimed for %s (REPORT_ID %s, lent with %s)", h.cfg.ID, c.owner, short(c.reportID), short(c.lentID))
 	h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = "", "", c.owner
+	h.cfg.ReservationGeneration++ // patchHotel sets the reclaim's reservation_ref (reservations.go, AB#982)
 	return nil
 }
 
@@ -311,6 +313,7 @@ func (b *broker) checkReservedRooms(h *hotel) bool {
 	changed := h.cfg.ReservedFor == owner && h.cfg.LentFrom == ""
 	if changed {
 		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = owner, lentReportUnknown, ""
+		h.cfg.ReservationGeneration++ // reserved_for changed (reservations.go, AB#982)
 	}
 	h.cfgMu.Unlock()
 	if changed {
@@ -373,9 +376,18 @@ func (b *broker) saveLendStateLogged(h *hotel) {
 	defer b.hotelsMutationMu.Unlock()
 	b.mu.Lock()
 	err := b.saveLendStateLocked(h)
+	// The fail-closed check bumped the generation: a config file hotel keeps
+	// it in the reservations file (reservations.go, AB#982).
+	var rerr error
+	if !h.runtime && b.cfg.StateDir != "" && b.noteConfigReservationLocked(h) {
+		rerr = b.saveConfigReservationsLocked()
+	}
 	b.mu.Unlock()
 	if err != nil {
 		log.Printf("LEND STATE NOT SAVED: hotel %s: %v; a restart would lose it", h.cfg.ID, err)
+	}
+	if rerr != nil {
+		log.Printf("hotel %s: %s not saved: %v; a restart would lose the generation bump", h.cfg.ID, reservationsFile, rerr)
 	}
 }
 

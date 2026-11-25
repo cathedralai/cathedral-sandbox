@@ -208,6 +208,9 @@ func parseConfigFile(raw []byte) (config, []*hotel, map[string]*guestState, map[
 		if h.cfg.LentFrom != "" || h.cfg.LentReportID != "" {
 			return c, nil, nil, nil, fmt.Errorf("config: hotel %q: lent_from and lent_report_id are set by PATCH {\"lend\": true} and kept in state_dir, not in the config file", h.cfg.ID)
 		}
+		if h.cfg.ReservationGeneration != 0 || h.cfg.ReservationRef != "" {
+			return c, nil, nil, nil, fmt.Errorf("config: hotel %q: reservation_generation and reservation_ref are set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
+		}
 	}
 	return c, hotels, guests, byKey, nil
 }
@@ -440,12 +443,23 @@ func (b *broker) reloadConfig(wantSHA string) (reloadSummary, error) {
 			log.Printf("config reload: drains not saved: %v; a restart reads the file's drain", err)
 		}
 	}
+	reservationsChanged := false
 	for _, h := range added {
 		h.roomsUnchecked = true // a reserved hotel waits for its first room list (lend.go)
 		h.fileDrain = h.cfg.Drain
+		// A hotel back in the file keeps its saved reservation while the
+		// file still says what it said then (reservations.go, AB#982).
+		if b.applySavedReservationLocked(h) {
+			reservationsChanged = true
+		}
 		if e, ok := b.lendsOnDisk[h.cfg.ID]; ok { // a lent hotel back in the file keeps its lend
 			h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = e.LentFrom, e.LentReportID, ""
 			delete(b.lendsOnDisk, h.cfg.ID)
+		}
+	}
+	if reservationsChanged {
+		if err := b.saveConfigReservationsLocked(); err != nil {
+			log.Printf("config reload: reservations not saved: %v; a restart applies the same file-wins rule", err)
 		}
 	}
 	b.mu.Unlock()
