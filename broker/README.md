@@ -984,16 +984,18 @@ answers 404 `route_not_found`. A change to either field needs a restart.
 The host's `authorized_keys` line for the broker key forces
 `vm-ctl.sh --from-broker`. The broker runs ssh with `BatchMode=yes`,
 `StrictHostKeyChecking=yes` and the configured known_hosts, sends only
-validated tokens as arguments and the customer key on stdin.
+validated tokens as arguments and the customer key on stdin. start, stop
+and reboot carry `--generation N`; the host answers exit 3 when N is not
+its current authorized generation.
 
 | Route (operator key) | What it does |
 |---|---|
 | `POST /v1/broker/vms` | Body `{"account", "vcpus", "mem_gib", "disk_gib", "ssh_public_key", optional "host"}`. Picks a host with room (every VM counts, stopped or not) and its lowest free port, makes id `vm-<12 hex>`, runs `create`. 201: the VM, stopped in generation 0. |
 | `GET /v1/broker/vms[/{id}]` | The record(s) with `host_status` from the host's `list` / `status`, or `host_status_error`. |
-| `POST /v1/broker/vms/{id}/authorize` | `{"paid_through": <unix s>, "generation": n}`. A stopped VM takes only generation+1, a running one only its own; paid_through never goes down. Else 409 `stale_authorization` (also host exit 3). |
-| `POST /v1/broker/vms/{id}/start` | Optional `{"generation": n}`. Needs the generation+1 authorization installed with paid_through after now (409 `not_authorized`), then bumps the generation. Host exit 4: 409 `not_paid`. |
-| `POST /v1/broker/vms/{id}/stop` | Answers the host's `stopped_at`. The run then takes no more authorizations. The disk stays. |
-| `POST /v1/broker/vms/{id}/reboot` | Running VMs only. Same generation. |
+| `POST /v1/broker/vms/{id}/authorize` | `{"paid_through": <unix s>, "generation": n}`. A stopped VM takes only generation+1, a running (or starting) one only its own; paid_through never goes down within a generation, a new generation may be funded for less. Else 409 `stale_authorization` (also host exit 3). |
+| `POST /v1/broker/vms/{id}/start` | Optional `{"generation": n}`. Needs the generation+1 authorization installed with paid_through after now (409 `not_authorized`), records `starting` in that generation, `running` once the host confirms. A start whose host answer was lost stays `starting` and may be repeated with the same generation; GET also moves it to `running` when the host's status runs that generation. Host exit 4: 409 `not_paid`. |
+| `POST /v1/broker/vms/{id}/stop` | Body `{"generation": n}` (400 without). Another generation: 409 `stale_generation`, no host call, no change. Answers the host's `stopped_at`; a repeat for the same stopped run answers the stored one. The run then takes no more authorizations. The disk stays. |
+| `POST /v1/broker/vms/{id}/reboot` | Running VMs only, optional `{"generation": n}` that must be the current one. |
 | `DELETE /v1/broker/vms/{id}` | Body `{"confirm": "<id>"}` or 400 `confirm_required`. The only route that removes a disk. |
 
 State is `state_dir/vms.json` (0600, fsynced). An operation records its
