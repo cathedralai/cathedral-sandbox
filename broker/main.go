@@ -75,6 +75,12 @@ type hotelConfig struct {
 	// needs a different one (a new launch). Set by PATCH {"lend": true}.
 	LentFrom     string `json:"lent_from,omitempty"`
 	LentReportID string `json:"lent_report_id,omitempty"`
+	// ReservationGeneration: bumped by every change of ReservedFor or
+	// ReservationRef; a PATCH with expect_generation is fenced by it.
+	// ReservationRef: the caller's name for the reservation (an order id).
+	// Set by PATCH, never by the config file (reservations.go, AB#982).
+	ReservationGeneration uint64 `json:"reservation_generation,omitempty"`
+	ReservationRef        string `json:"reservation_ref,omitempty"`
 	// MinerHotkey: the SS58 hotkey of the SN94 miner that runs the hotel.
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
@@ -361,7 +367,7 @@ type hotel struct {
 	// guestPin is the verified guest TLS SPKI (miner_tls.go); nil: none yet.
 	// Read on every TLS handshake, so atomic.
 	guestPin atomic.Pointer[[sha256.Size]byte]
-	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.ReservationGeneration, cfg.ReservationRef, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem      chan struct{}
 	conns    *connGate // data connection slots (hotelconns.go)
 
@@ -447,6 +453,9 @@ type hotel struct {
 	// fileDrain: this config file hotel's drain in the last file applied
 	// (drains.go). Guarded by broker.mu.
 	fileDrain bool
+	// fileReservedFor: this config file hotel's reserved_for in the last
+	// file applied (reservations.go). Guarded by broker.mu.
+	fileReservedFor string
 }
 
 // unreapedBatch is one create request's leftover rooms on a hotel.
@@ -559,7 +568,8 @@ type broker struct {
 	// adding guests while handlers without b.mu read it. admGen: bumped when
 	// the admission lists change, so a check that read the old lists is
 	// dropped. drains: saved runtime drains of config file hotels (drains.go),
-	// guarded by b.mu.
+	// guarded by b.mu. reservations: saved reservations of config file
+	// hotels (reservations.go, AB#982), guarded by b.mu.
 	cfgPath  string
 	fileCfg  atomic.Pointer[config]
 	adml     atomic.Pointer[admissionLists]
@@ -567,6 +577,8 @@ type broker struct {
 	guestsMu sync.RWMutex
 	admGen   atomic.Uint64
 	drains   map[string]drainRecord
+
+	reservations map[string]reservationRecord
 
 	// selfServe: the self-serve guests (self_serve.go). nil: no self_serve
 	// config.
@@ -683,9 +695,15 @@ func loadBroker(path string) (*broker, error) {
 		if h.cfg.LentFrom != "" || h.cfg.LentReportID != "" {
 			return nil, fmt.Errorf("config: hotel %q: lent_from and lent_report_id are set by PATCH {\"lend\": true} and kept in state_dir, not in the config file", h.cfg.ID)
 		}
+		if h.cfg.ReservationGeneration != 0 || h.cfg.ReservationRef != "" {
+			return nil, fmt.Errorf("config: hotel %q: reservation_generation and reservation_ref are set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
+		}
 		h.roomsUnchecked = true
 	}
 	b.loadConfigDrains() // PATCHed drains of config file hotels (drains.go, AB#946)
+	// PATCHed reservations of config file hotels (reservations.go, AB#982),
+	// before the lend state below, which wins over reserved_for.
+	b.loadConfigReservations()
 	fc := c
 	b.fileCfg.Store(&fc)
 	// The lend state in state_dir wins over reserved_for in the config file.

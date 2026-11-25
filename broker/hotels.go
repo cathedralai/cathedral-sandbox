@@ -5,7 +5,8 @@
 //
 //	GET    /v1/broker/hotels/<id>   the hotel document with its admission state
 //	POST   /v1/broker/hotels        {id, name, api, health, key, concurrency, labels, threads, ram_gib, sealed, max_slots, reserved_for, miner_hotkey, require_attestation, commitment}
-//	PATCH  /v1/broker/hotels/<id>   {drain, drain_notice, labels, reserved_for, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go; drain_notice: drain_notice.go)
+//	PATCH  /v1/broker/hotels/<id>   {drain, drain_notice, labels, reserved_for, reservation_ref, expect_generation, max_slots, lend}  (reserved_for null: back to the pool; lend and reclaim: lend.go; drain_notice: drain_notice.go)
+//	                                (reservation_ref: only with reserved_for; expect_generation: 409 reservation_conflict unless it is the hotel's reservation_generation; reservations.go)
 
 //	DELETE /v1/broker/hotels/<id>   (only a hotel with no rooms; drain it first)
 //	GET    /v1/broker/hotels/<id>/restart-check   200 only when a restart or roll may go (restart_guard.go)
@@ -410,6 +411,8 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	}
 	hc := req.hotelConfig
+	// Set by PATCH only (reservations.go, AB#982), never by the join.
+	hc.ReservationGeneration, hc.ReservationRef = 0, ""
 	if enroller {
 		if hc.MinerHotkey == "" || !hc.Sealed || (req.Verify != nil && !*req.Verify) ||
 			hc.ReservedFor != "" || hc.Labels != nil || hc.DataConns != 0 || hc.DataConnWaitSeconds != 0 || hc.MemFullPct != nil ||
@@ -678,13 +681,19 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		DrainNotice json.RawMessage   `json:"drain_notice"`  // a signed planned-maintenance notice; needs drain=true (drain_notice.go)
 		AlertChatID *string           `json:"alert_chat_id"` // the miner operator's alert chat; "" clears (alerts.go)
 		MemFullPct  json.RawMessage   `json:"mem_full_pct"`  // this hotel's memory limit, 1 to 100; null: the broker-wide value (AB#855)
+		// AB#982 (reservations.go): the caller's name for the reservation,
+		// and the reservation_generation the caller read; a PATCH against a
+		// newer one changes nothing.
+		ReservationRef   *string `json:"reservation_ref"`
+		ExpectGeneration *uint64 `json:"expect_generation"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
-	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil || len(req.MemFullPct) != 0) {
+	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil || len(req.MemFullPct) != 0 ||
+		req.ReservationRef != nil || req.ExpectGeneration != nil) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true, with or without a drain_notice")
 		return
 	}
@@ -757,6 +766,19 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		}
 		reserve = &v
 	}
+	ref := "" // null releases the reservation and its ref
+	if req.ReservationRef != nil {
+		switch {
+		case reserve == nil:
+			writeErr(w, 400, "invalid_json", "reservation_ref needs reserved_for in the same request")
+			return
+		case len(*req.ReservationRef) > maxReservationRef:
+			writeErr(w, 400, "invalid_json", fmt.Sprintf("reservation_ref is longer than %d bytes", maxReservationRef))
+			return
+		case *reserve != "":
+			ref = *req.ReservationRef
+		}
+	}
 	if req.Lend != nil && (!*req.Lend || reserve != nil) {
 		writeErr(w, 400, "invalid_lend", "lend takes true and no reserved_for; to take a lent hotel back, PATCH reserved_for")
 		return
@@ -776,6 +798,15 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	}
 	h.cfgMu.Lock()
 	oldCfg := h.cfg
+	// Under b.mu and h.cfgMu, which every reservation change holds (PATCH,
+	// lend, the fail-closed check): of two PATCHes that read one generation
+	// one wins (AB#982).
+	if req.ExpectGeneration != nil && *req.ExpectGeneration != h.cfg.ReservationGeneration {
+		h.cfgMu.Unlock()
+		b.mu.Unlock()
+		writeErr(w, 409, "reservation_conflict", fmt.Sprintf("hotel %s is at reservation_generation %d, not %d; read it again", h.cfg.ID, oldCfg.ReservationGeneration, *req.ExpectGeneration))
+		return
+	}
 	// A resent notice (same notice_id) keeps its first received_at, so a
 	// retry cannot shorten its lead. A new notice may not replace one whose
 	// window is still open.
@@ -817,8 +848,12 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	if req.MaxSlots != nil {
 		h.cfg.MaxSlots = *req.MaxSlots
 	}
-	if reserve != nil && !lc.reclaim { // a reclaim set reserved_for in applyLend
-		h.cfg.ReservedFor = *reserve
+	if reserve != nil {
+		if lc.reclaim { // applyLend set reserved_for and bumped the generation
+			h.cfg.ReservationRef = ref
+		} else {
+			setReservation(h, *reserve, ref)
+		}
 	}
 	if req.AlertChatID != nil {
 		h.cfg.AlertChatID = *req.AlertChatID
@@ -848,6 +883,20 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			drainSaved = true
 		}
 	}
+	// A config file hotel's reservation is kept in hotel-reservations.json
+	// (reservations.go, AB#982), the same way: saved before the 200 and put
+	// back if a later save fails.
+	var reservationsBefore map[string]reservationRecord
+	reservationSaved := false
+	if err == nil && h.cfg.ReservationGeneration != oldCfg.ReservationGeneration && !h.runtime && b.cfg.StateDir != "" {
+		reservationsBefore = maps.Clone(b.reservations)
+		b.noteConfigReservationLocked(h)
+		if err = b.saveConfigReservationsLocked(); err != nil {
+			b.reservations = reservationsBefore
+		} else {
+			reservationSaved = true
+		}
+	}
 	switch {
 	case err != nil:
 	case lc.lend || lc.reclaim:
@@ -861,6 +910,12 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			log.Printf("hotel %s: %s not put back: %v", h.cfg.ID, drainsFile, e)
 		}
 	}
+	if err != nil && reservationSaved {
+		b.reservations = reservationsBefore
+		if e := b.saveConfigReservationsLocked(); e != nil {
+			log.Printf("hotel %s: %s not put back: %v", h.cfg.ID, reservationsFile, e)
+		}
+	}
 	if err != nil {
 		log.Printf("hotel %s update not saved: %v", h.cfg.ID, err)
 		h.cfgMu.Lock()
@@ -869,6 +924,8 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.Labels = oldCfg.Labels
 		h.cfg.MaxSlots = oldCfg.MaxSlots
 		h.cfg.ReservedFor = oldCfg.ReservedFor
+		h.cfg.ReservationGeneration = oldCfg.ReservationGeneration
+		h.cfg.ReservationRef = oldCfg.ReservationRef
 		h.cfg.LentFrom = oldCfg.LentFrom
 		h.cfg.LentReportID = oldCfg.LentReportID
 		h.cfg.AlertChatID = oldCfg.AlertChatID
@@ -966,11 +1023,17 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	if l := h.lentFrom(); l != "" {
 		lent, lentReport = l, h.lentReportID()
 	}
+	gen, ref := h.reservation()
+	var resRef any // null when none, like reserved_for
+	if ref != "" {
+		resRef = ref
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := time.Now()
 	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
-		"reserved_for": reserved, "lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
+		"reserved_for": reserved, "reservation_generation": gen, "reservation_ref": resRef, // AB#982
+		"lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
 		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice(),
 		// rooms_in_use: rooms the broker holds on the hotel, plus creates queued or in flight. A
