@@ -173,6 +173,10 @@ type vmRecord struct {
 	DesiredState         string `json:"desired_state"`
 	CreatedAt            int64  `json:"created_at"`
 	StoppedAt            int64  `json:"stopped_at,omitempty"` // the host's effective stop time
+	// Ran: the host confirmed this generation running (start answer or GET
+	// reconcile). A run that never ran may be closed at now when the host
+	// never held it; one that ran keeps its host stop time only.
+	Ran bool `json:"ran,omitempty"`
 	// LastError: the last host call whose outcome is unknown (timeout,
 	// connection). Cleared by the next confirmed call.
 	LastError string `json:"last_error,omitempty"`
@@ -631,7 +635,7 @@ func (s *vmStore) reconcileStarting(id string, doc map[string]any) bool {
 	same := float64(rec.Generation) == gen
 	switch {
 	case state == vmStateRunning && same:
-		rec.DesiredState, rec.LastError = vmStateRunning, ""
+		rec.DesiredState, rec.LastError, rec.Ran = vmStateRunning, "", true
 	case (state == vmStateStopped || state == "created") && (!same || closed):
 		rec.DesiredState = vmStateStopped
 	default:
@@ -815,6 +819,10 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 		refuse = "the VM is not created yet"
 	case (rec.DesiredState == vmStateRunning || rec.DesiredState == vmStateStarting) && gen != rec.Generation:
 		refuse = fmt.Sprintf("a running VM takes only its own generation %d", rec.Generation)
+	case rec.DesiredState == vmStateStopped && rec.Generation > 0 && rec.StoppedAt == 0:
+		// A stop whose answer was lost: the run may still be closing at the host.
+		// Its receipt comes first, so the next run never makes it look stale.
+		refuse = fmt.Sprintf("the stop of generation %d has no receipt yet; repeat that stop first", rec.Generation)
 	case rec.DesiredState == vmStateStopped && gen != rec.Generation+1:
 		// Stop ended the run's authorizations (#2290 rule 5); a start needs the next one.
 		refuse = fmt.Sprintf("a stopped VM takes only generation %d", rec.Generation+1)
@@ -896,7 +904,7 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 	retry := rec.DesiredState == vmStateStarting
 	if !retry {
 		prev.LastError = ""
-		rec.Generation, rec.DesiredState, rec.StoppedAt = gen, vmStateStarting, 0
+		rec.Generation, rec.DesiredState, rec.StoppedAt, rec.Ran = gen, vmStateStarting, 0, false
 		if err := s.saveLocked(); err != nil {
 			*rec = prev
 			delete(s.busy, id)
@@ -932,7 +940,7 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 		cerr.write(w)
 		return
 	}
-	rec.DesiredState, rec.LastError = vmStateRunning, ""
+	rec.DesiredState, rec.LastError, rec.Ran = vmStateRunning, "", true
 	if err := s.saveLocked(); err != nil {
 		log.Printf("vms: %s not saved after start of %s: %v", vmsFile, id, err)
 	}
@@ -1014,6 +1022,14 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, id)
+	if cerr != nil && cerr.code == "stale_authorization" && (prev == vmStateStopped || prev == vmStateStarting) && !rec.Ran {
+		// A lost start (or one GET settled to stopped) that was never confirmed
+		// running, and whose generation the host does not hold: it never ran
+		// there, so it closes at now, as cancelVMRun does. A run that ran keeps
+		// the refusal: its real stop time is the host's, never "now".
+		// Without this the run stays consumed with no receipt and every Stop is 409.
+		doc, cerr = map[string]any{"stopped_at": float64(s.now().Unix())}, nil
+	}
 	if cerr != nil {
 		if cerr.unknown {
 			rec.LastError = "stop: " + cerr.code // stays stopped in intent; repeat the stop
