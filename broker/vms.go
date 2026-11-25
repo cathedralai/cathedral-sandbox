@@ -404,21 +404,24 @@ func (sshVMExecutor) Run(ctx context.Context, h vmHostConfig, stdin []byte, args
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	cmd.WaitDelay = 5 * time.Second
 	err := cmd.Run()
+	// A host answer that arrived wins over a deadline that passed afterwards:
+	// a known refusal (exit 3, 4) must roll back, not read as "unknown".
+	if err == nil {
+		return stdout.Bytes(), 0, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.Exited() {
+		if code := ee.ExitCode(); code != 255 { // 255: ssh itself failed
+			return stdout.Bytes(), code, nil
+		}
+	}
 	if ctx.Err() != nil {
 		return nil, 0, ctx.Err()
 	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		code := ee.ExitCode()
-		if code == 255 || code < 0 { // ssh itself failed, or a signal
-			return nil, 0, fmt.Errorf("ssh exit %d: %s", code, strings.TrimSpace(stderr.String()))
-		}
-		return stdout.Bytes(), code, nil
+	if ee != nil {
+		return nil, 0, fmt.Errorf("ssh exit %d: %s", ee.ExitCode(), strings.TrimSpace(stderr.String()))
 	}
-	if err != nil {
-		return nil, 0, err
-	}
-	return stdout.Bytes(), 0, nil
+	return nil, 0, err
 }
 
 // vmArgRE: what may go on the remote command line.
