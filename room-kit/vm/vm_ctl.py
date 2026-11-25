@@ -573,6 +573,11 @@ def cmd_delete(args: list[str]) -> dict:
     if opts.get("--confirm") != name:
         raise Refusal("confirm_required", f"delete needs --confirm {name}")
     with global_lock():
+        gone = root() / name
+        if not gone.exists() and not gone.is_symlink():
+            # Idempotent: the broker repeats a delete whose answer was lost, or clears a
+            # create that never reached the host. Nothing to stop or remove.
+            return {"name": name, "deleted": True, "existed": False}
         d = vm_dir(name)
         with Lock(d / ".lock"):
             stop_locked(name, d, "deleted")

@@ -241,6 +241,9 @@ def test_delete_needs_confirm_with_the_name(host):
     assert code == 0 and out == {"name": "vm1", "deleted": True}
     assert not (host.root / "vm1").exists() and not (host.units / "cathedral-vm-vm1.service").exists()
     assert not (host.units / "cathedral-vm-enforce.timer").exists()  # last VM gone
+    # A repeated delete (lost answer) or one for a create that never reached the host succeeds.
+    code, out = host.ctl("delete", "vm1", "--confirm", "vm1")
+    assert code == 0 and out == {"name": "vm1", "deleted": True, "existed": False}
 
 
 def test_reboot_needs_a_running_vm(host):
