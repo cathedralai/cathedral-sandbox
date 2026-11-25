@@ -306,6 +306,12 @@ type config struct {
 	// SelfServe turns on self-serve metered guests (self_serve.go, AB#894):
 	// the API registers a key hash per account at runtime. Absent: off.
 	SelfServe *selfServeConfig `json:"self_serve,omitempty"`
+	// VMsEnabled turns on the operator VM routes /v1/broker/vms (vms.go,
+	// AB#991). Off (the default): every one of them answers 404 like an
+	// unknown route. Needs state_dir, operator_key_sha256 and vm_hosts. A
+	// change to it or to vm_hosts needs a restart.
+	VMsEnabled bool           `json:"vms_enabled,omitempty"`
+	VMHosts    []vmHostConfig `json:"vm_hosts,omitempty"`
 }
 
 func (b *broker) maxExec() int {
@@ -583,6 +589,10 @@ type broker struct {
 	// selfServe: the self-serve guests (self_serve.go). nil: no self_serve
 	// config.
 	selfServe *selfServeState
+
+	// vms: the customer VMs on vm_hosts (vms.go, AB#991). nil: vms_enabled
+	// is off.
+	vms *vmStore
 }
 
 // A hotel counts as answering while its last good health answer is younger than okWindow.
@@ -728,12 +738,18 @@ func loadBroker(path string) (*broker, error) {
 	if err := b.loadReadyRooms(); err != nil {
 		return nil, err
 	}
+	if err := b.loadVMs(); err != nil {
+		return nil, fmt.Errorf("state: %w", err)
+	}
 	return b, nil
 }
 
 // validateTopConfig is the start's check of the config file's top-level
 // fields. A live reload (reload.go) runs it on the new file too.
 func validateTopConfig(c config) error {
+	if err := validateVMConfig(c); err != nil {
+		return err
+	}
 	if err := validateFreshMeasurements(c); err != nil {
 		return err
 	}
@@ -3371,6 +3387,10 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p == "/v1/broker/self-serve" || strings.HasPrefix(p, "/v1/broker/self-serve/") {
 		b.handleSelfServe(w, r, strings.TrimPrefix(p, "/v1/broker/self-serve")) // operator key only (self_serve.go)
+		return
+	}
+	if p == "/v1/broker/vms" || strings.HasPrefix(p, "/v1/broker/vms/") {
+		b.handleVMs(w, r, strings.TrimPrefix(p, "/v1/broker/vms")) // operator key only (vms.go)
 		return
 	}
 	if p == "/v1/broker/guests" || strings.HasPrefix(p, "/v1/broker/guests/") {
