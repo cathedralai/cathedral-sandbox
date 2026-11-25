@@ -289,6 +289,10 @@ def allocate(port: int) -> int:
         if int(env["VM_SSH_PORT"]) == port:
             raise Refusal("port_in_use", f"ssh port {port} is used by VM {other}", 5)
         used_slots.add(int(env["VM_SLOT"]))
+    # A host service already listening there would be shadowed by the forward.
+    listening = run("ss", "-Hltn", f"sport = :{port}", check=False).stdout
+    if listening.strip():
+        raise Refusal("port_in_use", f"ssh port {port} is already listened on by this host", 5)
     links, nets = host_taken()
     for slot in range(SLOTS):
         net = ipaddress.IPv4Network((int(NET.network_address) + 4 * slot, 30))
@@ -640,6 +644,8 @@ def cmd_enforce(args: list[str]) -> dict:
                     stopped.append({"name": name, "stopped_at": ev["stopped_at"], "generation": ev["generation"]})
         except Refusal as e:
             errors.append({"name": name, "error": e.error, "detail": e.detail})
+        except Exception as e:  # one VM's failure must not hide or skip the others
+            errors.append({"name": name, "error": "internal", "detail": type(e).__name__})
 
     expired = []
     for name in names:
@@ -655,6 +661,8 @@ def cmd_enforce(args: list[str]) -> dict:
                     run(str(KIT / "vm-net.sh"), "check", str(d / "vm.env"), check=False)
         except Refusal as e:
             errors.append({"name": name, "error": e.error, "detail": e.detail})
+        except Exception as e:
+            errors.append({"name": name, "error": "internal", "detail": type(e).__name__})
     # All expired VMs are cut together: the slowest guest bounds the delay, not the sum.
     threads = [threading.Thread(target=cut, args=(n,)) for n in expired]
     for t in threads:

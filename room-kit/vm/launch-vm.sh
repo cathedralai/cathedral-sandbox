@@ -14,6 +14,9 @@ source "$(readlink -f "${1:?vm.env}")"
 RUN=$VM_DIR/run
 mkdir -p "$RUN"
 rm -f "$RUN/qmp.sock"
+# Serial console in a 1 MiB ring in QEMU memory, never a host file: the guest has root
+# and could write to ttyS0 until the shared host disk is full (Reviewbot #754).
+# -sandbox: seccomp filter, no exec/setuid/obsolete syscalls (QEMU runs as root).
 exec "${QEMU:-/usr/bin/qemu-system-x86_64}" -no-user-config -nodefaults -name "cathedral-vm-$VM_NAME" \
   -machine q35,accel=kvm -enable-kvm -cpu host -smp "$VM_VCPUS" -m "${VM_MEM_GIB}G" \
   -drive "if=none,id=disk0,format=qcow2,file=$VM_DIR/disk.qcow2,cache=none,discard=unmap" \
@@ -23,4 +26,6 @@ exec "${QEMU:-/usr/bin/qemu-system-x86_64}" -no-user-config -nodefaults -name "c
   -netdev "tap,id=net0,ifname=$VM_TAP,script=no,downscript=no,vhost=on" \
   -device "virtio-net-pci,netdev=net0,mac=$VM_MAC,romfile=" \
   -qmp "unix:$RUN/qmp.sock,server=on,wait=off" \
-  -display none -vga none -monitor none -serial "file:$RUN/serial.log"
+  -display none -vga none -monitor none \
+  -chardev ringbuf,id=serial0,size=1M -serial chardev:serial0 \
+  -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny
