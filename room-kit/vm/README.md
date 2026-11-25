@@ -55,6 +55,10 @@ sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the 
 - `stop` disables the unit, asks the guest to power off (QMP, up to 60 s),
   stops the unit, prints `stopped_at`, and closes the generation: that run can
   never start again, so a resume needs a fresh generation.
+- `start`, `stop` and `reboot` take `--generation N` (the broker always sends it):
+  a call for any other run than the current one is refused (exit 3,
+  `stale_generation`) and changes nothing, so a delayed Stop of an old run
+  cannot stop the new one.
 - `cathedral-vm-enforce.timer` runs `enforce` every 30 s: any running VM past
   `paid_through` is stopped (reason `paid_through`) and keeps its disk. It
   also restores a running VM's link rules after a firewall reload. None of

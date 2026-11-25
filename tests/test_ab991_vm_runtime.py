@@ -319,3 +319,26 @@ def test_image_is_pinned():
 def test_no_em_dashes_in_the_kit():
     for f in KIT.iterdir():
         assert "—" not in f.read_text(), f
+
+
+def test_generation_fences_stop_start_and_reboot(host):
+    # At-least-once billing delivery: a delayed call from an older run must not touch the new one.
+    host.create()
+    now = int(time.time())
+    assert host.ctl("authorize", "vm1", str(now + 600), "1")[0] == 0
+    assert host.ctl("start", "vm1", "--generation", "1")[0] == 0
+    assert host.ctl("stop", "vm1", "--generation", "1")[0] == 0
+    assert host.ctl("authorize", "vm1", str(now + 60), "2")[0] == 0  # shorter window, new run: accepted
+    code, out = host.ctl("start", "vm1", "--generation", "1")
+    assert code == 3 and out["error"] == "stale_generation"
+    assert host.ctl("start", "vm1", "--generation", "2")[0] == 0
+    code, out = host.ctl("stop", "vm1", "--generation", "1")
+    assert code == 3 and out["error"] == "stale_generation"
+    assert host.ctl("status", "vm1")[1]["state"] == "running"
+    code, out = host.ctl("--from-broker", extra={"SSH_ORIGINAL_COMMAND": "stop vm1 --generation 1"})
+    assert code == 3 and out["error"] == "stale_generation"
+    assert host.ctl("reboot", "vm1", "--generation", "1")[1]["error"] == "stale_generation"
+    code, out = host.ctl("stop", "vm1", "--generation", "x1")
+    assert code == 2 and out["error"] == "invalid_generation"
+    assert host.ctl("status", "vm1")[1]["state"] == "running"
+    assert host.ctl("stop", "vm1", "--generation", "2")[0] == 0

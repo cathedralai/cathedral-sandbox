@@ -481,10 +481,24 @@ def cmd_check_paid(args: list[str]) -> dict:
     return {"name": name, "paid": True}
 
 
+def check_generation(opts: dict, a: dict) -> None:
+    """--generation N fences a call to one run: a delayed call from an older run
+    (at-least-once billing delivery) must not stop, start or reset the new one."""
+    want = opts.get("--generation")
+    if want is None:
+        return
+    if not re.fullmatch(r"[1-9][0-9]{0,17}", want):
+        raise Refusal("invalid_generation", "generation must be a positive integer")
+    if int(want) != a["generation"]:
+        raise Refusal("stale_generation", f"generation {want} is not the current run ({a['generation']})", 3)
+
+
 def cmd_start(args: list[str]) -> dict:
-    name = check_name(parse_opts(args, set(), 1)["_"][0])
+    opts = parse_opts(args, {"--generation"}, 1)
+    name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
+        check_generation(opts, auth_of(d))
         refusal = paid_refusal(auth_of(d), int(time.time()))
         if refusal:
             raise refusal
@@ -539,9 +553,11 @@ def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> d
 
 
 def cmd_stop(args: list[str]) -> dict:
-    name = check_name(parse_opts(args, set(), 1)["_"][0])
+    opts = parse_opts(args, {"--generation"}, 1)
+    name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
+        check_generation(opts, auth_of(d))
         return stop_locked(name, d, "requested")
 
 
@@ -559,9 +575,11 @@ def cmd_powerdown(args: list[str]) -> dict:
 
 
 def cmd_reboot(args: list[str]) -> dict:
-    name = check_name(parse_opts(args, set(), 1)["_"][0])
+    opts = parse_opts(args, {"--generation"}, 1)
+    name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
+        check_generation(opts, auth_of(d))
         if not unit_active(name):
             raise Refusal("not_running", f"VM {name} is not running", 5)
         if not qmp(name, "system_reset"):
