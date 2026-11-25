@@ -967,6 +967,41 @@ Each create answer has `X-Broker-Hotel`, `X-Broker-Queue-Ms`,
   (the room→guest mapping is persisted, so a reload does not expose another
   guest's receipts).
 
+## Customer VMs (AB#991)
+
+Off by default. With `"vms_enabled": true` (needs `state_dir`,
+`operator_key_sha256` and `vm_hosts`) the broker drives `vm-ctl.sh` on VM
+hosts (`room-kit/vm`) over SSH; while off, every `/v1/broker/vms` route
+answers 404 `route_not_found`. A change to either field needs a restart.
+
+```json
+"vms_enabled": true,
+"vm_hosts": [{"id": "vmh-1", "ssh_target": "vmctl@10.0.0.5", "ssh_key_file": "/etc/thin-broker/vmctl.key",
+  "known_hosts_file": "/etc/thin-broker/vmctl.known_hosts", "public_ip": "203.0.113.9",
+  "port_min": 22000, "port_max": 22099, "max_vcpus": 16, "max_mem_gib": 64, "max_disk_gib": 500}]
+```
+
+The host's `authorized_keys` line for the broker key forces
+`vm-ctl.sh --from-broker`. The broker runs ssh with `BatchMode=yes`,
+`StrictHostKeyChecking=yes` and the configured known_hosts, sends only
+validated tokens as arguments and the customer key on stdin.
+
+| Route (operator key) | What it does |
+|---|---|
+| `POST /v1/broker/vms` | Body `{"account", "vcpus", "mem_gib", "disk_gib", "ssh_public_key", optional "host"}`. Picks a host with room (every VM counts, stopped or not) and its lowest free port, makes id `vm-<12 hex>`, runs `create`. 201: the VM, stopped in generation 0. |
+| `GET /v1/broker/vms[/{id}]` | The record(s) with `host_status` from the host's `list` / `status`, or `host_status_error`. |
+| `POST /v1/broker/vms/{id}/authorize` | `{"paid_through": <unix s>, "generation": n}`. A stopped VM takes only generation+1, a running one only its own; paid_through never goes down. Else 409 `stale_authorization` (also host exit 3). |
+| `POST /v1/broker/vms/{id}/start` | Optional `{"generation": n}`. Needs the generation+1 authorization installed with paid_through after now (409 `not_authorized`), then bumps the generation. Host exit 4: 409 `not_paid`. |
+| `POST /v1/broker/vms/{id}/stop` | Answers the host's `stopped_at`. The run then takes no more authorizations. The disk stays. |
+| `POST /v1/broker/vms/{id}/reboot` | Running VMs only. Same generation. |
+| `DELETE /v1/broker/vms/{id}` | Body `{"confirm": "<id>"}` or 400 `confirm_required`. The only route that removes a disk. |
+
+State is `state_dir/vms.json` (0600, fsynced). An operation records its
+intent before the host call. A host that does not answer gives 502
+`vm_host_unreachable` and leaves the intent with `last_error`: a timeout is
+never read as success or failure. A host refusal gives 502
+`vm_host_refused` with the exit code only; stderr never reaches the client.
+
 ## Live config reload (AB#946)
 
 New customer keys, new hotels and new measurements need no restart.
