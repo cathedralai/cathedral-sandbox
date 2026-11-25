@@ -46,8 +46,9 @@
 // off, and the AMD chain must sign the report. One of the amdParallel slots
 // is reserved for these checks (amdSlots).
 //
-// verify_receipts.py reads the Milan and Genoa TCB layouts only: a Turin pin
-// is accepted here but a Turin report fails until the verifier handles it.
+// verify_receipts.py reads the Milan, Genoa and Turin TCB layouts (AB#938).
+// The Genoa firmware floors (min_genoa_snp_spl, min_genoa_microcode_spl) have
+// no Turin values: while one is set, checkGenoaTCBFloor refuses a Turin report.
 package main
 
 import (

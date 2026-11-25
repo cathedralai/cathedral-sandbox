@@ -5,7 +5,7 @@
 // VerifyAttestation checks, in order: the binding hash; the sealed schema;
 // REPORT_DATA committing to the binding; measurement, chip id, TCB, HOST_DATA
 // and policy equal to the binding; debug off; the measurement allow list; the
-// product (Genoa or Milan); then
+// product (Genoa, Milan or Turin); then
 // the AMD chain (ARK pinned and self-signed, ARK signs ASK, ASK signs VCEK, VCEK
 // hwID and SPL extensions equal the report, report signature verifies with the
 // VCEK). VerifyReceipts then checks each receipt's binding, hash and Ed25519

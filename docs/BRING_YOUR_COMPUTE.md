@@ -44,7 +44,7 @@ pass is not admission; step 5 is.
 
 | Item | Needs | Source of the rule |
 |---|---|---|
-| CPU | AMD EPYC 9004 Genoa (also Bergamo 97x4, Siena 8004). 7003 Milan: WARN, needs a guest measurement Cathedral has not published. 9005 Turin: WARN, the validator policy and the broker verifier lack it | Validator policy `sn94-snp-policy.json`; `broker/amd_chain.go` header; [SEALED_CAPACITY_ADD_HOTEL.md](SEALED_CAPACITY_ADD_HOTEL.md#1-pick-the-host) |
+| CPU | AMD EPYC 9004 Genoa (also Bergamo 97x4, Siena 8004). 7003 Milan: WARN, needs a guest measurement Cathedral has not published. 9005 Turin: WARN, the validator policy lacks it (the broker AMD chain verifier reads Turin since AB#938) | Validator policy `sn94-snp-policy.json`; [SEALED_CAPACITY_ADD_HOTEL.md](SEALED_CAPACITY_ADD_HOTEL.md#1-pick-the-host) |
 | BIOS | SMEE, SEV-SNP, SNP memory coverage, IOMMU on; SEV-ES ASID space above 0 | [SNP_OWN_SERVER_ONBOARDING.md](SNP_OWN_SERVER_ONBOARDING.md#1-check-the-hardware) |
 | Firmware | Genoa TCB at or above boot loader 12, TEE 0, SNP 28, microcode 88 (FAIL below). SNP 28 or 29: WARN, the broker floor planned under AB#809 is 30 | validator `snp_production.py` `_tcb_meets_minimum`; [broker README](../broker/README.md) `min_genoa_snp_spl` |
 | CHIP_ID | Not masked | `cathedral/verify/snp.py` |

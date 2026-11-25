@@ -20,6 +20,7 @@ const (
 	oidTEE        = "1.3.6.1.4.1.3704.1.3.2"
 	oidSNP        = "1.3.6.1.4.1.3704.1.3.3"
 	oidMicrocode  = "1.3.6.1.4.1.3704.1.3.8"
+	oidFMC        = "1.3.6.1.4.1.3704.1.3.9" // Turin only
 )
 
 // AMDInfo is what a passing chain check reports.
@@ -30,11 +31,13 @@ type AMDInfo struct {
 }
 
 // TCB holds the SPL parts of the reported TCB that the VCEK must match.
+// FMC is set for Turin only, as Python adds "fmc" for Turin only.
 type TCB struct {
-	Bootloader int `json:"bootloader"`
-	TEE        int `json:"tee"`
-	SNP        int `json:"snp"`
-	Microcode  int `json:"microcode"`
+	FMC        *int `json:"fmc,omitempty"`
+	Bootloader int  `json:"bootloader"`
+	TEE        int  `json:"tee"`
+	SNP        int  `json:"snp"`
+	Microcode  int  `json:"microcode"`
 }
 
 // pssVerify mirrors pss_verify() in verify_receipts.py: RSA-PSS, SHA-384,
@@ -61,7 +64,8 @@ func requireP384(pub *ecdsa.PublicKey, isECDSA bool) error {
 }
 
 // product mirrors product() in verify_receipts.py plus the check in verify_amd():
-// only Milan and Genoa are handled, because their TCB byte layout is the one used here.
+// Milan, Genoa and Turin are handled. A version 2 report takes only Milan or Genoa,
+// because Turin firmware writes version 3 on.
 func product(rep Report, override string) (string, error) {
 	if rep.Version < 2 || rep.Version > 5 {
 		return "", fail(CodeUnsupportedProduct, "the report is version %d, which has no layout here", rep.Version)
@@ -74,18 +78,21 @@ func product(rep Report, override string) (string, error) {
 		}
 	} else {
 		// A report that names its own product decides; the override is read only after this.
-		if rep.Family != 0x19 {
-			return "", fail(CodeUnsupportedProduct, "the report names cpuid family %d model %d, which has no layout here", rep.Family, rep.Model)
-		}
-		prod = "Milan"
-		if rep.Model >= 0x10 {
+		switch {
+		case rep.Family == 0x19 && rep.Model >= 0x10:
 			prod = "Genoa"
+		case rep.Family == 0x19:
+			prod = "Milan"
+		case rep.Family == 0x1A && rep.Model <= 0x11:
+			prod = "Turin" // same model range as cathedral/verify/snp.py _snp_generation
+		default:
+			return "", fail(CodeUnsupportedProduct, "the report names cpuid family %d model %d, which has no layout here", rep.Family, rep.Model)
 		}
 		if override != "" && override != prod {
 			return "", fail(CodeUnsupportedProduct, "product override %q disagrees with the report (%s)", override, prod)
 		}
 	}
-	if prod != "Genoa" && prod != "Milan" {
+	if prod != "Genoa" && prod != "Milan" && (prod != "Turin" || rep.Version == 2) {
 		return "", fail(CodeUnsupportedProduct, "only Milan and Genoa TCB layouts are handled, not %q", prod)
 	}
 	return prod, nil
@@ -167,23 +174,47 @@ func VerifyAMDChain(report []byte, fields Report, ark, ask, vcek []byte, arkPins
 	if err := pssVerify(askCert, vcekCert); err != nil {
 		return info, fail(CodeVCEKSignature, "VCEK is not signed by the ASK: %v", err)
 	}
-	// Milan and Genoa TCB layout: bootloader, tee, then snp and microcode at bytes 6 and 7.
+	// TCB_VERSION (SEV-SNP ABI 56860): Milan and Genoa are bootloader, TEE, reserved x4, SNP,
+	// microcode. Turin is FMC, bootloader, TEE, SNP, reserved x3, microcode.
 	tcb := fields.ReportedTCB
 	info.ARKSHA256 = arkFP
-	info.TCB = TCB{Bootloader: int(tcb[0]), TEE: int(tcb[1]), SNP: int(tcb[6]), Microcode: int(tcb[7])}
+	turin := prod == "Turin"
+	if turin {
+		fmc := int(tcb[0])
+		info.TCB = TCB{FMC: &fmc, Bootloader: int(tcb[1]), TEE: int(tcb[2]), SNP: int(tcb[3]), Microcode: int(tcb[7])}
+	} else {
+		info.TCB = TCB{Bootloader: int(tcb[0]), TEE: int(tcb[1]), SNP: int(tcb[6]), Microcode: int(tcb[7])}
+	}
+	hwidWant := fields.ChipID[:]
+	if turin {
+		// A Turin CHIP_ID is 8 bytes and the rest is zero; the VCEK hwID is those 8 bytes.
+		for _, b := range fields.ChipID[8:] {
+			if b != 0 {
+				return info, fail(CodeVCEKMismatch, "a Turin report chip id must be 8 bytes followed by zeros")
+			}
+		}
+		hwidWant = fields.ChipID[:8]
+	}
 	hwid, ok := extValue(vcekCert, oidHWID)
-	if !ok || len(hwid) < 64 || string(hwid[len(hwid)-64:]) != string(fields.ChipID[:]) {
+	// A Turin hwID is the raw 8 bytes, or those behind an OCTET STRING header (04 08).
+	if !ok || len(hwid) < len(hwidWant) || string(hwid[len(hwid)-len(hwidWant):]) != string(hwidWant) ||
+		(turin && len(hwid) != 8 && len(hwid) != 10) {
 		return info, fail(CodeVCEKMismatch, "VCEK hwID differs from the report chip id")
 	}
-	for _, c := range []struct {
+	type splCheck struct {
 		oid, name string
 		want      int
-	}{
+	}
+	checks := []splCheck{
 		{oidBootloader, "bootloader", info.TCB.Bootloader},
 		{oidTEE, "tee", info.TCB.TEE},
 		{oidSNP, "snp", info.TCB.SNP},
 		{oidMicrocode, "microcode", info.TCB.Microcode},
-	} {
+	}
+	if turin {
+		checks = append([]splCheck{{oidFMC, "fmc", *info.TCB.FMC}}, checks...)
+	}
+	for _, c := range checks {
 		got, ok := extInt(vcekCert, c.oid)
 		if !ok || got != c.want {
 			return info, fail(CodeVCEKMismatch, "VCEK %s SPL differs from the report", c.name)

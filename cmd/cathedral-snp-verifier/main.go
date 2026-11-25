@@ -62,7 +62,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	arkFile := fs.String("ark", "", "AMD ARK certificate (DER)")
 	askFile := fs.String("ask", "", "AMD ASK certificate (DER)")
 	vcekFile := fs.String("vcek", "", "VCEK certificate (DER)")
-	product := fs.String("product", "", "Genoa or Milan (default: from the report CPUID, version 3 and later)")
+	product := fs.String("product", "", "Genoa, Milan or Turin (default: from the report CPUID, version 3 and later)")
 	requireMeasurement := fs.Bool("require-measurement", false, "fail unless --expected-measurement is given")
 	var headers, pins, allowed multiFlag
 	var expected onceFlag

@@ -29,10 +29,10 @@ def test_list_is_dated_and_claims_no_proven_provider() -> None:
     assert "—" not in text
 
 
-def test_broker_verifier_still_refuses_turin_reports() -> None:
+def test_broker_verifier_reads_turin_but_the_miner_path_does_not_admit_it() -> None:
     verifier = (ROOT / "room-kit" / "verify_receipts.py").read_text(encoding="utf-8")
-    assert 'need(prod in ("Genoa", "Milan"), "only Milan and Genoa TCB layouts are handled")' in verifier
-    assert "Turin (EPYC 9xx5, family 0x1A) is not admissible today" in _doc()
+    assert 'need(prod in ("Genoa", "Milan", "Turin"), "only Milan, Genoa and Turin TCB layouts are handled")' in verifier
+    assert "Turin (EPYC 9xx5, family 0x1A) is not admissible today on the miner path" in _doc()
 
 
 def test_genoa_family_models_match_the_sandbox_verifier() -> None:

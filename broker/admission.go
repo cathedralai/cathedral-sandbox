@@ -422,6 +422,11 @@ func checkGenoaTCBFloor(reportB64 string, amd map[string]any, snpFloor, microcod
 	if product == "Milan" {
 		return nil // these floors are specific to the Genoa guidance in AMD-SB-3059 and AMD-SB-3061
 	}
+	if product == "Turin" {
+		// Turin has its own TCB layout (SNP at byte 3) and no published floor
+		// values here, so it fails closed rather than skip like Milan (AB#938).
+		return errors.New("SNP firmware floor: no Turin floor is defined; a Turin report is refused while a Genoa floor is set")
+	}
 	if product != "Genoa" {
 		return errors.New("SNP firmware floor: unsupported AMD processor generation")
 	}

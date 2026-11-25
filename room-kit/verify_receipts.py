@@ -21,10 +21,11 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      from AMD KDS (kdsintf.amd.com) and cached; VCEK hwID and TCB extensions
      equal the report; the report's ECDSA P-384 signature verifies with the VCEK.
      Optional --ark-sha256 pins the ARK certificate; repeat it to accept
-     any of several roots (one per product: Milan, Genoa, ...).
+     any of several roots (one per product: Milan, Genoa, Turin).
      Optional --min-genoa-snp-spl checks the current, reported, committed and
      launch SNP TCB components after the AMD chain; it cannot prove the OEM
-     PI, mitigation bit or full microcode patch in AMD-SB-3059/3061.
+     PI, mitigation bit or full microcode patch in AMD-SB-3059/3061. It is
+     not applied to Milan and refuses Turin (no Turin floor is defined).
   4. receipts: each statement names this binding and the sealed hotel receipt
      schema, receipt_sha256 = sha256(canonical(statement)), the Ed25519
      signature verifies with the binding's receipt key, and the chain links
@@ -121,7 +122,9 @@ list-mode checks; run mode does not do them.
 --product: a report with CPUID fields (version 3 on) names its own product. A family with no layout fails whatever
 --product says, and a --product that names another product than the report fails. Only a version 2 report, which
 has no CPUID fields, takes the product from --product; there nothing in the report can contradict the name, and
-Milan and Genoa share the layout. A report of version 0 or 1, or of a version above 5, fails whatever --product
+Milan and Genoa share the layout. A version 2 report takes only Milan or Genoa: Turin (family 0x1A, models 0x00 to
+0x11) writes version 3 on and has its own TCB layout (FMC, bootloader, TEE, SNP, microcode in bytes 0 to 3 and 7)
+and an 8-byte hwID. A report of version 0 or 1, or of a version above 5, fails whatever --product
 says ("the report is version N, which has no layout here"); the flag is read for no version but 2. List mode
 reads the product the same way.
 List mode reads the receipts file, each receipt header and the attestation file under the same raw-text limits as
@@ -365,11 +368,16 @@ def product(rep: dict, override: str | None) -> str:
         raise Fail(f"the report is version {version}, which has no layout here")
     if version == 2:
         if override is not None:
+            # Turin firmware writes version 3 or later, so a version 2 report is never Turin.
+            need(override in ("Genoa", "Milan"), "only Milan and Genoa TCB layouts are handled")
             return override
         raise Fail(f"cannot tell the product from cpuid family {fam} model {mod}; pass --product")
-    if fam != 0x19:
+    if fam == 0x19:
+        shown = "Genoa" if mod is not None and mod >= 0x10 else "Milan"
+    elif fam == 0x1A and mod is not None and mod <= 0x11:
+        shown = "Turin"  # same model range as cathedral/verify/snp.py _snp_generation
+    else:
         raise Fail(f"the report names cpuid family {fam} model {mod}, which has no layout here")
-    shown = "Genoa" if mod is not None and mod >= 0x10 else "Milan"
     if override is not None and override != shown:
         raise Fail(f"--product {override}: the report names the product {shown}")
     return shown
@@ -413,8 +421,14 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
                certs: dict | None = None) -> dict:
     """The AMD chain. certs (base64 DER vcek, ask, ark) replace the KDS fetch; every other check is the same."""
     tcb = rep["reported_tcb"]
-    need(prod in ("Genoa", "Milan"), "only Milan and Genoa TCB layouts are handled")
-    bl, tee, snp, ucode = tcb[0], tcb[1], tcb[6], tcb[7]
+    need(prod in ("Genoa", "Milan", "Turin"), "only Milan, Genoa and Turin TCB layouts are handled")
+    turin = prod == "Turin"
+    # TCB_VERSION (SEV-SNP ABI 56860): Milan and Genoa are bootloader, TEE, reserved x4, SNP, microcode.
+    # Turin is FMC, bootloader, TEE, SNP, reserved x3, microcode.
+    if turin:
+        fmc, bl, tee, snp, ucode = tcb[0], tcb[1], tcb[2], tcb[3], tcb[7]
+    else:
+        fmc, bl, tee, snp, ucode = None, tcb[0], tcb[1], tcb[6], tcb[7]
     if certs is None:
         chain_pem = fetch(f"{KDS}/{prod}/cert_chain", cache, f"{prod}-cert_chain.pem")
         loaded = x509.load_pem_x509_certificates(chain_pem)
@@ -432,14 +446,27 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
         pins = [ark_sha256] if isinstance(ark_sha256, str) else ark_sha256
         need(ark_fp in {p.lower() for p in pins}, f"ARK sha256 {ark_fp} differs from the pinned value")
     chip = rep["chip_id"].hex()
+    if turin:
+        # A Turin CHIP_ID is 8 bytes and the rest is zero; KDS names the VCEK by those 8 bytes (KDS spec 57230).
+        need(rep["chip_id"][8:] == bytes(56), "a Turin report chip id must be 8 bytes followed by zeros")
+        hwid_want, kds_id = rep["chip_id"][:8], chip[:16]
+        spl_query = f"fmcSPL={fmc}&blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}"
+    else:
+        hwid_want, kds_id = rep["chip_id"], chip
+        spl_query = f"blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}"
     if vcek is None:
-        vcek_url = f"{KDS}/{prod}/{chip}?blSPL={bl}&teeSPL={tee}&snpSPL={snp}&ucodeSPL={ucode}"
+        vcek_url = f"{KDS}/{prod}/{kds_id}?{spl_query}"
         vcek = x509.load_der_x509_certificate(fetch(vcek_url, cache, f"vcek-{chip[:16]}-{tcb.hex()}.der"))
     pss_verify(ask, vcek)
     hwid = vcek.extensions.get_extension_for_oid(x509.ObjectIdentifier("1.3.6.1.4.1.3704.1.4")).value.value
-    need(hwid[-64:] == rep["chip_id"], "VCEK hwID differs from the report chip id")
-    for oid, val, name in (("1.3.6.1.4.1.3704.1.3.1", bl, "bootloader"), ("1.3.6.1.4.1.3704.1.3.2", tee, "tee"),
-                           ("1.3.6.1.4.1.3704.1.3.3", snp, "snp"), ("1.3.6.1.4.1.3704.1.3.8", ucode, "microcode")):
+    # A Turin hwID is the raw 8 bytes, or those behind an OCTET STRING header (04 08).
+    need(hwid[-len(hwid_want):] == hwid_want and (not turin or len(hwid) in (8, 10)),
+         "VCEK hwID differs from the report chip id")
+    spls = [("1.3.6.1.4.1.3704.1.3.1", bl, "bootloader"), ("1.3.6.1.4.1.3704.1.3.2", tee, "tee"),
+            ("1.3.6.1.4.1.3704.1.3.3", snp, "snp"), ("1.3.6.1.4.1.3704.1.3.8", ucode, "microcode")]
+    if turin:
+        spls.insert(0, ("1.3.6.1.4.1.3704.1.3.9", fmc, "fmc"))
+    for oid, val, name in spls:
         need(ext_int(vcek, oid) == val, f"VCEK {name} SPL differs from the report")
     need(rep["signature_algo"] == 1, "report signature algorithm is not ECDSA P-384 SHA-384")
     sig = encode_dss_signature(rep["sig_r"], rep["sig_s"])
@@ -447,7 +474,10 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
         vcek.public_key().verify(sig, report[:SIGNED_LEN], ec.ECDSA(hashes.SHA384()))
     except InvalidSignature as exc:
         raise Fail("report signature does not verify with the VCEK") from exc
-    return {"product": prod, "ark_sha256": ark_fp, "tcb": {"bootloader": bl, "tee": tee, "snp": snp, "microcode": ucode}}
+    out_tcb = {"bootloader": bl, "tee": tee, "snp": snp, "microcode": ucode}
+    if turin:
+        out_tcb = {"fmc": fmc, **out_tcb}
+    return {"product": prod, "ark_sha256": ark_fp, "tcb": out_tcb}
 
 
 def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: str,
@@ -2449,7 +2479,7 @@ def main() -> int:
                     help="pin the AMD ARK certificate (sha256 of its DER); repeat to accept any of several")
     ap.add_argument("--min-genoa-snp-spl", type=int, metavar="N",
                     help="require Genoa current/reported/committed/launch SNP TCB components >= N (e.g. 30 for AMD-SB-3059); requires AMD chain")
-    ap.add_argument("--product", help="Milan or Genoa (default: from the report)")
+    ap.add_argument("--product", help="Milan, Genoa or Turin (default: from the report)")
     ap.add_argument("--kds-cache", help="list mode: where fetched AMD certificates are cached "
                                         "(default ~/.cache/amd-kds)")
     ap.add_argument("--skip-amd", action="store_true", help="skip the AMD chain (offline smoke test only)")

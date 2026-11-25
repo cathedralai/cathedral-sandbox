@@ -574,6 +574,16 @@ func TestGenoaSnpFloorChecksEachTCBComponent(t *testing.T) {
 	if err := checkGenoaTCBFloor(encoded(), map[string]any{"product": "Milan"}, floor, 0); err != nil {
 		t.Fatalf("Genoa floor applied to Milan: %v", err)
 	}
+	// AB#938: Turin has no floor values; a set Genoa floor refuses it and an unset one admits it.
+	turin := map[string]any{"product": "Turin"}
+	for _, floors := range [][2]int{{floor, 0}, {0, 0x5b}} {
+		if err := checkGenoaTCBFloor(encoded(), turin, floors[0], floors[1]); err == nil || !strings.Contains(err.Error(), "no Turin floor") {
+			t.Fatalf("Turin passed a Genoa floor %v: %v", floors, err)
+		}
+	}
+	if err := checkGenoaTCBFloor(encoded(), turin, 0, 0); err != nil {
+		t.Fatalf("unset floor refused Turin: %v", err)
+	}
 }
 
 func TestGenoaMicrocodeFloorChecksEachTCBComponent(t *testing.T) {
