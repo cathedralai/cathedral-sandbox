@@ -260,6 +260,24 @@ def test_write_escape_units_refuses_a_slot_it_cannot_retire_safely(tmp_path, ext
     assert not (tmp_path / "root" / "etc").exists()
 
 
+def test_write_escape_units_wires_a_guest_tls_slot_with_its_key_copy(tmp_path):
+    key = tmp_path / "root" / "srv" / "sealed-test" / "hotel.key"
+    key.parent.mkdir(parents=True)
+    key.write_text("k" * 32)
+    proc = _write_units(tmp_path, SEALED_MINER="1", SEALED_API_KEY_FILE="/srv/sealed-test/hotel.key")
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "root" / "etc" / "systemd" / "system" / "room-sealed-chi-test-escape.service").is_file()
+
+
+@pytest.mark.parametrize("extra", [{"SEALED_MINER": "1"},
+                                   {"SEALED_MINER": "1", "SEALED_API_KEY_FILE": "/srv/sealed-test/none.key"},
+                                   {"SEALED_MINER": "2"}])
+def test_write_escape_units_refuses_a_tls_slot_without_its_key_copy(tmp_path, extra):
+    proc = _write_units(tmp_path, **extra)
+    assert proc.returncode != 0 and "SEALED_MINER" in proc.stderr
+    assert not (tmp_path / "root" / "etc").exists()
+
+
 def test_write_escape_units_never_starts_or_stops_anything():
     text = WRITE_UNITS.read_text()
     for verb in ("restart", "start", "stop", "enable", "kill", "disable"):

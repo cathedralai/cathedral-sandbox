@@ -20,6 +20,8 @@
 # sealed.env of a fresh slot must also set:
 #   SEALED_ESCAPE_SLOT=1
 #   SEALED_BROKER_URL=https://<the broker this slot is joined to>
+# and on a guest TLS slot (SEALED_MINER=1):
+#   SEALED_API_KEY_FILE=<root-only copy of the broker's hotel key for this slot>
 set -euo pipefail
 ENV_FILE=$(readlink -f "${1:?usage: write-escape-units.sh sealed.env}")
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -29,7 +31,16 @@ source "$ENV_FILE"
 [ -n "${SEALED_DIR:-}" ] || { echo "SEALED_DIR is not set" >&2; exit 1; }
 [ "${SEALED_ESCAPE_SLOT:-0}" = 1 ] || { echo "SEALED_ESCAPE_SLOT=1 is not set: not a fresh slot, nothing written" >&2; exit 1; }
 [[ "${SEALED_BROKER_URL:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || { echo "SEALED_BROKER_URL must be an https origin" >&2; exit 1; }
-[ "${SEALED_MINER:-0}" = 0 ] || { echo "SEALED_MINER must be 0 on a fresh slot" >&2; exit 1; }
+# A guest TLS slot (SEALED_MINER=1) gets its hotel key only from the broker, in
+# the guest. The host half needs a copy of that key in SEALED_API_KEY_FILE: the
+# supervisor reads the guest's TLS port with it and the retire channel signs in
+# to the broker with it.
+case "${SEALED_MINER:-0}" in
+  0) ;;
+  1) [ -n "${SEALED_API_KEY_FILE:-}" ] && [ -s "${ROOM_DESTDIR:-}$SEALED_API_KEY_FILE" ] || {
+       echo "SEALED_MINER=1 slot needs SEALED_API_KEY_FILE: a copy of the broker's hotel key for $SEALED_NAME" >&2; exit 1; } ;;
+  *) echo "SEALED_MINER must be 0 or 1 on a fresh slot" >&2; exit 1 ;;
+esac
 [ "${SEALED_DATA_GIB:-0}" = 0 ] || { echo "SEALED_DATA_GIB must be 0 on a fresh slot: a data volume outlives the guest" >&2; exit 1; }
 UNIT=room-sealed-$SEALED_NAME
 ETC=${ROOM_DESTDIR:-}/etc/systemd/system
