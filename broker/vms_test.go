@@ -910,7 +910,10 @@ func TestVMsSettledLostStartGetsAReceipt(t *testing.T) {
 		t.Fatalf("stop of the settled run: %d %v", st, doc)
 	}
 	// Repeat: the stored receipt, no host call.
-	tb.host.answer = func(a []string) ([]byte, int, error) { t.Fatalf("host called for a stored receipt: %v", a); return nil, 0, nil }
+	tb.host.answer = func(a []string) ([]byte, int, error) {
+		t.Fatalf("host called for a stored receipt: %v", a)
+		return nil, 0, nil
+	}
 	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(tb.now.Unix()) {
 		t.Fatalf("repeat: %d %v", st, doc)
 	}
