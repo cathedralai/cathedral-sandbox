@@ -1,0 +1,96 @@
+{
+ "scheme": "btauth/1",
+ "service_hotkey": "5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN",
+ "cases": [
+  {
+   "name": "create",
+   "valid": true,
+   "method": "POST",
+   "path": "/v1/sandboxes",
+   "body_hex": "7b2274656d706c617465223a227365616c65642d317832227d",
+   "headers": {
+    "X-Bittensor-Version": "1",
+    "X-Bittensor-Hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    "X-Bittensor-Receiver": "5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN",
+    "X-Bittensor-Nonce": "1764000000000000000",
+    "X-Bittensor-Signature": "0xc466ea12d5cbb97e4f2738dd075945deaee939ae4a0fea9c246bef25fd883d7520b04fcaefe5907cf6b0526825e7959c472802ee4a2f2a6f64cf23777f295886"
+   },
+   "signed_message": "btauth/1\nsr25519\nPOST\n/v1/sandboxes\n4137f65e3550b8060253a60ba40c7f052187b7d66689d36537bea461a9f87570\n1764000000000000000\n5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\n5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN"
+  },
+  {
+   "name": "get with query",
+   "valid": true,
+   "method": "GET",
+   "path": "/v1/sandboxes/abc/files?path=/work/a.txt",
+   "body_hex": "",
+   "headers": {
+    "X-Bittensor-Version": "1",
+    "X-Bittensor-Hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    "X-Bittensor-Receiver": "5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN",
+    "X-Bittensor-Nonce": "1764000000000000000",
+    "X-Bittensor-Signature": "0x9e6c4997d6301372a128efa2702a524851073b8694f1bc03a827f41b260535383167b321adf2ae23e2352fc2bd88e8aabfd9125051bb27d3938f2f4bba825283"
+   },
+   "signed_message": "btauth/1\nsr25519\nGET\n/v1/sandboxes/abc/files?path=/work/a.txt\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n1764000000000000000\n5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\n5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN"
+  },
+  {
+   "name": "empty body delete",
+   "valid": true,
+   "method": "DELETE",
+   "path": "/v1/sandboxes/abc",
+   "body_hex": "",
+   "headers": {
+    "X-Bittensor-Version": "1",
+    "X-Bittensor-Hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    "X-Bittensor-Receiver": "5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN",
+    "X-Bittensor-Nonce": "1764000000000000000",
+    "X-Bittensor-Signature": "0x8840a596e935e715e7a2c50c19534482dabd951a6c56ba75249d1410cf018c2d6bcff548b0e45b9fe15075374d71c107e8bbba9764f9c6d6258a264270ea2884"
+   },
+   "signed_message": "btauth/1\nsr25519\nDELETE\n/v1/sandboxes/abc\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n1764000000000000000\n5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\n5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN"
+  },
+  {
+   "name": "signed by another key",
+   "valid": false,
+   "method": "POST",
+   "path": "/v1/sandboxes",
+   "body_hex": "7b2274656d706c617465223a227365616c65642d317832227d",
+   "headers": {
+    "X-Bittensor-Version": "1",
+    "X-Bittensor-Hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    "X-Bittensor-Receiver": "5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN",
+    "X-Bittensor-Nonce": "1764000000000000000",
+    "X-Bittensor-Signature": "0xce0dd0f539542cea4d62a2e28289e8648283d8b85da72680fae0af1fd8f2f065859a7b88b96da4650830e5b58d6641cc82ba0d5875979ddc69265e55599ab882"
+   },
+   "signed_message": "btauth/1\nsr25519\nPOST\n/v1/sandboxes\n4137f65e3550b8060253a60ba40c7f052187b7d66689d36537bea461a9f87570\n1764000000000000000\n5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\n5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN"
+  },
+  {
+   "name": "query left out of the signed path",
+   "valid": false,
+   "method": "GET",
+   "path": "/v1/sandboxes/abc/files?path=/x",
+   "body_hex": "",
+   "headers": {
+    "X-Bittensor-Version": "1",
+    "X-Bittensor-Hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    "X-Bittensor-Receiver": "5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN",
+    "X-Bittensor-Nonce": "1764000000000000000",
+    "X-Bittensor-Signature": "0x5ca3f20c181df3c1789332a0549a86f25e8f186addbd14353bb1a9ffb6686a0051b6ba05fcb50f7ff8cc007ec81eec86079ea4567d0abf5d117947b047807c82"
+   },
+   "signed_message": "btauth/1\nsr25519\nGET\n/v1/sandboxes/abc/files?path=/x\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n1764000000000000000\n5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\n5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN"
+  },
+  {
+   "name": "body changed after signing",
+   "valid": false,
+   "method": "POST",
+   "path": "/v1/sandboxes",
+   "body_hex": "7b2274656d706c617465223a227365616c65642d317832227d",
+   "headers": {
+    "X-Bittensor-Version": "1",
+    "X-Bittensor-Hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    "X-Bittensor-Receiver": "5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN",
+    "X-Bittensor-Nonce": "1764000000000000000",
+    "X-Bittensor-Signature": "0xc0d102ca4706a8703258c7abf27b0ca251e4d22db9d116b9ac1c3cecfbd88a01af3d1f6ee7f8ed603d6cb9be97dbc4d8e0f8fd11afeedba0602f262206c74b82"
+   },
+   "signed_message": "btauth/1\nsr25519\nPOST\n/v1/sandboxes\n4137f65e3550b8060253a60ba40c7f052187b7d66689d36537bea461a9f87570\n1764000000000000000\n5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY\n5FQsFkui1UvS7S7Sf3JAqN9FPCR7RmufSEZTGuVPPN5EDmsN"
+  }
+ ]
+}
