@@ -929,3 +929,34 @@ func TestVMsSettledLostStartGetsAReceipt(t *testing.T) {
 		t.Fatalf("running stale stop: %d %v", st, doc)
 	}
 }
+
+// Codex on #756: a run that ran and whose stop answer was lost must not get
+// a made-up receipt at "now", and the next run waits for the real one.
+func TestVMsLostStopOfARunThatRanKeepsItsReceipt(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	id := tb.create(t, nil)["id"].(string)
+	tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
+	if st, _ := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/start", nil); st != 200 {
+		t.Fatalf("start: %d", st)
+	}
+	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("timeout") }
+	if st, _ := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1}); st != 502 {
+		t.Fatalf("lost stop: %d", st)
+	}
+	tb.host.answer = nil
+	st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 2})
+	if st != 409 {
+		t.Fatalf("next run authorized before the stop receipt: %d %v", st, doc)
+	}
+	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"stale_generation"}`), 3, nil }
+	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1}); st != 409 || doc["stopped_at"] != nil {
+		t.Fatalf("made-up receipt for a run that ran: %d %v", st, doc)
+	}
+	tb.host.answer = nil // the host answers with its real stop time
+	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] == nil {
+		t.Fatalf("real receipt: %d %v", st, doc)
+	}
+	if st, _ := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 2}); st != 200 {
+		t.Fatalf("next run after the receipt: %d", st)
+	}
+}
