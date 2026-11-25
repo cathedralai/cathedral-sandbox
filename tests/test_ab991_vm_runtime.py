@@ -32,7 +32,10 @@ elif verb == "enable":
 elif verb == "disable":
     u["enabled"] = False
     if "--now" in sys.argv: u["active"] = False
-elif verb == "show": print("active" if u["active"] else "inactive")
+elif verb == "show":
+    act = "active" if u["active"] else "inactive"
+    if "--value" in sys.argv: print(act)
+    else: print(f"ActiveState={act}\nUnitFileState={'enabled' if u['enabled'] else 'disabled'}")
 json.dump(state, open(path, "w"))
 '''
 FAKE_LOG = '#!/bin/sh\necho "$(basename "$0") $*" >> "$FAKE_STATE.tools"\n'
@@ -387,10 +390,16 @@ def test_ipv6_shut_needs_one_of_disable_ipv6_or_ip6tables(host):
     assert p.returncode != 0 and "could not shut IPv6" in p.stderr
 
 
-def test_enforce_removes_a_stopped_vms_leftover_forward(host):
+def test_enforce_purges_a_stopped_vms_leftover_forward_only_when_disabled(host):
     host.create()
     host.tools.write_text("")
     assert host.ctl("enforce")[0] == 0
+    # Created, never started: disabled and inactive, so the purge runs (nat only, no tap or chain change).
     log = host.tools.read_text()
-    # The fake iptables logs every call: down deletes the tagged forward chain jump.
-    assert "-D FORWARD -m comment --comment cathedral-vm:vm1 -j CVM-CVM0-FWD" in log
+    assert "iptables -t nat -S" in log and "ip link del" not in log and "-D FORWARD" not in log
+    # Enabled but not active (host boot before systemd started it, or Restart= pending): hands off.
+    st = host.systemd(); st["cathedral-vm-vm1.service"]["enabled"] = True
+    (host.root.parent / "systemd.json").write_text(json.dumps(st))
+    host.tools.write_text("")
+    assert host.ctl("enforce")[0] == 0
+    assert "iptables" not in host.tools.read_text()

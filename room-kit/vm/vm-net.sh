@@ -102,7 +102,7 @@ rules_present() {
     && [ "$(iptables -S "$FWD" 2>/dev/null | grep -c -- '^-A')" -ge 7 ]
 }
 
-case "${1:?up|down|check}" in
+case "${1:?up|down|check|purge}" in
 up)
   lock
   port_clash
@@ -138,6 +138,15 @@ up)
   dnat -A PREROUTING
   dnat -A OUTPUT
   ;;
+purge)
+  # Leftover public forward of a stopped, disabled VM (vm-ctl enforce): nat rules only,
+  # under the same host lock as "up", like the sealed hotel's leftover purge.
+  lock
+  tagged=$(iptables -t nat -S 2>/dev/null | grep -cF -- "--comment \"$TAG\"" || true)
+  [ "${tagged:-0}" = 0 ] && exit 0
+  echo "cathedral-vm: removing $tagged leftover nat rules of stopped $VM_NAME" >&2
+  purge_nat
+  ;;
 check)
   # Run by "vm-ctl.sh enforce" for running VMs: put the rules back when a
   # firewall reload took them.
@@ -160,5 +169,5 @@ down)
   fi
   ;;
 *)
-  echo "usage: vm-net.sh up|down|check vm.env" >&2; exit 2 ;;
+  echo "usage: vm-net.sh up|down|check|purge vm.env" >&2; exit 2 ;;
 esac

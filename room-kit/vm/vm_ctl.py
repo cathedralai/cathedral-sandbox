@@ -657,11 +657,16 @@ def cmd_enforce(args: list[str]) -> dict:
             with Lock(d / ".lock", wait=20):
                 if not unit_active(name):
                     # A failed "down" (or a crash) can leave the public SSH forward of a
-                    # stopped VM behind, holding the port. Only for a unit that is really
-                    # down (inactive or failed), never one auto-restarting ("activating").
-                    state = systemctl("show", "-p", "ActiveState", "--value", unit_name(name), check=False).stdout.strip()
-                    if state in ("inactive", "failed"):
-                        run(str(KIT / "vm-net.sh"), "down", str(d / "vm.env"), check=False)
+                    # stopped VM behind, holding the port. Only for a VM that is stopped on
+                    # purpose: unit down AND disabled. An enabled unit may be about to start
+                    # (host boot, Restart=) and its ExecStartPre "up" must not race this.
+                    # vm-ctl start enables it under the VM lock held here. "purge" removes
+                    # only the tagged nat rules, under the same host lock as "up".
+                    show = systemctl("show", "-p", "ActiveState", "-p", "UnitFileState", unit_name(name),
+                                     check=False).stdout
+                    props = dict(l.split("=", 1) for l in show.splitlines() if "=" in l)
+                    if props.get("ActiveState") in ("inactive", "failed") and props.get("UnitFileState") == "disabled":
+                        run(str(KIT / "vm-net.sh"), "purge", str(d / "vm.env"), check=False)
                     continue
                 if paid_refusal(auth_of(d), int(time.time())):
                     expired.append(name)
