@@ -27,6 +27,13 @@ sudo ./install.sh --sealed sealed.env
    - `cmdline`: the kernel command line.
    It writes `manifest.json` with the sha256 of each file and of OVMF. It
    computes the expected launch measurement with `sev-snp-measure` (pinned).
+   With `SEALED_SNAPSHOT` set (AB#383) the packages come from that
+   snapshot.ubuntu.com snapshot, release pocket only; the build writes
+   `packages.lock` (name, version, architecture and archive sha256 of every
+   installed package) next to the image and stops if it differs from
+   `SEALED_PACKAGES_LOCK`. The kernel is the one the lock names, the guest's
+   apt sources are a constant line, and `base_rootfs` in `manifest.json` is
+   the lock's sha256. Unset, the build uses `SEALED_MIRROR` as before.
 4. **Unit** `room-sealed-<name>.service`:
    - `host-net.sh up`: a tap device with a /30, NAT to the internet, own
      iptables chains only.
@@ -95,6 +102,7 @@ Design, threat model, upgrade path and the proof on an SNP host:
 | vCPU count and CPU model | Yes | One VMSA per vCPU |
 | Guest policy (no debug, `0x30000`) | Yes | In the report |
 | Debug access | Yes | `cathedral.debug=0/1` in the command line |
+| systemd credentials from the host (fw_cfg, SMBIOS) | No, refused | `systemd.import_credentials=no` in the measured command line (AB#383): systemd imports no credential the host passes, so a host cannot add a unit or network config that way |
 | Files the kit downloads at boot (gVisor, uv, Python, Caddy, the pinned API wheel set) | No, but pinned | The installer refuses a file whose sha256 or sha512 differs from `versions.lock` and `requirements.lock`, which are in the measured initrd |
 | Room images (for example `alpine:3.20`) | No | Pulled at create. The receipt records the image reference and the image id |
 | Hotel name | No | QEMU fw_cfg `opt/cathedral/hotel-name`, checked against `^[a-z0-9][a-z0-9-]{0,58}$`; the guest refuses to start without it. The receipts front puts it in the attested binding (REPORT_DATA covers the binding). Two hotels of one build share one measurement |

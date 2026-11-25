@@ -165,6 +165,30 @@ ROOM_VOLUME_COMMIT_SECONDS=$COMMIT_SECONDS"
 fi
 # <<< synced volumes
 
+# Pinned packages (AB#383): SEALED_SNAPSHOT=<YYYYMMDDTHHMMSSZ> builds the base from
+# https://snapshot.ubuntu.com/ubuntu/<snapshot>, release pocket only, so every build of one
+# snapshot gets the same packages. The resolved set (name, version, architecture, sha256)
+# must equal SEALED_PACKAGES_LOCK or the build stops; SEALED_PACKAGES_LOCK_UPDATE=1 builds
+# anyway and leaves the new lock next to the image. Unset: the mirror build as before
+# (SEALED_MIRROR, newest kernel, same base cache key, same manifest). Checked before the long build.
+# >>> pinned snapshot (tests/test_ab383_pinned_snapshot.py runs this block)
+SNAPSHOT=${SEALED_SNAPSHOT:-}
+if [ -n "$SNAPSHOT" ]; then
+  LOCK_TOOL=$KIT/sealed/packages_lock.py
+  SNAPSHOT_EPOCH=$(python3 "$LOCK_TOOL" snapshot-epoch "$SNAPSHOT") \
+    || { echo "SEALED_SNAPSHOT must be a snapshot.ubuntu.com id such as 20261101T000000Z" >&2; exit 1; }
+  LOCK_UPDATE=${SEALED_PACKAGES_LOCK_UPDATE:-0}
+  case "$LOCK_UPDATE" in 0|1) ;; *) echo "SEALED_PACKAGES_LOCK_UPDATE must be 0 or 1" >&2; exit 1 ;; esac
+  LOCK_FILE=${SEALED_PACKAGES_LOCK:-}
+  if [ "$LOCK_UPDATE" = 0 ] && [ ! -f "$LOCK_FILE" ]; then
+    echo "SEALED_SNAPSHOT needs SEALED_PACKAGES_LOCK (the expected packages.lock), or SEALED_PACKAGES_LOCK_UPDATE=1 to make one" >&2; exit 1
+  fi
+  # The initrd and the shadow day use the kit commit time; a pinned build with no commit time is not reproducible.
+  SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$KIT" log -1 --format=%ct 2>/dev/null || echo 0)}
+  [[ "$SOURCE_DATE_EPOCH" =~ ^[1-9][0-9]*$ ]] || { echo "SEALED_SNAPSHOT needs the kit commit time: build from a git checkout or set SOURCE_DATE_EPOCH" >&2; exit 1; }
+fi
+# <<< pinned snapshot
+
 B=$SEALED_DIR/build
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$SEALED_DIR/images/$STAMP
@@ -173,16 +197,47 @@ mkdir -p "$B" "$OUT"
 # ---------------------------------------------------------------- 1. base root file system (cached)
 PKGS=systemd,systemd-sysv,udev,kmod,iproute2,nftables,iptables,conntrack,docker.io,containerd,xfsprogs,cryptsetup-bin,curl,ca-certificates,bzip2,python3,procps,util-linux,iputils-ping,linux-image-virtual,openssh-server,less,tar,gzip,zstd,passwd,dmsetup
 BASE_ID=$(echo "$SEALED_SUITE $SEALED_MIRROR $PKGS" | sha256sum | cut -c1-12)
+# >>> pinned base (tests/test_ab383_pinned_snapshot.py runs this block)
+# A pinned base is keyed by the snapshot, not the mirror URL; its lock is cached next to it.
+BASE_MIRROR=$SEALED_MIRROR
+if [ -n "$SNAPSHOT" ]; then
+  BASE_MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT
+  BASE_ID=$(echo "snapshot $SNAPSHOT $SEALED_SUITE $PKGS" | sha256sum | cut -c1-12)
+fi
 if [ ! -d "$B/base-$BASE_ID" ]; then
   log "mmdebstrap $SEALED_SUITE (base $BASE_ID)"
-  rm -rf "$B/base-$BASE_ID.tmp"
-  mmdebstrap --variant=minbase --aptopt='APT::Install-Recommends "false"' --components=main,universe \
-    --include="$PKGS" "$SEALED_SUITE" "$B/base-$BASE_ID.tmp" "$SEALED_MIRROR"
+  rm -rf "$B/base-$BASE_ID.tmp" "$B/base-$BASE_ID.packages.lock"
+  LOCK_HOOK=()
+  if [ -n "$SNAPSHOT" ]; then
+    # The hook runs on the build host before mmdebstrap removes the apt lists, which hold
+    # the sha256 of every .deb. The base's own dates come from the snapshot time.
+    LOCK_HOOK=(--customize-hook="python3 $(printf '%q' "$LOCK_TOOL") emit \"\$1\" > $(printf '%q' "$B/base-$BASE_ID.packages.lock.tmp")")
+  fi
+  ( [ -z "$SNAPSHOT" ] || export SOURCE_DATE_EPOCH=$SNAPSHOT_EPOCH
+    mmdebstrap --variant=minbase --aptopt='APT::Install-Recommends "false"' --components=main,universe \
+      "${LOCK_HOOK[@]}" --include="$PKGS" "$SEALED_SUITE" "$B/base-$BASE_ID.tmp" "$BASE_MIRROR" )
+  [ -z "$SNAPSHOT" ] || mv "$B/base-$BASE_ID.packages.lock.tmp" "$B/base-$BASE_ID.packages.lock"
   mv "$B/base-$BASE_ID.tmp" "$B/base-$BASE_ID"
 fi
 R=$B/rootfs
 rm -rf "$R"
 cp -a "$B/base-$BASE_ID" "$R"
+BASE_ROOTFS=$BASE_ID
+if [ -n "$SNAPSHOT" ]; then
+  BASE_LOCK=$B/base-$BASE_ID.packages.lock
+  [ -s "$BASE_LOCK" ] || { echo "base $BASE_ID has no packages.lock; remove $B/base-$BASE_ID to rebuild it" >&2; exit 1; }
+  python3 "$LOCK_TOOL" check "$R" "$BASE_LOCK" || { echo "base $BASE_ID does not match its packages.lock; remove it to rebuild" >&2; exit 1; }
+  install -m 0644 "$BASE_LOCK" "$OUT/packages.lock"
+  if [ "$LOCK_UPDATE" = 1 ]; then
+    log "SEALED_PACKAGES_LOCK_UPDATE=1: new lock at $OUT/packages.lock"
+  elif ! cmp -s "$BASE_LOCK" "$LOCK_FILE"; then
+    diff -u "$LOCK_FILE" "$BASE_LOCK" | head -40 >&2 || true
+    echo "resolved packages differ from $LOCK_FILE; set SEALED_PACKAGES_LOCK_UPDATE=1 to accept a new lock" >&2; exit 1
+  fi
+  # The manifest names the lock, not the mirror URL it was fetched from.
+  BASE_ROOTFS=$(sha256sum < "$OUT/packages.lock" | cut -d' ' -f1)
+fi
+# <<< pinned base
 
 # The data volume's header is verified at boot, but a cryptsetup older than 2.8.1
 # would still open a null-cipher key slot, so refuse to ship one with the volume on.
@@ -198,6 +253,8 @@ fi
 
 # ---------------------------------------------------------------- 2. kernel out, boot files gone
 KVER=$(ls "$R/lib/modules" | sort -V | tail -1)
+# A pinned build boots the kernel its lock names, not whichever is newest in the root.
+[ -z "$SNAPSHOT" ] || KVER=$(python3 "$LOCK_TOOL" kernel "$OUT/packages.lock")
 install -m 0644 "$R/boot/vmlinuz-$KVER" "$OUT/vmlinuz"
 rm -rf "${R:?}/boot"/* "$R/var/cache/apt/archives"/*.deb "$R/var/lib/apt/lists"/* 2>/dev/null || true
 
@@ -209,6 +266,12 @@ echo "room-sealed" > "$R/etc/hostname"
 : > "$R/etc/fstab"
 rm -f "$R/etc/resolv.conf"
 for d in $SEALED_DNS; do echo "nameserver $d"; done > "$R/etc/resolv.conf"
+# A pinned build ships the same apt sources whatever mirror or snapshot it was fetched from,
+# so the URL is not in the measurement. The guest never runs apt (timers masked below).
+if [ -n "$SNAPSHOT" ]; then
+  rm -f "$R"/etc/apt/sources.list.d/*
+  printf 'deb http://archive.ubuntu.com/ubuntu %s main universe\n' "$SEALED_SUITE" > "$R/etc/apt/sources.list"
+fi
 
 # The link (host IP, guest IP) is per hotel and NOT in the image (AB#432): the host
 # passes it in fw_cfg (opt/cathedral/link) and sealed-link.sh checks it and writes
@@ -452,11 +515,15 @@ log "packing initrd"
 # shellcheck disable=SC1091
 source "$KIT/sealed/pack-initrd.sh"
 pack_initrd "$R" "$OUT/initrd.cpio.zst" "$SOURCE_DATE_EPOCH"
-CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init cathedral.debug=$DEBUG"
+# systemd.import_credentials=no: systemd would otherwise import credentials from QEMU fw_cfg
+# and SMBIOS, which the host sets and nothing measures (a systemd.extra-unit.* credential is
+# root code in the guest with the measurement unchanged). Its confidential-VM detection is not
+# relied on. The guest reads its own fw_cfg keys (opt/cathedral/*) from sysfs, not as credentials.
+CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init systemd.import_credentials=no cathedral.debug=$DEBUG"
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
-python3 - "$OUT" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ID" \
+python3 - "$OUT" "$SEALED_VCPUS" "$SEALED_CPU_MODEL" "$KVER" "$DEBUG" "$BASE_ROOTFS" \
   "$MINER" "${MINER_TLS_PORT:-}" "${MINER_SIGNERS:-}" "$DATA_WS" <<'EOF'
 import hashlib, json, os, sys
 out, vcpus, cpu, kver, debug, base, miner, tls_port, signers, data_ws = sys.argv[1:]
