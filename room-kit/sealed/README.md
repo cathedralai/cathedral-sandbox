@@ -391,8 +391,13 @@ A dedicated machine's create receipts also carry `owner_request_sha256`,
 ### Not covered yet
 
 - **Image approval.** The verifier proves which measurement signed the
-  receipts. It does not prove that this measurement is an approved image.
-  A signed policy release that lists approved measurements is a later step.
+  receipts. `--approved-list FILE --approved-list-schema v1 --hotel <id>`
+  (AB#968) checks that Cathedral's signed list v1 names this hotel with the
+  report's chip and measurement. That is Cathedral's word, not proof that
+  the build matches the source. List v1 has no policy, tenancy, HOST_DATA or
+  release id, so those are not checked against it and `--require-release`
+  fails; list v2 with reproducible release entries (plan PR 5) and
+  `--release-file` are not built yet.
 - A new boot makes a new key and a new chain. A restart of
   `room-sealed-receipts.service` inside the guest also makes a new key and a
   new binding.

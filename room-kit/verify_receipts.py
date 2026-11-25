@@ -193,8 +193,15 @@ canonicalises it (names lower case, merged, sorted). The context is bound by its
 The output adds "run": the outputs, the exit code (confirmed only when exec_response_b64 hashes to the signed
 result; otherwise "not confirmed", and the verdict does not change), what the file shows, and what it does not.
 
-Not checked here (by design, today): that the measurement is an approved image.
-Image approval is a signed policy release; that is a later step.
+Approved list (AB#968): --approved-list FILE --approved-list-schema v1 --hotel ID [--approved-list-pins FILE]
+[--at T] [--previous-release N --previous-digest sha256:HEX] checks the signed cathedral_sealed_hotels_v1 release
+with verify_sealed_hotels.py (next to this file; pinned keys, windows, 24 h age, unknown fields refused), then
+requires the binding's hotel to equal --hotel and the list to name that hotel with the report's chip id and
+measurement. It needs --ark-sha256 (no --skip-amd), a report of version 3 or later and VMPL 0. List v1 carries no
+policy, tenancy or manifest_sha256, so the output names those as not checked; every v1 entry is legacy, so
+--require-release fails. --approved-list-schema v2 is refused until list v2 is published (plan PR 5). Fresh
+report mode takes the same flags (with --hotel) and also names tenancy and the debug cmdline as not checked.
+The output says approved_list: release, digest, schema and release_id, or "not checked".
 
 Usage:
   verify_receipts.py --attestation att.json --receipts chain.json [--receipt-header B64 ...]
@@ -446,14 +453,20 @@ def parse_min_tcb(specs: list[str]) -> dict[str, dict[str, int]]:
     return floors
 
 
+def check_vmpl_and_version(report: bytes, rep: dict, why: str) -> int:
+    """The validator's rule under a floor or a list: VMPL 0, and a report version with CPUID fields."""
+    vmpl = int.from_bytes(report[0x30:0x34], "little")
+    need(vmpl == 0, f"{why}: the report is from VMPL {vmpl}, not VMPL 0")
+    need(rep["version"] >= 3, f"{why}: report version {rep['version']} has no CPUID fields, so the generation is "
+                              "unknown")
+    return vmpl
+
+
 def check_tcb_floor(report: bytes, rep: dict, floors: dict[str, dict[str, int]]) -> dict:
     """The floor on a report whose AMD chain is verified: VMPL 0, CPUID fields present, a named generation, and
     every component of the current, reported, committed and launch TCB at or above it. A newer SNP byte does not
     make up for an older microcode byte."""
-    vmpl = int.from_bytes(report[0x30:0x34], "little")
-    need(vmpl == 0, f"TCB floor: the report is from VMPL {vmpl}, not VMPL 0")
-    need(rep["version"] >= 3, f"TCB floor: report version {rep['version']} has no CPUID fields, so the "
-                              "generation is unknown")
+    vmpl = check_vmpl_and_version(report, rep, "TCB floor")
     family, model = rep["cpuid_fam"], rep["cpuid_mod"]
     cpuid = f"family 0x{family:02x} model 0x{model:02x}"
     generation = next((name for name, (fam, models) in TCB_GENERATIONS.items()
@@ -481,6 +494,64 @@ def check_report_pins(report: bytes, rep: dict, min_tcb: dict | None, expected_c
     if min_tcb:
         out["tcb_floor"] = check_tcb_floor(report, rep, min_tcb)
     return out
+
+
+def load_sealed_hotels():
+    """verify_sealed_hotels.py from this folder, so the list is checked by the same code a customer runs alone."""
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_sealed_hotels.py")
+    need(os.path.exists(path), "approved list: --approved-list needs verify_sealed_hotels.py next to this file")
+    spec = importlib.util.spec_from_file_location("cathedral_verify_sealed_hotels", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def check_approved_list(opts: dict, report: bytes, rep: dict, binding: dict | None) -> dict:
+    """--approved-list (AB#968): the signed list, checked with verify_sealed_hotels.py's rules (pinned keys,
+    windows, 24 h age, unknown fields refused, --at, --previous-release and --previous-digest), must list this
+    hotel with the report's chip and measurement. Only list v1 exists: it carries no policy, tenancy or
+    manifest_sha256, so those are named as not checked, and every entry is legacy (no release_id)."""
+    from datetime import UTC, datetime
+
+    vsh = load_sealed_hotels()
+    hotel = opts["hotel"]
+    if binding is not None:
+        need(binding.get("hotel") == hotel,
+             f"approved list: the binding names hotel {binding.get('hotel')!r}, not --hotel {hotel!r}")
+    check_vmpl_and_version(report, rep, "approved list")
+    try:
+        with open(opts["path"], "rb") as f:
+            data = f.read(vsh.MAX_BYTES + 1)
+        if opts["pins"]:
+            with open(opts["pins"], "rb") as f:
+                pins = vsh.load_pins(vsh.strict_json(f.read(vsh.MAX_BYTES + 1), "pin file"))
+        else:
+            pins = vsh.load_pins({"schema": vsh.PINS_SCHEMA, "keys": vsh.PINNED_KEYS})
+        now = datetime.now(UTC).replace(microsecond=0)
+        at = vsh.utc_time(opts["at"], "--at") if opts["at"] else None
+        listed = vsh.verify(data, pins, now, at)
+        vsh.check_previous(listed, opts["previous_release"], opts["previous_digest"])
+    except OSError as exc:
+        raise Fail(f"approved list: cannot read {exc.filename}") from exc
+    except vsh.Refused as exc:
+        raise Fail(f"approved list: {exc}") from exc
+    need(not opts["require_release"],
+         "approved list: --require-release refuses legacy entries, and every list v1 entry is legacy (no "
+         "release_id; list v2 with release entries is plan PR 5)")
+    entry = listed["hotels"].get(hotel)
+    need(entry is not None, f"approved list: hotel {hotel} is not listed in release {listed['release']}")
+    need(rep["chip_id"].hex() == entry["chip_id"],
+         f"approved list: the report chip id is not the chip listed for hotel {hotel}")
+    need(rep["measurement"] in entry["measurements"],
+         f"approved list: the measurement is not listed for hotel {hotel}")
+    not_checked = ["policy, tenancy and host_data: list v1 has no policy, tenancy or manifest_sha256"]
+    if binding is None:
+        not_checked.append("tenancy and the debug cmdline: a fresh report has no binding")
+    return {"release": listed["release"], "digest": listed["digest"], "schema": "v1",
+            "release_id": "none (not reproducible)", "hotel": hotel, "key_id": listed["key_id"],
+            "checked_at": listed["checked_at"], "not_checked": not_checked}
 
 
 def fetch(url: str, cache: str, name: str) -> bytes:
@@ -582,7 +653,7 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
 
 def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: str,
                         ark_sha256: str | list[str] | None, min_tcb: dict | None = None,
-                        expected_chip_id: str | None = None) -> dict:
+                        expected_chip_id: str | None = None, approved_list: dict | None = None) -> dict:
     """One POST /room/attest answer: REPORT_DATA is the caller's, debug is off, the AMD chain signs the report.
 
     Only the signed report is read. The answer's other members (binding_sha256, measurement) are the hotel's
@@ -603,11 +674,13 @@ def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: s
     need(bool(ark_sha256), "a fresh report needs --ark-sha256: an unpinned chain proves nothing")
     amd = verify_amd(report, rep, product(rep, prod), cache, ark_sha256)
     pins = check_report_pins(report, rep, min_tcb, expected_chip_id)
+    listed = check_approved_list(approved_list, report, rep, None) if approved_list else "not checked"
     return {"fresh_report": {"report_data_hex": rep["report_data"].hex(), "measurement": rep["measurement"],
                              "chip_id": rep["chip_id"].hex(), "report_id": report[0x140:0x160].hex(),
                              "policy": hex(rep["policy"]), "launch_tcb": report[0x1F0:0x1F8].hex(),
                              "reported_tcb": rep["reported_tcb"].hex(), "report_version": rep["version"]},
-            "attestation": {"amd": amd}, "tcb_floor": pins.pop("tcb_floor", "not checked"), **pins}
+            "attestation": {"amd": amd}, "tcb_floor": pins.pop("tcb_floor", "not checked"), "approved_list": listed,
+            **pins}
 
 
 def is_hotel_level(att: dict) -> bool:
@@ -2616,6 +2689,17 @@ def main() -> int:
                          "reach it, and a processor the floor does not name fails; needs --ark-sha256 (AB#968)")
     ap.add_argument("--expected-chip-id", metavar="HEX",
                     help="the report's chip id (128 hex) must equal it; needs --ark-sha256 (AB#968)")
+    ap.add_argument("--approved-list", metavar="FILE",
+                    help="the signed approved list: it must list --hotel with this chip and measurement; needs "
+                         "--approved-list-schema, --hotel and --ark-sha256 (AB#968)")
+    ap.add_argument("--approved-list-schema", choices=("v1", "v2"), help="the schema of --approved-list (required)")
+    ap.add_argument("--approved-list-pins", metavar="FILE",
+                    help="with --approved-list: a pin file (cathedral_sealed_hotels_pins_v1) instead of the built-in pins")
+    ap.add_argument("--at", help="with --approved-list: historical check time, UTC YYYY-MM-DDTHH:MM:SSZ")
+    ap.add_argument("--previous-release", type=int, help="with --approved-list: refuse a release below this one")
+    ap.add_argument("--previous-digest", help="with --approved-list: sha256:<64 hex> of --previous-release")
+    ap.add_argument("--require-release", action="store_true",
+                    help="with --approved-list: refuse a legacy entry (every list v1 entry is legacy)")
     ap.add_argument("--product", help="Milan, Genoa or Turin (default: from the report)")
     ap.add_argument("--kds-cache", help="list mode: where fetched AMD certificates are cached "
                                         "(default ~/.cache/amd-kds)")
@@ -2651,23 +2735,46 @@ def main() -> int:
     if (a.min_tcb or a.expected_chip_id is not None) and (a.skip_amd or not a.ark_sha256):
         # A floor or chip read from a report no pinned chain signed proves nothing.
         ap.error("--min-tcb and --expected-chip-id need the AMD chain and --ark-sha256 (no --skip-amd)")
+    list_only = [flag for flag, value in (
+        ("--approved-list-schema", a.approved_list_schema), ("--approved-list-pins", a.approved_list_pins),
+        ("--at", a.at), ("--previous-release", a.previous_release), ("--previous-digest", a.previous_digest),
+        ("--require-release", a.require_release)) if value is not None and value is not False]
+    if a.approved_list is None and list_only:
+        ap.error(f"{', '.join(list_only)} only go with --approved-list")
+    a.list_opts = None
+    if a.approved_list is not None and not a.oneshot:
+        if a.approved_list_schema is None:
+            ap.error("--approved-list needs --approved-list-schema v1 or v2")
+        if a.approved_list_schema == "v2":
+            ap.error("--approved-list-schema v2: list v2 not published yet (plan PR 5)")
+        if not a.hotel:
+            ap.error("--approved-list needs --hotel: the list is checked for that hotel")
+        if a.skip_amd or not a.ark_sha256:
+            ap.error("--approved-list needs the AMD chain and --ark-sha256 (no --skip-amd)")
+        a.list_opts = {"path": a.approved_list, "pins": a.approved_list_pins, "at": a.at,
+                       "previous_release": a.previous_release, "previous_digest": a.previous_digest,
+                       "require_release": a.require_release, "hotel": a.hotel}
     if a.fresh_report is not None or a.report_data_hex is not None:
         # Fresh report mode reads the signed report and nothing else: every other flag would be a check
         # the caller believes ran.
         clash = [flag for flag, value in vars(a).items()
                  if flag not in ("fresh_report", "report_data_hex", "ark_sha256", "kds_cache", "product", "min_tcb",
-                                 "min_tcb_floors", "expected_chip_id")
+                                 "min_tcb_floors", "expected_chip_id", "approved_list", "approved_list_schema",
+                                 "approved_list_pins", "at", "previous_release", "previous_digest",
+                                 "require_release", "hotel", "list_opts")
                  and value is not None and value is not False and value != []]
         if clash:
-            ap.error("--fresh-report takes only --report-data-hex, --ark-sha256, --kds-cache, --product, --min-tcb "
-                     "and --expected-chip-id; not "
+            ap.error("--fresh-report takes only --report-data-hex, --ark-sha256, --kds-cache, --product, --min-tcb, "
+                     "--expected-chip-id and --approved-list with --hotel and its options; not "
                      + ", ".join("--" + f.replace("_", "-") for f in clash))
+        if a.hotel is not None and a.approved_list is None:
+            ap.error("--fresh-report takes --hotel only with --approved-list")
         if not a.fresh_report or a.report_data_hex is None:
             ap.error("--fresh-report FILE and --report-data-hex HEX go together")
         try:
             out = verify_fresh_report(read_document(a.fresh_report, "fresh report answer"), a.report_data_hex,
                                       a.product, a.kds_cache or os.path.expanduser("~/.cache/amd-kds"),
-                                      a.ark_sha256, a.min_tcb_floors, a.expected_chip_id)
+                                      a.ark_sha256, a.min_tcb_floors, a.expected_chip_id, a.list_opts)
         except Fail as exc:
             print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
             return 1
@@ -2691,7 +2798,10 @@ def main() -> int:
             ("--require-tls", a.require_tls), ("--kds-cache", a.kds_cache), ("--sandbox", a.sandbox),
             ("--hotel", a.hotel), ("--operator-key-file", a.operator_key_file), ("--save", a.save),
             ("--receipt-header", a.receipt_header), ("--cathedral-sandbox", a.cathedral_sandbox),
-            ("--key-file", a.key_file), ("--ingress-spki-sha256", a.ingress_spki_sha256))
+            ("--key-file", a.key_file), ("--ingress-spki-sha256", a.ingress_spki_sha256),
+            ("--approved-list", a.approved_list), ("--approved-list-schema", a.approved_list_schema),
+            ("--approved-list-pins", a.approved_list_pins), ("--at", a.at), ("--previous-release", a.previous_release),
+            ("--previous-digest", a.previous_digest), ("--require-release", a.require_release))
             if value is not None and value is not False and value != []]
         if clash:
             ap.error(f"--oneshot checks one file; it takes no {', '.join(clash)}")
@@ -2762,7 +2872,8 @@ def main() -> int:
         check_receipt_shapes(receipts)
         owner = owner_key_bytes(a.owner_pubkey) if a.owner_pubkey else None
         sealed_asked = (a.require_sealed or a.expected_measurement or a.ark_sha256 or a.product
-                        or a.min_genoa_snp_spl or owner or a.min_tcb or a.expected_chip_id is not None)
+                        or a.min_genoa_snp_spl or owner or a.min_tcb or a.expected_chip_id is not None
+                        or a.approved_list is not None)
         if is_hotel_level(att) and sealed_asked:
             # A sealed guest whose TSM is missing runs level 1 under the same
             # hotel name. Asking for a measurement means asking for SNP.
@@ -2791,6 +2902,10 @@ def main() -> int:
                                                  a.ark_sha256, a.skip_amd,
                                                  min_genoa_snp_spl=a.min_genoa_snp_spl or 0,
                                                  min_tcb=a.min_tcb_floors, expected_chip_id=a.expected_chip_id)
+            if a.list_opts:
+                live_report = base64.b64decode(att["report_b64"])
+                attestation_out["approved_list"] = check_approved_list(a.list_opts, live_report,
+                                                                       parse_report(live_report), att["binding"])
             guest_tls = verify_guest_tls(att, peer_spki, require=bool(a.require_tls or a.origin))
             if guest_tls is not None:
                 if a.origin:
@@ -2868,8 +2983,9 @@ def main() -> int:
         if "amd" in attestation_out:
             # Only a report under a verified AMD chain can carry a floor; level 1 and --skip-amd output is unchanged.
             out["tcb_floor"] = attestation_out.pop("tcb_floor", "not checked")
-            if archive_chains and (a.min_tcb or a.expected_chip_id is not None):
-                checked += "; the TCB floor and chip id checks cover the live binding only"
+            out["approved_list"] = attestation_out.pop("approved_list", "not checked")
+            if archive_chains and (a.min_tcb or a.expected_chip_id is not None or a.list_opts):
+                checked += "; the TCB floor, chip id and approved list checks cover the live binding only"
                 out["checked"] = checked
         not_proven = []
         if sealed_archive:
