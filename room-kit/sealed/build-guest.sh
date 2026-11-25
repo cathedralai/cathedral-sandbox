@@ -452,7 +452,11 @@ log "packing initrd"
 # shellcheck disable=SC1091
 source "$KIT/sealed/pack-initrd.sh"
 pack_initrd "$R" "$OUT/initrd.cpio.zst" "$SOURCE_DATE_EPOCH"
-CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init cathedral.debug=$DEBUG"
+# systemd.import_credentials=no: systemd would otherwise import credentials from QEMU fw_cfg
+# and SMBIOS, which the host sets and nothing measures (a systemd.extra-unit.* credential is
+# root code in the guest with the measurement unchanged). Its confidential-VM detection is not
+# relied on. The guest reads its own fw_cfg keys (opt/cathedral/*) from sysfs, not as credentials.
+CMDLINE="console=ttyS0 loglevel=7 systemd.show_status=error panic=-1 rdinit=/init systemd.import_credentials=no cathedral.debug=$DEBUG"
 printf '%s' "$CMDLINE" > "$OUT/cmdline"
 install -m 0644 "$SEALED_OVMF" "$OUT/OVMF.amdsev.fd"
 
