@@ -112,6 +112,10 @@ The loopback API check is `GET /v1/sandboxes/<id>` with a 2 s timeout.
 
 ### Restarts
 
+- Decision (Toby, Core 26 Nov): v1 limitation. A receipts front restart drops the in-room
+  report socket of every existing room; the customer recreates the room. No automatic
+  recreation, and no reseal of a hotel with customer work. A signed adopt receipt that
+  re-attaches running rooms is the follow-up (AB#1002).
 - Front restart: new binding and receipt key, empty incarnation table. Rooms made before
   it get no socket back. At start the front unlinks every `attest.sock` under the dir. A
   room that needs reports after a front restart is recreated. Answer for an old connection:
