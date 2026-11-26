@@ -137,7 +137,15 @@ Every append below is followed by fsync of the file and the state dir before the
     `vm-runs.jsonl`, durably.
   - A close intent is resolved by its receipt (B1).
   - An authorize intent is resolved by `{"resolved":"authorize","vm","generation",
-    "accepted"}`. A refusal counts as resolved and not accepted.
+    "accepted"}`. A refusal counts as resolved and not accepted. A receipt for that
+    generation also resolves it.
+  - Authorize intents are written only for a new generation (G > `AuthorizedGeneration`).
+    A paid-through refresh of the same generation writes none, so replay can never cancel a
+    live run after a lost refresh reply.
+  - When the host refuses a stop of a run that ran (409 `stale_generation`), the close
+    intent is resolved by `{"resolved":"close","vm","generation","accepted":false}`. An
+    unresolved intent would otherwise gate every authorize, and replay would cancel a live
+    run.
 - **B1. Stop receipts before anything else (r1 SHOULD 6, r2 SHOULD 6).**
   - Once the host returns a close record, the broker appends
     `{"vm","account","host","generation","stopped_at","kind"}` to `vm-runs.jsonl` and
@@ -175,7 +183,7 @@ Every append below is followed by fsync of the file and the state dir before the
 - **B4. IDs are not reused (r1 SHOULD 9).** `newVMID` also checks `vm-runs.jsonl` (receipts
   and tombstones).
 - **B5. Route.**
-  - `GET /v1/vms/{id}/runs/{G}` takes the operator key, the same trust as Stop. It is
+  - `GET /v1/broker/vms/{id}/runs/{G}` takes the operator key, the same trust as Stop. It is
     served from `vm-history.jsonl`, and from the host when still pending. It works for
     tombstoned VMs.
   - Answer: `{"vm","account","host","generation","started_at","stopped_at","close_reason",
