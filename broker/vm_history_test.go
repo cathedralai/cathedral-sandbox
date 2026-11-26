@@ -1521,3 +1521,46 @@ func TestVMHistoryMissingMembersAreRefusedNotStoredAsNull(t *testing.T) {
 		t.Fatalf("explicit null rows: %d", n)
 	}
 }
+
+// ---------------------------------------------------------------- Astra impl r2
+
+// Fix r2-1: a receipt line that a failed append left on disk must not be
+// published, or acknowledged by a repeated stop, while the re-sync still fails.
+func TestVMHistoryFailedResyncDoesNotPublishUnconfirmedReceipt(t *testing.T) {
+	c := newHistCase(t)
+	c.run(t)
+	armed, failing, fired := false, false, false
+	c.tb.b.vms.exec = execFunc(func(args []string) ([]byte, int, error) {
+		if args[0] == "stop" && !fired {
+			fired, armed = true, true // the next dir fsync is the receipt's own
+		}
+		return c.host.answer(args)
+	})
+	orig := durableSync
+	defer func() { durableSync = orig }()
+	durableSync = func(f *os.File) error {
+		if st, err := f.Stat(); err == nil && st.IsDir() && (armed || failing) {
+			armed, failing = false, true
+			return errors.New("dir fsync failed")
+		}
+		return orig(f)
+	}
+	if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 500 {
+		t.Fatalf("stop with a failing dir fsync: %d %v", st, doc)
+	}
+	// GET reconciliation re-syncs, and the sync fails again.
+	c.tb.call(t, "operator-key", "GET", c.base, nil)
+	if _, ok := c.tb.b.vms.receipts[vmRunKey{c.id, 1}]; ok {
+		t.Fatal("an unconfirmed receipt was published to memory")
+	}
+	if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 500 {
+		t.Fatalf("repeated stop acknowledged an unsynced receipt: %d %v", st, doc)
+	}
+	failing = false
+	if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(histStopBase+1) {
+		t.Fatalf("repeated stop once the disk works: %d %v", st, doc)
+	}
+	if rs := c.runs(t); len(rs) != 1 {
+		t.Fatalf("receipts: %+v", rs)
+	}
+}

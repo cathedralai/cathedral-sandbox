@@ -145,11 +145,23 @@ func (s *vmStore) appendJSONL(name string, v any) error {
 
 // settleLocked makes a journal trustworthy again after a failed append: it is
 // reloaded from disk with the startup rules (a torn tail is cut, the first
-// entry wins), memory is replaced by what the file holds, and the file and the
-// dir are fsynced again. Caller holds s.mu.
+// entry wins), and the file and the dir are fsynced again. What the reload
+// found is published to memory only once that sync succeeded: a line that may
+// still be lost in a crash must not be acknowledged through a receipt in
+// memory. Caller holds s.mu.
 func (s *vmStore) settleLocked(name string) error {
 	if !s.dirty[name] {
 		return nil
+	}
+	var restore func()
+	if name == vmRunsFile {
+		oldR, oldT, oldC, oldA, oldRes, oldAcc, oldRef := s.receipts, s.tombs, s.closeIntents, s.authIntents, s.authRes, s.authAccepted, s.closeRefused
+		restore = func() {
+			s.receipts, s.tombs, s.closeIntents, s.authIntents, s.authRes, s.authAccepted, s.closeRefused = oldR, oldT, oldC, oldA, oldRes, oldAcc, oldRef
+		}
+	} else {
+		oldH := s.hist
+		restore = func() { s.hist = oldH }
 	}
 	var err error
 	if name == vmRunsFile {
@@ -164,12 +176,15 @@ func (s *vmStore) settleLocked(name string) error {
 		serr := durableSync(f)
 		f.Close()
 		if serr != nil {
+			restore()
 			return serr
 		}
 	} else if !os.IsNotExist(err) {
+		restore()
 		return err
 	}
 	if err := syncDir(s.dir); err != nil {
+		restore()
 		return err
 	}
 	delete(s.dirty, name)
@@ -702,9 +717,12 @@ func (s *vmStore) pendingHistory(ctx context.Context, vm string) {
 
 // receiptMissingLocked: the run is closed in vms.json but has no receipt.
 func (s *vmStore) receiptMissingLocked(rec *vmRecord) bool {
-	_ = s.settleLocked(vmRunsFile)
+	serr := s.settleLocked(vmRunsFile)
 	if rec.DesiredState != vmStateStopped || rec.Generation == 0 || rec.StoppedAt == 0 {
 		return false
+	}
+	if serr != nil {
+		return true // the journal cannot be trusted: no receipt is confirmed
 	}
 	_, ok := s.receipts[vmRunKey{rec.ID, rec.Generation}]
 	return !ok

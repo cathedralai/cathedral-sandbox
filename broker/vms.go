@@ -1059,6 +1059,15 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	if rec.DesiredState == vmStateStopped && rec.StoppedAt != 0 {
 		// The stored receipt, answered only once it is on disk: the save
 		// after the host's stop may have failed.
+		// A receipt a failed append left on disk is acknowledged only once the
+		// journal is settled (fsynced) again.
+		if err := s.settleLocked(vmRunsFile); err != nil {
+			delete(s.busy, id)
+			s.mu.Unlock()
+			log.Printf("vms: %s not settled for the stop of %s: %v", vmRunsFile, id, err)
+			writeErr(w, 500, "state_not_saved", "the receipt could not be made durable; repeat the stop")
+			return
+		}
 		if _, have := s.receipts[vmRunKey{id, gen}]; !have {
 			// Closed on record with no B1 receipt (a crash, or an older
 			// broker): the host's close record makes it, if it agrees.
