@@ -1,7 +1,7 @@
 # In-room SNP report call for dedicated hotels
 
 Status: spec r3 (26 Nov 2026). Astra r1: 6 blockers taken. Astra r2: 2 blockers, 2 should taken.
-Build: Toby said build (Core, 26 Nov). PR 1 of 4: cathedral-sandbox #760. Owner: Mr Spock. Reviewer: SpockChaser, Astra.
+Build: Toby said build (Core, 26 Nov). PRs: #760 room API, #761 receipts front, #763 install, #762 verifier. Owner: Mr Spock. Reviewer: SpockChaser, Astra.
 Decision: Toby, Core 26 Nov: "Build the hotel-side report call for dedicated rooms (room
 supplies report_data_hex; hotel does SNP_GET_REPORT + VCEK). No gVisor ioctl proxy, no runc.
 After that lands + reseal, drop the #758 sev-guest bind/prefer-emulated."
@@ -79,9 +79,11 @@ statement with this schema.
 
 ### Transport: one Unix socket per room
 
-- Env `CATHEDRAL_ROOM_ATTEST_DIR`, set on dedicated sealed images only, a tmpfs path
-  (`/run/cathedral-room-attest`) made at boot by tmpfiles, owned by the API user
-  (`poolroom`) with the front's group able to write sockets. Unset means off.
+- room.env key `ROOM_IN_ROOM_ATTEST=1`, set by `build-guest.sh` on dedicated images only;
+  `install.sh` ignores it on any other tenancy. It makes the tmpfs root `/run/room-attest`
+  at boot (tmpfiles, `0700 poolroom poolroom`; the front runs as root and writes the
+  sockets), gives the API `CATHEDRAL_ROOM_ATTEST_DIR=/run/room-attest`, and gives the
+  receipts front `ROOM_IN_ROOM_ATTEST=1 ROOM_ROOM_ATTEST_DIR=/run/room-attest`.
 - The room API, on a dedicated hotel with the dir set, makes `<dir>/<room id>/` before
   `docker run` with the secrets-dir lifecycle (make, drop on failed start and retire, sweep
   strays on reconcile), and binds it read-only at `/run/cathedral`.
