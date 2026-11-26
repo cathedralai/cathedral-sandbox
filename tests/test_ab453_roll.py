@@ -70,6 +70,8 @@ case "$args" in
   *post_hotel.sh*)
     echo "ssh rooms" >> "$F/calls.log"
     n=$(cat "$F/rooms.txt")
+    # A guest-TLS hotel: the host has no hotel key, as post_hotel.sh answers it.
+    [ "$n" = nokey ] && { echo '{"status": 0, "error": "no guest ip or key file in sealed.env"}'; exit 0; }
     body=$(python3 -c "import base64,json,sys; print(base64.b64encode(json.dumps({'sandboxes': [{}]*int(sys.argv[1])}).encode()).decode())" "$n")
     echo "{\"status\": 200, \"body_b64\": \"$body\"}"; exit 0 ;;
 esac
@@ -953,3 +955,125 @@ def test_unknown_hotel_or_missing_route_refuses_when_the_hotel_document_does_not
     assert r.returncode == 1
     assert "hotel_drain=None" in r.stdout or "hotel_drain=?" in r.stdout, r.stdout
     assert "ssh install" not in calls(fake)
+
+
+# ---- Guest-TLS and miner-mode hotels (chi-ur-2 roll, 26 Nov) -----------------------------------------
+# The host cannot ask a guest-TLS hotel's API for its rooms. Only the broker's restart guard can prove
+# it empty; the broker's hotel document (rooms_in_use) is never a substitute (it leaves out rooms the
+# guard counts), and a broker without the guard refuses.
+NOT_DRAINED = {"error": {"code": "restart_refused", "message": "x"},
+               "check": {"restart_ok": False, "count_known": True, "rooms": 0, "reasons": ["the hotel is not drained"]}}
+
+
+@pytest.mark.parametrize("code, body", [
+    (404, {"error": {"code": "hotel_not_found", "message": "no hotel x"}}),  # broker before the guard
+    (404, "404 page not found"),                                              # no guard route at all
+])
+def test_guest_tls_hotel_without_a_restart_guard_refuses_even_at_zero_broker_rooms(env, code, body):
+    e, fake, _ = env
+    (fake / "rooms.txt").write_text("nokey")
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 0}))
+    guard(fake, code, body)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "rooms=?" in r.stdout, r.stdout
+    no_mutation(fake)
+
+
+@pytest.mark.parametrize("check", [
+    {"restart_ok": False, "count_known": True, "rooms": 1, "reasons": ["the hotel is not drained", "1 rooms"]},
+    {"restart_ok": False, "count_known": False, "rooms": 0,
+     "reasons": ["the hotel is not drained", "the room count is not known (no good room list from the hotel)"]},
+    {"restart_ok": False, "count_known": True, "rooms": 0, "reasons": ["the hotel is not drained", "1 unreaped"]},
+])
+def test_guest_tls_hotel_refuses_unless_the_guard_proves_zero(env, check):
+    e, fake, _ = env
+    (fake / "rooms.txt").write_text("nokey")
+    guard(fake, 409, {"error": {"code": "restart_refused", "message": "x"}, "check": check})
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "rooms=?" in r.stdout, r.stdout
+    no_mutation(fake)
+
+
+def test_guest_tls_hotel_with_an_unreadable_guard_refuses(env):
+    e, fake, _ = env
+    (fake / "rooms.txt").write_text("nokey")
+    guard(fake, 200, "not json")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "rooms=?" in r.stdout
+    no_mutation(fake)
+
+
+@pytest.mark.parametrize("before", [NOT_DRAINED, GUARD_OK])
+def test_guest_tls_hotel_rolls_when_the_guard_proves_zero(env, before):
+    e, fake, home = env
+    (fake / "rooms.txt").write_text("nokey")
+    # preflight reads the guard before the drain (not drained is its only reason), the later checks after
+    guard(fake, 409 if before is NOT_DRAINED else 200, before)
+    curl = fake.parent / "bin" / "curl"
+    curl.write_text(curl.read_text().replace(
+        '*/restart-check) echo "GET restart-check" >> "$F/calls.log"; cat "$F/restart.json"; printf \'\\n%s\' "$(cat "$F/restart.code")" ;;',
+        '*/restart-check) echo "GET restart-check" >> "$F/calls.log"; '
+        'if grep -q "PATCH.*true}" "$F/calls.log" 2>/dev/null; then cat "$F/restart.after"; printf \'\\n200\'; '
+        'else cat "$F/restart.json"; printf \'\\n%s\' "$(cat "$F/restart.code")"; fi ;;'))
+    (fake / "restart.after").write_text(json.dumps(GUARD_OK))
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    c = calls(fake)
+    assert "ssh install" in c
+    assert "GET hotel" not in c  # the broker's hotel document is never the room count
+    assert "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# install-sealed.sh refuses to restart a miner-mode guest (SEALED_MINER=1) unless told the hotel was
+# drained through the control plane. The roll passes that only for a miner hotel, after its own drain.
+INSTALL_RECORD_FLAG = """#!/bin/bash
+echo "install restart_with_rooms=${SEALED_RESTART_WITH_ROOMS:-unset}" >> "$FAKE_DIR/calls.log"
+if grep -q '^SEALED_MINER=1' "$2" && [ "${SEALED_RESTART_WITH_ROOMS:-0}" != 1 ]; then
+  echo "sealed: miner hotel: the host holds no hotel key, so live rooms cannot be counted" >&2; exit 1
+fi
+systemctl restart "room-sealed-hotel-x.service"
+echo "[sealed] guest starting; serial log"
+echo "[sealed] measurement matches the build"
+"""
+
+
+@pytest.mark.parametrize("miner,guard_ok,flag", [(True, True, "1"), (False, True, "0")])
+def test_restart_flag_only_for_a_miner_hotel(host, miner, guard_ok, flag):
+    e, fake, home, d, kit = host
+    if guard_ok:
+        guard(fake, 200, GUARD_OK)
+    if miner:
+        for env_file in (d / "sealed.env", Path(str(d).replace("srv-x", "stage")) / HOTEL / "sealed.env"):
+            env_file.write_text(env_file.read_text() + "SEALED_MINER=1\n")
+    (kit / "install.sh").write_text(INSTALL_RECORD_FLAG)
+    (kit / "install.sh").chmod(0o755)
+    curl = fake.parent / "bin" / "curl"
+    curl.write_text(curl.read_text().replace(
+        '*/v1/broker/capacity) cat "$F/capacity.json" ;;',
+        f'*/v1/broker/capacity) [ "$(readlink {d}/images/current)" = old ] && cat "$F/capacity.json" || cat "$F/capacity.new" ;;'))
+    (fake / "capacity.new").write_text(capacity(NEW, drain=True))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"install restart_with_rooms={flag}" in calls(fake)
+    assert any(x.startswith("systemctl restart") for x in calls(fake))
+    assert "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_miner_hotel_gets_no_restart_flag_without_the_guards_ok(host):
+    # A broker without the guard (the fixture's default 404): the installer keeps its own refusal,
+    # so the guest is never restarted on the strength of a weaker count.
+    e, fake, home, d, kit = host
+    for env_file in (d / "sealed.env", Path(str(d).replace("srv-x", "stage")) / HOTEL / "sealed.env"):
+        env_file.write_text(env_file.read_text() + "SEALED_MINER=1\n")
+    (kit / "install.sh").write_text(INSTALL_RECORD_FLAG)
+    (kit / "install.sh").chmod(0o755)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    c = calls(fake)
+    assert "install restart_with_rooms=0" in c, c
+    assert not any(x.startswith("systemctl restart") for x in c), c
+    assert "PHASE=rolled_back" in (home / "state" / f"{HOTEL}.env").read_text()
