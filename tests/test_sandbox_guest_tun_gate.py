@@ -65,7 +65,9 @@ def test_dedicated_hotel_gets_tun_and_sev_guest(monkeypatch, tun_and_sev):
     monkeypatch.delenv("ROOM_EXPOSE_SEV_GUEST", raising=False)
     args = _args(_req(network_capability="tun", image=ImageSource(image="ghcr.io/you/app@sha256:" + "ab" * 32)))
     assert "--cap-add=NET_ADMIN" in args and "--device=/dev/net/tun:/dev/net/tun" in args
-    assert "--device=/dev/sev-guest:/dev/sev-guest" in args
+    # Bind mount (not --device): runsc sentry /dev stubs ENXIO for sev-guest.
+    assert "--mount" in args
+    assert "type=bind,source=/dev/sev-guest,target=/dev/sev-guest" in args
 
 
 def test_dedicated_sev_guest_can_be_opted_out(monkeypatch, tun_and_sev):

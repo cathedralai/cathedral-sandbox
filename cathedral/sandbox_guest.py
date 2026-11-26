@@ -3004,9 +3004,11 @@ class DockerGuestProvider:
 
         Tenancy comes from hotel env (``CATHEDRAL_HOTEL_TENANCY``), never a request label —
         shared-pool customers cannot self-elevate. Shared hotels stay unchanged: no TUN, no
-        ``/dev/sev-guest``. Dedicated hotels expose ``/dev/sev-guest`` when the device exists
-        (opt out with ``ROOM_EXPOSE_SEV_GUEST=0``). Custom container images are unchanged —
-        they are the create ``image``; this path does not replace the SNP guest VM image.
+        ``/dev/sev-guest``. Dedicated hotels bind-mount ``/dev/sev-guest`` when the device
+        exists (opt out with ``ROOM_EXPOSE_SEV_GUEST=0``); the hotel's runsc flags must use
+        ``--character-device-policy=prefer-emulated`` or opens fail with ENXIO under gVisor.
+        Custom container images are unchanged — they are the create ``image``; this path does
+        not replace the SNP guest VM image.
         """
         args = list(tunables_args)
         dedicated = self._dedicated_room(request)
@@ -3027,10 +3029,17 @@ class DockerGuestProvider:
             args.extend(["--cap-add=NET_ADMIN", "--device=/dev/net/tun:/dev/net/tun"])
         # Dedicated Confidential Host only: in-room SNP reports with caller REPORT_DATA.
         # Shared rooms must not share /dev/sev-guest (sealing-key / boot-binding risk).
+        #
+        # Bind-mount, not ``--device``: under runsc, Docker ``--device`` lands a stub on
+        # sentry ``/dev`` (devtmpfs). Opens then hit the sentry registry and return ENXIO
+        # because gVisor does not emulate sev-guest. A bind puts the node on a gofer mount;
+        # dedicated hotels set ``--character-device-policy=prefer-emulated`` in
+        # ``ROOM_RUNSC_FLAGS`` so the gofer opens the host device (shared hotels stay
+        # ``emulated-only``). Keep runsc — do not switch the customer runtime to runc.
         if dedicated and os.environ.get("ROOM_EXPOSE_SEV_GUEST", "1") != "0":
             sev = Path("/dev/sev-guest")
             if sev.exists():
-                args.extend([f"--device={sev}:/dev/sev-guest"])
+                args.extend(["--mount", f"type=bind,source={sev},target=/dev/sev-guest"])
         return tuple(args)
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:
