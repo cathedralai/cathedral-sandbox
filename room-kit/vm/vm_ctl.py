@@ -1055,6 +1055,15 @@ def cmd_reboot(args: list[str]) -> dict:
 
 # ---- delete, status, list, enforce ---------------------------------------------
 
+def close_unreached_generation(name: str, d: Path) -> None:
+    """Delete removes the VM directory, and with it any way to cancel: close the next generation as
+    never started too, so a generation whose authorize never arrived is not history_open forever."""
+    h = read_history(name)
+    nxt = auth_of(d)["generation"] + 1
+    if is_tracked(h, nxt) and not event_of(h, "close", nxt):
+        append_close(name, nxt, "deleted")
+
+
 def cmd_delete(args: list[str]) -> dict:
     opts = parse_opts(args, {"--confirm"}, 1)
     name = check_name(opts["_"][0])
@@ -1069,6 +1078,7 @@ def cmd_delete(args: list[str]) -> dict:
         d = vm_dir(name)
         with Lock(d / ".lock"):
             stop_locked(name, d, "deleted")
+            close_unreached_generation(name, d)
             run(str(KIT / "vm-net.sh"), "down", str(d / "vm.env"), check=False)
             (unit_dir() / unit_name(name)).unlink(missing_ok=True)
             systemctl("daemon-reload", check=False)

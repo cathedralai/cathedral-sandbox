@@ -1125,6 +1125,22 @@ def test_the_abandoned_writer_dying_with_its_process_still_gets_a_close(vm, monk
         gate.set()
 
 
+def test_delete_closes_a_generation_nobody_authorized(vm):
+    """Bugbot Medium: create then delete must not leave generation 1 history_open forever."""
+    vm.create()
+    assert vm.run(vm.m.cmd_delete, "vm1", "--confirm", "vm1")[0] == 0
+    code, h = vm.history(1)
+    assert code == 0 and h["started_at"] is None and h["close_reason"] == "deleted"
+    # A started run that is deleted still bills from its start, and generation 2 is closed too.
+    vm.create("vm2", port="22002")
+    vm.auth(1, "vm2")
+    vm.start("vm2")
+    vm.clk.advance(60)
+    assert vm.run(vm.m.cmd_delete, "vm2", "--confirm", "vm2")[0] == 0
+    assert vm.history(1, "vm2")[1]["started_at"] is not None
+    assert vm.history(2, "vm2")[1]["started_at"] is None
+
+
 def test_no_em_dashes_in_the_history_work():
     for f in (KIT / "vm_ctl.py", KIT / "README.md", Path(__file__)):
         assert chr(0x2014) not in f.read_text(), f
