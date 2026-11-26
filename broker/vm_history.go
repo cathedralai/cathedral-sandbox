@@ -87,13 +87,14 @@ func (l vmRunLine) isReceipt() bool {
 
 // vmHistoryLine is one line of vm-history.jsonl: the host's closed answer.
 type vmHistoryLine struct {
-	VM          string  `json:"vm"`
-	Generation  uint64  `json:"generation"`
-	StartedAt   *string `json:"started_at"` // ISO 8601 with microseconds and Z, or null: never started
-	StoppedAt   int64   `json:"stopped_at"`
-	TrackedFrom uint64  `json:"tracked_from"`
-	CloseReason string  `json:"close_reason"`
-	History     string  `json:"history"`
+	VM               string  `json:"vm"`
+	Generation       uint64  `json:"generation"`
+	StartedAt        *string `json:"started_at"` // ISO 8601 with microseconds and Z, or null: never started
+	StoppedAt        int64   `json:"stopped_at"`
+	StartedAtErrorUS *int64  `json:"started_at_error_us,omitempty"`
+	TrackedFrom      uint64  `json:"tracked_from"`
+	CloseReason      string  `json:"close_reason"`
+	History          string  `json:"history"`
 }
 
 var vmStartedAtRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$`)
@@ -609,7 +610,7 @@ func (s *vmStore) storeHistory(ctx context.Context, vm string, gen uint64) (vmHi
 	hl, err := parseHostHistory(doc, vm, gen)
 	if err != nil {
 		log.Printf("vms: host %s: history of %s generation %d: %v", h.ID, vm, gen, err)
-		return vmHistoryLine{}, &vmCallErr{502, "vm_host_bad_answer", "the host's history answer is not valid", false}
+		return vmHistoryLine{}, &vmCallErr{502, "history_invalid", "the host's history answer is not valid; nothing stored", false}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -633,6 +634,13 @@ func (s *vmStore) storeHistory(ctx context.Context, vm string, gen uint64) (vmHi
 
 func parseHostHistory(doc map[string]any, vm string, gen uint64) (vmHistoryLine, error) {
 	hl := vmHistoryLine{VM: vm, Generation: gen}
+	// Every member the reader relies on must be present: a missing member is
+	// not the same as null, and is never stored as evidence.
+	for _, m := range []string{"generation", "stopped_at", "started_at"} {
+		if _, present := doc[m]; !present {
+			return hl, fmt.Errorf("%s is missing", m)
+		}
+	}
 	if g, ok := doc["generation"].(float64); !ok || g != float64(gen) {
 		return hl, errors.New("generation does not match")
 	}
@@ -654,6 +662,14 @@ func parseHostHistory(doc map[string]any, vm string, gen uint64) (vmHistoryLine,
 			return hl, errors.New("started_at is not ISO 8601 with microseconds and Z")
 		}
 		hl.StartedAt = &v
+		// The lower-bound error is part of the evidence of a non-null start.
+		ev, present := doc["started_at_error_us"]
+		ef, isNum := ev.(float64)
+		if !present || !isNum || ef < 0 || ef != float64(int64(ef)) {
+			return hl, errors.New("started_at_error_us is missing or not a non-negative integer")
+		}
+		e := int64(ef)
+		hl.StartedAtErrorUS = &e
 	default:
 		return hl, errors.New("started_at is not a string or null")
 	}

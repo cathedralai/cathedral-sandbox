@@ -42,7 +42,7 @@ func (f *fakeVMHost) Run(_ context.Context, h vmHostConfig, stdin []byte, args .
 	case "cancel": // the host's close record (vm_history.go); the same stopped_at as stop
 		return []byte(`{"name":"` + args[1] + `","generation":` + args[2] + `,"stopped_at":1900000000,"reason":"cancelled"}` + "\n"), 0, nil
 	case "history":
-		return []byte(`{"generation":` + args[2] + `,"closed":true,"started_at":"2030-03-17T17:46:39.500000Z","stopped_at":1900000000,"tracked_from":1,"close_reason":"stopped","history":"v2"}` + "\n"), 0, nil
+		return []byte(`{"generation":` + args[2] + `,"closed":true,"started_at":"2030-03-17T17:46:39.500000Z","started_at_error_us":1500,"stopped_at":1900000000,"tracked_from":1,"close_reason":"stopped","history":"v2"}` + "\n"), 0, nil
 	}
 	return []byte(`{"ok":true}` + "\n"), 0, nil
 }

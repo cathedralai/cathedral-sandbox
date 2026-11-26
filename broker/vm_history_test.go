@@ -31,6 +31,7 @@ type histHost struct {
 	closed      map[uint64]int64  // the host's close records
 	histStopped map[uint64]int64  // history answers with another stopped_at (tampering)
 	histExit    map[uint64]string // "open" or "unknown": exit 3 for history of g
+	histRaw     map[uint64]string // a history answer sent verbatim (a member left out, a wrong type)
 	down        map[string]bool   // subcommand -> the host does not answer
 	refuseStop  bool              // stop answers exit 3
 	deleted     bool
@@ -40,7 +41,7 @@ type histHost struct {
 }
 
 func newHistHost() *histHost {
-	return &histHost{closed: map[uint64]int64{}, histStopped: map[uint64]int64{}, histExit: map[uint64]string{}, down: map[string]bool{}}
+	return &histHost{closed: map[uint64]int64{}, histStopped: map[uint64]int64{}, histExit: map[uint64]string{}, histRaw: map[uint64]string{}, down: map[string]bool{}}
 }
 
 func (h *histHost) answer(args []string) ([]byte, int, error) {
@@ -80,11 +81,14 @@ func (h *histHost) answer(args []string) ([]byte, int, error) {
 		case h.histExit[g] == "open", h.closed[g] == 0:
 			return []byte(`{"code":"history_open"}` + "\n"), vmExitStale, nil
 		}
+		if raw, ok := h.histRaw[g]; ok {
+			return []byte(raw + "\n"), 0, nil
+		}
 		at := h.closed[g]
 		if o, ok := h.histStopped[g]; ok {
 			at = o
 		}
-		return []byte(fmt.Sprintf(`{"generation":%d,"closed":true,"started_at":%q,"stopped_at":%d,"tracked_from":1,"close_reason":"stopped","history":"v2"}`, g, histStartedAt, at) + "\n"), 0, nil
+		return []byte(fmt.Sprintf(`{"generation":%d,"closed":true,"started_at":%q,"started_at_error_us":1500,"stopped_at":%d,"tracked_from":1,"close_reason":"stopped","history":"v2"}`, g, histStartedAt, at) + "\n"), 0, nil
 	case "delete":
 		h.deleteCalls++
 		existed := !h.deleted
@@ -1457,5 +1461,63 @@ func TestVMHistoryDirFsyncFailureDoesNotDuplicateJournalLines(t *testing.T) {
 				t.Fatalf("lines after restart: %d receipts, %d history", r, h)
 			}
 		})
+	}
+}
+
+// P1 (SpockChaser HOLD): a history answer that leaves out started_at is not the
+// same as an explicit null. It must never be stored, or served as a never-started
+// run (a full refund).
+func TestVMHistoryMissingMembersAreRefusedNotStoredAsNull(t *testing.T) {
+	const ts = `"2030-03-17T17:46:39.500000Z"`
+	body := func(members string) string {
+		return `{"closed":true,"tracked_from":1,"close_reason":"stopped","history":"v2",` + members + `}`
+	}
+	stopped := fmt.Sprint(histStopBase + 1)
+	c := newHistCase(t)
+	c.run(t)
+	cases := []struct {
+		name, raw string
+	}{
+		{"started_at omitted", body(`"generation":1,"stopped_at":` + stopped + `,"started_at_error_us":1500`)},
+		{"started_at boolean", body(`"generation":1,"stopped_at":` + stopped + `,"started_at":false`)},
+		{"started_at_error_us omitted", body(`"generation":1,"stopped_at":` + stopped + `,"started_at":` + ts)},
+		{"started_at_error_us wrong type", body(`"generation":1,"stopped_at":` + stopped + `,"started_at":` + ts + `,"started_at_error_us":"1500"`)},
+		{"stopped_at omitted", body(`"generation":1,"started_at":` + ts + `,"started_at_error_us":1500`)},
+		{"generation omitted", body(`"stopped_at":` + stopped + `,"started_at":` + ts + `,"started_at_error_us":1500`)},
+	}
+	for _, tc := range cases {
+		c.host.set(func(h *histHost) { h.histRaw[1] = tc.raw })
+		if tc.name == cases[0].name {
+			// Through the real routes: Stop with a bad history still answers 200.
+			c.must(t, "stop", map[string]any{"generation": 1})
+		}
+		st, doc := c.tb.call(t, "operator-key", "GET", c.base+"/runs/1", nil)
+		if st != 502 || vmErrCode(doc) != "history_invalid" {
+			t.Fatalf("%s: %d %v", tc.name, st, doc)
+		}
+		if n := len(readHistFile(t, c.tb)); n != 0 {
+			t.Fatalf("%s: %d durable history rows", tc.name, n)
+		}
+	}
+	// A valid answer after a restart: the real start time, not a cached null.
+	c.host.set(func(h *histHost) { delete(h.histRaw, 1) })
+	tb2 := c.tb.restart(t, true)
+	st, doc := tb2.call(t, "operator-key", "GET", c.base+"/runs/1", nil)
+	if st != 200 || doc["started_at"] != histStartedAt {
+		t.Fatalf("after restart: %d %v", st, doc)
+	}
+	// Controls: an explicit null is the certified never-started case.
+	d := newHistCase(t)
+	d.run(t)
+	d.host.set(func(h *histHost) {
+		h.histRaw[1] = body(`"generation":1,"stopped_at":` + stopped + `,"started_at":null`)
+	})
+	d.must(t, "stop", map[string]any{"generation": 1})
+	st, doc = d.tb.call(t, "operator-key", "GET", d.base+"/runs/1", nil)
+	if v, present := doc["started_at"]; st != 200 || !present || v != nil {
+		t.Fatalf("explicit null: %d %v", st, doc)
+	}
+	if n := len(readHistFile(t, d.tb)); n != 1 {
+		t.Fatalf("explicit null rows: %d", n)
 	}
 }
