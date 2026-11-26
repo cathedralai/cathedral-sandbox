@@ -1,6 +1,7 @@
 # In-room SNP report call for dedicated hotels
 
-Status: spec r2 for review (26 Nov 2026; r1 reviewed by Astra, 6 blockers taken). Owner: Mr Spock. Reviewer: SpockChaser, Astra.
+Status: spec r3 (26 Nov 2026). Astra r1: 6 blockers taken. Astra r2: 2 blockers, 2 should taken.
+Build: Toby said build (Core, 26 Nov). PR 1 of 4: cathedral-sandbox #760. Owner: Mr Spock. Reviewer: SpockChaser, Astra.
 Decision: Toby, Core 26 Nov: "Build the hotel-side report call for dedicated rooms (room
 supplies report_data_hex; hotel does SNP_GET_REPORT + VCEK). No gVisor ioctl proxy, no runc.
 After that lands + reseal, drop the #758 sev-guest bind/prefer-emulated."
@@ -92,18 +93,20 @@ statement with this schema.
 ### Liveness on every request, not on the listener
 
 Closing a listener does not end accepted connections. So each request, not each
-connection, is checked:
+connection, is checked, before and after the chip work:
 
 1. Snapshot `(create receipt, incarnation)` for the room under the ledger lock.
-2. Refuse 410 if the room is not current: no incarnation, in `reaping` or `broken`, or a
-   delete receipt signed. Ask the room API (loopback `GET /v1/sandboxes/<id>`) and refuse
-   410 unless it answers running. That catches a retire the API did on its own
-   (`room_end`, idle GC, reconcile) that the front never signed.
+2. Check. Terminal (no incarnation, or a delete receipt signed, or the room API answers
+   404 or deleting): 410 `room_gone`, close the room's tracked connections, unlink the
+   socket. Temporary (`reaping`, `broken`, frozen, the API check fails or times out, the API
+   answers anything but running): 503 `room_not_ready` with Retry-After; the socket stays.
 3. Make the report (chip work, no ledger lock held).
-4. Re-check the incarnation. If a replayed create rotated it, answer 409 `retry`.
+4. Check again exactly as in step 2, and also that the incarnation is unchanged (409
+   `retry` if a replayed create rotated it). Only then sign the statement and answer. A room
+   the API retired while its report ran gets no statement, even if docker could not remove
+   its container.
 
-On a delete receipt or a 410, the front closes every tracked connection of that room and
-unlinks the socket.
+The loopback API check is `GET /v1/sandboxes/<id>` with a 2 s timeout.
 
 ### Restarts
 
@@ -117,14 +120,23 @@ unlinks the socket.
 
 ### Chip fairness and resource bounds
 
-- Kernel serializes SNP guest requests (sev-guest driver mutex). In-room reports go
-  through one in-room gate: at most 1 in-room report in flight per hotel, at most 1 waiting
-  per room, others 429 with Retry-After. The broker's fresh check and the hotel attest
-  route (`POST /room/attest`) bypass the gate, so they queue behind at most one in-room
-  report. Measure the report time on chi-ur-2 before choosing the per-minute limit.
+Facts: the kernel serializes SNP guest requests (sev-guest driver mutex) and can retry a
+throttled request for up to 60 s; a TSM read cannot be cancelled once it blocks. So no
+gate can promise the broker its 10 s while the provider itself stalls. What this design
+promises: in-room reports never make a broker check wait behind more than one in-room
+report, and never add to a stall.
+
+- One front-level report scheduler for every fresh report: the broker's fresh check
+  (guest `_broker_fresh`), the hotel attest route, and in-room calls. Priority in that
+  order. A waiting higher-priority request is served before any waiting lower one.
+- At most one in-room report in flight per hotel. Its slot is held until the TSM read
+  returns, even past the room's own 5 s deadline (the room gets 503; the slot stays taken).
+  So a stall never admits a second in-room read.
+- At most 1 waiting in-room request per room; more get 429 with Retry-After.
 - Per-room listener: at most 4 open connections, 5 s header and body deadline, 1 KiB body,
   rate limit bucket `_room:<id>` through `attest_slot`.
-- If the TSM read takes over 5 s, answer 503 and log it; do not retry inside the handler.
+- Measure the report time on chi-ur-2 before setting the per-minute limit. If a broker
+  fresh check waited over 2 s behind an in-room report, log it.
 
 ### Verifier
 
@@ -133,7 +145,8 @@ boot report chain and signature (AMD), measurement in the signed approved list, 
 matches the boot report, receipt key from the binding, statement signature, create receipt
 signature and `receipt_sha256 == incarnation`, statement `sandbox_id` and nonce as expected,
 fresh report chain and signature, its measurement equals the binding's, its REPORT_DATA
-equals the formula, its chip_id equals the boot report's.
+equals the formula, its chip_id equals the boot report's, and its REPORT_ID is nonzero and
+equals the boot report's (same launch, as the broker's fresh check requires; Astra r2).
 
 ## Work packages (r2)
 
@@ -146,15 +159,18 @@ equals the formula, its chip_id equals the boot report's.
    bounds. Tests with fake `fresh_report` and fake API: formula and signature; two rooms
    get different statements; forgery test (an outsider's `/room/attest` report over the
    same REPORT_DATA has no valid statement signature and fails the verifier); keep-alive
-   connection after delete gets 410 then close; API says retired, front gets 410; replay
-   during a report gives 409; front restart unlinks old sockets; gate gives 429 at cap
-   while `/room/attest` still answers; slow reader hits the deadline.
+   connection after delete gets 410 then close; API retires the room while its report runs:
+   no statement; `reaping` or a failed API check gives 503 and keeps the socket; replay
+   during a report gives 409; front restart unlinks old sockets; a broker request waiting
+   behind an in-room request is served before the next in-room one; a stalled in-room read
+   keeps its slot past the 5 s answer; slow reader hits the deadline.
 3. Install wiring: `room-kit/install.sh` and `room-kit/profiles/v1.sh` pass
    `CATHEDRAL_ROOM_ATTEST_DIR` into the API env and the receipts unit; tmpfiles entry;
    `room-kit/sealed/build-guest.sh` dedicated env and `--host-uds=open`; repin the API
    tarball and its sha256. Tests on the generated unit and env files.
-4. Verifier: `--room-report`, with fixtures for good, wrong key, wrong room, other launch,
-   tampered statement, and the outsider forgery.
+4. Verifier: `--room-report`, with fixtures for good, wrong key, wrong room, other launch
+   (same chip and measurement, different REPORT_ID), tampered statement, and the outsider
+   forgery.
 5. Live, after reseal and a signed release: a non-root probe in a fresh chi-ur-2 room with
    real `--network none` (Docker config checked), and one with `internet`; the verifier
    passes on both. Then a follow-up PR drops the #758 bind and `prefer-emulated`.
