@@ -2418,14 +2418,12 @@ const hotelAttestBodyMax = 20480
 
 // handleHotelAttest passes POST /v1/hotels/<id>/attest to the hotel's
 // POST /room/attest: a fresh SEV-SNP report whose REPORT_DATA is the 64
-// bytes the caller sent. A hotel outside the guest's list answers 404, as
-// for receipts. The body goes to the hotel unchanged and the hotel's JSON
-// (status, body, Retry-After) comes back unchanged; the hotel validates.
+// bytes the caller sent. Like GET attestation, a fresh chip report proves
+// the machine, not a room — so guest hotel lists do not gate this route
+// (creates, receipts, and secrets still do). Optional sandbox_id in the
+// body is still checked against this guest's rooms on h. The hotel
+// validates the body and rate-limits per guest.
 func (b *broker) handleHotelAttest(w http.ResponseWriter, r *http.Request, h *hotel, g *guestState) {
-	if !g.limitsAllow(b, h.cfg.ID) {
-		writeErr(w, 404, "route_not_found", "no such hotel document")
-		return
-	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hotelAttestBodyMax))
 	if err != nil {
 		writeErr(w, 413, "body_too_large", "attest body over 20480 bytes")

@@ -3000,16 +3000,18 @@ class DockerGuestProvider:
         return os.environ.get("CATHEDRAL_HOTEL_TENANCY", "").strip().lower() == "dedicated"
 
     def _run_args_for(self, request: CreateSandboxRequest, tunables_args: Iterable[str] = ()) -> tuple[str, ...]:
-        """Docker run extras: TUN (URnetwork Q5) only on a dedicated hotel that allows it.
+        """Docker run extras on a dedicated hotel only: TUN and in-room /dev/sev-guest.
 
-        No room gets /dev/sev-guest: with it a room could derive the hotel's sealed-data key
-        (SNP_GET_DERIVED_KEY) and get reports in the boot-binding shape (AB#392). In-room
-        attestation needs a design decision first; the API's per-sandbox attestation route
-        asks the hotel instead.
+        Tenancy comes from hotel env (``CATHEDRAL_HOTEL_TENANCY``), never a request label —
+        shared-pool customers cannot self-elevate. Shared hotels stay unchanged: no TUN, no
+        ``/dev/sev-guest``. Dedicated hotels expose ``/dev/sev-guest`` when the device exists
+        (opt out with ``ROOM_EXPOSE_SEV_GUEST=0``). Custom container images are unchanged —
+        they are the create ``image``; this path does not replace the SNP guest VM image.
         """
         args = list(tunables_args)
+        dedicated = self._dedicated_room(request)
         if request.network_capability == "tun":
-            if not (self._dedicated_room(request) and os.environ.get("ROOM_ALLOW_TUN") == "1"):
+            if not (dedicated and os.environ.get("ROOM_ALLOW_TUN") == "1"):
                 raise SandboxOpError(
                     "tun_requires_dedicated",
                     403,
@@ -3023,6 +3025,12 @@ class DockerGuestProvider:
                     "/dev/net/tun is not present on this hotel",
                 )
             args.extend(["--cap-add=NET_ADMIN", "--device=/dev/net/tun:/dev/net/tun"])
+        # Dedicated Confidential Host only: in-room SNP reports with caller REPORT_DATA.
+        # Shared rooms must not share /dev/sev-guest (sealing-key / boot-binding risk).
+        if dedicated and os.environ.get("ROOM_EXPOSE_SEV_GUEST", "1") != "0":
+            sev = Path("/dev/sev-guest")
+            if sev.exists():
+                args.extend([f"--device={sev}:/dev/sev-guest"])
         return tuple(args)
 
     def _after_start(self, doc: dict[str, Any], sandbox_id: str, container_id: str, dind: bool) -> dict[str, Any]:

@@ -79,19 +79,19 @@ func TestHotelAttestNeedsAGuestKey(t *testing.T) {
 	}
 }
 
-func TestHotelAttestOutsideTheGuestListIs404(t *testing.T) {
+func TestHotelAttestIsAllowedOutsideTheGuestList(t *testing.T) {
+	// Like GET attestation: a fresh chip report proves the machine. Guest
+	// hotel lists still gate creates/receipts; Dedicated Confidential Hosts
+	// must be attestable through the shared customer sealed guest.
 	tc := newChain(t)
 	tc.b.guests["g1"].limits = guestLimits{Hotels: []string{"b"}}
-	resp, _ := tc.postRaw(t, "key1", "/v1/hotels/a/attest", []byte(`{"report_data_hex":"`+strings.Repeat("00", 64)+`"}`))
-	if resp.StatusCode != 404 {
-		t.Fatalf("status %d", resp.StatusCode)
+	in := []byte(`{"report_data_hex":"` + strings.Repeat("ab", 64) + `"}`)
+	resp, out := tc.postRaw(t, "key1", "/v1/hotels/a/attest", in)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d %s", resp.StatusCode, out)
 	}
-	if n := len(tc.hotels["a"].attestIn); n != 0 {
-		t.Fatalf("hotel outside the guest's list was asked %d time(s)", n)
-	}
-	// The other guest, with every hotel, still gets through.
-	if resp, out := tc.postRaw(t, "key2", "/v1/hotels/a/attest", []byte(`{}`)); resp.StatusCode != 200 {
-		t.Fatalf("guest g2: %d %s", resp.StatusCode, out)
+	if n := len(tc.hotels["a"].attestIn); n != 1 {
+		t.Fatalf("hotel asked %d time(s), want 1", n)
 	}
 }
 
