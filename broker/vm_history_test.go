@@ -1564,3 +1564,35 @@ func TestVMHistoryFailedResyncDoesNotPublishUnconfirmedReceipt(t *testing.T) {
 		t.Fatalf("receipts: %+v", rs)
 	}
 }
+
+// Fix r2-2: delete closes a legacy run through the same dispute rule as a stop
+// or a replay: disputed receipt, stored time kept for audit, B5 answers 409.
+func TestVMHistoryDeleteDisputesLegacyStoredTime(t *testing.T) {
+	c := newHistCase(t)
+	c.run(t)
+	c.must(t, "stop", map[string]any{"generation": 1})
+	legacy := int64(histStopBase + 1 + 4000)
+	setLegacyStoppedAt(t, c.tb, c.id, legacy)
+	c.tb = c.tb.restart(t, false) // the host was unreachable at startup
+	del := func() (int, map[string]any) {
+		return c.tb.call(t, "operator-key", "DELETE", c.base, map[string]any{"confirm": c.id})
+	}
+	c.host.set(func(h *histHost) { h.down["history"] = true })
+	if st, doc := del(); st != 409 || vmErrCode(doc) != "history_not_stored" {
+		t.Fatalf("delete with history pending: %d %v", st, doc)
+	}
+	rs := c.runs(t)
+	if len(rs) != 1 || !rs[0].Disputed || rs[0].StoppedAt != histStopBase+1 {
+		t.Fatalf("receipt: %+v", rs)
+	}
+	if rec := onDiskRecord(t, c.tb, c.id); rec.LegacyStoppedAt != legacy || rec.StoppedAt != histStopBase+1 {
+		t.Fatalf("record: %+v", rec)
+	}
+	c.host.set(func(h *histHost) { h.down["history"] = false })
+	if st, doc := del(); st != 200 {
+		t.Fatalf("delete: %d %v", st, doc)
+	}
+	if st, doc := c.tb.call(t, "operator-key", "GET", c.base+"/runs/1", nil); st != 409 || vmErrCode(doc) != "vm_receipt_mismatch" {
+		t.Fatalf("/runs/1 after delete: %d %v", st, doc)
+	}
+}

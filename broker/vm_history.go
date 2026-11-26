@@ -958,7 +958,15 @@ func (s *vmStore) deleteSteps(ctx context.Context, id string, h vmHostConfig) *v
 			return cerr
 		}
 		s.mu.Lock()
-		if err := s.appendReceiptLocked(id, account, host, g, at, vmReceiptCancel, false); err != nil {
+		// A closed run whose stored time the host does not share (a legacy
+		// broker's clock) is disputed here as in a stop or a replay, and the
+		// stored time is kept for audit.
+		var legacy int64
+		if cur := s.recs[id]; cur != nil && cur.Generation == g && cur.StoppedAt != 0 && cur.StoppedAt != at {
+			legacy = cur.StoppedAt
+			log.Printf("vms: delete of %s generation %d: host close at %d, vms.json says %d; receipt written as disputed", id, g, at, legacy)
+		}
+		if err := s.appendReceiptLocked(id, account, host, g, at, vmReceiptCancel, legacy != 0); err != nil {
 			s.mu.Unlock()
 			if errors.Is(err, errReceiptMismatch) {
 				return &vmCallErr{409, "vm_receipt_mismatch", "the host's close differs from the receipt on record", false}
@@ -970,6 +978,9 @@ func (s *vmStore) deleteSteps(ctx context.Context, id string, h vmHostConfig) *v
 				rec.Generation, rec.Ran = g, false
 			}
 			if g == rec.Generation {
+				if legacy != 0 {
+					rec.LegacyStoppedAt = legacy
+				}
 				rec.DesiredState, rec.StoppedAt, rec.LastError = vmStateStopped, at, ""
 			}
 			if err := s.saveLocked(); err != nil {
