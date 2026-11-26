@@ -878,6 +878,9 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 		// than the settled run before it.
 		refuse = "paid_through never goes down within a generation"
 	}
+	if refuse == "" {
+		code, refuse = s.closedInJournalLocked(id, gen)
+	}
 	if refuse != "" {
 		delete(s.busy, id)
 		s.mu.Unlock()
@@ -958,6 +961,11 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 		code, refuse = "receipt_missing", "a close or authorize of this VM has no receipt yet; repeat the stop, or wait for the replay"
 	case rec.AuthorizedGeneration != gen || rec.PaidThrough <= s.now().Unix():
 		code, refuse = "not_authorized", fmt.Sprintf("authorize generation %d with a paid_through after now first", gen)
+	}
+	if refuse == "" {
+		// Under the same lock as the start intent below: a generation the
+		// journal closed never starts, whatever vms.json still says.
+		code, refuse = s.closedInJournalLocked(id, gen)
 	}
 	if refuse != "" {
 		delete(s.busy, id)

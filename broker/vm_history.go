@@ -486,6 +486,21 @@ func (s *vmStore) openIntentLocked(vm string) bool {
 	return len(c)+len(a) > 0
 }
 
+// closedInJournalLocked answers why generation gen of vm may not be authorized
+// or started although vms.json allows it: vm-runs.jsonl already closes it (a
+// receipt) or the VM is tombstoned. vms.json can lag the journal (a save that
+// failed after a cancel receipt, or a restart before the replay copied it
+// forward), so the journal decides. "" when neither. Caller holds s.mu.
+func (s *vmStore) closedInJournalLocked(vm string, gen uint64) (code, why string) {
+	if _, gone := s.tombs[vm]; gone {
+		return "vm_deleted", "the VM was deleted on the host; repeat the delete to finish it"
+	}
+	if _, closed := s.receipts[vmRunKey{vm, gen}]; closed {
+		return "generation_closed", fmt.Sprintf("generation %d is already closed (its receipt is on record); GET the VM or repeat its stop to settle the record", gen)
+	}
+	return "", ""
+}
+
 // idUsedLocked: the id is in vm-runs.jsonl as a receipt or a tombstone (B4).
 func (s *vmStore) idUsedLocked(id string) bool {
 	if _, ok := s.tombs[id]; ok {

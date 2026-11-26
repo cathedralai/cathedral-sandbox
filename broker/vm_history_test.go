@@ -1641,3 +1641,53 @@ func TestVMHistoryDisputedReceiptRepairsInterruptedStateUpdate(t *testing.T) {
 		t.Fatalf("/runs/1: %d %v", st, d)
 	}
 }
+
+// ---------------------------------------------------------------- Bugbot r1
+
+// Bugbot "Start ignores existing cancel receipt": a cancel of the authorized,
+// unstarted G2 wrote its receipt, then the vms.json save failed and memory
+// rolled back to G1 stopped with G2 authorized. vm-runs.jsonl already closes
+// G2, so neither a start nor an authorize of G2 may reach the host: not in this
+// process, and not after a restart before the replay copied the receipt forward.
+func TestVMHistoryStartRefusesGenerationClosedInJournal(t *testing.T) {
+	c := newHistCase(t)
+	c.run(t)
+	c.must(t, "stop", map[string]any{"generation": 1})
+	c.authorize(t, 2)
+	c.tb.b.vms.saveHook = func() error { return errors.New("crash") }
+	if st, doc := c.post(t, "stop", map[string]any{"generation": 2}); st != 500 {
+		t.Fatalf("cancel: %d %v", st, doc)
+	}
+	c.tb.b.vms.saveHook = nil
+	if rs := c.runs(t); len(rs) != 2 || rs[1].Generation != 2 {
+		t.Fatalf("receipts: %+v", rs)
+	}
+	refused := func(c *histCase) {
+		t.Helper()
+		starts := len(c.tb.host.calls)
+		if st, doc := c.post(t, "start", map[string]any{"generation": 2}); st != 409 || vmErrCode(doc) != "generation_closed" {
+			t.Fatalf("start of the closed G2: %d %v", st, doc)
+		}
+		if st, doc := c.post(t, "authorize", map[string]any{"generation": 2, "paid_through": c.tb.now.Unix() + 600}); st != 409 || vmErrCode(doc) != "generation_closed" {
+			t.Fatalf("authorize of the closed G2: %d %v", st, doc)
+		}
+		if got := c.tb.host.calls[starts:]; len(got) != 0 {
+			t.Fatalf("host calls for a closed generation: %v", got)
+		}
+	}
+	refused(c)
+	// A restart whose replay has not reached the VM yet: the same refusal.
+	tb2 := c.tb.restart(t, false)
+	c2 := &histCase{tb: tb2, host: c.host, id: c.id, base: c.base}
+	if rec := onDiskRecord(t, tb2, c.id); rec.Generation != 1 || rec.AuthorizedGeneration != 2 {
+		t.Fatalf("vms.json should still lag the journal: %+v", rec)
+	}
+	refused(c2)
+	// The replay copies the receipt forward; the next run is G3.
+	tb2.b.vms.replay(context.Background())
+	if rec := onDiskRecord(t, tb2, c.id); rec.Generation != 2 || rec.StoppedAt != histStopBase+2 {
+		t.Fatalf("after the replay: %+v", rec)
+	}
+	c2.authorize(t, 3)
+	c2.must(t, "start", map[string]any{"generation": 3})
+}
