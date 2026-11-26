@@ -1731,7 +1731,9 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 	if h.unreaped == nil {
 		h.unreaped = map[string]*unreapedBatch{}
 	}
-	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true}
+	// The deadline goes on this record too: a retry that lists nothing while
+	// the hotel is still starting the create proves nothing (pin_only.go).
+	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true, holdUntil: until, lostHold: true}
 	h.unreaped[batchID] = ub
 	b.mu.Unlock()
 	go func() {
