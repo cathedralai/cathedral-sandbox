@@ -452,6 +452,12 @@ type hotel struct {
 	// keeps those rooms out of the guest's rooms and retries their removal
 	// until a list shows none left (AB#338).
 	unreaped map[string]*unreapedBatch
+	// lostPending: creates sent here whose outcome is unknown (the reply was
+	// lost or the hotel failed after starting the room) and whose cleanup has
+	// not ended. Counted in the hold that ends h.creating, so the hotel is
+	// never seen empty in between (pin_only.go occupancyKnown). Guarded by
+	// broker.mu.
+	lostPending int
 	// Guarded by broker.mu. guestWarm: per guest, the images that guest
 	// prefetched here since the hotel last came up. guestWant: per guest,
 	// the refs to pull again when the hotel comes back (prefetched without a
@@ -1571,6 +1577,7 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// the guest's own image fault is a refusal: no room was started.
 			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
+				h.lostPending++          // same hold as creating--: until createMany's cleanup confirms (reapOrphans)
 				b.noteUncertainLocked(g) // counts for a metered guest until reaped (allowance.go)
 			}
 			if err != nil {
@@ -1629,11 +1636,11 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 		}
 		wg.Wait()
 	}
-	lost := map[*hotel]bool{}
+	lost := map[*hotel]int{} // the lost attempts per hotel, each counted in h.lostPending
 	keep := map[*hotel]map[string]bool{}
 	for _, res := range results {
 		for _, h := range res.lost {
-			lost[h] = true
+			lost[h]++
 		}
 		if res.status == 202 {
 			if hid, ok := res.doc["id"].(string); ok {
@@ -1648,8 +1655,8 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 			}
 		}
 	}
-	for h := range lost {
-		if b.reapOrphans(h, g, batchID, keep[h]) {
+	for h, n := range lost {
+		if b.reapOrphans(h, g, batchID, keep[h], n) {
 			continue
 		}
 		// The failed hotel may still run a room of this request: the guest
@@ -1679,11 +1686,19 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 // gets its answer and its result is returned: true only when h confirmed
 // every such room gone. Otherwise the request is recorded in h.unreaped and
 // later passes retry in the background, then from the sync loop.
-func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool) bool {
+//
+// pending is the number of lost attempts this request counted in
+// h.lostPending: they end here, with the request either confirmed gone or
+// recorded in h.unreaped in the same b.mu hold, so the hotel never looks empty.
+func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool, pending int) bool {
 	if b.reapPass(h, g.cfg.ID, batchID, keep, 3*time.Second) {
+		b.mu.Lock()
+		h.lostPending -= pending
+		b.mu.Unlock()
 		return true
 	}
 	b.mu.Lock()
+	h.lostPending -= pending
 	if h.unreaped == nil {
 		h.unreaped = map[string]*unreapedBatch{}
 	}

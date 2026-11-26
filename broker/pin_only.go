@@ -174,10 +174,10 @@ func (b *broker) pinStillOpen(h *hotel, resGen uint64) bool {
 // occupancyKnown reports whether h's room count can be trusted: a room list
 // answered since start, the last one did, and no failed create's rooms are
 // unconfirmed. The same test as the restart guard's count_known (restart_guard.go),
-// plus unreaped. Zero rooms with this false means unknown, not empty. Caller
+// plus unreaped and creates whose outcome is still unresolved (lostPending). Zero rooms with this false means unknown, not empty. Caller
 // holds b.mu.
 func (h *hotel) occupancyKnown() bool {
-	return !h.roomsUnchecked && h.listOK && len(h.unreaped) == 0
+	return !h.roomsUnchecked && h.listOK && len(h.unreaped) == 0 && h.lostPending == 0
 }
 
 // claim counts a call that selected h (B5). Caller holds b.mu, and takes the

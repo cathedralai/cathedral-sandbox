@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -271,4 +274,54 @@ func TestCompatImportClaimsOnlyWhereTheGuestMayPull(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("claims left behind: %d", n)
 	}
+}
+
+// Astra r2: a create whose reply is lost leaves a room the broker has not
+// recorded yet. Until cleanup confirms it gone, the hotel's occupancy is
+// unknown, so a same-owner reference change must wait.
+func TestReferenceChangeWaitsForALostCreateToBeReaped(t *testing.T) {
+	tc := pinChain(t) // generation 1
+	ha := tc.b.hotelByID("a")
+	upstream := ha.cfg.API
+	gate := make(chan struct{})
+	var held sync.Once
+	reached := make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		status, hdr, out := forwardTo(upstream, r, body)
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/v1/sandboxes":
+			hijackClose(w) // the hotel started the room; the reply never arrives
+		case r.Method == "GET" && r.URL.Path == "/v1/sandboxes":
+			held.Do(func() { close(reached) }) // the reap pass: pause it here
+			<-gate
+			passThrough(w, status, hdr, out)
+		default:
+			passThrough(w, status, hdr, out)
+		}
+	}))
+	t.Cleanup(proxy.Close)
+	setHotel(tc, "a", func(h *hotel) { h.cfg.API = proxy.URL })
+
+	done := make(chan int, 1)
+	go func() {
+		status, _ := tc.callWith(t, "key2", dedMark(1), "POST", "/v1/sandboxes", dedBody())
+		done <- status
+	}()
+	<-reached // reply lost, cleanup not finished
+	change := map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}
+	status, doc := patchHotelDoc(t, tc, "a", change)
+	if status != 409 || errCode(doc) != "rooms_active" {
+		close(gate)
+		t.Fatalf("reference change while the lost create is unresolved: %d %v", status, doc)
+	}
+	close(gate)
+	if s := <-done; s != 502 {
+		t.Fatalf("create: %d", s)
+	}
+	status, doc = patchHotelDoc(t, tc, "a", change)
+	if status != 200 {
+		t.Fatalf("after cleanup confirmed the room gone: %d %v", status, doc)
+	}
+	wantReservation(t, doc, "g2", "owner:g2:2", 2)
 }
