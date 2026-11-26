@@ -335,6 +335,27 @@ def test_booting_guest_refusing_past_the_grace_alerts_once(rig):
     assert systemctl.mutating() == []
 
 
+@pytest.mark.parametrize("gap", ["timeout", 500])
+def test_failed_reads_between_refusals_keep_the_refusal_timer(rig, gap):
+    # SpockChaser on #759: 401 every 5 s with a timeout or a 500 at t=55 and t=115 must still
+    # alert once the refusal outlasts the grace; only an accepted answer resets the timer.
+    sup, guest, systemctl, clock, lines = rig
+    for t in range(0, 125, 5):
+        if t in (55, 115):
+            if gap == "timeout":
+                guest.up = False
+            else:
+                guest.status = 500
+        else:
+            guest.up, guest.status = True, 401
+        sup.step()
+        clock.now += 5.0
+    alerts = [x for x in lines if x.startswith("[OPERATOR-ALERT]")]
+    assert len(alerts) == 1 and "guest_refused_key" in alerts[0]
+    assert sup.launch.state == "booting"
+    assert systemctl.mutating() == []
+
+
 def test_answered_guest_that_starts_refusing_alerts_at_once(rig):
     sup, guest, systemctl, clock, lines = rig
     poll(sup, clock)

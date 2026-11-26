@@ -470,11 +470,13 @@ class SlotSupervisor:
                 self.alert("guest_refused_key",
                            f"guest answered {r_status}/{s_status}; check SEALED_API_KEY_FILE")
             return
-        launch.refused_since = None
         answered = (r_status == 200 and isinstance(receipts, dict)
                     and s_status == 200 and isinstance(rooms_doc, dict)
                     and isinstance(rooms_doc.get("sandboxes"), list))
         if answered:
+            # Only an accepted answer shows the key works. A timeout or a 500 between
+            # refusals proves nothing, so it keeps the refusal timer running.
+            launch.refused_since = None
             answered = self.observe(receipts, rooms_doc["sandboxes"])
             if self.launch is not launch or self.launch.state == "retiring":
                 return
