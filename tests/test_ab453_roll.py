@@ -958,35 +958,73 @@ def test_unknown_hotel_or_missing_route_refuses_when_the_hotel_document_does_not
 
 
 # ---- Guest-TLS and miner-mode hotels (chi-ur-2 roll, 26 Nov) -----------------------------------------
-# The host cannot ask a guest-TLS hotel's API for its rooms, so the count comes from the broker,
-# whose rooms_in_use includes creates queued or in flight.
-def test_guest_tls_hotel_counts_rooms_at_the_broker(env):
+# The host cannot ask a guest-TLS hotel's API for its rooms. Only the broker's restart guard can prove
+# it empty; the broker's hotel document (rooms_in_use) is never a substitute (it leaves out rooms the
+# guard counts), and a broker without the guard refuses.
+NOT_DRAINED = {"error": {"code": "restart_refused", "message": "x"},
+               "check": {"restart_ok": False, "count_known": True, "rooms": 0, "reasons": ["the hotel is not drained"]}}
+
+
+@pytest.mark.parametrize("code, body", [
+    (404, {"error": {"code": "hotel_not_found", "message": "no hotel x"}}),  # broker before the guard
+    (404, "404 page not found"),                                              # no guard route at all
+])
+def test_guest_tls_hotel_without_a_restart_guard_refuses_even_at_zero_broker_rooms(env, code, body):
     e, fake, _ = env
     (fake / "rooms.txt").write_text("nokey")
-    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": False, "rooms_in_use": 2}))
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": True, "rooms_in_use": 0}))
+    guard(fake, code, body)
     r = run(e, "apply", HOTEL)
     assert r.returncode == 1
-    assert "rooms=2" in r.stdout
+    assert "rooms=?" in r.stdout, r.stdout
     no_mutation(fake)
 
 
-def test_guest_tls_hotel_with_an_unreadable_broker_count_refuses(env):
+@pytest.mark.parametrize("check", [
+    {"restart_ok": False, "count_known": True, "rooms": 1, "reasons": ["the hotel is not drained", "1 rooms"]},
+    {"restart_ok": False, "count_known": False, "rooms": 0,
+     "reasons": ["the hotel is not drained", "the room count is not known (no good room list from the hotel)"]},
+    {"restart_ok": False, "count_known": True, "rooms": 0, "reasons": ["the hotel is not drained", "1 unreaped"]},
+])
+def test_guest_tls_hotel_refuses_unless_the_guard_proves_zero(env, check):
     e, fake, _ = env
     (fake / "rooms.txt").write_text("nokey")
-    (fake / "hotel.json").write_text("not json")
+    guard(fake, 409, {"error": {"code": "restart_refused", "message": "x"}, "check": check})
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "rooms=?" in r.stdout, r.stdout
+    no_mutation(fake)
+
+
+def test_guest_tls_hotel_with_an_unreadable_guard_refuses(env):
+    e, fake, _ = env
+    (fake / "rooms.txt").write_text("nokey")
+    guard(fake, 200, "not json")
     r = run(e, "apply", HOTEL)
     assert r.returncode == 1
     assert "rooms=?" in r.stdout
     no_mutation(fake)
 
 
-def test_guest_tls_hotel_with_zero_broker_rooms_rolls(env):
+@pytest.mark.parametrize("before", [NOT_DRAINED, GUARD_OK])
+def test_guest_tls_hotel_rolls_when_the_guard_proves_zero(env, before):
     e, fake, home = env
     (fake / "rooms.txt").write_text("nokey")
+    # preflight reads the guard before the drain (not drained is its only reason), the later checks after
+    guard(fake, 409 if before is NOT_DRAINED else 200, before)
+    curl = fake.parent / "bin" / "curl"
+    curl.write_text(curl.read_text().replace(
+        '*/restart-check) echo "GET restart-check" >> "$F/calls.log"; cat "$F/restart.json"; printf \'\\n%s\' "$(cat "$F/restart.code")" ;;',
+        '*/restart-check) echo "GET restart-check" >> "$F/calls.log"; '
+        'if grep -q "PATCH.*true}" "$F/calls.log" 2>/dev/null; then cat "$F/restart.after"; printf \'\\n200\'; '
+        'else cat "$F/restart.json"; printf \'\\n%s\' "$(cat "$F/restart.code")"; fi ;;'))
+    (fake / "restart.after").write_text(json.dumps(GUARD_OK))
     serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
     r = run(e, "apply", HOTEL)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "ssh install" in calls(fake)
+    c = calls(fake)
+    assert "ssh install" in c
+    assert "GET hotel" not in c  # the broker's hotel document is never the room count
     assert "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
 
 
@@ -1003,9 +1041,11 @@ echo "[sealed] measurement matches the build"
 """
 
 
-@pytest.mark.parametrize("miner,flag", [(True, "1"), (False, "0")])
-def test_restart_flag_only_for_a_miner_hotel(host, miner, flag):
+@pytest.mark.parametrize("miner,guard_ok,flag", [(True, True, "1"), (False, True, "0")])
+def test_restart_flag_only_for_a_miner_hotel(host, miner, guard_ok, flag):
     e, fake, home, d, kit = host
+    if guard_ok:
+        guard(fake, 200, GUARD_OK)
     if miner:
         for env_file in (d / "sealed.env", Path(str(d).replace("srv-x", "stage")) / HOTEL / "sealed.env"):
             env_file.write_text(env_file.read_text() + "SEALED_MINER=1\n")
@@ -1021,3 +1061,19 @@ def test_restart_flag_only_for_a_miner_hotel(host, miner, flag):
     assert f"install restart_with_rooms={flag}" in calls(fake)
     assert any(x.startswith("systemctl restart") for x in calls(fake))
     assert "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+def test_miner_hotel_gets_no_restart_flag_without_the_guards_ok(host):
+    # A broker without the guard (the fixture's default 404): the installer keeps its own refusal,
+    # so the guest is never restarted on the strength of a weaker count.
+    e, fake, home, d, kit = host
+    for env_file in (d / "sealed.env", Path(str(d).replace("srv-x", "stage")) / HOTEL / "sealed.env"):
+        env_file.write_text(env_file.read_text() + "SEALED_MINER=1\n")
+    (kit / "install.sh").write_text(INSTALL_RECORD_FLAG)
+    (kit / "install.sh").chmod(0o755)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    c = calls(fake)
+    assert "install restart_with_rooms=0" in c, c
+    assert not any(x.startswith("systemctl restart") for x in c), c
+    assert "PHASE=rolled_back" in (home / "state" / f"{HOTEL}.env").read_text()

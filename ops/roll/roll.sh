@@ -122,9 +122,10 @@ print(h.get("up"), a.get("state"), a.get("measurement") or "-", h.get("drain"), 
 # Live rooms from the hotel's own API (as install-sealed.sh counts them). Not free_rooms: a drained hotel reports 0.
 rooms() {
   # A guest-TLS hotel (AB#817) keeps its hotel key inside the guest only, so the host cannot ask the
-  # hotel API ("no guest ip or key file"). Count through the broker then: rooms_in_use also includes
-  # creates queued or in flight, so it is never lower than the hotel's own list.
-  local r _bd bn
+  # hotel API ("no guest ip or key file"). Only the broker's restart guard can prove such a hotel empty
+  # (guard_rooms); the broker's hotel document (rooms_in_use) is not enough: it leaves out rooms the
+  # guard counts (rooms the API holds, failed and unknown lists, unreaped batches).
+  local r
   r=$(ssh -n "${SSHO[@]}" "root@$HOST" "$STAGE/post_hotel.sh $D /v1/sandboxes GET < /dev/null" 2>/dev/null | python3 -I -c '
 import base64, json, sys
 try:
@@ -136,8 +137,30 @@ try:
         print(len(b.get("sandboxes", [])) if d["status"] == 200 else "?")
 except Exception:
     print("?")')
-  if [ "$r" = nokey ]; then read -r _bd bn <<< "$(broker_busy)"; r=$bn; fi
+  [ "$r" = nokey ] && r=$(guard_rooms)
   echo "$r"
+}
+# guard_rooms: "0" when the broker's restart guard proves the hotel holds no room: it says restart_ok,
+# or it refuses for one reason only, "the hotel is not drained" (preflight runs before the drain).
+# Anything else prints "?": a broker without the guard (404), an unknown count, any room or create.
+guard_rooms() {
+  curl -s -m 20 -w '\n%{http_code}' -H "Authorization: Bearer $(opkey)" "$BROKER/v1/broker/hotels/$HOTEL/restart-check" |
+    python3 -I -c '
+import json, sys
+raw = sys.stdin.read().rsplit("\n", 1)
+code = raw[-1].strip() if len(raw) == 2 else ""
+try:
+    d = json.loads(raw[0])
+except Exception:
+    d = None
+ok = False
+if isinstance(d, dict):
+    if code == "200" and d.get("restart_ok") is True:
+        ok = True
+    elif code == "409" and isinstance(d.get("error"), dict) and d["error"].get("code") == "restart_refused":
+        c = d.get("check") if isinstance(d.get("check"), dict) else {}
+        ok = c.get("count_known") is True and c.get("reasons") == ["the hotel is not drained"]
+print("0" if ok else "?")'
 }
 # The broker's own count before a guest restart (AB#875): "<drain> <rooms_in_use>". rooms_in_use
 # includes creates queued or in flight, which the hotel's room list does not show yet.
@@ -179,8 +202,9 @@ else:
 # restart_ok [capacity]: a guest restart may run only when the broker's restart guard says ok and the
 # hotel's own room list shows 0 live rooms. A broker from before the guard (notfound while the hotel
 # document still reads, or absent) falls back to that document (drain=true, rooms_in_use=0, creates in
-# flight included); an unknown hotel reads "? ?" there and refuses. With "capacity", the capacity
-# view must read drain=True as well (the recovery rollback). Prints why not.
+# flight included); an unknown hotel reads "? ?" there and refuses. A hotel with no room list of its
+# own (guest-TLS) never takes that fallback: rooms() then reads "?" unless the guard proves 0. With
+# "capacity", the capacity view must read drain=True as well (the recovery rollback). Prints why not.
 restart_ok() {
   local up adm meas dr=True sl fr g bd bn r
   if [ "${1:-}" = capacity ]; then read -r up adm meas dr sl fr <<< "$(hotel_state)"; fi
@@ -249,8 +273,8 @@ REMOTE
 
 # Copies the staged image in, sets the two sealed flags, runs install.sh. Rolls itself back on a failed install.
 host_install() {
-  ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" "$OLDIMG" "$1" <<'REMOTE' 2>&1
-D=$1 S=$2 NEWIMG=$3 KIT=$4 UNIT=$5 OLDIMG=$6 TS=$7
+  ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" "$OLDIMG" "$1" "${2:-no}" <<'REMOTE' 2>&1
+D=$1 S=$2 NEWIMG=$3 KIT=$4 UNIT=$5 OLDIMG=$6 TS=$7 GUARD=$8
 set -u
 [ -e "$D/sealed.env.bak-$TS" ] || cp -a "$D/sealed.env" "$D/sealed.env.bak-$TS" || { echo "RESULT=nochange backup failed"; exit 0; }
 for k in SEALED_ROOM_SEALED_SECRETS SEALED_ROOM_SEALED_EXEC; do
@@ -271,9 +295,11 @@ unit_run() { echo "$(systemctl is-active "$UNIT" 2>/dev/null) $(systemctl show -
 RUN0=$(unit_run)
 LOGF=${ROLL_REMOTE_LOGDIR:-/root}/sealed-roll-$(basename "$D")-$TS.log
 # A miner-mode hotel (SEALED_MINER=1) keeps its hotel key in the guest, so install-sealed.sh cannot
-# count rooms and asks for a control-plane drain plus SEALED_RESTART_WITH_ROOMS=1. This roll drained
-# at the broker and proved 0 rooms there (creates in flight included) just before this step.
-RWR=0; grep -q "^SEALED_MINER=1" "$D/sealed.env" && RWR=1
+# count rooms and asks for a control-plane drain plus SEALED_RESTART_WITH_ROOMS=1. The override is
+# given only when the broker's restart guard said ok just before this step (GUARD=ok): drained, and
+# 0 rooms, creates, queued, claims and unreaped batches, from a known count. Otherwise the installer
+# keeps its own refusal.
+RWR=0; [ "$GUARD" = ok ] && grep -q "^SEALED_MINER=1" "$D/sealed.env" && RWR=1
 ( cd "$KIT" && SEALED_SKIP_BUILD=1 SEALED_RESTART_WITH_ROOMS=$RWR ./install.sh --sealed "$D/sealed.env" ) > "$LOGF" 2>&1
 rc=$?
 grep -E "expected measurement|measurement matches|MEASUREMENT DIFFERS|no attestation|guest stopped|live room|guest starting" "$LOGF" | cut -c1-200
@@ -492,8 +518,9 @@ run_apply() {
   if [ "$phase" = drained ]; then
     # Checked again right before the install, which restarts the guest.
     local why; why=$(restart_ok) || die "$HOTEL is not empty before the install ($why); nothing installed"
+    local guard; guard=$(restart_check)
     st_set PHASE installing; phase=installing
-    local out; out=$(host_install "$TS")
+    local out; out=$(host_install "$TS" "${guard%% *}")
     while read -r l; do log "host: $l"; done <<< "$out"
     case "$out" in
       *RESULT=installed*) st_set PHASE installed; phase=installed ;;
