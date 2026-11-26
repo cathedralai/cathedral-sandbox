@@ -154,6 +154,7 @@ import re
 import select
 import shutil
 import socket
+import socketserver
 import ssl
 import stat
 import subprocess
@@ -1750,6 +1751,8 @@ class Ledger:
         self.sealed_exec = sealed_exec
         # The env overlay (AB#414) opens with the secrets key: on with sealed secrets, off without.
         self.sealed_env = SealedEnv() if secrets is not None else None
+        # In-room report call (AB#1001): set by main() on a sealed dedicated hotel, else None.
+        self.room_reports: "RoomReports | None" = None
         # Raw Ed25519 owner key on a dedicated sealed machine, else None (no gate).
         self.owner_key: bytes | None = None
         # AB#963: hex sha256 of the one create this machine was launched for, else None.
@@ -2828,6 +2831,21 @@ class Ledger:
         with self.lock:
             return self._sign_locked(fields, create)
 
+    def room_snapshot(self, room: str) -> tuple[str | None, dict | None, bool]:
+        """(incarnation, its create receipt, temporarily unusable) for *room*, read under one lock (AB#1001).
+
+        The incarnation is the receipt_sha256 of the room's last successful create receipt, so the two
+        always name the same receipt. Unusable: the room is being reaped or lost an answer."""
+        with self.lock:
+            incarnation = self.incarnations.get(room)
+            receipt = None
+            if incarnation is not None:
+                for i in reversed(self.by_room.get(room, [])):
+                    if self.chain[i]["receipt_sha256"] == incarnation:
+                        receipt = self.chain[i]
+                        break
+            return incarnation, receipt, room in self.reaping or room in self.broken
+
     def launch_report_id(self) -> str | None:
         """REPORT_ID of this guest's SNP launch (64 hex), or None when unsealed or all zero (fail closed).
 
@@ -3129,6 +3147,393 @@ class Ledger:
             self.deleted_snapshots.add(gone)
         self.store.write(canonical(receipt) + b"\n")
         return receipt
+
+
+# ---------------------------------------------------------------- in-room report call (AB#1001)
+#
+# docs/IN_ROOM_REPORT_CALL.md. On a sealed dedicated hotel (ROOM_IN_ROOM_ATTEST=1) the room API makes
+# ROOM_ROOM_ATTEST_DIR/<room>/ and mounts it read-only at /run/cathedral in that room only. This front
+# serves <dir>/<room>/attest.sock for each room it signed a create for. A room posts its own 64 bytes;
+# the front signs a statement naming the hotel, binding, room, incarnation and those bytes with the
+# receipt key, and asks the chip for a report whose REPORT_DATA is SHA-512(domain || statement). Any
+# broker guest can get a report over any 64 bytes from POST /room/attest, so the statement signature,
+# which only this path makes, is what shows a report came from inside the room.
+
+ROOM_REPORT_SCHEMA = "cathedral.room.report/v1"
+ROOM_REPORT_DOMAIN = b"cathedral.room.report/v1\0"
+ROOM_REPORT_SOCKET = "attest.sock"
+ROOM_REPORT_ROUTE = "/v1/report"
+ROOM_REPORT_BODY_MAX = 1024
+ROOM_REPORT_DEADLINE_SECONDS = 5.0  # the room's answer; the chip slot stays held until the read returns
+ROOM_REPORT_IO_SECONDS = 5.0  # per read and write on the room's connection
+ROOM_REPORT_CONNECTIONS = 4  # open connections per room
+ROOM_REPORT_API_SECONDS = 2.0  # the loopback room API check
+ROOM_REPORT_SCAN_SECONDS = 1.0
+DEFAULT_ROOM_ATTEST_DIR = "/run/room-attest"
+BROKER_FRESH_GUEST = "_broker_fresh"  # broker/fresh_attest.go freshGuestID
+ROOM_LEAVING_STATES = ("deleting", "stopped_deleting")  # cathedral/sandbox_provider.py _LEAVING
+
+
+def room_report_wanted() -> bool:
+    """ROOM_IN_ROOM_ATTEST=1 (install sets it on dedicated sealed hotels only). Anything else: off."""
+    return os.environ.get("ROOM_IN_ROOM_ATTEST") == "1"
+
+
+def room_report_data(statement: dict) -> bytes:
+    """REPORT_DATA of an in-room report: SHA-512(ROOM_REPORT_DOMAIN || canonical(statement))."""
+    return hashlib.sha512(ROOM_REPORT_DOMAIN + canonical(statement)).digest()
+
+
+class ReportScheduler:
+    """One fresh report at a time from this front, highest priority first (AB#1001).
+
+    The kernel serializes SNP guest requests anyway; this decides the order. The broker's fresh check
+    goes before the hotel attest route, which goes before in-room calls, so a broker check waits behind
+    at most the one report already running. A holder keeps the slot until its TSM read returns."""
+
+    BROKER, HOTEL, ROOM = 0, 1, 2
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.busy = False
+        self.waiting = [0, 0, 0]
+
+    def acquire(self, priority: int, deadline: float | None = None) -> bool:
+        """Take the slot. With *deadline* (time.monotonic), give up when it passes and leave the queue."""
+        with self.cond:
+            self.waiting[priority] += 1
+            try:
+                while self.busy or any(self.waiting[p] for p in range(priority)):
+                    if deadline is None:
+                        self.cond.wait()
+                        continue
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return False
+                    self.cond.wait(left)
+                self.busy = True
+                return True
+            finally:
+                self.waiting[priority] -= 1
+
+    def release(self) -> None:
+        with self.cond:
+            self.busy = False
+            self.cond.notify_all()
+
+
+class _RoomReportServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """The listener on one room's attest.sock. It knows its room: the socket is the caller's identity."""
+
+    daemon_threads = True
+    allow_reuse_address = False
+
+    def __init__(self, path: str, reports: "RoomReports", room: str):
+        self.reports, self.room = reports, room
+        self.conns: set = set()
+        self.conns_lock = threading.Lock()
+        super().__init__(path, _RoomReportHandler)
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        with self.conns_lock:
+            self.conns.add(conn)
+        return conn, addr
+
+    def verify_request(self, request, client_address) -> bool:
+        with self.conns_lock:
+            return len(self.conns) <= ROOM_REPORT_CONNECTIONS
+
+    def shutdown_request(self, request) -> None:
+        with self.conns_lock:
+            self.conns.discard(request)
+        super().shutdown_request(request)
+
+    def handle_error(self, request, client_address) -> None:
+        # A room that hangs up, or a connection a close ended, is not the hotel's error.
+        print(f"room-receipts: room report connection for {self.room} ended: {sys.exc_info()[1]!r}", flush=True)
+
+    def close_connections(self) -> None:
+        """End every accepted connection: closing the listener alone leaves them open."""
+        with self.conns_lock:
+            conns = list(self.conns)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+class _RoomReportHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    timeout = ROOM_REPORT_IO_SECONDS
+    server: _RoomReportServer
+
+    def log_message(self, fmt, *args) -> None:  # noqa: D102 the client address of a Unix socket is empty
+        pass
+
+    def reply(self, status: int, doc: dict, headers: dict | None = None) -> None:
+        out = canonical(doc)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(out)
+
+    def do_GET(self) -> None:
+        self.reply(405, {"error": "method_not_allowed"}, {"Allow": "POST"})
+
+    do_PUT = do_DELETE = do_PATCH = do_GET
+
+    def do_POST(self) -> None:
+        if urlsplit(self.path).path != ROOM_REPORT_ROUTE:
+            return self.reply(404, {"error": "route_not_found"})
+        try:
+            length = int(self.headers.get("Content-Length") or "-1")
+        except ValueError:
+            length = -1
+        if not 0 <= length <= ROOM_REPORT_BODY_MAX:
+            self.close_connection = True
+            return self.reply(413, {"error": "body_too_large", "max_bytes": ROOM_REPORT_BODY_MAX})
+        try:
+            doc = json.loads(self.rfile.read(length) or b"")
+        except ValueError:
+            doc = None
+        raw = doc.get("report_data_hex") if isinstance(doc, dict) else None
+        if not isinstance(raw, str) or not HEX64.fullmatch(raw):
+            return self.reply(400, {"error": "report_data_hex must be 128 hex characters (64 bytes)"})
+        status, answer, headers = self.server.reports.report(self.server.room, bytes.fromhex(raw))
+        self.reply(status, answer, headers)
+
+
+class RoomReports:
+    """The per-room report sockets of a sealed dedicated hotel and the report each one answers (AB#1001)."""
+
+    def __init__(self, root: str, ledger: "Ledger", per_minute: int = 30):
+        self.root, self.ledger, self.per_minute = root, ledger, max(1, int(per_minute))
+        self.scheduler = ReportScheduler()
+        self.api_get = None  # Server.api_get, set by start()
+        self.lock = threading.Lock()
+        self.listeners: dict[str, _RoomReportServer] = {}
+        self.active: set[str] = set()  # rooms with a report waiting or running
+        self._stop = threading.Event()
+
+    # -- sockets
+
+    def start(self, api_get, scan_seconds: float | None = ROOM_REPORT_SCAN_SECONDS) -> None:
+        """Clear sockets an earlier front left, then open one per room this front signed a create for.
+
+        A front restart makes a new binding and receipt key and an empty incarnation table, so rooms made
+        before it get no socket again: recreate the room to get reports (spec, Restarts)."""
+        self.api_get = api_get
+        for room in self._room_dirs():
+            try:
+                os.unlink(os.path.join(self.root, room, ROOM_REPORT_SOCKET))
+            except OSError:
+                pass
+        self.scan()
+        if scan_seconds:
+            threading.Thread(target=self._scan_loop, args=(scan_seconds,), daemon=True, name="room-reports").start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        for room in list(self.listeners):
+            self.close(room)
+
+    def _scan_loop(self, seconds: float) -> None:
+        while not self._stop.wait(seconds):
+            try:
+                self.scan()
+            except Exception:  # noqa: BLE001 a scan failure must not end the loop
+                traceback.print_exc()
+
+    def _room_dirs(self) -> list[str]:
+        try:
+            names = os.listdir(self.root)
+        except OSError:
+            return []
+        return [n for n in names if SECRETS_ROOM_RE.fullmatch(n) and self._is_room_dir(n)]
+
+    def _is_room_dir(self, room: str) -> bool:
+        try:
+            st = os.lstat(os.path.join(self.root, room))
+        except OSError:
+            return False
+        return stat.S_ISDIR(st.st_mode)  # lstat: a link is never a room directory
+
+    def scan(self) -> None:
+        """Open a socket for each room directory with a live incarnation; close the rest."""
+        with self.ledger.lock:
+            live = set(self.ledger.incarnations)
+        dirs = set(self._room_dirs())
+        for room in sorted(dirs & live):
+            if room not in self.listeners:
+                self.open(room)
+        for room in list(self.listeners):
+            if room not in live or room not in dirs:
+                self.close(room)
+
+    def open(self, room: str) -> None:
+        path = os.path.join(self.root, room, ROOM_REPORT_SOCKET)
+        with self.lock:
+            if room in self.listeners or self._stop.is_set():
+                return
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return
+            try:
+                srv = _RoomReportServer(path, self, room)
+                # The directory is mounted in this one room only. 0666 lets a non-root room user connect.
+                os.chmod(path, 0o666)
+            except OSError as exc:
+                print(f"room-receipts: room report socket for {room} NOT open: {exc}", flush=True)
+                return
+            # Started before it is listed, so a close() never waits on a loop that never ran.
+            threading.Thread(target=srv.serve_forever, daemon=True, name=f"room-report-{room}").start()
+            self.listeners[room] = srv
+
+    def close(self, room: str) -> None:
+        """Stop the room's listener, end its accepted connections and unlink its socket."""
+        with self.lock:
+            srv = self.listeners.pop(room, None)
+        if srv is None:
+            return
+        srv.shutdown()
+        srv.server_close()
+        srv.close_connections()
+        try:
+            os.unlink(os.path.join(self.root, room, ROOM_REPORT_SOCKET))
+        except OSError:
+            pass
+
+    def retire(self, room: str, incarnation_of=None) -> None:
+        """A signed delete or room_end ended the room (retire_room). A room made again keeps its socket."""
+        if incarnation_of is not None and incarnation_of(room) is not None:
+            return
+        self.close(room)
+
+    # -- one report
+
+    def report(self, room: str, caller: bytes) -> tuple[int, dict, dict]:
+        """(status, answer, headers) for one in-room request. See docs/IN_ROOM_REPORT_CALL.md, Liveness."""
+        wait = self.ledger.attest_slot("_room:" + room, self.per_minute)
+        if wait:
+            return 429, {"error": "room_report_rate_limit"}, {"Retry-After": str(int(wait) + 1)}
+        with self.lock:
+            if room in self.active:
+                return 429, {"error": "room_report_busy"}, {"Retry-After": "1"}
+            self.active.add(room)
+        handed_off = False
+        try:
+            refused, incarnation, receipt = self._check(room)
+            if refused is not None:
+                return refused
+            statement = {"schema": ROOM_REPORT_SCHEMA, "hotel": self.ledger.hotel,
+                         "binding_sha256": self.ledger.binding_sha256, "sandbox_id": room,
+                         "incarnation": incarnation, "caller_report_data_hex": caller.hex(),
+                         "requested_at": int(time.time())}
+            result: dict = {}
+            done = threading.Event()
+            expired = threading.Event()  # the room got its answer (503); a read not yet begun is skipped
+            deadline = time.monotonic() + ROOM_REPORT_DEADLINE_SECONDS
+
+            def work() -> None:
+                # A waiter leaves the queue at the room's deadline without touching the chip. Once the
+                # read starts, the slot and the room's place are held until it returns, even past the
+                # deadline: a stalled read never lets a second in-room read in.
+                acquired = False
+                try:
+                    acquired = self.scheduler.acquire(ReportScheduler.ROOM, deadline)
+                    if not acquired or expired.is_set():
+                        return  # no chip work for a caller that already has its 503
+                    result["out"] = self.ledger.attest(room_report_data(statement))
+                except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's
+                    result["error"] = exc
+                finally:
+                    if acquired:
+                        self.scheduler.release()
+                    with self.lock:
+                        self.active.discard(room)
+                    done.set()
+
+            threading.Thread(target=work, daemon=True, name=f"room-report-work-{room}").start()
+            handed_off = True
+            if not done.wait(max(0.0, deadline - time.monotonic())) or not result:
+                expired.set()
+                return 503, {"error": "room_report_slow"}, {"Retry-After": str(int(ROOM_REPORT_DEADLINE_SECONDS))}
+            if "error" in result:
+                return 500, {"error": "attest_failed", "detail": type(result["error"]).__name__}, {}
+            # Check again: a room the API retired, or that was made again, while its report ran gets
+            # no statement, even if its container still runs.
+            refused, again, receipt = self._check(room)
+            if refused is not None:
+                return refused
+            if again != incarnation:
+                return 409, {"error": "retry", "message": "the room was made again during the report"}, {}
+            attestation = self.ledger.attestation()
+            # Fence: the ledger did not wait for the API call above. Read it again and sign under its lock,
+            # so a signed delete or a new create that landed during that call gets no statement.
+            with self.ledger.lock:
+                now = self.ledger.incarnations.get(room)
+                unusable = room in self.ledger.reaping or room in self.ledger.broken
+                signature = self.ledger.key.sign(canonical(statement)) \
+                    if now == incarnation and not unusable else None
+            if now is None:
+                return self._gone(room)
+            if now != incarnation:
+                return 409, {"error": "retry", "message": "the room was made again during the report"}, {}
+            if signature is None:
+                return 503, {"error": "room_not_ready"}, {"Retry-After": "5"}
+            out = result["out"]
+            answer = {**out, "statement": statement,
+                      "statement_sig_b64": b64(signature),
+                      "statement_sha256": sha(canonical(statement)),
+                      "create_receipt": receipt, "attestation": attestation}
+            if out.get("cert_chain") is None:
+                fields = report_fields(base64.b64decode(out["report_b64"]))
+                answer["chip_id"], answer["reported_tcb"] = fields["chip_id"], fields["reported_tcb"]
+            return 200, answer, {}
+        finally:
+            if not handed_off:
+                with self.lock:
+                    self.active.discard(room)
+
+    def _check(self, room: str) -> tuple[tuple[int, dict, dict] | None, str | None, dict | None]:
+        """(refusal or None, incarnation, create receipt). 410 only when the room is surely gone."""
+        incarnation, receipt, unusable = self.ledger.room_snapshot(room)
+        if incarnation is None or receipt is None:
+            return self._gone(room), None, None
+        if unusable:
+            return (503, {"error": "room_not_ready"}, {"Retry-After": "5"}), None, None
+        answered = self.api_get(f"/v1/sandboxes/{room}", ROOM_REPORT_API_SECONDS, ROOM_REPORT_API_SECONDS) \
+            if self.api_get is not None else None
+        if answered is None:
+            return (503, {"error": "room_not_ready"}, {"Retry-After": "5"}), None, None
+        status, body = answered
+        if status == 404:
+            return self._gone(room), None, None
+        state = None
+        if status == 200:
+            try:
+                doc = json.loads(body)
+                state = doc.get("state") if isinstance(doc, dict) else None
+            except (ValueError, RecursionError):
+                state = None
+        if state in ROOM_LEAVING_STATES:
+            return self._gone(room), None, None
+        if state != "running":
+            return (503, {"error": "room_not_ready"}, {"Retry-After": "5"}), None, None
+        return None, incarnation, receipt
+
+    def _gone(self, room: str) -> tuple[int, dict, dict]:
+        # The answer goes out on this connection first; the listener closes from another thread.
+        threading.Thread(target=self.close, args=(room,), daemon=True).start()
+        return 410, {"error": "room_gone"}, {}
 
 
 # ---------------------------------------------------------------- proxy
@@ -3596,6 +4001,8 @@ def retire_room(ledger: "Ledger", room: str, exec_results: "ExecResults | None" 
         exec_results.forget_room(room, ledger.room_life)
     if ledger.ingress is not None and ledger.ingress.serving is not None:
         ledger.ingress.serving.forget_room(room)  # its Preview URLs answer 404 from here on
+    if ledger.room_reports is not None:
+        ledger.room_reports.retire(room, ledger.room_incarnation)  # its report socket and connections go
 
 
 def room_of(path: str) -> str | None:
@@ -4617,11 +5024,18 @@ class Handler(BaseHTTPRequestHandler):
         wait = ledger.attest_slot(guest, self.server.attest_per_minute)
         if wait:
             return self.reply(429, b'{"error":"attest_rate_limit"}', {"Retry-After": str(int(wait) + 1)})
+        reports = ledger.room_reports
+        if reports is not None:
+            # AB#1001: with in-room reports on, the broker's fresh check goes first, then this route.
+            reports.scheduler.acquire(ReportScheduler.BROKER if guest == BROKER_FRESH_GUEST else ReportScheduler.HOTEL)
         try:
             out = ledger.attest(bytes.fromhex(raw), claims)
         except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's, not the caller's
             traceback.print_exc()
             return self.reply(500, canonical({"error": "attest_failed", "detail": type(exc).__name__}))
+        finally:
+            if reports is not None:
+                reports.scheduler.release()
         if room is not None:
             # The room's signed create receipt (its tunables and tunables_sha256, when it
             # has them), under the receipt key of the binding this report names.
@@ -5692,15 +6106,27 @@ def main() -> int:
             # The hotel keeps serving rooms; expose goes to the API (501) as with the flag off.
             print(f"room-receipts: guest ingress NOT serving: {exc}", flush=True)
     volumes = start_volumes(ledger, env)
+    if room_report_wanted():
+        if ledger.sealed:
+            ledger.room_reports = RoomReports(env.get("ROOM_ROOM_ATTEST_DIR") or DEFAULT_ROOM_ATTEST_DIR, ledger,
+                                              int(env.get("ROOM_ATTEST_PER_MINUTE", "30")))
+        else:
+            print("room-receipts: ROOM_IN_ROOM_ATTEST=1 ignored: level 1 has no SNP report", flush=True)
     if miner is None:
         srv = Server((host, int(port)), *args, look_seconds=look or None, **reaper)
         srv.volumes = volumes
+        if ledger.room_reports is not None:
+            ledger.room_reports.start(srv.api_get)
+            print(f"room-receipts: in-room reports on: {ledger.room_reports.root}/<room>/{ROOM_REPORT_SOCKET}",
+                  flush=True)
         srv.serve_forever()
         return 0
     tls_host, tls_port = env["ROOM_RECEIPTS_TLS_LISTEN"].rsplit(":", 1)
     tls = TLSServer((tls_host, int(tls_port)), *args, tls_context=miner.tls_context(store), look_seconds=look or None,
                     **reaper)
     tls.volumes = volumes
+    if ledger.room_reports is not None:
+        ledger.room_reports.start(tls.api_get)
     plain = Server((host, int(port)), *args, attestation_only=True)
     threading.Thread(target=plain.serve_forever, daemon=True).start()
     print(f"room-receipts: miner hotel: HTTPS {tls_host}:{tls_port} tls_spki_sha256 {miner.tls_spki_sha256}; "
