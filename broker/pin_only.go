@@ -185,6 +185,10 @@ func (h *hotel) occupancyKnown() bool {
 	return !h.roomsUnchecked && h.listOK && len(h.unreaped) == 0 && h.lostPending == 0
 }
 
+func pinUnknownMsg(h *hotel) string {
+	return "hotel " + h.cfg.ID + " is pin_only and its rooms are not known (no good room list since start, a create with an unknown outcome, or unconfirmed cleanup); retry when the room count is known"
+}
+
 // claim counts a call that selected h (B5). Caller holds b.mu, and takes the
 // claim in the same hold as the check that selected h.
 func (h *hotel) claim() { h.claims++ }
