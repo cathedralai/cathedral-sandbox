@@ -128,11 +128,12 @@ class Fixture:
         return doc
 
     def run(self, answer: dict, nonce: str = NONCE, *extra: str, hotel: str = "ab968-hotel",
-            room: str = ROOM) -> tuple[int, dict]:
+            room: str = ROOM, trust: tuple[str, ...] = ("--expected-measurement", snp.MEASUREMENT)) -> tuple[int, dict]:
         path = self.tmp_path / "room-report.json"
         path.write_text(json.dumps(answer))
         proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), "--room-report", str(path),
-                               "--nonce", nonce, "--hotel", hotel, "--sandbox-id", room, "--ark-sha256", snp.ark_pin(), "--kds-cache", str(self.cache), *extra],
+                               "--nonce", nonce, "--hotel", hotel, "--sandbox-id", room, "--ark-sha256", snp.ark_pin(),
+                               "--kds-cache", str(self.cache), *trust, *extra],
                               capture_output=True, text=True, check=False)
         assert proc.stdout.strip(), proc.stderr
         return proc.returncode, json.loads(proc.stdout)
@@ -324,3 +325,53 @@ def test_room_report_refuses_flags_it_does_not_act_on(fx: Fixture) -> None:
     proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), "--nonce", NONCE],
                           capture_output=True, text=True, check=False)
     assert proc.returncode == 2 and "go together" in proc.stderr
+
+
+# -- a trusted build (SpockChaser HOLD on #762): a chip-signed guest is not enough
+
+
+def _guest_of_its_own(fx: Fixture) -> dict:
+    """A real SNP guest running an unapproved build, with its own receipt key in its own binding."""
+    own = _key("a guest of its own")
+    boot = snp.attestation(fx.tmp_path / "own")
+    binding = {**boot["binding"], "receipt_key_ed25519_b64": _b64(own.public_key().public_bytes_raw())}
+    bsha = vr.sha(vr.canonical(binding))
+    fx.binding, fx.bsha = binding, bsha
+    fx.boot_report = _with_report_id(snp.make_report(bsha), LAUNCH)
+    fx.create = _create_receipt(bsha, key=own)
+    fx.statement = _statement(bsha, fx.create["receipt_sha256"])
+    answer = fx.answer()
+    answer["statement_sig_b64"] = _sign_statement(fx.statement, own)
+    return answer
+
+
+def test_without_a_trusted_build_a_room_report_never_passes(fx: Fixture) -> None:
+    _fails(fx.run(fx.answer(), trust=()), "a room report needs a trusted build")
+
+
+def test_an_empty_measurement_is_no_trusted_build(fx: Fixture) -> None:
+    _fails(fx.run(fx.answer(), trust=("--expected-measurement", "")), "a room report needs a trusted build")
+
+
+def test_a_chip_signed_guest_with_its_own_key_passes_only_without_trust_and_fails_with_it(fx: Fixture) -> None:
+    answer = _guest_of_its_own(fx)
+    # The counterexample: self-consistent, so only the trust input can refuse it.
+    _fails(fx.run(answer, trust=()), "a room report needs a trusted build")
+    _fails(fx.run(answer, trust=("--expected-measurement", "ab" * 48)), "measurement")
+
+
+def test_an_approved_list_naming_the_chip_and_measurement_passes(fx: Fixture) -> None:
+    from tests.test_verify_receipts_approved_list import _write_list
+    listed, pins = _write_list(fx.tmp_path / "list")
+    code, out = fx.run(fx.answer(), trust=("--approved-list", str(listed), "--approved-list-schema", "v1",
+                                           "--approved-list-pins", str(pins)))
+    assert code == 0 and out["verdict"] == "PASS", out
+
+
+def test_an_approved_list_without_this_measurement_fails(fx: Fixture) -> None:
+    from tests.test_verify_receipts_approved_list import _write_list
+    listed, pins = _write_list(fx.tmp_path / "list", {"ab968-hotel": {"chip_id": snp.CHIP_ID,
+                                                                     "measurements": ["ab" * 48]}})
+    code, out = fx.run(fx.answer(), trust=("--approved-list", str(listed), "--approved-list-schema", "v1",
+                                           "--approved-list-pins", str(pins)))
+    assert code != 0 and out["verdict"] == "FAIL", out

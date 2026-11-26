@@ -226,7 +226,7 @@ with what it admitted. It refuses a policy with the migration agent bit (18). It
 --kds-cache, --product, --min-tcb and --expected-chip-id (checked as in list mode); any other flag is exit 2.
 
 Room report mode (--room-report FILE --nonce HEX128 --hotel ID --sandbox-id ID [--incarnation HEX64]
---ark-sha256 HEX, AB#1001) checks one in-room SNP report
+--ark-sha256 HEX and --expected-measurement HEX or --approved-list FILE, AB#1001) checks one in-room SNP report
 answer (docs/IN_ROOM_REPORT_CALL.md). The file is a JSON object: statement (schema cathedral.room.report/v1,
 hotel, binding_sha256, sandbox_id, incarnation, caller_report_data_hex, requested_at), statement_sig_b64 (base64
 Ed25519 signature of the room's receipt key over canonical(statement); the signature encoding of a receipt),
@@ -755,6 +755,11 @@ def verify_room_report(answer, nonce: str, hotel: str, sandbox_id: str, incarnat
     need(incarnation is None or re.fullmatch(r"[0-9a-f]{64}", incarnation) is not None,
          "--incarnation must be 64 lower-case hex characters")
     need(bool(ark_sha256), "a room report needs --ark-sha256: an unpinned chain proves nothing")
+    # Without a trusted build, any SNP guest can put its own receipt key in a binding and sign a statement
+    # naming any hotel and room: the checks below then show only that the answer is self-consistent.
+    measurements = [expected_measurement] if isinstance(expected_measurement, str) else list(expected_measurement or [])
+    need(any(isinstance(m, str) and m.strip() for m in measurements) or bool(approved_list),
+         "a room report needs a trusted build: --expected-measurement or --approved-list")
     att, statement, create = answer.get("attestation"), answer.get("statement"), answer.get("create_receipt")
     # 1. The boot attestation: AMD chain, binding commitment, measurement, optional pins and approved list.
     check_attestation_shape(att)
