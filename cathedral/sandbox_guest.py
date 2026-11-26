@@ -110,6 +110,10 @@ LABEL_OWNER = "cathedral.sandbox.owner"
 LABEL_SANDBOX_ID = "cathedral.sandbox.id"
 # Customer-sealed secrets inside a room (AB#417); room-kit room_receipts.SECRETS_IN_ROOM.
 SECRETS_IN_ROOM = "/run/secrets"
+# In-room SNP report call (AB#1001, docs/IN_ROOM_REPORT_CALL.md). On a dedicated hotel the
+# receipts front serves <CATHEDRAL_ROOM_ATTEST_DIR>/<room>/attest.sock; the room sees that
+# one directory here, read-only.
+ATTEST_IN_ROOM = "/run/cathedral"
 # -v also removes the room's anonymous volumes. An image that declares VOLUME
 # (docker:dind has VOLUME /var/lib/docker) gets one per room on the hotel data
 # disk, outside the room's quota. Without -v every deleted DinD room left its
@@ -117,6 +121,29 @@ SECRETS_IN_ROOM = "/run/secrets"
 # 99 of 100 GiB). Named volumes are never removed by -v; rooms get none.
 ROOM_RM_FLAGS = ("-f", "-v")
 SECRETS_DROP_TRIES = 5  # rmtree again while a write of the receipts front races a retire
+
+
+def _fresh_room_dir(path: Path, code: str, message: str) -> None:
+    """A new, empty per-room directory: nothing from an earlier room survives."""
+    shutil.rmtree(path, ignore_errors=True)
+    try:
+        path.mkdir(mode=0o755)
+        path.chmod(0o755)  # the room's own user may not be root
+    except OSError as exc:
+        raise SandboxOpError(code, 503, message, retry_after=30) from exc
+
+
+def _remove_room_dir(path: Path) -> None:
+    """rmtree until the directory is gone.
+
+    The receipts front may add a file (a secret, a socket) while rmtree runs, and then
+    the last rmdir fails (ENOTEMPTY, ignored). Try again a few times; reconcile drops
+    whatever is still left.
+    """
+    for _ in range(SECRETS_DROP_TRIES):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.lexists(path):
+            return
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -972,6 +999,7 @@ class DockerClient:
         default_runtime: str = "",
         secrets_dir: Path | None = None,
         image_default: bool = False,
+        attest_dir: Path | None = None,
     ) -> str:
         """Start one room. ``default_runtime`` is the daemon's default OCI runtime,
         the room's runtime when no ``--runtime`` is passed."""
@@ -1003,6 +1031,10 @@ class DockerClient:
             # Customer-sealed secrets (AB#417): the room's tmpfs directory, read-only
             # inside. The receipts front writes it; the room only reads.
             argv.extend(["--mount", f"type=bind,source={secrets_dir.resolve()},target={SECRETS_IN_ROOM},readonly"])
+        if attest_dir is not None:
+            # AB#1001: the room's own report socket directory, read-only. The front makes the
+            # socket; runsc reaches it only with --host-uds=open (dedicated hotels).
+            argv.extend(["--mount", f"type=bind,source={attest_dir.resolve()},target={ATTEST_IN_ROOM},readonly"])
         if user:
             argv.extend(["--user", user])
         chosen = None
@@ -1927,6 +1959,11 @@ class DockerGuestProvider:
         # Customer-sealed secrets (AB#417). None: CATHEDRAL_SEALED_SECRETS_DIR is unset.
         secrets_root = os.environ.get("CATHEDRAL_SEALED_SECRETS_DIR", "").strip()
         self._secrets_root = Path(secrets_root) if secrets_root else None
+        # In-room report call (AB#1001). None unless the hotel is dedicated and
+        # CATHEDRAL_ROOM_ATTEST_DIR is set: shared hotels never mount a report socket.
+        attest_root = os.environ.get("CATHEDRAL_ROOM_ATTEST_DIR", "").strip()
+        dedicated = os.environ.get("CATHEDRAL_HOTEL_TENANCY", "").strip().lower() == "dedicated"
+        self._attest_root = Path(attest_root) if attest_root and dedicated else None
         self._doomed_ws: dict[str, tuple[str, str, str, bool]] = {}  # sandbox_id -> workspace of a queued removal
         self._doomed_nets: dict[str, str | None] = {}  # sandbox_id -> network of a queued removal
         self._net_pending: dict[str, str] = {}  # sandbox_id -> network while docker run runs
@@ -2664,9 +2701,11 @@ class DockerGuestProvider:
             workspace = (owner, spec.name, spec.path, spec.version_on_delete, data)
         try:
             self._make_secrets_dir(doc["id"])
+            self._make_attest_dir(doc["id"])
             return self._start_guest_mounted(doc, request, workspace, owner)
         except BaseException:
             self._drop_secrets_dir(doc["id"])
+            self._drop_attest_dir(doc["id"])
             if workspace is not None:
                 self._workspaces.unmount(workspace[0], workspace[1], doc["id"])
             raise
@@ -2681,14 +2720,8 @@ class DockerGuestProvider:
         path = self._secrets_dir(sandbox_id)
         if path is None:
             return
-        shutil.rmtree(path, ignore_errors=True)
-        try:
-            path.mkdir(mode=0o755)
-            path.chmod(0o755)  # the room's own user may not be root
-        except OSError as exc:
-            raise SandboxOpError("sealed_secrets_unavailable", 503,
-                                 "this hotel could not make the room's /run/secrets directory",
-                                 retry_after=30) from exc
+        _fresh_room_dir(path, "sealed_secrets_unavailable",
+                        "this hotel could not make the room's /run/secrets directory")
 
     def _drop_secrets_dir(self, sandbox_id: str) -> None:
         """Remove the room's secrets at once. Idempotent; the next boot starts with none (tmpfs).
@@ -2701,10 +2734,7 @@ class DockerGuestProvider:
         path = self._secrets_dir(sandbox_id)
         if path is None:
             return
-        for _ in range(SECRETS_DROP_TRIES):
-            shutil.rmtree(path, ignore_errors=True)
-            if not os.path.lexists(path):
-                return
+        _remove_room_dir(path)
 
     def _sweep_secrets_dirs(self) -> int:
         """Drop the secrets directory of every room with no record (AB#417). Returns how many.
@@ -2712,15 +2742,42 @@ class DockerGuestProvider:
         A directory is made only after its record, and a retire drops it, so one
         with no record belongs to a room this API lost (a restart, an orphan).
         """
-        if self._secrets_root is None:
+        return self._sweep_room_dirs(self._secrets_root, self._drop_secrets_dir)
+
+    def _attest_dir(self, sandbox_id: str) -> Path | None:
+        if self._attest_root is None:
+            return None
+        return self._attest_root / sandbox_id
+
+    def _make_attest_dir(self, sandbox_id: str) -> None:
+        """A new, empty report socket directory for the room (AB#1001); the front adds the socket."""
+        path = self._attest_dir(sandbox_id)
+        if path is None:
+            return
+        _fresh_room_dir(path, "room_attest_unavailable",
+                        "this hotel could not make the room's /run/cathedral directory")
+
+    def _drop_attest_dir(self, sandbox_id: str) -> None:
+        """Remove the room's report socket directory. Idempotent; the front also closes its connections."""
+        path = self._attest_dir(sandbox_id)
+        if path is None:
+            return
+        _remove_room_dir(path)
+
+    def _sweep_attest_dirs(self) -> int:
+        """Drop the report socket directory of every room with no record (AB#1001). Returns how many."""
+        return self._sweep_room_dirs(self._attest_root, self._drop_attest_dir)
+
+    def _sweep_room_dirs(self, root: Path | None, drop: Callable[[str], None]) -> int:
+        if root is None:
             return 0
         try:
-            names = os.listdir(self._secrets_root)
+            names = os.listdir(root)
         except OSError:
             return 0
         stale = [name for name in names if not self._inner.has_record(name)]
         for name in stale:
-            self._drop_secrets_dir(name)
+            drop(name)
         return len(stale)
 
     def _start_guest_mounted(
@@ -2817,6 +2874,7 @@ class DockerGuestProvider:
                 mounts=[(workspace[4], workspace[2])] if workspace is not None else (),
                 tunables=room_tunables,
                 secrets_dir=self._secrets_dir(sandbox_id),
+                attest_dir=self._attest_dir(sandbox_id),
             )
         except BaseException:
             self._release_pending(sandbox_id)
@@ -2961,6 +3019,7 @@ class DockerGuestProvider:
         mounts: Iterable[tuple[Path, str]] = (),
         tunables: tuple[str, list[str], dict[str, Any]] | None = None,
         secrets_dir: Path | None = None,
+        attest_dir: Path | None = None,
     ) -> str:
         resolv_conf = None
         if network and self._net_pool is not None and self._net_pool.dns:
@@ -2992,6 +3051,7 @@ class DockerGuestProvider:
             run_args=self._run_args_for(request, tunables[1] if tunables is not None else ()),
             default_runtime=self._oci_runtime,
             secrets_dir=secrets_dir,
+            attest_dir=attest_dir,
         )
 
     def _dedicated_room(self, request: CreateSandboxRequest) -> bool:
@@ -4190,6 +4250,8 @@ class DockerGuestProvider:
             return False
         # A room on its way out keeps no secrets, even while its container lingers.
         self._drop_secrets_dir(sandbox_id)
+        # Nor its report socket: a lingering container must not reach the chip (AB#1001).
+        self._drop_attest_dir(sandbox_id)
         guest = self._guests.pop(sandbox_id, None)
         if guest is None:
             cid = self._find_labeled_container(sandbox_id)
@@ -4363,6 +4425,7 @@ class DockerGuestProvider:
             self._liveness_at = read_at
         removed = sum(1 for gone in self._remove_many(orphans) if gone)
         self._sweep_secrets_dirs()
+        self._sweep_attest_dirs()
         self._reconcile_snapshot_images()
         if self._net_pool is not None:
             # Drift guard: count ports from what this API holds now.
