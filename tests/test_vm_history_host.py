@@ -1061,6 +1061,70 @@ def test_a_late_tracked_from_does_not_duplicate_the_first_line(vm):
     assert vm.lines() == [{"event": "tracked_from", "generation": 1}]
 
 
+# ---- Pending-stop fence and delete (Codex P1, Bugbot High and Medium on 4679f78) ----------------
+
+def stalled_cutoff(vm, monkeypatch):
+    """Start vm1, expire it, and run enforce while the close append never answers.
+
+    Returns (gate, first pass result). The gate is the abandoned writer's blocker."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    a = vm.authjson()
+    a["paid_through"] = int(time.time()) - 5
+    (vm.root / "vm1" / "authorization.json").write_text(json.dumps(a))
+    gate = threading.Event()
+    real = vm.m.history_append
+    monkeypatch.setattr(vm.m, "HISTORY_BUDGET", 0.3, raising=False)
+    monkeypatch.setattr(vm.m, "history_append",
+                        lambda name, rec: (gate.wait(30), real(name, rec))[1] if rec["event"] == "close"
+                        else real(name, rec))
+    first = vm.m.cmd_enforce([])
+    assert [e["error"] for e in first["errors"]] == ["history_stalled"]
+    monkeypatch.setattr(vm.m, "history_append", real)  # the journal answers again from here on
+    return gate, first
+
+
+def test_a_stalled_cutoff_fences_its_generation_before_it_returns(vm, monkeypatch):
+    """Codex P1: renew-and-start of the generation whose close is still pending must be refused."""
+    gate, first = stalled_cutoff(vm, monkeypatch)
+    try:
+        assert closes(vm) == []
+        assert (vm.root / "vm1" / "pending-close.json").exists()
+        # A host reboot relaunch goes through check-paid, which only reads: the fence refuses it too.
+        assert vm.check_paid() == (3, {"error": "generation_closed"})
+        code, out = vm.auth(1, paid=vm.paid + 99)  # same generation, higher paid_through
+        assert code == 3 and out["error"] == "generation_closed"
+        code, out = vm.start()
+        assert code == 3 and out["error"] == "generation_closed"
+        assert not vm.systemd()["cathedral-vm-vm1.service"]["active"]
+        # A later tick, in a process with no memory of the stall, writes the missing close.
+        vm.m._stalled.clear()
+        vm.m.cmd_enforce([])
+        assert len(closes(vm)) == 1 and not (vm.root / "vm1" / "pending-close.json").exists()
+        code, h = vm.history(1)
+        assert code == 0 and h["stopped_at"] == first["stopped"][0]["stopped_at"] == closes(vm)[0]["stopped_at"]
+        assert vm.auth(2)[0] == 0  # and the next generation is not blocked by generation_open
+    finally:
+        gate.set()
+
+
+def test_the_abandoned_writer_dying_with_its_process_still_gets_a_close(vm, monkeypatch):
+    """Bugbot High: the oneshot exits and takes the abandoned append with it; the next tick closes."""
+    gate, first = stalled_cutoff(vm, monkeypatch)
+    try:
+        assert closes(vm) == []  # the writer never wrote anything (it is the one that dies)
+        vm.m._stalled.clear()  # a new process
+        vm.clk.advance(30)
+        assert vm.auth(2)[0] == 0  # begin() finishes the pending close before deciding
+        assert [c["reason"] for c in closes(vm)] == ["paid_through"]
+        # The close carries the stop-time stamp, not the time of the later tick.
+        assert closes(vm)[0]["wall_us"] == T0
+        assert vm.history(1)[0] == 0
+    finally:
+        gate.set()
+
+
 def test_no_em_dashes_in_the_history_work():
     for f in (KIT / "vm_ctl.py", KIT / "README.md", Path(__file__)):
         assert chr(0x2014) not in f.read_text(), f

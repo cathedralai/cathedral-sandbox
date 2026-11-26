@@ -547,9 +547,42 @@ def recover_closure(name: str, d: Path) -> dict:
     return a
 
 
+def finish_pending_close(name: str, d: Path) -> None:
+    """Write the close a stalled cutoff could not (see fence_pending_close), with the stop-time stamp.
+
+    The marker survives the death of the process that abandoned the append, so the next command or
+    enforce tick closes the generation. history_append is idempotent, so a late abandoned writer
+    that lands first or after is harmless."""
+    marker = d / "pending-close.json"
+    p = read_json(marker, {})
+    if not p:
+        return
+    g = p["generation"]
+    h = hio(name, read_history, name)
+    if is_tracked(h, g) and not event_of(h, "close", g):
+        hio(name, history_append, name, {"event": "close", "generation": g, "reason": p["reason"],
+                                         "stopped_at": p["wall_us"] // 1_000_000,
+                                         **{k: p.get(k) for k in ("wall_us", "boot_id", "mono_ns", "boot_ns",
+                                                                  "synced", "maxerror_us")}})
+    marker.unlink(missing_ok=True)
+
+
+def fence_pending_close(name: str, d: Path, reason: str) -> dict:
+    """The stop is done but the journal did not answer: fence the generation durably, without any
+    history I/O, on the lock-holding thread. closed_generation stops authorize and start from
+    reviving it; the marker makes the next command or tick write the close."""
+    a = auth_of(d)
+    marker = {"generation": a["generation"], "reason": reason, **stamp()}
+    write_atomic(d / "pending-close.json", json.dumps(marker, sort_keys=True) + "\n")
+    a["closed_generation"] = max(a.get("closed_generation", 0), a["generation"])
+    write_atomic(d / "authorization.json", json.dumps(a, sort_keys=True) + "\n")
+    return marker
+
+
 def begin(name: str, d: Path) -> None:
     """First thing under the VM lock in every command that decides something."""
     ensure_tracked(name, d)
+    finish_pending_close(name, d)
     recover_closure(name, d)
 
 
@@ -963,7 +996,8 @@ def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> d
         # Enforce only: the unit is down and the journal is not answering. Leave the close to the
         # next stop, cancel, delete or authorize (each runs stop_locked or recover_closure again).
         a = auth_of(d)
-        return {"name": name, "stopped_at": int(time.time()), "generation": a["generation"],
+        fence = fence_pending_close(name, d, reason)
+        return {"name": name, "stopped_at": fence["wall_us"] // 1_000_000, "generation": a["generation"],
                 "paid_through": a["paid_through"], "reason": reason, "was_running": was_running,
                 "graceful": graceful, "state": "stopped", "history_pending": True}
     if close is not None:
