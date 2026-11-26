@@ -1460,8 +1460,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			gone := ctx.Err() != nil
 			h.release(rm)
 			rm.hid, rm.id = hid, h.cfg.ID+"."+hid
+			turned := b.registerReapedLocked(h, rm) // same hold as creating--: the hotel is never seen empty
 			b.mu.Unlock()
-			b.reapRoom(h, rm)
+			b.finishReap(h, rm, turned)
 			if gone {
 				return finish(clientGone())
 			}
@@ -1474,8 +1475,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// asked: remove it and try another hotel, without resting this one.
 			h.release(rm)
 			rm.hid, rm.id = hid, h.cfg.ID+"."+hid
+			turned := b.registerReapedLocked(h, rm) // same hold as creating--: the hotel is never seen empty
 			b.mu.Unlock()
-			b.reapRoom(h, rm)
+			b.finishReap(h, rm, turned)
 			last = createResult{status: 409, doc: errDoc("tunables_unavailable",
 				"hotel "+h.cfg.ID+" does not apply per-room tunables (room kit without them)")}
 			continue

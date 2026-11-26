@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -51,5 +54,55 @@ func TestProbeHoldsAClaimSoPinOnlyCannotSwitchMidProbe(t *testing.T) {
 	}
 	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"pin_only": true}); status != 200 {
 		t.Fatalf("switch after the probe: %d %v", status, doc)
+	}
+}
+
+// Finding 2: a room the hotel returns after the client left (or one the
+// tunables check rejects) is in h.rooms in the same b.mu hold that ends
+// h.creating. A sampler that takes b.mu in a loop must never see the hotel
+// with no creating, no rooms, and a create the hotel already answered.
+func TestReapedRoomIsRegisteredWithTheEndOfCreating(t *testing.T) {
+	for _, tunables := range []bool{false, true} {
+		for i := 0; i < 60; i++ {
+			tc := newChain(t)
+			a := tc.b.hotelByID("a")
+			setHotel(tc, "b", func(h *hotel) { h.ok = false })
+			setHotel(tc, "c", func(h *hotel) { h.ok = false })
+			tc.hotels["a"].createDelay = 15 * time.Millisecond
+			body := []byte(`{"image":"alpine:3.20"}`)
+			if tunables {
+				body = []byte(`{"image":"alpine:3.20","tunables":{"x":1}}`)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			var stop, bad atomic.Bool
+			var sampled sync.WaitGroup
+			for k := 0; k < 8; k++ { // many waiters on b.mu: one gets it in the gap
+				sampled.Add(1)
+				go func() {
+					defer sampled.Done()
+					for !stop.Load() {
+						f := tc.hotels["a"]
+						f.mu.Lock()
+						answered := len(f.creates) > 0
+						f.mu.Unlock()
+						tc.b.mu.Lock()
+						if answered && a.creating == 0 && a.queued == 0 && len(a.rooms) == 0 {
+							bad.Store(true)
+						}
+						tc.b.mu.Unlock()
+					}
+				}()
+			}
+			go func() { time.Sleep(5 * time.Millisecond); cancel() }()
+			g := tc.b.guests["g1"]
+			pl := placement{guest: "g1", ids: map[string]bool{"a": true}, image: "alpine:3.20"}
+			res := tc.b.createOne(ctx, g, body, map[string]any{}, time.Now(), pl)
+			stop.Store(true)
+			sampled.Wait()
+			cancel()
+			if bad.Load() {
+				t.Fatalf("tunables=%v run %d: the hotel looked empty after its create answered (status %d)", tunables, i, res.status)
+			}
+		}
 	}
 }
