@@ -106,7 +106,11 @@ CADDY_SHA512=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777cc
 RESTIC_VERSION=0.19.1
 RESTIC_URL=https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
 RESTIC_SHA256=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
-CATHEDRAL_COMMIT=286d643
-CATHEDRAL_TARBALL=dist/cathedral-286d643.tar.gz
-CATHEDRAL_TARBALL_SHA256=50df5aead4fef5c66fb1fe61410f65db56427023c01848b8b6dad74df5b303ae
+# Pinned 2026-11-26 to 79c0cc0: main after #760 (room API makes the per-room report socket directory and mounts
+# it read-only at /run/cathedral on dedicated hotels, AB#1001), #761 and #763. cathedral/ changed only in
+# sandbox_guest.py since 286d643 (#757, #758, #760). Same make-dist.sh; 286d643 rebuilds to its pinned 50df5aea...
+# with the same tool, and 79c0cc0 builds to the same sha twice.
+CATHEDRAL_COMMIT=79c0cc0
+CATHEDRAL_TARBALL=dist/cathedral-79c0cc0.tar.gz
+CATHEDRAL_TARBALL_SHA256=9d3a181e020d0549ae205dccf3c2ef9cc868e935e4a8d114cc25ea24043aa4d4
 PROBE_IMAGE=alpine:3.20
