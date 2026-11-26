@@ -225,7 +225,8 @@ signed fields (measurement, chip id, REPORT_ID, policy, launch and reported TCB)
 with what it admitted. It refuses a policy with the migration agent bit (18). It takes only --ark-sha256,
 --kds-cache, --product, --min-tcb and --expected-chip-id (checked as in list mode); any other flag is exit 2.
 
-Room report mode (--room-report FILE --nonce HEX128 --ark-sha256 HEX, AB#1001) checks one in-room SNP report
+Room report mode (--room-report FILE --nonce HEX128 --hotel ID --sandbox-id ID [--incarnation HEX64]
+--ark-sha256 HEX, AB#1001) checks one in-room SNP report
 answer (docs/IN_ROOM_REPORT_CALL.md). The file is a JSON object: statement (schema cathedral.room.report/v1,
 hotel, binding_sha256, sandbox_id, incarnation, caller_report_data_hex, requested_at), statement_sig_b64 (base64
 Ed25519 signature of the room's receipt key over canonical(statement); the signature encoding of a receipt),
@@ -234,10 +235,11 @@ fetch), create_receipt (the room's signed create receipt) and attestation (GET /
 REPORT_DATA = SHA-512(b"cathedral.room.report/v1\0" || canonical(statement)). Every check must pass: the boot
 report (AMD chain, binding commitment, --expected-measurement, --approved-list); the statement (exact members,
 this binding and hotel, caller_report_data_hex equal to --nonce, signature under the binding's receipt key);
-the create receipt (same key and binding, a successful create of the statement's room, receipt_sha256 equal to
+the expected hotel, room and incarnation come from these flags, never from the file, and must equal the
+binding, the statement and the create receipt; the create receipt (same key and binding, a successful create of the room, receipt_sha256 equal to
 incarnation); the fresh report (REPORT_DATA is the formula, AMD chain, measurement equal to the binding's, chip id
 equal to the boot report's, REPORT_ID nonzero and equal to the boot report's: the same launch). It takes only
---nonce, --ark-sha256, --kds-cache, --product, --min-tcb, --expected-chip-id, --expected-measurement and
+--nonce, --hotel, --sandbox-id, --incarnation, --ark-sha256, --kds-cache, --product, --min-tcb, --expected-chip-id, --expected-measurement and
 --approved-list with --hotel and its options.
 
 When receipts name a binding_sha256 other than the live attestation, pass --broker and
@@ -735,16 +737,23 @@ def _check_room_statement(statement) -> None:
          "the statement requested_at is not a non-negative integer")
 
 
-def verify_room_report(answer, nonce: str, prod: str | None, cache: str, ark_sha256: str | list[str] | None,
+def verify_room_report(answer, nonce: str, hotel: str, sandbox_id: str, incarnation: str | None, prod: str | None,
+                       cache: str, ark_sha256: str | list[str] | None,
                        expected_measurement: list[str] | None = None, min_tcb: dict | None = None,
                        expected_chip_id: str | None = None, approved_list: dict | None = None) -> dict:
     """One in-room report answer (docs/IN_ROOM_REPORT_CALL.md): a statement the room's receipt key signed, a fresh
     SNP report whose REPORT_DATA commits to it, the room's create receipt and the boot attestation. It shows the
-    code that signed the statement runs in the room named in it, on the chip and launch of the boot report."""
+    code that signed the statement runs in the room named in it, on the chip and launch of the boot report.
+
+    hotel, sandbox_id and incarnation (optional) are the caller's own expectation, never read from the file."""
     need(isinstance(answer, dict), "the room report answer is not a JSON object")
     need(isinstance(nonce, str) and re.fullmatch(r"[0-9a-fA-F]{128}", nonce) is not None,
          "--nonce must be 128 hex characters (64 bytes)")
     nonce = nonce.lower()
+    need(isinstance(hotel, str) and hotel != "" and isinstance(sandbox_id, str) and sandbox_id != "",
+         "--hotel and --sandbox-id are required")
+    need(incarnation is None or re.fullmatch(r"[0-9a-f]{64}", incarnation) is not None,
+         "--incarnation must be 64 lower-case hex characters")
     need(bool(ark_sha256), "a room report needs --ark-sha256: an unpinned chain proves nothing")
     att, statement, create = answer.get("attestation"), answer.get("statement"), answer.get("create_receipt")
     # 1. The boot attestation: AMD chain, binding commitment, measurement, optional pins and approved list.
@@ -760,7 +769,12 @@ def verify_room_report(answer, nonce: str, prod: str | None, cache: str, ark_sha
     # 2. The statement: exact shape, this binding, this caller's nonce, signed by the binding's receipt key.
     _check_room_statement(statement)
     need(statement["binding_sha256"] == bsha, "the statement names another binding than the boot attestation")
-    need(statement["hotel"] == binding.get("hotel"), "the statement names another hotel than the binding")
+    need(binding.get("hotel") == hotel, f"the boot binding names hotel {binding.get('hotel')!r}, not --hotel {hotel!r}")
+    need(statement["hotel"] == hotel, f"the statement names hotel {statement['hotel']!r}, not --hotel {hotel!r}")
+    need(statement["sandbox_id"] == sandbox_id,
+         f"the statement names room {statement['sandbox_id']!r}, not --sandbox-id {sandbox_id!r}")
+    need(incarnation is None or statement["incarnation"] == incarnation,
+         "the statement names another incarnation than --incarnation")
     need(statement["caller_report_data_hex"] == nonce, "the statement does not carry the nonce sent")
     key = Ed25519PublicKey.from_public_bytes(base64.b64decode(binding["receipt_key_ed25519_b64"]))
     _ed25519_verify(key, answer.get("statement_sig_b64"), canonical(statement), "the statement")
@@ -779,6 +793,8 @@ def verify_room_report(answer, nonce: str, prod: str | None, cache: str, ark_sha
     need(create["receipt_sha256"] == statement["incarnation"],
          "the create receipt is not the incarnation the statement names")
     need(cst.get("sandbox_id") == statement["sandbox_id"], "the create receipt is for another room than the statement")
+    need(cst["sandbox_id"] == sandbox_id, "the create receipt is for another room than --sandbox-id")
+    need(cst.get("hotel") == hotel, "the create receipt names another hotel than --hotel")
     # 4. The fresh report: its REPORT_DATA is the formula over the signed statement, so the room's key vouched
     # for this report; then the AMD chain, and the same launch and chip as the boot report.
     raw = answer.get("report_b64")
@@ -800,7 +816,8 @@ def verify_room_report(answer, nonce: str, prod: str | None, cache: str, ark_sha
     report_id, boot_report_id = fresh_report[0x140:0x160], boot_report[0x140:0x160]
     need(report_id != bytes(32), "fresh report REPORT_ID is zero")
     need(report_id == boot_report_id, "fresh report REPORT_ID differs from the boot report's: another launch")
-    return {"room_report": {"hotel": statement["hotel"], "sandbox_id": statement["sandbox_id"],
+    return {"room_report": {"hotel": statement["hotel"], "expected": {"hotel": hotel, "sandbox_id": sandbox_id,
+                                                                      "incarnation": incarnation or "not given"}, "sandbox_id": statement["sandbox_id"],
                             "incarnation": statement["incarnation"], "binding_sha256": bsha,
                             "requested_at": statement["requested_at"], "caller_report_data_hex": nonce,
                             "statement_sha256": sha(canonical(statement)),
@@ -2865,6 +2882,9 @@ def main() -> int:
     ap.add_argument("--fresh-report", help="fresh report mode: an answer of POST /room/attest to check (AB#947)")
     ap.add_argument("--report-data-hex", help="fresh report mode: the 64 bytes (128 hex) sent as REPORT_DATA")
     ap.add_argument("--room-report", help="in-room report mode: an in-room SNP report answer to check")
+    ap.add_argument("--sandbox-id", help="in-room report mode: the room you expect (required)")
+    ap.add_argument("--incarnation", help="in-room report mode: the create receipt's receipt_sha256 you expect "
+                                          "(optional, 64 hex)")
     ap.add_argument("--nonce", help="in-room report mode: the 64 bytes (128 hex) the room asked to be signed")
     a = ap.parse_args()
     try:
@@ -2899,23 +2919,22 @@ def main() -> int:
         a.list_opts = {"path": a.approved_list, "pins": a.approved_list_pins, "at": a.at,
                        "previous_release": a.previous_release, "previous_digest": a.previous_digest,
                        "require_release": a.require_release, "hotel": a.hotel}
-    if a.room_report is not None or a.nonce is not None:
-        allowed = ("room_report", "nonce", "ark_sha256", "kds_cache", "product", "min_tcb", "min_tcb_floors",
+    if a.room_report is not None or a.nonce is not None or a.sandbox_id is not None or a.incarnation is not None:
+        allowed = ("room_report", "nonce", "sandbox_id", "incarnation", "ark_sha256", "kds_cache", "product", "min_tcb", "min_tcb_floors",
                    "expected_chip_id", "expected_measurement", "approved_list", "approved_list_schema",
                    "approved_list_pins", "at", "previous_release", "previous_digest", "require_release", "hotel",
                    "list_opts")
         clash = [flag for flag, value in vars(a).items()
                  if flag not in allowed and value is not None and value is not False and value != []]
         if clash:
-            ap.error("--room-report takes only --nonce, --ark-sha256, --kds-cache, --product, --min-tcb, "
+            ap.error("--room-report takes only --nonce, --hotel, --sandbox-id, --incarnation, --ark-sha256, --kds-cache, --product, --min-tcb, "
                      "--expected-chip-id, --expected-measurement and --approved-list with --hotel and its "
                      "options; not " + ", ".join("--" + f.replace("_", "-") for f in clash))
-        if a.hotel is not None and a.approved_list is None:
-            ap.error("--room-report takes --hotel only with --approved-list")
-        if not a.room_report or a.nonce is None:
-            ap.error("--room-report FILE and --nonce HEX go together")
+        if not a.room_report or a.nonce is None or not a.hotel or not a.sandbox_id:
+            ap.error("--room-report FILE, --nonce HEX, --hotel ID and --sandbox-id ID go together")
         try:
-            out = verify_room_report(read_document(a.room_report, "room report answer"), a.nonce, a.product,
+            out = verify_room_report(read_document(a.room_report, "room report answer"), a.nonce, a.hotel,
+                                     a.sandbox_id, a.incarnation, a.product,
                                      a.kds_cache or os.path.expanduser("~/.cache/amd-kds"), a.ark_sha256,
                                      a.expected_measurement, a.min_tcb_floors, a.expected_chip_id, a.list_opts)
         except Fail as exc:

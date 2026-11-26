@@ -127,11 +127,12 @@ class Fixture:
         doc.update(over)
         return doc
 
-    def run(self, answer: dict, nonce: str = NONCE, *extra: str) -> tuple[int, dict]:
+    def run(self, answer: dict, nonce: str = NONCE, *extra: str, hotel: str = "ab968-hotel",
+            room: str = ROOM) -> tuple[int, dict]:
         path = self.tmp_path / "room-report.json"
         path.write_text(json.dumps(answer))
         proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), "--room-report", str(path),
-                               "--nonce", nonce, "--ark-sha256", snp.ark_pin(), "--kds-cache", str(self.cache), *extra],
+                               "--nonce", nonce, "--hotel", hotel, "--sandbox-id", room, "--ark-sha256", snp.ark_pin(), "--kds-cache", str(self.cache), *extra],
                               capture_output=True, text=True, check=False)
         assert proc.stdout.strip(), proc.stderr
         return proc.returncode, json.loads(proc.stdout)
@@ -201,7 +202,8 @@ def test_a_create_receipt_signed_by_another_key_fails(fx: Fixture) -> None:
 
 def test_a_statement_for_another_room_fails(fx: Fixture) -> None:
     other = _statement(fx.bsha, fx.create["receipt_sha256"], sandbox_id="room-b")  # signed, but the create is room-a's
-    _fails(fx.run(fx.answer(statement=other)), "the create receipt is for another room")
+    _fails(fx.run(fx.answer(statement=other), room="room-b"), "the create receipt is for another room")
+    _fails(fx.run(fx.answer(statement=other)), "not --sandbox-id")  # and the caller's own room refuses it too
 
 
 def test_a_statement_naming_another_incarnation_fails(fx: Fixture) -> None:
@@ -286,9 +288,38 @@ def test_the_boot_report_is_checked_too(fx: Fixture) -> None:
     _fails(fx.run(answer), "REPORT_DATA does not commit to the binding")
 
 
+def test_the_wrong_hotel_fails(fx: Fixture) -> None:
+    _fails(fx.run(fx.answer(), hotel="another-hotel"), "not --hotel")
+
+
+def test_the_wrong_sandbox_id_fails(fx: Fixture) -> None:
+    _fails(fx.run(fx.answer(), room="room-b"), "not --sandbox-id")
+
+
+def test_the_incarnation_flag_is_checked(fx: Fixture) -> None:
+    ok = fx.run(fx.answer(), NONCE, "--incarnation", fx.create["receipt_sha256"])
+    assert ok[1]["verdict"] == "PASS", ok
+    _fails(fx.run(fx.answer(), NONCE, "--incarnation", "11" * 32), "another incarnation than --incarnation")
+
+
+def test_a_create_receipt_of_another_hotel_fails(fx: Fixture) -> None:
+    fx.create = _create_receipt(fx.bsha)
+    fx.create["statement"]["hotel"] = "another-hotel"
+    fx.create["signature_b64"] = _b64(RECEIPT_KEY.sign(vr.canonical(fx.create["statement"])))
+    fx.create["receipt_sha256"] = vr.sha(vr.canonical(fx.create["statement"]))
+    fx.statement = _statement(fx.bsha, fx.create["receipt_sha256"])
+    _fails(fx.run(fx.answer()), "the create receipt names another hotel")
+
+
+def test_room_report_needs_hotel_and_sandbox_id() -> None:
+    proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), "--room-report", "x.json", "--nonce",
+                           NONCE], capture_output=True, text=True, check=False)
+    assert proc.returncode == 2 and "--hotel ID and --sandbox-id ID" in proc.stderr
+
+
 def test_room_report_refuses_flags_it_does_not_act_on(fx: Fixture) -> None:
     proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), "--room-report", "x.json", "--nonce",
-                           NONCE, "--receipts", "r.json"], capture_output=True, text=True, check=False)
+                           NONCE, "--hotel", "h", "--sandbox-id", "r", "--receipts", "r.json"], capture_output=True, text=True, check=False)
     assert proc.returncode == 2 and "--room-report takes only" in proc.stderr
     proc = subprocess.run([sys.executable, str(KIT / "verify_receipts.py"), "--nonce", NONCE],
                           capture_output=True, text=True, check=False)
