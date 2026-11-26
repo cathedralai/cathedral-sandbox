@@ -521,10 +521,12 @@ func (b *broker) unresolvedLocked(h *hotel, batchID string) int {
 // answer). A record without a hold (a guest that is not metered) never
 // stays. Caller holds b.mu.
 func (b *broker) holdsLocked(h *hotel, batchID string, ub *unreapedBatch, asked time.Time) bool {
-	if ub.unsettled && ub.lostHold {
-		// settleUncertain has not recorded this request's real outcome yet: the
-		// attempt count reads zero meanwhile, which must not release the hold
-		// (pin_only.go, Astra r4).
+	if ub.lostHold && (ub.unsettled || (h.pinOnly() && asked.Before(ub.holdUntil))) {
+		// Before settleUncertain the attempt count reads zero. On a pin_only
+		// hotel the create deadline holds the record whatever the count says,
+		// a fully removed request included: the hotel may still start a room
+		// the broker has not heard of (pin_only.go, Astra r4 and r5). The
+		// allowance charges nothing for it: see unresolvedLocked.
 		return true
 	}
 	return asked.Before(ub.holdUntil) && b.unresolvedLocked(h, batchID) > 0
@@ -624,6 +626,10 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 			if ub == nil {
 				delete(b.allow.attempts, key)
 				delete(b.allow.removed, key)
+			} else if metered {
+				// The record stays (cleanup still busy): record that its attempts
+				// are all removed, so it charges the allowance 0, not the default 1.
+				b.allow.attempts[key] = n
 			}
 			continue
 		}

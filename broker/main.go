@@ -1717,7 +1717,9 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 	if b.reapPass(h, g.cfg.ID, batchID, keep, 3*time.Second) {
 		b.mu.Lock()
 		h.lostPending -= pending
-		if asked.Before(until) && h.unreaped[batchID] == nil {
+		// Only a pin_only hotel keeps the post-deadline record (B8 needs it);
+		// an ordinary hotel clears on an empty list, as on main.
+		if h.pinOnly() && asked.Before(until) && h.unreaped[batchID] == nil {
 			if h.unreaped == nil {
 				h.unreaped = map[string]*unreapedBatch{}
 			}
@@ -1733,7 +1735,10 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 	}
 	// The deadline goes on this record too: a retry that lists nothing while
 	// the hotel is still starting the create proves nothing (pin_only.go).
-	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true, holdUntil: until, lostHold: true}
+	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true}
+	if h.pinOnly() {
+		ub.holdUntil, ub.lostHold = until, true
+	}
 	h.unreaped[batchID] = ub
 	b.mu.Unlock()
 	go func() {
