@@ -32,7 +32,7 @@ func TestFullyRemovedBusyCleanupChargesNoAllowanceButStillHolds(t *testing.T) {
 	if len(res.lost) != 1 {
 		t.Fatalf("lost: %v (status %d)", res.lost, res.status)
 	}
-	if tc.b.reapOrphans(ha, g, batchID, nil, 1, res.lostUntil) {
+	if tc.b.reapOrphans(ha, g, batchID, nil, 1, len(res.lostGuarded), res.lostUntil) {
 		t.Fatal("the first cleanup should have failed")
 	}
 	f.mu.Lock()

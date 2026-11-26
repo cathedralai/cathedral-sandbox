@@ -458,6 +458,10 @@ type hotel struct {
 	// never seen empty in between (pin_only.go occupancyKnown). Guarded by
 	// broker.mu.
 	lostPending int
+	// guardedLost: of those, the attempts that were guarded (pin_only, held or
+	// quarantined) when sent. They keep the hotel guarded until reapOrphans
+	// installs the record, in the same b.mu hold (pin_only.go).
+	guardedLost int
 	// quarantineUntil (unix ns): a pin_only hotel with a lost create is closed
 	// to every unmarked placement until the create deadline, even after the
 	// flag is cleared (pin_only.go quarantined). Atomic: selects reads it
@@ -1268,6 +1272,9 @@ type createResult struct {
 	// the latest send time plus hotelCreateTimeout and lostMargin. An empty
 	// cleanup list before it proves nothing (pin_only.go).
 	lostUntil time.Time
+	// lostGuarded: the lost attempts (one entry each) that were guarded when
+	// sent: they leave the quarantine and the hold (pin_only.go).
+	lostGuarded []*hotel
 	// sent: the create bytes the hotel that answered 202 received. createOne
 	// sends one slice on every attempt, so these are the bytes of any retry
 	// too; handleCreate returns them when the caller asks (returnCreateHeader).
@@ -1291,7 +1298,11 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	var last createResult
 	var lost []*hotel
 	var lostUntil time.Time
-	finish := func(r createResult) createResult { r.lost, r.lostUntil = lost, lostUntil; return r }
+	var lostGuarded []*hotel
+	finish := func(r createResult) createResult {
+		r.lost, r.lostUntil, r.lostGuarded = lost, lostUntil, lostGuarded
+		return r
+	}
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
 	// size: read from body at the first retry of a metered create (allowance.go).
@@ -1429,6 +1440,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		h.queued--
 		g.queued--
 		h.creating++
+		// Decided once, at send time: whether this attempt must leave a fence if
+		// its reply is lost, whatever the hotel's flag is by then (pin_only.go).
+		guarded := h.pinGuardedLocked()
 		h.place(rm)
 		b.mu.Unlock()
 
@@ -1591,8 +1605,10 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// the guest's own image fault is a refusal: no room was started.
 			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
-				if h.cfg.PinOnly { // b.mu held: close it to unmarked placement until the deadline
+				if guarded { // b.mu held: close it to unmarked placement until the deadline
 					h.noteQuarantine(tDispatch.Add(hotelCreateTimeout + lostMargin))
+					h.guardedLost++
+					lostGuarded = append(lostGuarded, h)
 				}
 				h.lostPending++ // same hold as creating--: until createMany's cleanup confirms (reapOrphans)
 				if u := tDispatch.Add(hotelCreateTimeout + lostMargin); u.After(lostUntil) {
@@ -1656,10 +1672,14 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 		}
 		wg.Wait()
 	}
-	lost := map[*hotel]int{} // the lost attempts per hotel, each counted in h.lostPending
+	lost := map[*hotel]int{}     // the lost attempts per hotel, each counted in h.lostPending
+	guardedN := map[*hotel]int{} // of those, the attempts guarded when sent (h.guardedLost)
 	keep := map[*hotel]map[string]bool{}
 	var lostUntil time.Time
 	for _, res := range results {
+		for _, h := range res.lostGuarded {
+			guardedN[h]++
+		}
 		if res.lostUntil.After(lostUntil) {
 			lostUntil = res.lostUntil
 		}
@@ -1680,7 +1700,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 		}
 	}
 	for h, n := range lost {
-		if b.reapOrphans(h, g, batchID, keep[h], n, lostUntil) {
+		if b.reapOrphans(h, g, batchID, keep[h], n, guardedN[h], lostUntil) {
 			continue
 		}
 		// The failed hotel may still run a room of this request: the guest
@@ -1720,14 +1740,16 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 // that the request is retained in h.unreaped with a hold to until, in the
 // same b.mu hold that drops the pending count, and the sync loop ends it with
 // a list asked after until (pin_only.go, Astra r3).
-func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool, pending int, until time.Time) bool {
+func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool, pending, guarded int, until time.Time) bool {
 	asked := time.Now()
 	if b.reapPass(h, g.cfg.ID, batchID, keep, 3*time.Second) {
 		b.mu.Lock()
 		h.lostPending -= pending
-		// Only a pin_only hotel keeps the post-deadline record (B8 needs it);
-		// an ordinary hotel clears on an empty list, as on main.
-		if h.pinOnly() && asked.Before(until) && h.unreaped[batchID] == nil {
+		h.guardedLost -= guarded
+		// Only attempts guarded when sent keep the post-deadline record (B8
+		// needs it), whatever the flag is now; an ordinary hotel clears on an
+		// empty list, as on main.
+		if guarded > 0 && asked.Before(until) && h.unreaped[batchID] == nil {
 			if h.unreaped == nil {
 				h.unreaped = map[string]*unreapedBatch{}
 			}
@@ -1738,13 +1760,14 @@ func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[s
 	}
 	b.mu.Lock()
 	h.lostPending -= pending
+	h.guardedLost -= guarded
 	if h.unreaped == nil {
 		h.unreaped = map[string]*unreapedBatch{}
 	}
 	// The deadline goes on this record too: a retry that lists nothing while
 	// the hotel is still starting the create proves nothing (pin_only.go).
 	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true}
-	if h.pinOnly() {
+	if guarded > 0 {
 		ub.holdUntil, ub.lostHold = until, true
 	}
 	h.unreaped[batchID] = ub

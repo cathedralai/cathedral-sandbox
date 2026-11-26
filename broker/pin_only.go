@@ -234,7 +234,9 @@ func (h *hotel) lostHeldLocked() bool {
 // lost-create record, so clearing the flag (switch off, fail-closed audit)
 // cannot open the hotel while a record is held. The protection follows the
 // record, not the flag (Astra r6). Caller holds b.mu.
-func (h *hotel) pinGuardedLocked() bool { return h.cfg.PinOnly || h.lostHeldLocked() }
+func (h *hotel) pinGuardedLocked() bool {
+	return h.cfg.PinOnly || h.quarantined() || h.guardedLost > 0 || h.lostHeldLocked()
+}
 
 func pinUnknownMsg(h *hotel) string {
 	return "hotel " + h.cfg.ID + " is pin_only and its rooms are not known (no good room list since start, a create with an unknown outcome, or unconfirmed cleanup); retry when the room count is known"

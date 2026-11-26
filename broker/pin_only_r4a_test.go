@@ -37,7 +37,7 @@ func TestEmptySyncBetweenCleanupAndSettlementKeepsTheHold(t *testing.T) {
 	}
 	// createMany's first step: the cleanup pass finds nothing and the request
 	// is retained...
-	if !tc.b.reapOrphans(ha, g, batchID, nil, 1, res.lostUntil) {
+	if !tc.b.reapOrphans(ha, g, batchID, nil, 1, len(res.lostGuarded), res.lostUntil) {
 		t.Fatal("cleanup not confirmed")
 	}
 	// ...and an empty sync runs before settleUncertain takes b.mu.
