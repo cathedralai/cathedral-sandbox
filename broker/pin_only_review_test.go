@@ -14,7 +14,7 @@ import (
 // Finding 1: the probe decides and claims under one b.mu hold, and keeps the
 // claim for the whole probe.
 func TestProbeHoldsAClaimSoPinOnlyCannotSwitchMidProbe(t *testing.T) {
-	tc := newChainState(t, t.TempDir())
+	tc := knownChain(t)
 	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
@@ -104,5 +104,43 @@ func TestReapedRoomIsRegisteredWithTheEndOfCreating(t *testing.T) {
 				t.Fatalf("tunables=%v run %d: the hotel looked empty after its create answered (status %d)", tunables, i, res.status)
 			}
 		}
+	}
+}
+
+// Finding 3: zero rooms before the first good room list is unknown, not empty.
+func TestPinOnlySwitchAndReferenceChangeRefuseWhileRoomsAreUnknown(t *testing.T) {
+	tc := pinChain(t) // pin_only, generation 1
+	change := map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}
+	for _, c := range []struct {
+		name string
+		set  func(h *hotel)
+		undo func(h *hotel)
+	}{
+		{"restart: no room list yet", func(h *hotel) { h.roomsUnchecked = true }, func(h *hotel) { h.roomsUnchecked = false }},
+		{"last room list failed", func(h *hotel) { h.listOK = false }, func(h *hotel) { h.listOK = true }},
+		{"unconfirmed create cleanup", func(h *hotel) { h.unreaped = map[string]*unreapedBatch{"b1": {guest: "g2"}} }, func(h *hotel) { h.unreaped = nil }},
+	} {
+		setHotel(tc, "a", c.set)
+		if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
+			t.Fatalf("%s: reference change: %d %v", c.name, status, doc)
+		}
+		wantReservation(t, getHotelDoc(t, tc, "a"), "g2", "owner:g2", 1)
+		setHotel(tc, "a", c.undo)
+	}
+	// A real restart: the counters are empty and the hotel is unchecked.
+	tc.start(t)
+	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
+		t.Fatalf("after restart: %d %v", status, doc)
+	}
+	// The switch is refused too: a plain reserved hotel, count unknown.
+	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": "g1"}); status != 200 {
+		t.Fatalf("reserve b: %d %v", status, doc)
+	}
+	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"pin_only": true}); status != 409 || errCode(doc) != "rooms_active" {
+		t.Fatalf("switch with unknown rooms: %d %v", status, doc)
+	}
+	markRoomsKnown(tc)
+	if status, doc := patchHotelDoc(t, tc, "a", change); status != 200 {
+		t.Fatalf("once known and empty: %d %v", status, doc)
 	}
 }

@@ -20,9 +20,26 @@ import (
 
 const dedHeader = dedicatedHotelHeader
 
-func pinChain(t *testing.T) *testChain {
+// knownChain is newChainState over a fresh state dir with every hotel's room
+// count known, as after the first good room list (occupancyKnown).
+func knownChain(t *testing.T) *testChain {
 	t.Helper()
 	tc := newChainState(t, t.TempDir())
+	markRoomsKnown(tc)
+	return tc
+}
+
+func markRoomsKnown(tc *testChain) {
+	tc.b.mu.Lock()
+	defer tc.b.mu.Unlock()
+	for _, h := range tc.b.hotelList() {
+		h.roomsUnchecked, h.listOK = false, true
+	}
+}
+
+func pinChain(t *testing.T) *testChain {
+	t.Helper()
+	tc := knownChain(t)
 	status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2", "pin_only": true})
 	if status != 200 || doc["pin_only"] != true {
 		t.Fatalf("pin a: %d %v", status, doc)
@@ -179,7 +196,7 @@ func TestPinOnlySharedCreatesNeverLandOnTheHotel(t *testing.T) {
 }
 
 func TestPinOnlyQueuedSharedCreateIsPlacedAgainAtTheRecheck(t *testing.T) {
-	tc := newChainState(t, t.TempDir())
+	tc := knownChain(t)
 	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
@@ -318,7 +335,7 @@ func pinWait(t *testing.T, cond func() bool) {
 }
 
 func TestPinOnlySwitchWaitsForCreatesQueuedAndClaims(t *testing.T) {
-	tc := newChainState(t, t.TempDir())
+	tc := knownChain(t)
 	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
@@ -349,7 +366,7 @@ func TestPinOnlySwitchWaitsForCreatesQueuedAndClaims(t *testing.T) {
 }
 
 func TestPinOnlyClaimHeldByAPrefetchBlocksTheSwitchAndPruningKeepsPullingJobs(t *testing.T) {
-	tc := newChainState(t, t.TempDir())
+	tc := knownChain(t)
 	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
@@ -423,6 +440,7 @@ func TestPinOnlyClaimHeldByAWorkspaceCreateBlocksTheSwitch(t *testing.T) {
 	wc := newWSChain(t)
 	wc.b.cfg.StateDir = t.TempDir()
 	wc.b.cfg.OperatorKeySHA256 = sha("operator-key")
+	markRoomsKnown(wc.testChain)
 	if status, doc := patchHotelDoc(t, wc.testChain, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
@@ -556,6 +574,7 @@ func TestPinOnlyReservedForChangeClearsItAndASameOwnerPatchKeepsIt(t *testing.T)
 	}
 	// A restart keeps it (hotel-reservations.json), with the generation.
 	tc.start(t)
+	markRoomsKnown(tc)
 	doc := getHotelDoc(t, tc, "a")
 	if doc["pin_only"] != true {
 		t.Fatalf("after restart: %v", doc)
@@ -579,6 +598,7 @@ func TestPinOnlyReservedForChangeClearsItAndASameOwnerPatchKeepsIt(t *testing.T)
 		t.Fatalf("release: %d %v", status, doc)
 	}
 	tc.start(t)
+	markRoomsKnown(tc)
 	if doc := getHotelDoc(t, tc, "a"); doc["pin_only"] != false {
 		t.Fatalf("after release and restart: %v", doc)
 	}
@@ -640,7 +660,7 @@ func TestPinOnlyFailClosedAuditAndLendClearIt(t *testing.T) {
 }
 
 func TestPinOnlyNeedsAReservationInTheConfigFileAndOnJoin(t *testing.T) {
-	tc := newChainState(t, t.TempDir())
+	tc := knownChain(t)
 	raw, _ := os.ReadFile(tc.cfgPath)
 	var c config
 	if err := json.Unmarshal(raw, &c); err != nil {
@@ -655,7 +675,7 @@ func TestPinOnlyNeedsAReservationInTheConfigFileAndOnJoin(t *testing.T) {
 		t.Fatalf("config pin_only without reserved_for: %v", err)
 	}
 	// A join with pin_only and no reservation is 400.
-	tc = newChainState(t, t.TempDir())
+	tc = knownChain(t)
 	_, url := newOperatorHotel(t, 4, snpAttestation(t, attestOpts{chip: chipOf("j1")}))
 	status, doc := tc.call(t, "operator-key", "POST", "/v1/broker/hotels", map[string]any{"id": "j1", "api": url, "key": joinKey, "sealed": true, "pin_only": true})
 	if status != 400 || errCode(doc) != "invalid_hotel" {

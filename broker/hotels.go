@@ -824,6 +824,11 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			writeErr(w, 409, "rooms_active", fmt.Sprintf("hotel %s has %d creates or calls in flight; wait until they end, then set pin_only", h.cfg.ID, n))
 			return
 		}
+		if !h.occupancyKnown() {
+			b.mu.Unlock()
+			writeErr(w, 409, "rooms_active", fmt.Sprintf("hotel %s: its rooms are not known yet (no good room list since start, or unconfirmed create cleanup); retry when the room count is known", h.cfg.ID))
+			return
+		}
 	}
 	h.cfgMu.Lock()
 	oldCfg := h.cfg
@@ -842,6 +847,13 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	// below: a create that passed the dispatch recheck is in h.creating until
 	// it ends, so the bump cannot overtake it.
 	if reserve != nil && !lc.reclaim && h.cfg.PinOnly && *reserve == h.cfg.ReservedFor && ref != h.cfg.ReservationRef {
+		if !h.occupancyKnown() {
+			// Zero rooms after a restart or a failed list is unknown, not empty.
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, 409, "rooms_active", fmt.Sprintf("hotel %s is pin_only and its rooms are not known (no good room list since start, or unconfirmed create cleanup); retry when the room count is known", h.cfg.ID))
+			return
+		}
 		if n := len(h.rooms) + h.creating + h.queued + h.claims; n > 0 {
 			h.cfgMu.Unlock()
 			b.mu.Unlock()
