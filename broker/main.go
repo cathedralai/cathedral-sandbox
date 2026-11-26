@@ -81,6 +81,10 @@ type hotelConfig struct {
 	// Set by PATCH, never by the config file (reservations.go, AB#982).
 	ReservationGeneration uint64 `json:"reservation_generation,omitempty"`
 	ReservationRef        string `json:"reservation_ref,omitempty"`
+	// PinOnly: a reserved sealed hotel that takes only a create marked for it
+	// by its owner (pin_only.go, AB#982 Track A). Any change of ReservedFor
+	// clears it.
+	PinOnly bool `json:"pin_only,omitempty"`
 	// MinerHotkey: the SS58 hotkey of the SN94 miner that runs the hotel.
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
@@ -373,7 +377,7 @@ type hotel struct {
 	// guestPin is the verified guest TLS SPKI (miner_tls.go); nil: none yet.
 	// Read on every TLS handshake, so atomic.
 	guestPin atomic.Pointer[[sha256.Size]byte]
-	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.ReservationGeneration, cfg.ReservationRef, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.ReservationGeneration, cfg.ReservationRef, cfg.PinOnly, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem      chan struct{}
 	conns    *connGate // data connection slots (hotelconns.go)
 
@@ -383,6 +387,7 @@ type hotel struct {
 	rooms        map[string]*room // by hotel room id
 	queued       int
 	creating     int
+	claims       int // prefetch, workspace create and prewarm calls selected here and not ended (pin_only.go)
 	diskPending  int // extra disk GiB of the creates in queued and creating (disk.go)
 	backoffUntil time.Time
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
@@ -707,6 +712,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if h.cfg.ReservationGeneration != 0 || h.cfg.ReservationRef != "" {
 			return nil, fmt.Errorf("config: hotel %q: reservation_generation and reservation_ref are set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
+		}
+		if err := pinOnlyConfigError(h.cfg); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", h.cfg.ID, err)
 		}
 		h.roomsUnchecked = true
 	}
@@ -1294,6 +1302,12 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 				return finish(refusedRetry(last, e, retry))
 			}
 		}
+		if b.dedicatedStaleLocked(pl) {
+			// A retry of a dedicated create whose hotel moved on ends here,
+			// however late it resumes (pin_only.go, B4).
+			b.mu.Unlock()
+			return finish(dedicatedStaleResult(pl))
+		}
 		h := b.pick(tried, pl)
 		if h == nil && !fellBack {
 			// "placement": "prefer": the named hotels are down or full.
@@ -1342,6 +1356,21 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		// Give the slot back and place the create again.
 		now := time.Now()
 		stale := h.leaving || !b.admitted(h, now) || !b.freshAttestOK(h, now)
+		// The selection changed while the create waited (for example the
+		// hotel turned pin_only): a create that no longer qualifies is placed
+		// again, and a dedicated create whose marker went stale ends here
+		// (pin_only.go, AB#982). The create stays counted in h.queued, then
+		// h.creating (one b.mu hold moves it), so a PATCH that would bump the
+		// generation (B8) or change the owner sees it until it ends.
+		if b.dedicatedStaleLocked(pl) {
+			h.queued--
+			g.queued--
+			h.holdDisk(pl, -1)
+			b.mu.Unlock()
+			<-h.sem
+			return finish(dedicatedStaleResult(pl))
+		}
+		stale = stale || !pl.selects(h)
 		// A fresh create (AB#683) was pinned against the hotel's attestation
 		// at that time. While it waited, the hotel may have re-attested on
 		// another kit or binding (noteAttestation replaces h.adm), and an
@@ -1849,6 +1878,16 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
+	// The dedicated marker (pin_only.go) is checked against the hotel as it is
+	// now, before anything is placed; placement.selects holds it from here on.
+	mark, present, merr := parseDedicatedHeader(r)
+	if present && merr == nil {
+		merr = b.checkDedicated(g, mark, payload)
+	}
+	if merr != nil {
+		writeAPIErr(w, merr)
+		return
+	}
 	// AB#683: either fresh header needs the #659 opt-in (default off). It is
 	// refused before the headers are read or the replay table is asked, so a
 	// guest without it learns nothing and nothing is sent.
@@ -1934,7 +1973,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 			return
 		}
 	}
-	pl, perr := b.placementFor(r.Context(), g, payload)
+	pl, perr := b.placementFor(r.Context(), g, payload, mark)
 	if perr != nil {
 		writeAPIErr(w, perr)
 		return
@@ -3405,6 +3444,9 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 401, "unauthorized", "missing or unknown Bearer key")
 			return
 		}
+		if refuseDedicatedHeader(w, r) {
+			return
+		}
 		if isCompat(r) {
 			b.serveCompat(w, r, g)
 			return
@@ -3491,7 +3533,7 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.mu.Lock()
 			n, up := 0, 0
 			for _, h := range b.hotelList() {
-				if !g.cfg.Ops && !g.guestReaches(h) {
+				if !g.cfg.Ops && (!g.guestReaches(h) || h.pinOnly()) { // pin_only: listed, not counted (B7)
 					continue
 				}
 				n++

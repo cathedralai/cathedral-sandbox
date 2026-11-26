@@ -211,6 +211,9 @@ func parseConfigFile(raw []byte) (config, []*hotel, map[string]*guestState, map[
 		if h.cfg.ReservationGeneration != 0 || h.cfg.ReservationRef != "" {
 			return c, nil, nil, nil, fmt.Errorf("config: hotel %q: reservation_generation and reservation_ref are set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
 		}
+		if err := pinOnlyConfigError(h.cfg); err != nil {
+			return c, nil, nil, nil, fmt.Errorf("config: hotel %q: %w", h.cfg.ID, err)
+		}
 	}
 	return c, hotels, guests, byKey, nil
 }
@@ -453,7 +456,7 @@ func (b *broker) reloadConfig(wantSHA string) (reloadSummary, error) {
 			reservationsChanged = true
 		}
 		if e, ok := b.lendsOnDisk[h.cfg.ID]; ok { // a lent hotel back in the file keeps its lend
-			h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = e.LentFrom, e.LentReportID, ""
+			h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor, h.cfg.PinOnly = e.LentFrom, e.LentReportID, "", false
 			delete(b.lendsOnDisk, h.cfg.ID)
 		}
 	}
