@@ -1,6 +1,7 @@
 # VM execution history for billing settlement (AB#992)
 
-Status: spec r3 (Astra r1: 10 findings; r2: 2 BLOCKER and 6 SHOULD, all addressed below). Owner: Spock.
+Status: spec r4 (Astra r1: 10 findings; r2: 2 BLOCKER, 6 SHOULD; r3: 1 BLOCKER, 2 SHOULD, 1 NIT; all addressed
+below). Owner: Spock.
 Consumer: the inactive VM billing worker in polariscomputer (PR 2296 stack, `ExecutionReader`
 in `polaris/services/vm_credit_settlement.py`). Rates and thresholds are not touched here
 (Toby, Core 26 Nov: contract defaults, frozen catalog quote).
@@ -96,16 +97,25 @@ anything that depends on it (H2, H5). Delete never removes it.
   - Any other malformed line makes the whole file `history_unknown`.
 - **H7. Names are not reused (r1 SHOULD 9).** `cmd_create` refuses a name that has a history
   file.
-- **H8. Time (r1 SHOULD 10).**
+- **H8. Time (r1 SHOULD 10, r2 BLOCKER 2, r3 BLOCKER 1).**
   - Each line records the wall clock in microseconds, `boot_id`, `CLOCK_MONOTONIC`
-    nanoseconds and `synced` (from `adjtimex`, the kernel's NTP sync state).
-  - `history` derives `started_at` only when both lines are `synced` (r2 BLOCKER 2).
-    Otherwise it answers `history_unknown`:
-    - **Same boot** for start and close: `started_at = close.wall_us - (close.mono_ns -
-      start.mono_ns) / 1000`. The duration is exact, and the anchor is the close line's
-      microsecond wall time, not the integer `stopped_at`.
-    - **Different boots** (a reboot during the run): `start.wall_us`.
-  - `started_at` is never later than the close time.
+    nanoseconds, and from `adjtimex(2)` (read only):
+    - `synced`: STA_UNSYNC clear.
+    - `maxerror_us`: the kernel's maximum clock error.
+  - `started_at` is a conservative LOWER bound: never later than real execution, so no
+    execution goes unbilled.
+  - How `history` derives it:
+    - **Same boot:** `started_at = close.wall_us - close.maxerror_us -
+      ceil(elapsed_us * 1.0005)`, with `elapsed_us = (close.mono_ns - start.mono_ns) / 1000`.
+      The 500 ppm covers NTP slewing of CLOCK_MONOTONIC.
+    - **Different boots** (a reboot during the run): `start.wall_us - start.maxerror_us`.
+    - It answers `history_unknown` if any line it uses is unsynced, or its `maxerror_us` is
+      missing or above 1 s.
+  - The answer carries `started_at_error_us`, the total error subtracted.
+  - Because it is a lower bound, it can fall before the run's funding time. Real execution
+    cannot precede funding: the host checks payment before writing the start line. So the
+    consumer clamps `started_at` up to `run.started_at` instead of rejecting it. This is a
+    change to `confirm_stopped` in `vm_credit_ledger.py` on the 2296 stack, for its owner.
 - **H9. `vm-ctl.sh history <name> <G>`**, read-only, works after delete:
   - Closed G with G >= N answers `{"generation":G,"closed":true,"started_at":ISO-us|null,
     "stopped_at":S,"tracked_from":N,"close_reason":R,"history":"v2"}`.
@@ -121,16 +131,28 @@ Every append below is followed by fsync of the file and the state dir before the
     (`stale_authorization` or `generation_closed`).
   - They call host `cancel` for that generation. It returns the canonical close, whether
     the close was just made or made earlier (for example an H3 `superseded` close).
+- **B0a. Intents before dispatch (r3 SHOULD 2, 3).**
+  - Before sending a host `authorize`, `cancel` or `stop` for (vm, G), the broker appends an
+    intent `{"intent":"authorize"|"close","vm","account","host","generation"}` to
+    `vm-runs.jsonl`, durably.
+  - A close intent is resolved by its receipt (B1).
+  - An authorize intent is resolved by `{"resolved":"authorize","vm","generation",
+    "accepted"}`. A refusal counts as resolved and not accepted.
 - **B1. Stop receipts before anything else (r1 SHOULD 6, r2 SHOULD 6).**
   - Once the host returns a close record, the broker appends
     `{"vm","account","host","generation","stopped_at","kind"}` to `vm-runs.jsonl` and
     makes it durable.
   - Only then does it write the stopped state to `vms.json` and answer 200. A failed
     append answers 500 `state_not_saved`, and `vms.json` is unchanged.
-  - Authorize and start of G+1 refuse with 409 `receipt_missing` while G is closed on
-    record without a B1 receipt.
-  - At broker start, a reconcile pass replays any VM whose `vms.json` shows a closed G
-    without a receipt by calling host `cancel G`, which returns the same close.
+  - Authorize and start of a new generation refuse with 409 `receipt_missing` while any
+    intent for that VM is unresolved.
+  - Broker start replays, in this order:
+    1. It copies receipts forward into a stale `vms.json`.
+    2. Every close intent without a receipt goes through host `cancel G`, which returns
+       the same close.
+    3. Every unresolved authorize intent also goes through host `cancel G`, which fences
+       it, and gets a receipt. A lost authorize reply then never leaves an open,
+       unrecorded generation.
 - **B2. Eager history.**
   - Right after B1, the broker calls the host `history` once and appends the closed answer
     to `vm-history.jsonl`, keyed by `(vm, generation)`. It is never overwritten.
@@ -139,8 +161,8 @@ Every append below is followed by fsync of the file and the state dir before the
   - An answer whose `stopped_at` differs from the B1 receipt is refused with
     `vm_history_mismatch` and logged. After H4 this means a bug or tampering.
 - **B3. Delete (r1 SHOULD 7, r2 SHOULD 7, 8).**
-  - `deleteVM` first works out the outstanding set: `Generation`, `AuthorizedGeneration`
-    and any unresolved start intent.
+  - `deleteVM` first works out the outstanding set: `Generation`, `AuthorizedGeneration`,
+    any unresolved start intent, and every authorize intent not resolved as refused.
   - It closes every member through host `cancel` (B0, B1), and stores history for every
     generation with a B1 receipt (B2).
   - It refuses with 409 `history_not_stored` until every receipt has history or the host
@@ -185,7 +207,9 @@ Every append below is followed by fsync of the file and the state dir before the
   - Cancel and start racing in both orders.
   - A start line, then a failed launch, then cancel G: it closes, and history bills from the
     start line.
-  - Unsynced lines give `history_unknown` in both time branches.
+  - Unsynced lines, or a missing or oversized `maxerror_us`, give `history_unknown`.
+  - A clock running fast by up to `maxerror_us` never gives a `started_at` after the true
+    start.
   - Rollout with a running G: stop G, then `history` is `history_unknown`, and a retried
     start of G stays unknown.
   - Authorize G+1 over a started G is refused; over an unstarted G it closes G as never
@@ -194,8 +218,8 @@ Every append below is followed by fsync of the file and the state dir before the
   - Crash after the close line and before `stop.json`: the retry returns the same
     `stopped_at`, and history agrees.
   - Delete, then `history` still answers. Create with the same name is refused.
-  - Cancel of an undelivered G fences it and is idempotent. Cancel of a started G is
-    refused.
+  - Cancel of an undelivered G fences it and is idempotent. Cancel of a started G stops
+    and closes it, keeps its start line, and repeats the same record.
   - A torn final line is ignored and repaired. A torn middle line makes the file unknown.
   - Same-boot derivation; cross-boot with unsynced clocks is unknown.
   - Ordinary start and stop retries keep the first times.
@@ -203,7 +227,10 @@ Every append below is followed by fsync of the file and the state dir before the
   - A host refusal on stop or cancel stores the host's canonical close, never broker time.
   - A crash between the B1 append and `vms.json` replays at start. G+1 is refused while G
     has no receipt.
-  - Delete with an authorized, unstarted G2 cancels and records G2 first.
+  - Delete with an authorized, unstarted G2 cancels and records G2 first. So does a lost
+    authorize reply.
+  - A crash after the B1 receipt and before `vms.json` is copied forward at start.
+  - A cancel that fails before B1 is recovered from its intent.
   - An interrupted delete replays.
   - The B1 receipt is written before 200, and a failed write is 500.
   - A history fetch failure, then G+1 starts, then the G history read still matches the B1
