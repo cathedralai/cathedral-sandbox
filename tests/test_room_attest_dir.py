@@ -33,7 +33,6 @@ def fake(tmp_path, monkeypatch) -> FakeDocker:
 
 def _app(monkeypatch, root: Path | None, *, tenancy: str | None = "dedicated"):
     monkeypatch.delenv("CATHEDRAL_SEALED_SECRETS_DIR", raising=False)
-    monkeypatch.delenv("ROOM_EXPOSE_SEV_GUEST", raising=False)
     if tenancy is None:
         monkeypatch.delenv("CATHEDRAL_HOTEL_TENANCY", raising=False)
     else:
