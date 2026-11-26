@@ -81,6 +81,10 @@ type hotelConfig struct {
 	// Set by PATCH, never by the config file (reservations.go, AB#982).
 	ReservationGeneration uint64 `json:"reservation_generation,omitempty"`
 	ReservationRef        string `json:"reservation_ref,omitempty"`
+	// PinOnly: a reserved sealed hotel that takes only a create marked for it
+	// by its owner (pin_only.go, AB#982 Track A). Any change of ReservedFor
+	// clears it.
+	PinOnly bool `json:"pin_only,omitempty"`
 	// MinerHotkey: the SS58 hotkey of the SN94 miner that runs the hotel.
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
@@ -373,7 +377,7 @@ type hotel struct {
 	// guestPin is the verified guest TLS SPKI (miner_tls.go); nil: none yet.
 	// Read on every TLS handshake, so atomic.
 	guestPin atomic.Pointer[[sha256.Size]byte]
-	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.ReservationGeneration, cfg.ReservationRef, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.ReservationGeneration, cfg.ReservationRef, cfg.PinOnly, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem      chan struct{}
 	conns    *connGate // data connection slots (hotelconns.go)
 
@@ -383,6 +387,7 @@ type hotel struct {
 	rooms        map[string]*room // by hotel room id
 	queued       int
 	creating     int
+	claims       int // prefetch, workspace create and prewarm calls selected here and not ended (pin_only.go)
 	diskPending  int // extra disk GiB of the creates in queued and creating (disk.go)
 	backoffUntil time.Time
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
@@ -447,6 +452,21 @@ type hotel struct {
 	// keeps those rooms out of the guest's rooms and retries their removal
 	// until a list shows none left (AB#338).
 	unreaped map[string]*unreapedBatch
+	// lostPending: creates sent here whose outcome is unknown (the reply was
+	// lost or the hotel failed after starting the room) and whose cleanup has
+	// not ended. Counted in the hold that ends h.creating, so the hotel is
+	// never seen empty in between (pin_only.go occupancyKnown). Guarded by
+	// broker.mu.
+	lostPending int
+	// guardedLost: of those, the attempts that were guarded (pin_only, held or
+	// quarantined) when sent. They keep the hotel guarded until reapOrphans
+	// installs the record, in the same b.mu hold (pin_only.go).
+	guardedLost int
+	// quarantineUntil (unix ns): a pin_only hotel with a lost create is closed
+	// to every unmarked placement until the create deadline, even after the
+	// flag is cleared (pin_only.go quarantined). Atomic: selects reads it
+	// without b.mu.
+	quarantineUntil atomic.Int64
 	// Guarded by broker.mu. guestWarm: per guest, the images that guest
 	// prefetched here since the hotel last came up. guestWant: per guest,
 	// the refs to pull again when the hotel comes back (prefetched without a
@@ -476,6 +496,10 @@ type unreapedBatch struct {
 	// counted its lost attempts, which still count in uncertain until then
 	// (allowance.go unresolvedLocked).
 	unsettled bool
+	// lostHold: kept only because an empty cleanup list proves nothing before
+	// holdUntil (reapOrphans, pin_only.go). A metered request whose attempts
+	// all got a room listed and removed is settled and drops it.
+	lostHold bool
 }
 
 // recordedLeftover reports whether listed room id, with these labels, is a
@@ -707,6 +731,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if h.cfg.ReservationGeneration != 0 || h.cfg.ReservationRef != "" {
 			return nil, fmt.Errorf("config: hotel %q: reservation_generation and reservation_ref are set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
+		}
+		if err := pinOnlyConfigError(h.cfg, c.StateDir); err != nil {
+			return nil, fmt.Errorf("config: hotel %q: %w", h.cfg.ID, err)
 		}
 		h.roomsUnchecked = true
 	}
@@ -1241,6 +1268,13 @@ type createResult struct {
 	// lost: hotels that got the create but never answered. Each may hold a
 	// room this guest does not know about; handleCreate reaps them.
 	lost []*hotel
+	// lostUntil: when the hotel can no longer be working on the lost creates:
+	// the latest send time plus hotelCreateTimeout and lostMargin. An empty
+	// cleanup list before it proves nothing (pin_only.go).
+	lostUntil time.Time
+	// lostGuarded: the lost attempts (one entry each) that were guarded when
+	// sent: they leave the quarantine and the hold (pin_only.go).
+	lostGuarded []*hotel
 	// sent: the create bytes the hotel that answered 202 received. createOne
 	// sends one slice on every attempt, so these are the bytes of any retry
 	// too; handleCreate returns them when the caller asks (returnCreateHeader).
@@ -1263,7 +1297,12 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	tried := map[*hotel]bool{}
 	var last createResult
 	var lost []*hotel
-	finish := func(r createResult) createResult { r.lost = lost; return r }
+	var lostUntil time.Time
+	var lostGuarded []*hotel
+	finish := func(r createResult) createResult {
+		r.lost, r.lostUntil, r.lostGuarded = lost, lostUntil, lostGuarded
+		return r
+	}
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
 	// size: read from body at the first retry of a metered create (allowance.go).
@@ -1293,6 +1332,12 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 				b.mu.Unlock()
 				return finish(refusedRetry(last, e, retry))
 			}
+		}
+		if b.dedicatedStaleLocked(pl) {
+			// A retry of a dedicated create whose hotel moved on ends here,
+			// however late it resumes (pin_only.go, B4).
+			b.mu.Unlock()
+			return finish(dedicatedStaleResult(pl))
 		}
 		h := b.pick(tried, pl)
 		if h == nil && !fellBack {
@@ -1342,6 +1387,21 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		// Give the slot back and place the create again.
 		now := time.Now()
 		stale := h.leaving || !b.admitted(h, now) || !b.freshAttestOK(h, now)
+		// The selection changed while the create waited (for example the
+		// hotel turned pin_only): a create that no longer qualifies is placed
+		// again, and a dedicated create whose marker went stale ends here
+		// (pin_only.go, AB#982). The create stays counted in h.queued, then
+		// h.creating (one b.mu hold moves it), so a PATCH that would bump the
+		// generation (B8) or change the owner sees it until it ends.
+		if b.dedicatedStaleLocked(pl) {
+			h.queued--
+			g.queued--
+			h.holdDisk(pl, -1)
+			b.mu.Unlock()
+			<-h.sem
+			return finish(dedicatedStaleResult(pl))
+		}
+		stale = stale || !pl.selects(h)
 		// A fresh create (AB#683) was pinned against the hotel's attestation
 		// at that time. While it waited, the hotel may have re-attested on
 		// another kit or binding (noteAttestation replaces h.adm), and an
@@ -1380,6 +1440,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 		h.queued--
 		g.queued--
 		h.creating++
+		// Decided once, at send time: whether this attempt must leave a fence if
+		// its reply is lost, whatever the hotel's flag is by then (pin_only.go).
+		guarded := h.pinGuardedLocked()
 		h.place(rm)
 		b.mu.Unlock()
 
@@ -1431,8 +1494,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			gone := ctx.Err() != nil
 			h.release(rm)
 			rm.hid, rm.id = hid, h.cfg.ID+"."+hid
+			turned := b.registerReapedLocked(h, rm) // same hold as creating--: the hotel is never seen empty
 			b.mu.Unlock()
-			b.reapRoom(h, rm)
+			b.finishReap(h, rm, turned)
 			if gone {
 				return finish(clientGone())
 			}
@@ -1445,8 +1509,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// asked: remove it and try another hotel, without resting this one.
 			h.release(rm)
 			rm.hid, rm.id = hid, h.cfg.ID+"."+hid
+			turned := b.registerReapedLocked(h, rm) // same hold as creating--: the hotel is never seen empty
 			b.mu.Unlock()
-			b.reapRoom(h, rm)
+			b.finishReap(h, rm, turned)
 			last = createResult{status: 409, doc: errDoc("tunables_unavailable",
 				"hotel "+h.cfg.ID+" does not apply per-room tunables (room kit without them)")}
 			continue
@@ -1540,6 +1605,15 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// the guest's own image fault is a refusal: no room was started.
 			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
+				if guarded { // b.mu held: close it to unmarked placement until the deadline
+					h.noteQuarantine(tDispatch.Add(hotelCreateTimeout + lostMargin))
+					h.guardedLost++
+					lostGuarded = append(lostGuarded, h)
+				}
+				h.lostPending++ // same hold as creating--: until createMany's cleanup confirms (reapOrphans)
+				if u := tDispatch.Add(hotelCreateTimeout + lostMargin); u.After(lostUntil) {
+					lostUntil = u
+				}
 				b.noteUncertainLocked(g) // counts for a metered guest until reaped (allowance.go)
 			}
 			if err != nil {
@@ -1598,11 +1672,19 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 		}
 		wg.Wait()
 	}
-	lost := map[*hotel]bool{}
+	lost := map[*hotel]int{}     // the lost attempts per hotel, each counted in h.lostPending
+	guardedN := map[*hotel]int{} // of those, the attempts guarded when sent (h.guardedLost)
 	keep := map[*hotel]map[string]bool{}
+	var lostUntil time.Time
 	for _, res := range results {
+		for _, h := range res.lostGuarded {
+			guardedN[h]++
+		}
+		if res.lostUntil.After(lostUntil) {
+			lostUntil = res.lostUntil
+		}
 		for _, h := range res.lost {
-			lost[h] = true
+			lost[h]++
 		}
 		if res.status == 202 {
 			if hid, ok := res.doc["id"].(string); ok {
@@ -1617,8 +1699,8 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 			}
 		}
 	}
-	for h := range lost {
-		if b.reapOrphans(h, g, batchID, keep[h]) {
+	for h, n := range lost {
+		if b.reapOrphans(h, g, batchID, keep[h], n, guardedN[h], lostUntil) {
 			continue
 		}
 		// The failed hotel may still run a room of this request: the guest
@@ -1648,15 +1730,46 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 // gets its answer and its result is returned: true only when h confirmed
 // every such room gone. Otherwise the request is recorded in h.unreaped and
 // later passes retry in the background, then from the sync loop.
-func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool) bool {
+//
+// pending is the number of lost attempts this request counted in
+// h.lostPending: they end here, with the request either confirmed gone or
+// recorded in h.unreaped in the same b.mu hold, so the hotel never looks empty.
+//
+// An empty list proves absence only once the hotel can no longer be working
+// on the create (until, from the send time and the create timeout): before
+// that the request is retained in h.unreaped with a hold to until, in the
+// same b.mu hold that drops the pending count, and the sync loop ends it with
+// a list asked after until (pin_only.go, Astra r3).
+func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool, pending, guarded int, until time.Time) bool {
+	asked := time.Now()
 	if b.reapPass(h, g.cfg.ID, batchID, keep, 3*time.Second) {
+		b.mu.Lock()
+		h.lostPending -= pending
+		h.guardedLost -= guarded
+		// Only attempts guarded when sent keep the post-deadline record (B8
+		// needs it), whatever the flag is now; an ordinary hotel clears on an
+		// empty list, as on main.
+		if guarded > 0 && asked.Before(until) && h.unreaped[batchID] == nil {
+			if h.unreaped == nil {
+				h.unreaped = map[string]*unreapedBatch{}
+			}
+			h.unreaped[batchID] = &unreapedBatch{guest: g.cfg.ID, keep: keep, holdUntil: until, unsettled: true, lostHold: true}
+		}
+		b.mu.Unlock()
 		return true
 	}
 	b.mu.Lock()
+	h.lostPending -= pending
+	h.guardedLost -= guarded
 	if h.unreaped == nil {
 		h.unreaped = map[string]*unreapedBatch{}
 	}
+	// The deadline goes on this record too: a retry that lists nothing while
+	// the hotel is still starting the create proves nothing (pin_only.go).
 	ub := &unreapedBatch{guest: g.cfg.ID, keep: keep, busy: true, unsettled: true}
+	if guarded > 0 {
+		ub.holdUntil, ub.lostHold = until, true
+	}
 	h.unreaped[batchID] = ub
 	b.mu.Unlock()
 	go func() {
@@ -1849,6 +1962,16 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 		writeErr(w, 400, "invalid_json", "request body is not JSON")
 		return
 	}
+	// The dedicated marker (pin_only.go) is checked against the hotel as it is
+	// now, before anything is placed; placement.selects holds it from here on.
+	mark, present, merr := parseDedicatedHeader(r)
+	if present && merr == nil {
+		merr = b.checkDedicated(g, mark, payload)
+	}
+	if merr != nil {
+		writeAPIErr(w, merr)
+		return
+	}
 	// AB#683: either fresh header needs the #659 opt-in (default off). It is
 	// refused before the headers are read or the replay table is asked, so a
 	// guest without it learns nothing and nothing is sent.
@@ -1934,7 +2057,7 @@ func (b *broker) handleCreate(w http.ResponseWriter, r *http.Request, g *guestSt
 			return
 		}
 	}
-	pl, perr := b.placementFor(r.Context(), g, payload)
+	pl, perr := b.placementFor(r.Context(), g, payload, mark)
 	if perr != nil {
 		writeAPIErr(w, perr)
 		return
@@ -3405,6 +3528,9 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 401, "unauthorized", "missing or unknown Bearer key")
 			return
 		}
+		if refuseDedicatedHeader(w, r) {
+			return
+		}
 		if isCompat(r) {
 			b.serveCompat(w, r, g)
 			return
@@ -3491,7 +3617,7 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.mu.Lock()
 			n, up := 0, 0
 			for _, h := range b.hotelList() {
-				if !g.cfg.Ops && !g.guestReaches(h) {
+				if !g.cfg.Ops && (!g.guestReaches(h) || h.closedToShared()) { // pin_only: listed, not counted (B7)
 					continue
 				}
 				n++

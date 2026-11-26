@@ -98,7 +98,7 @@ func lendConfigError(hc hotelConfig) error {
 // every create placed on h and not yet listed (a reserved hotel takes creates
 // from its owner only, so they count as the owner's). Caller holds b.mu.
 func ownerBusy(h *hotel, owner string) int {
-	n := h.creating + h.queued
+	n := h.creating + h.queued + h.claims
 	for _, rm := range h.rooms {
 		if rm.guest == owner {
 			n++
@@ -187,14 +187,18 @@ func (b *broker) prepareLend(ctx context.Context, h *hotel, lend bool, reserve *
 
 // busyErr is the refusal for rooms on h. Caller holds b.mu.
 func (c lendChange) busyErr(h *hotel) *apiErr {
+	// h.cfg is read directly: applyLend holds h.cfgMu, and b.mu guards PinOnly writes.
+	if (c.lend || c.reclaim) && h.pinGuardedLocked() && !h.occupancyKnown() {
+		return &apiErr{409, "rooms_active", pinUnknownMsg(h)}
+	}
 	switch {
 	case c.lend:
 		if n := ownerBusy(h, c.owner); n > 0 {
 			return &apiErr{409, "owner_rooms_active", fmt.Sprintf("guest %s has %d rooms or creates on hotel %s; a hotel is lent only with none", c.owner, n, h.cfg.ID)}
 		}
 	case c.reclaim:
-		if n := h.used(); n > 0 {
-			return &apiErr{409, "rooms_active", fmt.Sprintf("hotel %s has %d rooms or creates; set drain first and wait until they are gone", h.cfg.ID, n)}
+		if n := h.used() + h.claims; n > 0 {
+			return &apiErr{409, "rooms_active", fmt.Sprintf("hotel %s has %d rooms, creates or calls; set drain first and wait until they are gone", h.cfg.ID, n)}
 		}
 	}
 	return nil
@@ -222,13 +226,13 @@ func (c lendChange) applyLend(h *hotel) *apiErr {
 		return e
 	}
 	if c.lend {
-		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = c.owner, c.reportID, ""
+		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor, h.cfg.PinOnly = c.owner, c.reportID, "", false
 		h.cfg.ReservationGeneration++ // reserved_for changed (reservations.go, AB#982); the ref stays the owner's
 		log.Printf("hotel %s lent from %s (REPORT_ID %s)", h.cfg.ID, c.owner, short(c.reportID))
 		return nil
 	}
 	log.Printf("hotel %s reclaimed for %s (REPORT_ID %s, lent with %s)", h.cfg.ID, c.owner, short(c.reportID), short(c.lentID))
-	h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = "", "", c.owner
+	h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor, h.cfg.PinOnly = "", "", c.owner, false
 	h.cfg.ReservationGeneration++ // patchHotel sets the reclaim's reservation_ref (reservations.go, AB#982)
 	return nil
 }
@@ -286,11 +290,28 @@ func foreignRooms(h *hotel, owner string) int {
 // creates would land next to those rooms and stay there. Caller holds b.mu
 // and not h.cfgMu.
 func reserveErr(h *hotel, owner string) *apiErr {
-	if owner == "" || owner == h.reservedFor() || hotelClass(h) != classSealed {
+	cur := h.reservedFor()
+	if owner == cur || hotelClass(h) != classSealed {
+		return nil // the same owner is no change
+	}
+	if h.pinGuardedLocked() && !h.occupancyKnown() {
+		// Release, a new owner and lend all open a pin_only hotel to shared
+		// placement: its room count must be known first (pin_only.go).
+		return &apiErr{409, "rooms_active", pinUnknownMsg(h)}
+	}
+	if owner == "" {
+		// A release is a reserved_for change too (B5): it opens the hotel to
+		// shared placement, so work the owner has in flight must be over.
+		// The owner's own rooms may stay, as before.
+		if n := h.creating + h.queued + h.claims; n > 0 {
+			return &apiErr{409, "rooms_active", fmt.Sprintf("hotel %s has %d creates or calls in flight; wait until they end, then release it", h.cfg.ID, n)}
+		}
 		return nil
 	}
-	if n := foreignRooms(h, owner) + h.creating + h.queued; n > 0 {
-		return &apiErr{409, "rooms_active", fmt.Sprintf("hotel %s has %d rooms or creates that are not %s's; "+
+	// h.claims: a prefetch or workspace create selected h before this change
+	// and has not ended (pin_only.go, AB#982).
+	if n := foreignRooms(h, owner) + h.creating + h.queued + h.claims; n > 0 {
+		return &apiErr{409, "rooms_active", fmt.Sprintf("hotel %s has %d rooms, creates or calls that are not %s's; "+
 			"drain it and wait until they are gone, then reserve it", h.cfg.ID, n, owner)}
 	}
 	return nil
@@ -312,7 +333,7 @@ func (b *broker) checkReservedRooms(h *hotel) bool {
 	h.cfgMu.Lock()
 	changed := h.cfg.ReservedFor == owner && h.cfg.LentFrom == ""
 	if changed {
-		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = owner, lentReportUnknown, ""
+		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor, h.cfg.PinOnly = owner, lentReportUnknown, "", false
 		h.cfg.ReservationGeneration++ // reserved_for changed (reservations.go, AB#982)
 	}
 	h.cfgMu.Unlock()
@@ -458,7 +479,7 @@ func (b *broker) loadConfigLends() error {
 		if r := h.cfg.ReservedFor; r != "" {
 			log.Printf("hotel %s is lent from %s (state_dir); config reserved_for %s waits for a reclaim", id, e.LentFrom, r)
 		}
-		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = e.LentFrom, e.LentReportID, ""
+		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor, h.cfg.PinOnly = e.LentFrom, e.LentReportID, "", false
 	}
 	return nil
 }

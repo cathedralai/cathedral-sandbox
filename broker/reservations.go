@@ -48,6 +48,7 @@ type reservationRecord struct {
 	Ref               string `json:"reservation_ref"`
 	Generation        uint64 `json:"reservation_generation"`
 	ConfigReservedFor string `json:"config_reserved_for"` // the file's reserved_for when the PATCH came
+	PinOnly           bool   `json:"pin_only,omitempty"`
 }
 
 // reservation is h's reservation_generation and reservation_ref.
@@ -63,6 +64,9 @@ func setReservation(h *hotel, owner, ref string) {
 	if h.cfg.ReservedFor != owner || h.cfg.ReservationRef != ref {
 		h.cfg.ReservationGeneration++
 	}
+	if h.cfg.ReservedFor != owner {
+		h.cfg.PinOnly = false // a new owner never inherits pin_only (pin_only.go)
+	}
 	h.cfg.ReservedFor, h.cfg.ReservationRef = owner, ref
 }
 
@@ -74,7 +78,7 @@ func (b *broker) noteConfigReservationLocked(h *hotel) bool {
 		b.reservations = map[string]reservationRecord{}
 	}
 	h.cfgMu.RLock()
-	r := reservationRecord{ReservedFor: h.cfg.ReservedFor, Ref: h.cfg.ReservationRef, Generation: h.cfg.ReservationGeneration, ConfigReservedFor: h.fileReservedFor}
+	r := reservationRecord{ReservedFor: h.cfg.ReservedFor, Ref: h.cfg.ReservationRef, Generation: h.cfg.ReservationGeneration, ConfigReservedFor: h.fileReservedFor, PinOnly: h.cfg.PinOnly}
 	h.cfgMu.RUnlock()
 	old, ok := b.reservations[h.cfg.ID]
 	if (ok && old == r) || (!ok && r.Generation == 0) {
@@ -118,10 +122,11 @@ func (b *broker) applySavedReservationLocked(h *hotel) bool {
 	if r.ConfigReservedFor != h.fileReservedFor {
 		log.Printf("hotel %s: saved reserved_for %q (ref %q) dropped: the config file's reserved_for changed since (file wins)", h.cfg.ID, r.ReservedFor, r.Ref)
 		h.cfg.ReservationGeneration = r.Generation + 1
-		b.reservations[h.cfg.ID] = reservationRecord{ReservedFor: h.cfg.ReservedFor, Generation: h.cfg.ReservationGeneration, ConfigReservedFor: h.fileReservedFor}
+		b.reservations[h.cfg.ID] = reservationRecord{ReservedFor: h.cfg.ReservedFor, Generation: h.cfg.ReservationGeneration, ConfigReservedFor: h.fileReservedFor, PinOnly: h.cfg.PinOnly}
 		return true
 	}
 	h.cfg.ReservedFor, h.cfg.ReservationRef, h.cfg.ReservationGeneration = r.ReservedFor, r.Ref, r.Generation
+	h.cfg.PinOnly = r.PinOnly && r.ReservedFor != ""
 	log.Printf("hotel %s: reserved_for %q (ref %q, generation %d) kept from before the restart (%s)", h.cfg.ID, r.ReservedFor, r.Ref, r.Generation, reservationsFile)
 	return false
 }

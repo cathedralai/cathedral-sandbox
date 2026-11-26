@@ -415,7 +415,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	hc.ReservationGeneration, hc.ReservationRef = 0, ""
 	if enroller {
 		if hc.MinerHotkey == "" || !hc.Sealed || (req.Verify != nil && !*req.Verify) ||
-			hc.ReservedFor != "" || hc.Labels != nil || hc.DataConns != 0 || hc.DataConnWaitSeconds != 0 || hc.MemFullPct != nil ||
+			hc.ReservedFor != "" || hc.PinOnly || hc.Labels != nil || hc.DataConns != 0 || hc.DataConnWaitSeconds != 0 || hc.MemFullPct != nil ||
 			!strings.HasPrefix(hc.API, "https://") || (hc.Health != "" && !strings.HasPrefix(hc.Health, "https://")) {
 			writeErr(w, 403, "enroller_scope", "miner enrollment requires a verified HTTPS sealed miner hotel without custom labels or reservation")
 			return
@@ -534,6 +534,10 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 	}
 	if hc.ReservedFor != "" && !b.guestExists(hc.ReservedFor) {
 		writeErr(w, 409, "unknown_guest", "reserved_for names no guest "+hc.ReservedFor)
+		return
+	}
+	if err := pinOnlyConfigError(hc, b.cfg.StateDir); err != nil {
+		writeErr(w, 400, "invalid_hotel", err.Error())
 		return
 	}
 	h := newHotel(hc, req.Key)
@@ -686,6 +690,9 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		// newer one changes nothing.
 		ReservationRef   *string `json:"reservation_ref"`
 		ExpectGeneration *uint64 `json:"expect_generation"`
+		// pin_only (pin_only.go): the hotel takes only creates its owner marks
+		// for it. Operator only.
+		PinOnly *bool `json:"pin_only"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
@@ -693,7 +700,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		return
 	}
 	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil || len(req.MemFullPct) != 0 ||
-		req.ReservationRef != nil || req.ExpectGeneration != nil) {
+		req.ReservationRef != nil || req.ExpectGeneration != nil || req.PinOnly != nil) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true, with or without a drain_notice")
 		return
 	}
@@ -779,6 +786,24 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			ref = *req.ReservationRef
 		}
 	}
+	if b.cfg.StateDir == "" && ((req.PinOnly != nil && *req.PinOnly) || (h.pinOnly() && reserve != nil)) {
+		// Never acknowledge a fence that a restart would lose (pin_only.go).
+		writeErr(w, 409, "no_state_dir", "set state_dir in the config: pin_only and its reservation changes must be saved")
+		return
+	}
+	if req.PinOnly != nil && *req.PinOnly {
+		switch {
+		case hotelClass(h) != classSealed:
+			writeErr(w, 400, "invalid_hotel", "pin_only needs a sealed hotel")
+			return
+		case req.Lend != nil:
+			writeErr(w, 400, "invalid_hotel", "pin_only cannot be set while lending the hotel")
+			return
+		case (reserve != nil && *reserve == "") || (reserve == nil && h.reservedFor() == ""):
+			writeErr(w, 400, "invalid_hotel", "pin_only needs a reserved hotel")
+			return
+		}
+	}
 	if req.Lend != nil && (!*req.Lend || reserve != nil) {
 		writeErr(w, 400, "invalid_lend", "lend takes true and no reserved_for; to take a lent hotel back, PATCH reserved_for")
 		return
@@ -789,10 +814,45 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		return
 	}
 	b.mu.Lock()
+	// An owner change of a pin_only hotel is an operator procedure: the broker
+	// cannot prove from its own clocks that no dispatched create is still
+	// starting a room, so it takes the hotel only while drained (AB#982). The
+	// one-time switch on (the hotel is not pin_only yet) is not covered.
+	if h.pinOnly() && !h.drain() {
+		changesOwner := (reserve != nil && !lc.reclaim && (*reserve != h.reservedFor() || ref != h.cfg.ReservationRef)) ||
+			req.Lend != nil || (req.PinOnly != nil && !*req.PinOnly)
+		if changesOwner {
+			b.mu.Unlock()
+			writeErr(w, 409, "owner_change_needs_drain", "hotel "+h.cfg.ID+" is pin_only: an owner change (reserved_for, reservation_ref, release, lend or pin_only off) needs the hotel drained first. "+
+				"Operator procedure: check all customer work on the hotel (hotel-side workspace and image-pull lists) before drain — a timeout or zero room count is not terminal proof. Then drain the hotel, lock out the old owner, wait for the restart guard to show zero rooms with count_known, then send the one PATCH")
+			return
+		}
+	}
 	if reserve != nil && !lc.reclaim {
 		if e := reserveErr(h, *reserve); e != nil {
 			b.mu.Unlock()
 			writeErr(w, e.status, e.code, e.msg)
+			return
+		}
+	}
+	if req.PinOnly != nil && !*req.PinOnly && h.pinGuardedLocked() && !h.occupancyKnown() {
+		// Switching it off opens the hotel as much as switching it on closes it:
+		// the same known-occupancy rule applies (Astra r6).
+		b.mu.Unlock()
+		writeErr(w, 409, "rooms_active", pinUnknownMsg(h))
+		return
+	}
+	if req.PinOnly != nil && *req.PinOnly && !h.pinOnly() {
+		// Turning pin_only on waits for every create, queued create and
+		// prefetch or workspace call that selected h before (B5).
+		if n := h.creating + h.queued + h.claims; n > 0 {
+			b.mu.Unlock()
+			writeErr(w, 409, "rooms_active", fmt.Sprintf("hotel %s has %d creates or calls in flight; wait until they end, then set pin_only", h.cfg.ID, n))
+			return
+		}
+		if !h.occupancyKnown() {
+			b.mu.Unlock()
+			writeErr(w, 409, "rooms_active", fmt.Sprintf("hotel %s: its rooms are not known yet (no good room list since start, or unconfirmed create cleanup); retry when the room count is known", h.cfg.ID))
 			return
 		}
 	}
@@ -806,6 +866,26 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		b.mu.Unlock()
 		writeErr(w, 409, "reservation_conflict", fmt.Sprintf("hotel %s is at reservation_generation %d, not %d; read it again", h.cfg.ID, oldCfg.ReservationGeneration, *req.ExpectGeneration))
 		return
+	}
+	// B8 (pin_only.go): a new reservation_ref on a pin_only hotel moves the
+	// generation that fences every marker, so it waits until the hotel is
+	// empty. Same b.mu and h.cfgMu hold as the compare above and the bump
+	// below: a create that passed the dispatch recheck is in h.creating until
+	// it ends, so the bump cannot overtake it.
+	if reserve != nil && !lc.reclaim && h.cfg.PinOnly && *reserve == h.cfg.ReservedFor && ref != h.cfg.ReservationRef {
+		if !h.occupancyKnown() {
+			// Zero rooms after a restart or a failed list is unknown, not empty.
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, 409, "rooms_active", fmt.Sprintf("hotel %s is pin_only and its rooms are not known (no good room list since start, or unconfirmed create cleanup); retry when the room count is known", h.cfg.ID))
+			return
+		}
+		if n := len(h.rooms) + h.creating + h.queued + h.claims; n > 0 {
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, 409, "rooms_active", fmt.Sprintf("hotel %s is pin_only and has %d rooms, creates or calls; wait until it is empty, then change reservation_ref", h.cfg.ID, n))
+			return
+		}
 	}
 	// A resent notice (same notice_id) keeps its first received_at, so a
 	// retry cannot shorten its lead. A new notice may not replace one whose
@@ -853,6 +933,12 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			h.cfg.ReservationRef = ref
 		} else {
 			setReservation(h, *reserve, ref)
+		}
+	}
+	if req.PinOnly != nil && *req.PinOnly != h.cfg.PinOnly {
+		h.cfg.PinOnly = *req.PinOnly
+		if h.cfg.ReservationGeneration == oldCfg.ReservationGeneration {
+			h.cfg.ReservationGeneration++ // markers issued before the switch are void
 		}
 	}
 	if req.AlertChatID != nil {
@@ -926,6 +1012,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.ReservedFor = oldCfg.ReservedFor
 		h.cfg.ReservationGeneration = oldCfg.ReservationGeneration
 		h.cfg.ReservationRef = oldCfg.ReservationRef
+		h.cfg.PinOnly = oldCfg.PinOnly
 		h.cfg.LentFrom = oldCfg.LentFrom
 		h.cfg.LentReportID = oldCfg.LentReportID
 		h.cfg.AlertChatID = oldCfg.AlertChatID
@@ -972,8 +1059,14 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 	// no create can be placed on the hotel between "empty" and "gone".
 	b.mu.Lock()
 	busy := len(h.rooms) + h.creating + h.queued
+	// A pin_only hotel keeps its unresolved creates: a rejoin starts a fresh
+	// hotel with none (pin_only.go).
+	unresolved := 0
+	if h.pinGuardedLocked() {
+		unresolved = h.lostPending + len(h.unreaped)
+	}
 	leaving := h.leaving
-	if busy == 0 {
+	if busy == 0 && unresolved == 0 {
 		h.leaving = true
 	}
 	b.mu.Unlock()
@@ -983,6 +1076,10 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 	}
 	if busy > 0 {
 		writeErr(w, 409, "hotel_not_empty", fmt.Sprintf("hotel %s has %d rooms; drain it and wait until they are gone", id, busy))
+		return
+	}
+	if unresolved > 0 {
+		writeErr(w, 409, "hotel_not_empty", fmt.Sprintf("hotel %s is pin_only and has %d create(s) with an unknown outcome or unconfirmed cleanup; wait until they resolve, then leave", id, unresolved))
 		return
 	}
 	if !b.dropHotelIf(id, h) {
@@ -1032,7 +1129,7 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 	defer b.mu.Unlock()
 	now := time.Now()
 	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
-		"reserved_for": reserved, "reservation_generation": gen, "reservation_ref": resRef, // AB#982
+		"reserved_for": reserved, "reservation_generation": gen, "reservation_ref": resRef, "pin_only": h.pinOnly(), // AB#982
 		"lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
 		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice(),

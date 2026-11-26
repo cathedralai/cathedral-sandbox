@@ -140,30 +140,37 @@ func (b *broker) handleProbe(w http.ResponseWriter, r *http.Request, g *guestSta
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
-		// A hotel outside the guest's list may be dedicated to another
-		// guest: the probe must not start a room there.
-		if !g.limitsAllow(b, h.cfg.ID) {
-			mu.Lock()
-			out[h.cfg.ID] = probeResult{ProbedAt: time.Now().UTC().Format(time.RFC3339),
-				Error: "skipped: hotel is not in this guest's hotel list"}
-			mu.Unlock()
-			continue
-		}
+		// One b.mu hold decides and claims: a PATCH that turns the hotel
+		// pin_only cannot slip in between, and the claim lasts through the
+		// probe, its Docker-inside create and the cleanup (pin_only.go, B5).
 		b.mu.Lock()
-		resting := h.drain() || time.Now().Before(h.backoffUntil)
-		b.mu.Unlock()
-		if resting {
+		skip := ""
+		switch {
+		case !g.allowsHotel(h):
+			// A hotel outside the guest's list may be dedicated to another
+			// guest: the probe must not start a room there.
+			skip = "skipped: hotel is not in this guest's hotel list"
+		case h.closedToShared():
+			// A pin_only hotel takes only marked dedicated creates (pin_only.go).
+			skip = "skipped: hotel is pin_only"
+		case h.drain() || time.Now().Before(h.backoffUntil):
 			// Drain means no new rooms here; a probe room would block the
 			// hotel's removal and a kit update.
+			skip = "skipped: hotel is draining or resting"
+		default:
+			h.claim()
+		}
+		b.mu.Unlock()
+		if skip != "" {
 			mu.Lock()
-			out[h.cfg.ID] = probeResult{ProbedAt: time.Now().UTC().Format(time.RFC3339),
-				Error: "skipped: hotel is draining or resting"}
+			out[h.cfg.ID] = probeResult{ProbedAt: time.Now().UTC().Format(time.RFC3339), Error: skip}
 			mu.Unlock()
 			continue
 		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
+			defer b.releaseClaim(h)
 			res := b.probeHotel(r.Context(), h, g, req.Dind)
 			mu.Lock()
 			out[h.cfg.ID] = res

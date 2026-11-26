@@ -120,6 +120,11 @@ type placement struct {
 	// AB#862). A create still waiting for a hotel create slot at this time
 	// ends with 503 create_timeout; one already sent to a hotel is not cut.
 	deadline time.Time
+	// dedicated, dedicatedGen: the validated X-Cathedral-Dedicated-Hotel
+	// marker (pin_only.go). A pin_only hotel matches only this hotel at this
+	// generation, on every pick, retry, queue move and recheck.
+	dedicated    string
+	dedicatedGen uint64
 }
 
 func (pl placement) selects(h *hotel) bool {
@@ -140,6 +145,9 @@ func (pl placement) selects(h *hotel) bool {
 	}
 	if r := h.reservedFor(); r != "" && r != pl.guest {
 		return false
+	}
+	if pin, gen := h.pinState(); (pin || h.quarantined()) && (pl.dedicated != h.cfg.ID || pl.dedicatedGen != gen) {
+		return false // a shared create never reaches a pin_only hotel (pin_only.go)
 	}
 	if l := h.lentFrom(); l != "" && (l == pl.guest || pl.noLent) {
 		return false
@@ -446,6 +454,12 @@ func stringMap(v any, field string) (map[string]string, *apiErr) {
 // answers 400 sealed_only for "sealed": false, 409 for an unknown hotel id
 // and 409 when no hotel matches.
 func (b *broker) parseSelection(g *guestState, payload map[string]any) (placement, *apiErr) {
+	return b.parseSelectionMarked(g, payload, nil)
+}
+
+// parseSelectionMarked is parseSelection for a create that carries a
+// validated dedicated marker (pin_only.go); nil for every other route.
+func (b *broker) parseSelectionMarked(g *guestState, payload map[string]any, mark *dedicatedMark) (placement, *apiErr) {
 	var pl placement
 	// First, so the answer does not depend on the rest of the selection.
 	if v, ok := payload["sealed"].(bool); ok && !v {
@@ -523,6 +537,9 @@ func (b *broker) parseSelection(g *guestState, payload map[string]any) (placemen
 		return pl, &apiErr{400, "require_chip_id_needs_prefer", "require_chip_id needs prefer_chip_id"}
 	}
 	_, pl.registryAuth = createRegistryAuth(payload)
+	if mark != nil {
+		pl.dedicated, pl.dedicatedGen = mark.hotel, mark.gen
+	}
 	b.scope(g, &pl)
 	if pl.requireChipID {
 		matched := false
@@ -582,17 +599,17 @@ func (b *broker) fallbackFor(pl placement) (placement, bool) {
 
 // placementFor reads the hotel choice of a create and, for a fork or a
 // workspace, finds the hotel that holds it.
-func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[string]any) (placement, *apiErr) {
-	pl, e := b.snapshotPlacement(ctx, g, payload)
+func (b *broker) placementFor(ctx context.Context, g *guestState, payload map[string]any, mark *dedicatedMark) (placement, *apiErr) {
+	pl, e := b.snapshotPlacement(ctx, g, payload, mark)
 	if e != nil {
 		return pl, e
 	}
 	return b.workspacePlacement(ctx, g, payload, pl)
 }
 
-func (b *broker) snapshotPlacement(ctx context.Context, g *guestState, payload map[string]any) (placement, *apiErr) {
+func (b *broker) snapshotPlacement(ctx context.Context, g *guestState, payload map[string]any, mark *dedicatedMark) (placement, *apiErr) {
 	ref, _ := payload["snapshot_id"].(string)
-	pl, e := b.parseSelection(g, payload)
+	pl, e := b.parseSelectionMarked(g, payload, mark)
 	if e != nil && !(ref != "" && (e.code == "no_matching_hotel" || e.code == "hotel_lent")) {
 		return pl, e
 	}
@@ -627,7 +644,11 @@ func (b *broker) handleHotels(w http.ResponseWriter, g *guestState) {
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		out = append(out, map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.drain(), "free_rooms": free, "down_since": downSince(h)})
+		row := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "up": h.ok, "drain": h.drain(), "free_rooms": free, "down_since": downSince(h)}
+		if h.pinOnly() {
+			row["pin_only"] = true // listed for its owner; takes only marked dedicated creates (pin_only.go)
+		}
+		out = append(out, row)
 	}
 	b.mu.Unlock()
 	writeJSON(w, 200, map[string]any{"hotels": out})
@@ -922,6 +943,17 @@ type prefetchJob struct {
 	Hotels  map[string]*prefetchHotel `json:"hotels"`
 }
 
+// pulling reports whether any hotel of the job is still pulling. Caller holds
+// b.prefetch.mu.
+func (j *prefetchJob) pulling() bool {
+	for _, st := range j.Hotels {
+		if st.State == "pulling" {
+			return true
+		}
+	}
+	return false
+}
+
 type prefetchJobs struct {
 	mu   sync.Mutex
 	jobs map[string]*prefetchJob
@@ -1004,6 +1036,7 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 		for _, ref := range images {
 			st.Images = append(st.Images, map[string]any{"ref": ref, "state": "pulling"})
 		}
+		h.claim() // same hold as pl.selects: a switch to pin_only waits for the pulls (pin_only.go)
 		targets = append(targets, h)
 	}
 	gens := make([]int, len(targets))
@@ -1016,8 +1049,8 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 		b.prefetch.jobs = map[string]*prefetchJob{}
 	}
 	for id, j := range b.prefetch.jobs {
-		if time.Since(j.Created) > prefetchKeep {
-			delete(b.prefetch.jobs, id)
+		if time.Since(j.Created) > prefetchKeep && !j.pulling() {
+			delete(b.prefetch.jobs, id) // a job with a hotel still pulling stays: its pulls hold claims
 		}
 	}
 	b.prefetch.jobs[job.ID] = job
@@ -1035,6 +1068,7 @@ func (b *broker) handlePrefetch(w http.ResponseWriter, r *http.Request, g *guest
 // for the whole list ran past its cap on a long list while the hotel kept
 // pulling. gen is h.warmGen when the job started.
 func (b *broker) prefetchOn(h *hotel, job *prefetchJob, auth any, gen int) {
+	defer b.releaseClaim(h) // taken by handlePrefetch with the selection
 	g := b.guestByID(job.guest)
 	sem := make(chan struct{}, prefetchPerHotel)
 	var wg sync.WaitGroup

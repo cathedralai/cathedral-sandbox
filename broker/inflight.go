@@ -97,6 +97,17 @@ func clientGone() createResult {
 // does not hold b.mu.
 func (b *broker) reapRoom(h *hotel, rm *room) {
 	b.mu.Lock()
+	turned := b.registerReapedLocked(h, rm)
+	b.mu.Unlock()
+	b.finishReap(h, rm, turned)
+}
+
+// registerReapedLocked puts rm in h.rooms as "deleting", so the hotel never
+// looks empty while the room is still there. createOne calls it in the same
+// b.mu hold that ends h.creating, so a reservation_ref change (B8, pin_only.go)
+// cannot pass between the two. It reports whether the usage meter must be
+// made durable before the delete. Caller holds b.mu.
+func (b *broker) registerReapedLocked(h *hotel, rm *room) bool {
 	rm.state, rm.since, rm.vanished = stDeleting, time.Now(), time.Now()
 	// The guest never had this room: it gets no end record (ended.go).
 	rm.reaped = true
@@ -105,8 +116,12 @@ func (b *broker) reapRoom(h *hotel, rm *room) {
 	}
 	h.rooms[rm.hid] = rm
 	b.rememberGuestRoom(rm.guest, h.cfg.ID, rm.hid)
-	turned := b.usageMeter.seen(usageSightingOf(h, rm, nil), time.Now()) // metered, not billable: no client id (usage_meter.go)
-	b.mu.Unlock()
+	return b.usageMeter.seen(usageSightingOf(h, rm, nil), time.Now()) // metered, not billable: no client id (usage_meter.go)
+}
+
+// finishReap deletes a room registerReapedLocked registered. The caller does
+// not hold b.mu.
+func (b *broker) finishReap(h *hotel, rm *room, turned bool) {
 	if turned { // durable before the delete, outside b.mu, bounded
 		b.usageMeter.awaitDurable(usageTurnWait)
 	}
