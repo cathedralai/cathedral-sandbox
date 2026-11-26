@@ -48,7 +48,7 @@ func (b *broker) prewarmHotel(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
 	pin, resGen := h.pinState()
-	if pin {
+	if pin || h.quarantined() {
 		b.mu.Unlock()
 		return // a pin_only hotel takes no unmarked pull (pin_only.go, B6)
 	}
@@ -329,7 +329,7 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
 	pin, resGen := h.pinState()
-	if pin {
+	if pin || h.quarantined() {
 		b.mu.Unlock()
 		return // a pin_only hotel takes no unmarked pull (pin_only.go, B6)
 	}
@@ -370,7 +370,7 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 		// changed owner since the run began (B6).
 		b.mu.Lock()
 		stop := h.warmGen != gen || !h.ok || b.prefetchDiskFull(h)
-		if pinNow, genNow := h.pinState(); pinNow || genNow != resGen {
+		if pinNow, genNow := h.pinState(); pinNow || h.quarantined() || genNow != resGen {
 			stop = true
 		}
 		g := b.guestByID(j.guest)

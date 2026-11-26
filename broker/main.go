@@ -458,6 +458,11 @@ type hotel struct {
 	// never seen empty in between (pin_only.go occupancyKnown). Guarded by
 	// broker.mu.
 	lostPending int
+	// quarantineUntil (unix ns): a pin_only hotel with a lost create is closed
+	// to every unmarked placement until the create deadline, even after the
+	// flag is cleared (pin_only.go quarantined). Atomic: selects reads it
+	// without b.mu.
+	quarantineUntil atomic.Int64
 	// Guarded by broker.mu. guestWarm: per guest, the images that guest
 	// prefetched here since the hotel last came up. guestWant: per guest,
 	// the refs to pull again when the hotel comes back (prefetched without a
@@ -1586,6 +1591,9 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// the guest's own image fault is a refusal: no room was started.
 			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
+				if h.cfg.PinOnly { // b.mu held: close it to unmarked placement until the deadline
+					h.noteQuarantine(tDispatch.Add(hotelCreateTimeout + lostMargin))
+				}
 				h.lostPending++ // same hold as creating--: until createMany's cleanup confirms (reapOrphans)
 				if u := tDispatch.Add(hotelCreateTimeout + lostMargin); u.After(lostUntil) {
 					lostUntil = u
@@ -3586,7 +3594,7 @@ func (b *broker) serveNative(w http.ResponseWriter, r *http.Request, g *guestSta
 			b.mu.Lock()
 			n, up := 0, 0
 			for _, h := range b.hotelList() {
-				if !g.cfg.Ops && (!g.guestReaches(h) || h.pinOnly()) { // pin_only: listed, not counted (B7)
+				if !g.cfg.Ops && (!g.guestReaches(h) || h.closedToShared()) { // pin_only: listed, not counted (B7)
 					continue
 				}
 				n++

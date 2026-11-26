@@ -150,7 +150,7 @@ func (b *broker) handleProbe(w http.ResponseWriter, r *http.Request, g *guestSta
 			// A hotel outside the guest's list may be dedicated to another
 			// guest: the probe must not start a room there.
 			skip = "skipped: hotel is not in this guest's hotel list"
-		case h.pinOnly():
+		case h.closedToShared():
 			// A pin_only hotel takes only marked dedicated creates (pin_only.go).
 			skip = "skipped: hotel is pin_only"
 		case h.drain() || time.Now().Before(h.backoffUntil):

@@ -166,6 +166,25 @@ func refuseDedicatedHeader(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// noteQuarantine closes h to unmarked placement until t, never shortening it.
+func (h *hotel) noteQuarantine(t time.Time) {
+	n := t.UnixNano()
+	for {
+		cur := h.quarantineUntil.Load()
+		if cur >= n || h.quarantineUntil.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+// quarantined reports whether a lost create on h may still be starting a room.
+func (h *hotel) quarantined() bool { return time.Now().UnixNano() < h.quarantineUntil.Load() }
+
+// closedToShared: no unmarked create, pull or count may use h: it is pin_only,
+// or quarantined after the flag was cleared (for example by the fail-closed
+// audit) while a lost create may still start its room (Astra r7).
+func (h *hotel) closedToShared() bool { return h.pinOnly() || h.quarantined() }
+
 // pinStillOpen reports whether a run that started at reservation generation
 // resGen may pull on h again: h is not pin_only and its generation did not
 // move (B6).
@@ -173,7 +192,7 @@ func (b *broker) pinStillOpen(h *hotel, resGen uint64) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	pin, gen := h.pinState()
-	return !pin && gen == resGen
+	return !pin && !h.quarantined() && gen == resGen
 }
 
 // occupancyKnown reports whether h's room count can be trusted: a room list

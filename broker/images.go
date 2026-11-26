@@ -146,7 +146,7 @@ func (pl placement) selects(h *hotel) bool {
 	if r := h.reservedFor(); r != "" && r != pl.guest {
 		return false
 	}
-	if pin, gen := h.pinState(); pin && (pl.dedicated != h.cfg.ID || pl.dedicatedGen != gen) {
+	if pin, gen := h.pinState(); (pin || h.quarantined()) && (pl.dedicated != h.cfg.ID || pl.dedicatedGen != gen) {
 		return false // a shared create never reaches a pin_only hotel (pin_only.go)
 	}
 	if l := h.lentFrom(); l != "" && (l == pl.guest || pl.noLent) {

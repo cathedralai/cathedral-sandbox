@@ -334,7 +334,7 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 func (b *broker) claimForImport(g *guestState, ht *hotel) (gen int, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !g.allowsHotel(ht) || ht.pinOnly() || b.prefetchDiskFull(ht) {
+	if !g.allowsHotel(ht) || ht.closedToShared() || b.prefetchDiskFull(ht) {
 		return 0, false
 	}
 	ht.claim()
@@ -1297,7 +1297,7 @@ func (b *broker) freeRoomsFor(g *guestState) int {
 	defer b.mu.Unlock()
 	free := 0
 	for _, h := range b.hotelList() {
-		if !h.ok || !g.allowsHotel(h) || h.pinOnly() || !b.admitted(h, time.Now()) {
+		if !h.ok || !g.allowsHotel(h) || h.closedToShared() || !b.admitted(h, time.Now()) {
 			continue // a pin_only hotel is no free room for unmarked creates (pin_only.go)
 		}
 		if f := b.freeFor(h); f > 0 {
