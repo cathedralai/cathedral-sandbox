@@ -1038,8 +1038,14 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 	// no create can be placed on the hotel between "empty" and "gone".
 	b.mu.Lock()
 	busy := len(h.rooms) + h.creating + h.queued
+	// A pin_only hotel keeps its unresolved creates: a rejoin starts a fresh
+	// hotel with none (pin_only.go).
+	unresolved := 0
+	if h.pinOnly() {
+		unresolved = h.lostPending + len(h.unreaped)
+	}
 	leaving := h.leaving
-	if busy == 0 {
+	if busy == 0 && unresolved == 0 {
 		h.leaving = true
 	}
 	b.mu.Unlock()
@@ -1049,6 +1055,10 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 	}
 	if busy > 0 {
 		writeErr(w, 409, "hotel_not_empty", fmt.Sprintf("hotel %s has %d rooms; drain it and wait until they are gone", id, busy))
+		return
+	}
+	if unresolved > 0 {
+		writeErr(w, 409, "hotel_not_empty", fmt.Sprintf("hotel %s is pin_only and has %d create(s) with an unknown outcome or unconfirmed cleanup; wait until they resolve, then leave", id, unresolved))
 		return
 	}
 	if !b.dropHotelIf(id, h) {
