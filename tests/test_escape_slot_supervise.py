@@ -308,6 +308,44 @@ def test_refused_key_alerts_and_never_retires(rig, status):
     assert len(alerts) == 1 and "guest_refused_key" in alerts[0]
 
 
+def test_booting_guest_refusing_until_the_broker_installs_the_key_is_not_an_alert(rig):
+    # Live chi-escape 26 Nov 14:06Z: 401 at boot, key installed 4 s later, answered 5 s later.
+    sup, guest, systemctl, clock, lines = rig
+    guest.status = 401
+    poll(sup, clock, times=2)
+    guest.status = 200
+    poll(sup, clock)
+    assert sup.launch.state == "fresh"
+    assert sup.launch.refused_since is None
+    assert [x for x in lines if x.startswith("[OPERATOR-ALERT]")] == []
+    assert systemctl.mutating() == []
+
+
+def test_booting_guest_refusing_past_the_grace_alerts_once(rig):
+    sup, guest, systemctl, clock, lines = rig
+    guest.status = 401
+    seconds = 5.0
+    polls = int(es.KEY_INSTALL_GRACE_SECONDS / seconds)
+    poll(sup, clock, times=polls, seconds=seconds)
+    assert [x for x in lines if x.startswith("[OPERATOR-ALERT]")] == []
+    poll(sup, clock, times=3, seconds=seconds)
+    alerts = [x for x in lines if x.startswith("[OPERATOR-ALERT]")]
+    assert len(alerts) == 1 and "guest_refused_key" in alerts[0]
+    assert sup.launch.state == "booting"
+    assert systemctl.mutating() == []
+
+
+def test_answered_guest_that_starts_refusing_alerts_at_once(rig):
+    sup, guest, systemctl, clock, lines = rig
+    poll(sup, clock)
+    assert sup.launch.state == "fresh"
+    guest.status = 403
+    poll(sup, clock)
+    alerts = [x for x in lines if x.startswith("[OPERATOR-ALERT]")]
+    assert len(alerts) == 1 and "guest_refused_key" in alerts[0]
+    assert systemctl.mutating() == []
+
+
 def test_only_get_requests_reach_the_guest(rig):
     sup, guest, _systemctl, clock, _ = rig
     poll(sup, clock)

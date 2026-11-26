@@ -93,6 +93,10 @@ STOPPED_KEEP = 64  # stopped records kept for late broker requests
 # (cathedral/sandbox_api.py). A room still listed past that plus a margin is stuck.
 ROOM_GC_GRACE_SECONDS = 300
 ROOM_EXPIRY_MARGIN_SECONDS = 60
+# A fresh guest answers 401 until the broker installs the hotel key in it, which the live
+# broker log shows 4 to 5 s after the guest first answers (chi-escape, 26 Nov). A booting
+# guest that still refuses after this long has the wrong key.
+KEY_INSTALL_GRACE_SECONDS = 60
 
 Fetch = Callable[[str], "tuple[int | None, dict | None]"]
 Systemctl = Callable[[list], "tuple[int, str]"]
@@ -259,6 +263,7 @@ class Launch:
     in_use_at: float | None = None
     empty_polls: int = 0
     latest_expiry: float | None = None
+    refused_since: float | None = None  # first 401/403 of the current refusal run
     room_ids: set = field(default_factory=set)
     alerted: set = field(default_factory=set)
 
@@ -456,9 +461,16 @@ class SlotSupervisor:
         if r_status in (401, 403) or s_status in (401, 403):
             # Wrong key or a miner image: a config error, not a dead guest.
             # Never retire for it, or a misconfigured slot restarts forever.
-            self.alert("guest_refused_key",
-                       f"guest answered {r_status}/{s_status}; check SEALED_API_KEY_FILE")
+            # While booting, the broker may not have installed the hotel key yet:
+            # alert only once the refusal outlasts KEY_INSTALL_GRACE_SECONDS.
+            now = self.clock()
+            if launch.refused_since is None:
+                launch.refused_since = now
+            if launch.state != "booting" or now - launch.refused_since >= KEY_INSTALL_GRACE_SECONDS:
+                self.alert("guest_refused_key",
+                           f"guest answered {r_status}/{s_status}; check SEALED_API_KEY_FILE")
             return
+        launch.refused_since = None
         answered = (r_status == 200 and isinstance(receipts, dict)
                     and s_status == 200 and isinstance(rooms_doc, dict)
                     and isinstance(rooms_doc.get("sandboxes"), list))
