@@ -558,6 +558,9 @@ def test_a_suspend_gap_is_counted_through_clock_boottime(vm):
     vm.stop()
     code, h = vm.history(1)
     assert code == 0 and started_us_of(vm, h) <= T0, started_us_of(vm, h) - T0
+    # The bound counts the hour asleep: elapsed 3700 s, not the 100 s of CLOCK_MONOTONIC.
+    close = vm.lines()[-1]
+    assert started_us_of(vm, h) == lower(close["wall_us"], 3_700_000_000) < T0 - 1000
     # What the old monotonic-based rule would have said is an hour too late.
     close, start = vm.lines()[-1], vm.lines()[1]
     assert close["wall_us"] - (close["mono_ns"] - start["mono_ns"]) // 1000 > T0 + 3_000_000_000
