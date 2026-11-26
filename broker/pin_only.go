@@ -44,12 +44,16 @@ func (h *hotel) pinOnly() bool {
 }
 
 // pinOnlyConfigError checks the pin_only field of a hotel config: it needs a
-// reservation and a sealed hotel, and is not set on a lent hotel.
-func pinOnlyConfigError(hc hotelConfig) error {
+// reservation, a sealed hotel and a state_dir: the fence (pin_only and the
+// reservation generation) must survive a restart, so it is never acknowledged
+// unsaved.
+func pinOnlyConfigError(hc hotelConfig, stateDir string) error {
 	if !hc.PinOnly {
 		return nil
 	}
 	switch {
+	case stateDir == "":
+		return errors.New("pin_only needs state_dir, so the fence survives a restart")
 	case hc.ReservedFor == "":
 		return errors.New("pin_only needs reserved_for")
 	case !hc.Sealed:

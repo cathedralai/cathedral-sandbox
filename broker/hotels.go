@@ -536,7 +536,7 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		writeErr(w, 409, "unknown_guest", "reserved_for names no guest "+hc.ReservedFor)
 		return
 	}
-	if err := pinOnlyConfigError(hc); err != nil {
+	if err := pinOnlyConfigError(hc, b.cfg.StateDir); err != nil {
 		writeErr(w, 400, "invalid_hotel", err.Error())
 		return
 	}
@@ -785,6 +785,11 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		case *reserve != "":
 			ref = *req.ReservationRef
 		}
+	}
+	if b.cfg.StateDir == "" && ((req.PinOnly != nil && *req.PinOnly) || (h.pinOnly() && reserve != nil)) {
+		// Never acknowledge a fence that a restart would lose (pin_only.go).
+		writeErr(w, 409, "no_state_dir", "set state_dir in the config: pin_only and its reservation changes must be saved")
+		return
 	}
 	if req.PinOnly != nil && *req.PinOnly {
 		switch {

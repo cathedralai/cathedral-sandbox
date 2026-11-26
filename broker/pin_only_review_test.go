@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,5 +144,50 @@ func TestPinOnlySwitchAndReferenceChangeRefuseWhileRoomsAreUnknown(t *testing.T)
 	markRoomsKnown(tc)
 	if status, doc := patchHotelDoc(t, tc, "a", change); status != 200 {
 		t.Fatalf("once known and empty: %d %v", status, doc)
+	}
+}
+
+// Finding 4: pin_only and its fence are never acknowledged without a state_dir.
+func TestPinOnlyNeedsADurableStateDir(t *testing.T) {
+	tc := newChain(t) // no state_dir
+	markRoomsKnown(tc)
+	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 409 || errCode(doc) != "no_state_dir" {
+		t.Fatalf("pin_only without state_dir: %d %v", status, doc)
+	}
+	if tc.b.hotelByID("a").pinOnly() || tc.b.hotelByID("a").reservedFor() != "" {
+		t.Fatal("an unsaved PATCH changed the hotel")
+	}
+	// A pin_only hotel that exists anyway takes no reservation change unsaved.
+	setHotel(tc, "a", func(h *hotel) { h.cfg.ReservedFor, h.cfg.PinOnly = "g2", true })
+	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "x"}); status != 409 || errCode(doc) != "no_state_dir" {
+		t.Fatalf("ref change without state_dir: %d %v", status, doc)
+	}
+
+	// The config file: pin_only needs state_dir at load and in -check-config.
+	tc = knownChain(t)
+	raw, _ := os.ReadFile(tc.cfgPath)
+	var c config
+	if err := json.Unmarshal(raw, &c); err != nil {
+		t.Fatal(err)
+	}
+	c.StateDir = ""
+	c.Hotels[0].ReservedFor, c.Hotels[0].PinOnly = "g2", true
+	raw, _ = json.Marshal(c)
+	if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadBroker(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "state_dir") {
+		t.Fatalf("load: %v", err)
+	}
+	if err := checkConfigFile(tc.cfgPath); err == nil || !strings.Contains(err.Error(), "state_dir") {
+		t.Fatalf("-check-config: %v", err)
+	}
+	c.StateDir = t.TempDir()
+	raw, _ = json.Marshal(c)
+	if err := os.WriteFile(tc.cfgPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkConfigFile(tc.cfgPath); err != nil {
+		t.Fatalf("-check-config with a state_dir: %v", err)
 	}
 }
