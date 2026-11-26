@@ -188,7 +188,7 @@ func (b *broker) prepareLend(ctx context.Context, h *hotel, lend bool, reserve *
 // busyErr is the refusal for rooms on h. Caller holds b.mu.
 func (c lendChange) busyErr(h *hotel) *apiErr {
 	// h.cfg is read directly: applyLend holds h.cfgMu, and b.mu guards PinOnly writes.
-	if c.lend && h.cfg.PinOnly && !h.occupancyKnown() {
+	if (c.lend || c.reclaim) && h.pinGuardedLocked() && !h.occupancyKnown() {
 		return &apiErr{409, "rooms_active", pinUnknownMsg(h)}
 	}
 	switch {
@@ -294,7 +294,7 @@ func reserveErr(h *hotel, owner string) *apiErr {
 	if owner == cur || hotelClass(h) != classSealed {
 		return nil // the same owner is no change
 	}
-	if h.pinOnly() && !h.occupancyKnown() {
+	if h.pinGuardedLocked() && !h.occupancyKnown() {
 		// Release, a new owner and lend all open a pin_only hotel to shared
 		// placement: its room count must be known first (pin_only.go).
 		return &apiErr{409, "rooms_active", pinUnknownMsg(h)}

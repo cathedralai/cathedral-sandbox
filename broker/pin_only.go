@@ -185,6 +185,23 @@ func (h *hotel) occupancyKnown() bool {
 	return !h.roomsUnchecked && h.listOK && len(h.unreaped) == 0 && h.lostPending == 0
 }
 
+// lostHeldLocked reports whether h holds a lost-create record kept to its
+// create deadline. Caller holds b.mu.
+func (h *hotel) lostHeldLocked() bool {
+	for _, ub := range h.unreaped {
+		if ub.lostHold {
+			return true
+		}
+	}
+	return false
+}
+
+// pinGuardedLocked: the occupancy gates apply while h is pin_only or holds a
+// lost-create record, so clearing the flag (switch off, fail-closed audit)
+// cannot open the hotel while a record is held. The protection follows the
+// record, not the flag (Astra r6). Caller holds b.mu.
+func (h *hotel) pinGuardedLocked() bool { return h.cfg.PinOnly || h.lostHeldLocked() }
+
 func pinUnknownMsg(h *hotel) string {
 	return "hotel " + h.cfg.ID + " is pin_only and its rooms are not known (no good room list since start, a create with an unknown outcome, or unconfirmed cleanup); retry when the room count is known"
 }

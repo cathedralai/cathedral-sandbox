@@ -821,6 +821,13 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			return
 		}
 	}
+	if req.PinOnly != nil && !*req.PinOnly && h.pinGuardedLocked() && !h.occupancyKnown() {
+		// Switching it off opens the hotel as much as switching it on closes it:
+		// the same known-occupancy rule applies (Astra r6).
+		b.mu.Unlock()
+		writeErr(w, 409, "rooms_active", pinUnknownMsg(h))
+		return
+	}
 	if req.PinOnly != nil && *req.PinOnly && !h.pinOnly() {
 		// Turning pin_only on waits for every create, queued create and
 		// prefetch or workspace call that selected h before (B5).
@@ -1041,7 +1048,7 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 	// A pin_only hotel keeps its unresolved creates: a rejoin starts a fresh
 	// hotel with none (pin_only.go).
 	unresolved := 0
-	if h.pinOnly() {
+	if h.pinGuardedLocked() {
 		unresolved = h.lostPending + len(h.unreaped)
 	}
 	leaving := h.leaving
