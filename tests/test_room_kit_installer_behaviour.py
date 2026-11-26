@@ -1361,6 +1361,36 @@ def test_install_sealed_secrets_wires_the_front_the_api_and_the_tmpfs_root(host:
     assert 'ROOM_SEALED_SECRETS="1"' in (host.etc / "room.env").read_text()
 
 
+def test_install_in_room_attest_wires_dedicated_hotels(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(CATHEDRAL_HOTEL_TENANCY="dedicated", ROOM_IN_ROOM_ATTEST="1")))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    unit = host.unit("room-a-receipts.service")
+    assert "Environment=ROOM_IN_ROOM_ATTEST=1 ROOM_ROOM_ATTEST_DIR=/run/room-attest\n" in unit
+    assert unit.index("ROOM_IN_ROOM_ATTEST=1") < unit.index("ExecStart=")
+    assert "CATHEDRAL_ROOM_ATTEST_DIR=/run/room-attest\n" in (host.etc / "api.env").read_text()
+    conf = host.root / "etc" / "tmpfiles.d" / "pool-room-attest.conf"
+    assert conf.read_text() == "d /run/room-attest 0700 poolroom poolroom -\n"
+    assert host.calls("systemd-tmpfiles") == [f"systemd-tmpfiles --create {conf}"]
+    assert 'ROOM_IN_ROOM_ATTEST="1"' in (host.etc / "room.env").read_text()
+
+
+def test_install_in_room_attest_is_ignored_off_dedicated(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(ROOM_IN_ROOM_ATTEST="1")))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    assert "ATTEST" not in host.unit("room-a-receipts.service")
+    assert "ATTEST" not in (host.etc / "api.env").read_text()
+    assert not (host.root / "etc" / "tmpfiles.d" / "pool-room-attest.conf").exists()
+    assert not host.calls("systemd-tmpfiles")
+
+
+def test_install_in_room_attest_off_by_default_even_when_dedicated(host: FakeHost) -> None:
+    proc = host.install(str(host.room_env(CATHEDRAL_HOTEL_TENANCY="dedicated")))
+    assert proc.returncode == 0, proc.stdout + proc.stderr[-4000:]
+    assert "ATTEST" not in host.unit("room-a-receipts.service")
+    assert "ATTEST" not in (host.etc / "api.env").read_text()
+    assert not (host.root / "etc" / "tmpfiles.d" / "pool-room-attest.conf").exists()
+
+
 def test_install_sealed_exec_wires_the_front_only(host: FakeHost) -> None:
     default = host.install(str(host.room_env()))
     assert default.returncode == 0, default.stdout + default.stderr[-4000:]

@@ -414,7 +414,8 @@ ROOM_DNS="$SEALED_DNS"
 # gofer (sentry emulated-only returns ENXIO for that char device). Shared stays
 # emulated-only. Still runsc — not a runc switch.
 if [ "$TENANCY" = dedicated ]; then
-  ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none --net-raw --character-device-policy=prefer-emulated"
+  # --host-uds=open: the room reaches its report socket (AB#1001) on a bind mount.
+  ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none --net-raw --character-device-policy=prefer-emulated --host-uds=open"
 else
   ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none --net-raw"
 fi
@@ -454,6 +455,9 @@ ROOM_GUEST_INGRESS=${SEALED_ROOM_GUEST_INGRESS:-0}
 # so the listen addresses resolve then; unset, the install stops.
 EOF
 [ -z "$DEDICATED_ENV" ] || { echo; echo "$DEDICATED_ENV"; } >> "$R/opt/room-kit/room.env"
+# AB#1001: the in-room report call is on for dedicated images only. It sits outside the
+# measured dedicated TUN block above, whose output is pinned by its own tests.
+[ "$TENANCY" != dedicated ] || echo "ROOM_IN_ROOM_ATTEST=1" >> "$R/opt/room-kit/room.env"
 if [ -n "$VOLUME_ENV" ]; then
   { echo "# Synced volumes (AB#789): install.sh fetches the pinned restic and the receipts front runs the"
     echo "# guest volume agent against this registry and gateway, trusting only these registry keys."
