@@ -149,6 +149,14 @@ func (b *broker) handleProbe(w http.ResponseWriter, r *http.Request, g *guestSta
 			mu.Unlock()
 			continue
 		}
+		if h.pinOnly() {
+			// A pin_only hotel takes only marked dedicated creates (pin_only.go).
+			mu.Lock()
+			out[h.cfg.ID] = probeResult{ProbedAt: time.Now().UTC().Format(time.RFC3339),
+				Error: "skipped: hotel is pin_only"}
+			mu.Unlock()
+			continue
+		}
 		b.mu.Lock()
 		resting := h.drain() || time.Now().Before(h.backoffUntil)
 		b.mu.Unlock()

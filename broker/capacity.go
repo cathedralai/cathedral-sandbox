@@ -270,6 +270,9 @@ func (b *broker) capacityDoc(e capacityEntry, now time.Time, mb *minerBudget) ma
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
 	}
+	if h.pinOnly() {
+		d["pin_only"] = true // takes only marked dedicated creates (pin_only.go)
+	}
 	return d
 }
 
@@ -354,7 +357,9 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 			continue
 		}
 		t := g.tierOf(e.h)
-		b.addTotals(totals, e, now, sum)
+		if !e.h.pinOnly() { // a pin_only hotel is listed, but no unmarked create can use it: out of the totals (B7)
+			b.addTotals(totals, e, now, sum)
+		}
 		d := b.capacityDoc(e, now, docs)
 		d["tier"] = t
 		guestDiskDoc(e.h, d)

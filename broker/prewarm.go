@@ -47,7 +47,14 @@ func (b *broker) prewarms(h *hotel) bool {
 func (b *broker) prewarmHotel(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
+	pin, resGen := h.pinState()
+	if pin {
+		b.mu.Unlock()
+		return // a pin_only hotel takes no unmarked pull (pin_only.go, B6)
+	}
+	h.claim()
 	b.mu.Unlock()
+	defer b.releaseClaim(h)
 	seen := map[string]bool{}
 	for _, t := range catalogTemplates {
 		if !t.Live || t.Image == "" || seen[t.Image] || !prewarmsTemplate(h, t) {
@@ -56,6 +63,9 @@ func (b *broker) prewarmHotel(h *hotel) {
 		seen[t.Image] = true
 		if b.prewarmSkipsFullDisk(h, t.Image) {
 			continue
+		}
+		if !b.pinStillOpen(h, resGen) {
+			return
 		}
 		body, _ := json.Marshal(map[string]any{"images": []string{t.Image}})
 		status, _, _, err := h.do(context.Background(), "POST", "/v1/images/prefetch", nil, body, 30*time.Minute)
@@ -318,6 +328,13 @@ func (b *broker) hotelHolds(h *hotel, g *guestState, ref string) bool {
 func (b *broker) replayGuestPrefetch(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
+	pin, resGen := h.pinState()
+	if pin {
+		b.mu.Unlock()
+		return // a pin_only hotel takes no unmarked pull (pin_only.go, B6)
+	}
+	h.claim()
+	defer b.releaseClaim(h) // runs after the unlock below
 	type job struct {
 		guest, ref string
 		pin        int64 // the guest's pin cap when this ref was pinned here (AB#860)
@@ -344,26 +361,28 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 	if len(jobs) == 0 {
 		return
 	}
-	allowed := map[string]bool{}
-	for _, j := range jobs {
-		if _, seen := allowed[j.guest]; !seen {
-			g := b.guestByID(j.guest)
-			allowed[j.guest] = g != nil && g.limitsAllow(b, h.cfg.ID)
-		}
-	}
 	sem := make(chan struct{}, prefetchPerHotel)
 	var wg sync.WaitGroup
 	for _, j := range jobs {
-		if !allowed[j.guest] {
-			continue
-		}
 		sem <- struct{}{}
+		// Every check runs again before each pull, in one hold: the guest may
+		// have lost the hotel, and the hotel may have turned pin_only or
+		// changed owner since the run began (B6).
 		b.mu.Lock()
 		stop := h.warmGen != gen || !h.ok || b.prefetchDiskFull(h)
+		if pinNow, genNow := h.pinState(); pinNow || genNow != resGen {
+			stop = true
+		}
+		g := b.guestByID(j.guest)
+		mayUse := g != nil && g.allowsHotel(h)
 		b.mu.Unlock()
 		if stop {
 			<-sem
 			break
+		}
+		if !mayUse {
+			<-sem
+			continue
 		}
 		wg.Add(1)
 		go func(j job) {

@@ -319,11 +319,20 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 		}
 		b.mu.Lock()
 		full, gen := b.prefetchDiskFull(ht), ht.warmGen
+		// A pin_only hotel takes no unmarked work; the claim is taken in the
+		// same hold as the check (pin_only.go, AB#982).
+		skip := full || ht.pinOnly() // AB#861 for full
+		if !skip {
+			ht.claim()
+		}
 		b.mu.Unlock()
-		if full { // AB#861
+		if skip {
 			continue
 		}
-		go b.prefetchRef(ht, g, img.Ref, nil, gen, true)
+		go func(ht *hotel) {
+			defer b.releaseClaim(ht)
+			b.prefetchRef(ht, g, img.Ref, nil, gen, true)
+		}(ht)
 	}
 	writeJSON(w, 200, map[string]any{"image_id": img.ID, "state": "ready", "image": img.Ref})
 }
@@ -1284,8 +1293,8 @@ func (b *broker) freeRoomsFor(g *guestState) int {
 	defer b.mu.Unlock()
 	free := 0
 	for _, h := range b.hotelList() {
-		if !h.ok || !g.allowsHotel(h) || !b.admitted(h, time.Now()) {
-			continue
+		if !h.ok || !g.allowsHotel(h) || h.pinOnly() || !b.admitted(h, time.Now()) {
+			continue // a pin_only hotel is no free room for unmarked creates (pin_only.go)
 		}
 		if f := b.freeFor(h); f > 0 {
 			free += f

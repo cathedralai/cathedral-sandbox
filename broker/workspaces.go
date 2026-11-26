@@ -189,11 +189,15 @@ func (b *broker) handleWorkspaces(w http.ResponseWriter, r *http.Request, g *gue
 	}
 	b.mu.Lock()
 	h := b.pick(nil, pl)
+	if h != nil {
+		h.claim() // same hold as the pick; ends when the send ends (pin_only.go)
+	}
 	b.mu.Unlock()
 	if h == nil {
 		writeErr(w, 503, "no_hotel_available", "no hotel in the selection takes new rooms now; retry later")
 		return
 	}
+	defer b.releaseClaim(h)
 	body, _ := json.Marshal(map[string]any{"name": name})
 	status, _, out, err := h.doGuest(r.Context(), g, "POST", "/v1/workspaces", nil, body, time.Minute)
 	if err != nil {
