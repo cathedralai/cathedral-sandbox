@@ -362,6 +362,11 @@ func (b *broker) handleCapacity(w http.ResponseWriter, g *guestState, minerOnly 
 		}
 		d := b.capacityDoc(e, now, docs)
 		d["tier"] = t
+		if e.h.reservedFor() == g.cfg.ID {
+			// The owner reads the fence its dedicated creates carry (pin_only.go).
+			gen, _ := e.h.reservation()
+			d["reservation_generation"] = gen
+		}
 		guestDiskDoc(e.h, d)
 		out = append(out, d)
 	}
