@@ -39,6 +39,10 @@ func (f *fakeVMHost) Run(_ context.Context, h vmHostConfig, stdin []byte, args .
 		return []byte(`{"ok":true,"stopped_at":1900000000}` + "\n"), 0, nil
 	case "list":
 		return []byte(`{"vms":[]}`), 0, nil
+	case "cancel": // the host's close record (vm_history.go); the same stopped_at as stop
+		return []byte(`{"name":"` + args[1] + `","generation":` + args[2] + `,"stopped_at":1900000000,"reason":"cancelled"}` + "\n"), 0, nil
+	case "history":
+		return []byte(`{"generation":` + args[2] + `,"closed":true,"started_at":"2030-03-17T17:46:39.500000Z","stopped_at":1900000000,"tracked_from":1,"close_reason":"stopped","history":"v2"}` + "\n"), 0, nil
 	}
 	return []byte(`{"ok":true}` + "\n"), 0, nil
 }
@@ -50,6 +54,18 @@ func (f *fakeVMHost) last() []string {
 		return nil
 	}
 	return f.calls[len(f.calls)-1]
+}
+
+// lastOf is the last call of one subcommand, host id first.
+func (f *fakeVMHost) lastOf(cmd string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		if f.calls[i][1] == cmd {
+			return f.calls[i]
+		}
+	}
+	return nil
 }
 
 func (f *fakeVMHost) count() int {
@@ -432,6 +448,7 @@ func TestVMsHostRefusalsMapTo409(t *testing.T) {
 func TestVMsExecutorErrorsAre502WithoutStderr(t *testing.T) {
 	tb := newVMTestBroker(t, true)
 	id := tb.create(t, nil)["id"].(string)
+	id2 := tb.create(t, nil)["id"].(string) // the lost authorize below leaves an open intent on id
 	secret := "Permission denied (publickey) /etc/cathedral/secret-path"
 	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New(secret) }
 	for _, rt := range []struct {
@@ -453,7 +470,7 @@ func TestVMsExecutorErrorsAre502WithoutStderr(t *testing.T) {
 	// A non-zero exit with output on stdout: 502, output not passed on.
 	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"secret detail"}`), 1, nil }
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v1/broker/vms/"+id+"/authorize", bytes.NewReader(vmBodyJSON(map[string]any{"paid_through": tb.now.Unix() + 60, "generation": 1})))
+	req := httptest.NewRequest("POST", "/v1/broker/vms/"+id2+"/authorize", bytes.NewReader(vmBodyJSON(map[string]any{"paid_through": tb.now.Unix() + 60, "generation": 1})))
 	req.Header.Set("Authorization", "Bearer operator-key")
 	tb.b.ServeHTTP(rec, req)
 	if rec.Code != 502 || strings.Contains(rec.Body.String(), "secret") {
@@ -467,7 +484,7 @@ func TestVMsExecutorErrorsAre502WithoutStderr(t *testing.T) {
 	}
 	// A create whose answer was lost keeps its record (and port) as creating.
 	st, list := tb.call(t, "operator-key", "GET", "/v1/broker/vms", nil)
-	if st != 200 || len(list["vms"].([]any)) != 2 {
+	if st != 200 || len(list["vms"].([]any)) != 3 {
 		t.Fatalf("list: %d %v", st, list)
 	}
 }
@@ -617,7 +634,7 @@ func TestVMsStopIsScopedToGeneration(t *testing.T) {
 	if st != 200 || doc["stopped_at"] != float64(1900000000) {
 		t.Fatalf("stop: %d %v", st, doc)
 	}
-	if got := tb.host.last(); strings.Join(got[1:], " ") != "stop "+id+" --generation 1" {
+	if got := tb.host.lastOf("stop"); strings.Join(got[1:], " ") != "stop "+id+" --generation 1" {
 		t.Fatalf("stop argv %v", got)
 	}
 	// A repeated Stop of the same run answers the stored receipt, no host call.
@@ -801,10 +818,11 @@ func TestVMsStopCancelsNextRunBeforeStart(t *testing.T) {
 	if st, _ := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 2}); st != 502 {
 		t.Fatalf("cancel with host down: %d", st)
 	}
-	tb.host.answer = nil
+	// (A GET with the host up would replay the open close intent: vm_history_test.go.)
 	if _, one := tb.call(t, "operator-key", "GET", base, nil); one["generation"] != float64(1) || one["stopped_at"] != float64(1900000000) {
 		t.Fatalf("state after a lost cancel: %v", one)
 	}
+	tb.host.answer = nil
 	// Stop of a generation two ahead is still refused.
 	for _, g := range []int{3} {
 		if st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": g}); st != 409 || vmErrCode(doc) != "stale_generation" {
@@ -817,7 +835,7 @@ func TestVMsStopCancelsNextRunBeforeStart(t *testing.T) {
 		t.Fatalf("cancel: %d %v", st, doc)
 	}
 	tb.host.answer = nil
-	if got := tb.host.last(); strings.Join(got[1:], " ") != "stop "+id+" --generation 2" {
+	if got := tb.host.lastOf("stop"); strings.Join(got[1:], " ") != "stop "+id+" --generation 2" {
 		t.Fatalf("cancel argv %v", got)
 	}
 	calls := tb.host.count()
@@ -851,9 +869,16 @@ func TestVMsCancelWithLostAuthorizeReply(t *testing.T) {
 	// and the host never got it, so its stop answers exit 3.
 	tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("connection reset") }
 	tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
-	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"stale_generation"}`), vmExitStale, nil }
+	// The host refuses the stop (exit 3); its cancel closes the generation and
+	// the close record's time is used, not the broker's clock (B0).
+	tb.host.answer = func(args []string) ([]byte, int, error) {
+		if args[0] == "cancel" {
+			return []byte(`{"generation":1,"stopped_at":1800000042}`), 0, nil
+		}
+		return []byte(`{"error":"stale_generation"}`), vmExitStale, nil
+	}
 	st, doc := tb.call(t, "operator-key", "POST", base+"/stop", map[string]any{"generation": 1})
-	if st != 200 || doc["generation"] != float64(1) || doc["stopped_at"] != float64(tb.now.Unix()) || doc["desired_state"] != "stopped" {
+	if st != 200 || doc["generation"] != float64(1) || doc["stopped_at"] != float64(1800000042) || doc["desired_state"] != "stopped" {
 		t.Fatalf("cancel with lost authorize: %d %v", st, doc)
 	}
 	tb.host.answer = nil
@@ -904,9 +929,14 @@ func TestVMsSettledLostStartGetsAReceipt(t *testing.T) {
 	if _, doc := tb.call(t, "operator-key", "GET", "/v1/broker/vms/"+id, nil); doc["desired_state"] != "stopped" {
 		t.Fatalf("settle: %v", doc)
 	}
-	tb.host.answer = func([]string) ([]byte, int, error) { return []byte(`{"error":"stale_generation"}`), 3, nil }
+	tb.host.answer = func(args []string) ([]byte, int, error) {
+		if args[0] == "cancel" {
+			return []byte(`{"generation":1,"stopped_at":1800000042}`), 0, nil
+		}
+		return []byte(`{"error":"stale_generation"}`), 3, nil
+	}
 	st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1})
-	if st != 200 || doc["stopped_at"] != float64(tb.now.Unix()) {
+	if st != 200 || doc["stopped_at"] != float64(1800000042) {
 		t.Fatalf("stop of the settled run: %d %v", st, doc)
 	}
 	// Repeat: the stored receipt, no host call.
@@ -914,7 +944,7 @@ func TestVMsSettledLostStartGetsAReceipt(t *testing.T) {
 		t.Fatalf("host called for a stored receipt: %v", a)
 		return nil, 0, nil
 	}
-	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(tb.now.Unix()) {
+	if st, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(1800000042) {
 		t.Fatalf("repeat: %d %v", st, doc)
 	}
 	// A running run whose host refuses the stop as stale keeps the refusal.

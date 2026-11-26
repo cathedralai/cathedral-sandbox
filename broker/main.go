@@ -3566,6 +3566,9 @@ func main() {
 	}
 	ctx, stopLoops := context.WithCancel(context.Background())
 	b.loopsCtx.Store(&ctx) // hotels added by a live reload stop with the rest at SIGTERM
+	if b.vms != nil {
+		go b.vms.replay(ctx) // closed runs without a receipt, pending history (vm_history.go)
+	}
 	if err := b.loadCompat(); err != nil {
 		log.Printf("client state not loaded: %v", err)
 	}

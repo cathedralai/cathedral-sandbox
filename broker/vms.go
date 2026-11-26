@@ -8,6 +8,7 @@
 //	POST   /v1/broker/vms/{id}/stop        {"generation": n}
 //	POST   /v1/broker/vms/{id}/reboot      optional {"generation": n}
 //	DELETE /v1/broker/vms/{id}             {"confirm": "<id>"}
+//	GET    /v1/broker/vms/{id}/runs/{n}    the closed run n: started_at, stopped_at (vm_history.go)
 //
 // The broker runs vm-ctl.sh on the VM host over SSH. The host's
 // authorized_keys line for the broker key forces `vm-ctl.sh --from-broker`,
@@ -203,13 +204,29 @@ type vmStore struct {
 	busy  map[string]bool // a host call in flight for this VM
 	exec  vmExecutor
 	now   func() time.Time
+
+	// Run history (vm_history.go): receipts and tombstones from vm-runs.jsonl,
+	// the host's closed answers from vm-history.jsonl. Guarded by mu.
+	receipts map[vmRunKey]vmRunLine
+	tombs    map[string]vmRunLine
+	hist     map[vmRunKey]vmHistoryLine
+	// Intents of vm-runs.jsonl: a close is open until its receipt exists, an
+	// authorize until its answer (authRes: accepted) or a receipt.
+	closeIntents map[vmRunKey]vmRunLine
+	closeRefused map[vmRunKey]bool
+	authIntents  map[vmRunKey]vmRunLine
+	authRes      map[vmRunKey]bool
+
+	newID      func() string                        // newVMID; a test makes it repeat an id
+	appendHook func(file string, line []byte) error // tests: fail an append before it writes
+	saveHook   func() error                         // tests: fail a vms.json save before it writes
 }
 
 func (b *broker) loadVMs() error {
 	if !b.cfg.VMsEnabled {
 		return nil
 	}
-	s := &vmStore{dir: b.cfg.StateDir, hosts: map[string]vmHostConfig{}, recs: map[string]*vmRecord{}, busy: map[string]bool{}, exec: sshVMExecutor{}, now: time.Now}
+	s := &vmStore{dir: b.cfg.StateDir, hosts: map[string]vmHostConfig{}, recs: map[string]*vmRecord{}, busy: map[string]bool{}, exec: sshVMExecutor{}, now: time.Now, newID: newVMID}
 	for _, h := range b.cfg.VMHosts {
 		for _, f := range []string{h.SSHKeyFile, h.KnownHostsFile} {
 			if _, err := os.Stat(f); err != nil {
@@ -243,6 +260,9 @@ func (b *broker) loadVMs() error {
 			s.recs[r.ID] = &r
 		}
 	}
+	if err := s.loadRuns(); err != nil {
+		return err // never start with run history forgotten
+	}
 	b.vms = s
 	log.Printf("vms: on, %d host(s), %d VM(s) from %s", len(s.hosts), len(s.recs), vmsFile)
 	return nil
@@ -250,6 +270,11 @@ func (b *broker) loadVMs() error {
 
 // saveLocked writes vms.json. Caller holds s.mu.
 func (s *vmStore) saveLocked() error {
+	if s.saveHook != nil {
+		if err := s.saveHook(); err != nil {
+			return err
+		}
+	}
 	doc := vmsFileDoc{Version: 1, VMs: []vmRecord{}}
 	for _, r := range s.recs {
 		doc.VMs = append(doc.VMs, *r)
@@ -289,7 +314,15 @@ func (b *broker) handleVMs(w http.ResponseWriter, r *http.Request, rest string) 
 		return
 	}
 	id, action, _ := strings.Cut(strings.TrimPrefix(rest, "/"), "/")
-	if !vmIDRE.MatchString(id) || strings.Contains(action, "/") {
+	if !vmIDRE.MatchString(id) {
+		writeErr(w, 404, "vm_not_found", "no such VM")
+		return
+	}
+	if gen, ok := strings.CutPrefix(action, "runs/"); ok && r.Method == "GET" && !strings.Contains(gen, "/") {
+		b.getVMRun(w, r, id, gen)
+		return
+	}
+	if strings.Contains(action, "/") {
 		writeErr(w, 404, "vm_not_found", "no such VM")
 		return
 	}
@@ -356,6 +389,9 @@ func (s *vmStore) call(ctx context.Context, h vmHostConfig, timeout time.Duratio
 	switch code {
 	case 0:
 	case vmExitStale:
+		if c := vmRefusalCode(out); c != "" { // history_open, history_unknown
+			return nil, &vmCallErr{409, c, "the host has no closed history for this run (" + c + ")", false}
+		}
 		return nil, &vmCallErr{409, "stale_authorization", "the host holds a newer generation or a later paid_through", false}
 	case vmExitUnpaid:
 		return nil, &vmCallErr{409, "not_paid", "the host has no paid_through after now for this VM", false}
@@ -585,6 +621,7 @@ func (b *broker) listVMs(w http.ResponseWriter, r *http.Request) {
 
 func (b *broker) getVM(w http.ResponseWriter, r *http.Request, id string) {
 	s := b.vms
+	s.reconcileRuns(r.Context(), id) // receipts and history still pending (B1, B2)
 	s.mu.Lock()
 	rec := s.recs[id]
 	if rec == nil {
@@ -689,9 +726,9 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "no_vm_capacity", "no VM host has the capacity and a free SSH port")
 		return
 	}
-	id := newVMID()
-	for s.recs[id] != nil {
-		id = newVMID()
+	id := s.newID()
+	for s.recs[id] != nil || s.idUsedLocked(id) { // never an id a receipt or tombstone names (B4)
+		id = s.newID()
 	}
 	rec := &vmRecord{ID: id, Account: req.Account, Host: h.ID, SSHPort: port, VCPUs: req.VCPUs, MemGiB: req.MemGiB, DiskGiB: req.DiskGiB,
 		DesiredState: vmStateCreating, CreatedAt: s.now().Unix()}
@@ -814,9 +851,12 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 	var refuse string
+	code := "stale_authorization"
 	switch {
 	case rec.DesiredState == vmStateCreating:
 		refuse = "the VM is not created yet"
+	case s.receiptMissingLocked(rec) || s.openIntentLocked(id):
+		code, refuse = "receipt_missing", "a close or authorize of this VM has no receipt yet; repeat the stop, or wait for the replay"
 	case (rec.DesiredState == vmStateRunning || rec.DesiredState == vmStateStarting) && gen != rec.Generation:
 		refuse = fmt.Sprintf("a running VM takes only its own generation %d", rec.Generation)
 	case rec.DesiredState == vmStateStopped && rec.Generation > 0 && rec.StoppedAt == 0:
@@ -836,8 +876,20 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 	if refuse != "" {
 		delete(s.busy, id)
 		s.mu.Unlock()
-		writeErr(w, 409, "stale_authorization", refuse)
+		writeErr(w, 409, code, refuse)
 		return
+	}
+	// Intent first for a generation the broker has not recorded yet: a lost
+	// reply must never leave an open generation on the host that no line names.
+	// A refresh of the tracked generation has no intent (cancelling it would
+	// close a run that is live).
+	if gen > rec.AuthorizedGeneration {
+		if err := s.appendAuthIntentLocked(id, rec.Account, rec.Host, gen); err != nil {
+			delete(s.busy, id)
+			s.mu.Unlock()
+			writeErr(w, 500, "state_not_saved", "the authorization could not be recorded; nothing was sent to the host")
+			return
+		}
 	}
 	s.mu.Unlock()
 
@@ -848,10 +900,16 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 	delete(s.busy, id)
 	if cerr != nil {
 		if cerr.unknown {
-			rec.LastError = "authorize: " + cerr.code
+			rec.LastError = "authorize: " + cerr.code // the intent stays open: replay fences it
 			_ = s.saveLocked()
+		} else if err := s.resolveAuthLocked(id, gen, false); err != nil {
+			log.Printf("vms: refused authorize of %s generation %d not resolved: %v", id, gen, err)
 		}
 		cerr.write(w)
+		return
+	}
+	if err := s.resolveAuthLocked(id, gen, true); err != nil {
+		writeErr(w, 500, "state_not_saved", "the host took the authorization but the broker could not record it; repeat it")
 		return
 	}
 	rec.AuthorizedGeneration, rec.PaidThrough, rec.LastError = gen, pt, ""
@@ -889,6 +947,8 @@ func (b *broker) startVM(w http.ResponseWriter, r *http.Request, id string) {
 		code, refuse = "vm_not_stopped", "only a stopped VM starts (state "+rec.DesiredState+")"
 	case req.Generation != nil && *req.Generation != gen:
 		code, refuse = "stale_generation", fmt.Sprintf("the generation to start is %d", gen)
+	case s.receiptMissingLocked(rec) || s.openIntentLocked(id):
+		code, refuse = "receipt_missing", "a close or authorize of this VM has no receipt yet; repeat the stop, or wait for the replay"
 	case rec.AuthorizedGeneration != gen || rec.PaidThrough <= s.now().Unix():
 		code, refuse = "not_authorized", fmt.Sprintf("authorize generation %d with a paid_through after now first", gen)
 	}
@@ -992,6 +1052,35 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	if rec.DesiredState == vmStateStopped && rec.StoppedAt != 0 {
 		// The stored receipt, answered only once it is on disk: the save
 		// after the host's stop may have failed.
+		if _, have := s.receipts[vmRunKey{id, gen}]; !have {
+			// Closed on record with no B1 receipt (a crash, or an older
+			// broker): the host's close record makes it, if it agrees.
+			stored := rec.StoppedAt
+			if err := s.appendCloseIntentLocked(id, rec.Account, rec.Host, gen); err != nil {
+				delete(s.busy, id)
+				s.mu.Unlock()
+				writeErr(w, 500, "state_not_saved", "the close could not be recorded; nothing was sent to the host")
+				return
+			}
+			s.mu.Unlock()
+			at, cerr := s.hostCancel(r.Context(), h, id, gen)
+			s.mu.Lock()
+			if cerr != nil {
+				delete(s.busy, id)
+				s.mu.Unlock()
+				cerr.write(w)
+				return
+			}
+			if at != stored {
+				log.Printf("vms: %s generation %d: host close at %d, vms.json says %d; no receipt written", id, gen, at, stored)
+				delete(s.busy, id)
+				s.mu.Unlock()
+				writeErr(w, 409, "vm_receipt_mismatch", "the host's close of this run differs from the stopped_at on record; not changed")
+				return
+			}
+			s.finishClose(r.Context(), w, rec, gen, at, vmReceiptCancel, func(*vmRecord) {}, false)
+			return
+		}
 		err := s.saveLocked()
 		delete(s.busy, id)
 		v := s.view(rec)
@@ -1002,6 +1091,13 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 			return
 		}
 		writeJSON(w, 200, v)
+		return
+	}
+	// Close intent first (vm-runs.jsonl), then the stop intent in vms.json.
+	if err := s.appendCloseIntentLocked(id, rec.Account, rec.Host, gen); err != nil {
+		delete(s.busy, id)
+		s.mu.Unlock()
+		writeErr(w, 500, "state_not_saved", "the stop could not be recorded; nothing was sent to the host")
 		return
 	}
 	// Intent first: once asked to stop, the run takes no more authorizations.
@@ -1018,23 +1114,32 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	s.mu.Unlock()
 
 	doc, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "stop", id, "--generation", strconv.FormatUint(gen, 10))
+	kind := vmReceiptStop
+	if cerr != nil && cerr.code == "stale_authorization" {
+		// A lost start (or one GET settled to stopped) that was never confirmed
+		// running, and whose generation the host does not hold. The host's own
+		// close record settles it (B0), never broker time. A run that ran keeps
+		// the refusal: its real stop is the host's stop answer.
+		s.mu.Lock()
+		neverRan := (prev == vmStateStopped || prev == vmStateStarting) && !rec.Ran
+		s.mu.Unlock()
+		if neverRan {
+			var at int64
+			if at, cerr = s.hostCancel(r.Context(), h, id, gen); cerr == nil {
+				doc, kind = map[string]any{"stopped_at": float64(at)}, vmReceiptCancel
+			}
+		}
+	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.busy, id)
-	if cerr != nil && cerr.code == "stale_authorization" && (prev == vmStateStopped || prev == vmStateStarting) && !rec.Ran {
-		// A lost start (or one GET settled to stopped) that was never confirmed
-		// running, and whose generation the host does not hold: it never ran
-		// there, so it closes at now, as cancelVMRun does. A run that ran keeps
-		// the refusal: its real stop time is the host's, never "now".
-		// Without this the run stays consumed with no receipt and every Stop is 409.
-		doc, cerr = map[string]any{"stopped_at": float64(s.now().Unix())}, nil
-	}
 	if cerr != nil {
+		defer s.mu.Unlock()
+		delete(s.busy, id)
 		if cerr.unknown {
 			rec.LastError = "stop: " + cerr.code // stays stopped in intent; repeat the stop
 		} else {
 			rec.DesiredState = prev // the host refused this generation's stop
+			s.refuseCloseLocked(id, gen)
 		}
 		_ = s.saveLocked()
 		if cerr.code == "stale_authorization" {
@@ -1045,58 +1150,57 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	at, ok := vmUnixField(doc["stopped_at"])
 	if !ok {
+		defer s.mu.Unlock()
+		delete(s.busy, id)
 		rec.LastError = "stop: no stopped_at"
 		_ = s.saveLocked()
 		writeErr(w, 502, "vm_host_bad_answer", "the host's stop answer has no stopped_at")
 		return
 	}
-	rec.StoppedAt, rec.LastError = at, ""
-	if err := s.saveLocked(); err != nil {
-		log.Printf("vms: %s not saved after stop of %s: %v", vmsFile, id, err)
-		writeErr(w, 500, "state_not_saved", "the host stopped the VM but the broker could not record stopped_at; repeat the stop")
-		return
-	}
-	writeJSON(w, 200, s.view(rec))
+	// B1: the receipt is durable before vms.json shows the stop and before the 200.
+	s.finishClose(r.Context(), w, rec, gen, at, kind, func(r *vmRecord) { r.StoppedAt, r.LastError = at, "" }, false)
 }
 
 // cancelVMRun closes the next run of a stopped VM before it started (its
 // authorization delivered, or its reply lost). The generation is consumed:
 // a late start or authorize of it is refused since the next is gen+1. The
-// host closes it and answers stopped_at; exit 3 means the host never got
-// that authorization, so the run closes at now. A host that does not
-// answer changes nothing and the cancel may be repeated. Caller holds the
-// VM busy (begin), not s.mu.
+// host closes it and answers stopped_at; when the host refuses the stop
+// (exit 3, it never got that authorization) the host's cancel closes the
+// generation and its close record is used (B0), never broker time. A host
+// that does not answer changes nothing and the cancel may be repeated.
+// Caller holds the VM busy (begin), not s.mu.
 func (b *broker) cancelVMRun(w http.ResponseWriter, r *http.Request, rec *vmRecord, h vmHostConfig, gen uint64) {
 	s := b.vms
 	id := rec.ID
-	doc, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "stop", id, "--generation", strconv.FormatUint(gen, 10))
-
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.busy, id)
+	if err := s.appendCloseIntentLocked(id, rec.Account, rec.Host, gen); err != nil {
+		delete(s.busy, id)
+		s.mu.Unlock()
+		writeErr(w, 500, "state_not_saved", "the cancel could not be recorded; nothing was sent to the host")
+		return
+	}
+	s.mu.Unlock()
+	doc, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "stop", id, "--generation", strconv.FormatUint(gen, 10))
 	var at int64
 	switch {
 	case cerr != nil && cerr.code == "stale_authorization":
-		at = s.now().Unix()
-	case cerr != nil:
-		cerr.write(w)
-		return
-	default:
+		at, cerr = s.hostCancel(r.Context(), h, id, gen)
+	case cerr == nil:
 		var ok bool
 		if at, ok = vmUnixField(doc["stopped_at"]); !ok {
-			writeErr(w, 502, "vm_host_bad_answer", "the host's stop answer has no stopped_at")
-			return
+			cerr = &vmCallErr{502, "vm_host_bad_answer", "the host's stop answer has no stopped_at", false}
 		}
 	}
-	prev := *rec
-	rec.Generation, rec.StoppedAt, rec.LastError = gen, at, ""
-	if err := s.saveLocked(); err != nil {
-		*rec = prev
-		log.Printf("vms: %s not saved after cancel of %s generation %d: %v", vmsFile, id, gen, err)
-		writeErr(w, 500, "state_not_saved", "the run was closed on the host but the broker could not record it; repeat the stop")
+	s.mu.Lock()
+	if cerr != nil {
+		delete(s.busy, id)
+		s.mu.Unlock()
+		cerr.write(w)
 		return
 	}
-	writeJSON(w, 200, s.view(rec))
+	s.finishClose(r.Context(), w, rec, gen, at, vmReceiptCancel, func(r *vmRecord) {
+		r.Generation, r.StoppedAt, r.LastError = gen, at, ""
+	}, true)
 }
 
 // vmUnixField reads a time as unix seconds (a number) or RFC 3339.
@@ -1182,25 +1286,12 @@ func (b *broker) deleteVM(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	s.mu.Unlock()
 
-	_, cerr := s.call(r.Context(), h, 2*time.Minute, nil, "delete", id, "--confirm", id)
-
+	cerr := s.deleteSteps(r.Context(), id, h)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.busy, id)
+	s.mu.Unlock()
 	if cerr != nil {
-		if rec := s.recs[id]; rec != nil && cerr.unknown {
-			rec.LastError = "delete: " + cerr.code
-			_ = s.saveLocked()
-		}
 		cerr.write(w)
-		return
-	}
-	rec := s.recs[id]
-	delete(s.recs, id)
-	if err := s.saveLocked(); err != nil {
-		s.recs[id] = rec
-		log.Printf("vms: %s not saved after delete of %s: %v", vmsFile, id, err)
-		writeErr(w, 500, "state_not_saved", "the host deleted the VM but the broker could not record it; repeat the delete")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": id, "deleted": true})
