@@ -1691,3 +1691,72 @@ func TestVMHistoryStartRefusesGenerationClosedInJournal(t *testing.T) {
 	c2.authorize(t, 3)
 	c2.must(t, "start", map[string]any{"generation": 3})
 }
+
+// Bugbot "Failed close refusal fences live run": the host refused the stop of
+// the running G1, and the line that resolves its close intent as refused could
+// not be written. The stop answers 500 (retryable), not the host's 409. While
+// the refusal is unrecorded this broker never cancels G1 through GET, and it
+// keeps the receipt_missing gate. Once the journal takes writes again, a
+// repeated stop or the next GET records the refusal; then the gate lifts and a
+// restart's replay leaves the live run alone.
+func TestVMHistoryUnrecordedStopRefusalFailsAndNeverCancelsLiveRun(t *testing.T) {
+	for _, retry := range []string{"stop", "get"} {
+		t.Run(retry, func(t *testing.T) {
+			c := newHistCase(t)
+			c.run(t)
+			c.host.set(func(h *histHost) { h.refuseStop = true })
+			journalDown := true
+			c.tb.b.vms.appendHook = func(name string, line []byte) error {
+				if journalDown && name == vmRunsFile && bytes.Contains(line, []byte(`"resolved":"close"`)) {
+					return errors.New("disk full")
+				}
+				return nil
+			}
+			if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 500 || vmErrCode(doc) != "state_not_saved" {
+				t.Fatalf("stop with the refusal unrecorded: %d %v", st, doc)
+			}
+			if st, doc := c.tb.call(t, "operator-key", "GET", c.base, nil); st != 200 || doc["desired_state"] != vmStateRunning {
+				t.Fatalf("GET: %d %v", st, doc)
+			}
+			if len(c.host.cancels) != 0 {
+				t.Fatalf("a GET cancelled the live run: %v", c.host.cancels)
+			}
+			if st, doc := c.post(t, "authorize", map[string]any{"generation": 1, "paid_through": c.tb.now.Unix() + 600}); st != 409 || vmErrCode(doc) != "receipt_missing" {
+				t.Fatalf("authorize while the refusal is unrecorded: %d %v", st, doc)
+			}
+			// The disk is still failing: a repeated stop cannot save its intent and
+			// sends nothing, so the refusal still stands for the next GET.
+			c.tb.b.vms.saveHook = func() error { return errors.New("disk full") }
+			if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 500 {
+				t.Fatalf("stop with vms.json failing: %d %v", st, doc)
+			}
+			c.tb.b.vms.saveHook = nil
+			c.tb.call(t, "operator-key", "GET", c.base, nil)
+			if len(c.host.cancels) != 0 {
+				t.Fatalf("a GET after an undispatched stop cancelled the live run: %v", c.host.cancels)
+			}
+			journalDown = false
+			if retry == "stop" {
+				if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 409 || vmErrCode(doc) != "stale_generation" {
+					t.Fatalf("repeated stop: %d %v", st, doc)
+				}
+			} else {
+				c.tb.call(t, "operator-key", "GET", c.base, nil)
+			}
+			refusals := 0
+			for _, l := range readRawRuns(t, c.tb) {
+				if l.Resolved == "close" && l.Generation == 1 {
+					refusals++
+				}
+			}
+			if refusals != 1 {
+				t.Fatalf("refusal lines for G1: %d", refusals)
+			}
+			c.authorize(t, 1) // the paid_through refresh of the live run goes through again
+			c.tb.restart(t, true)
+			if len(c.host.cancels) != 0 {
+				t.Fatalf("replay cancelled the live run: %v", c.host.cancels)
+			}
+		})
+	}
+}

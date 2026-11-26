@@ -232,7 +232,7 @@ func decodeVMLine(line []byte, v any) error {
 
 // loadRuns reads both files into memory. Called by loadVMs.
 func (s *vmStore) loadRuns() error {
-	s.dirty = map[string]bool{}
+	s.dirty, s.closeRefusing = map[string]bool{}, map[vmRunKey]bool{}
 	if err := s.loadRunsFile(); err != nil {
 		return err
 	}
@@ -344,6 +344,9 @@ func (s *vmStore) appendCloseIntentLocked(vm, account, host string, gen uint64) 
 		return err
 	}
 	k := vmRunKey{vm, gen}
+	// A new dispatch follows: its outcome may be a close, so an earlier
+	// refusal held in memory no longer keeps the replay away from this intent.
+	delete(s.closeRefusing, k)
 	if _, ok := s.receipts[k]; ok {
 		return nil
 	}
@@ -364,23 +367,47 @@ func (s *vmStore) appendCloseIntentLocked(vm, account, host string, gen uint64) 
 // as it was (a stop of a generation the host does not hold, for a run that
 // ran). The intent is answered, so it no longer blocks the next authorize.
 // This line is an addition to the spec's intent lines.
-func (s *vmStore) refuseCloseLocked(vm string, gen uint64) {
-	if err := s.settleLocked(vmRunsFile); err != nil {
-		return
-	}
+//
+// A refusal that cannot be written is never dropped: an open intent is what
+// the replay cancels, and that cancel would stop the run the host just kept.
+// It is held in closeRefusing, the caller fails the request (5xx, repeat the
+// stop), this broker never cancels the intent, and the receipt_missing gate
+// stays until the line is on disk. retryRefusalsLocked writes it on the next
+// GET, authorize or start. The hold is memory only: a restart before the line
+// lands replays the intent as open (B1), which is why the stop answers 5xx
+// and not the host's 409. Caller holds s.mu.
+func (s *vmStore) refuseCloseLocked(vm string, gen uint64) error {
 	k := vmRunKey{vm, gen}
-	if _, ok := s.closeIntents[k]; !ok || s.closeRefused[k] {
-		return
+	if err := s.settleLocked(vmRunsFile); err != nil {
+		log.Printf("vms: %s: refused close of %s generation %d not recorded: %v", vmRunsFile, vm, gen, err)
+		s.closeRefusing[k] = true
+		return err
 	}
-	if _, done := s.receipts[k]; done {
-		return
+	_, open := s.closeIntents[k]
+	_, done := s.receipts[k]
+	if !open || done || s.closeRefused[k] {
+		delete(s.closeRefusing, k)
+		return nil
 	}
 	no := false
 	if err := s.appendJSONL(vmRunsFile, vmRunLine{Resolved: "close", VM: vm, Generation: gen, Accepted: &no}); err != nil {
 		log.Printf("vms: %s: refused close of %s generation %d not recorded: %v", vmRunsFile, vm, gen, err)
-		return // stays open: conservative
+		s.closeRefusing[k] = true
+		return err
 	}
 	s.closeRefused[k] = true
+	delete(s.closeRefusing, k)
+	return nil
+}
+
+// retryRefusalsLocked writes each refusal of vm still held in memory only.
+// Caller holds s.mu.
+func (s *vmStore) retryRefusalsLocked(vm string) {
+	for k := range s.closeRefusing {
+		if k.vm == vm {
+			_ = s.refuseCloseLocked(vm, k.gen) // logged there; still held on failure
+		}
+	}
 }
 
 // appendAuthIntentLocked records that the broker is about to send a host
@@ -480,8 +507,10 @@ func (s *vmStore) unresolvedGensLocked(vm string) (closes, auths []uint64) {
 }
 
 // openIntentLocked: any intent of vm is unresolved (the receipt_missing gate).
+// A refusal held in memory only still counts as unresolved.
 func (s *vmStore) openIntentLocked(vm string) bool {
 	_ = s.settleLocked(vmRunsFile)
+	s.retryRefusalsLocked(vm)
 	c, a := s.unresolvedGensLocked(vm)
 	return len(c)+len(a) > 0
 }
@@ -806,7 +835,16 @@ func (s *vmStore) reconcileRuns(ctx context.Context, id string) {
 	if s.adoptReceiptsLocked(rec) {
 		save("adopting a receipt")
 	}
-	closes, auths := s.unresolvedGensLocked(id)
+	s.retryRefusalsLocked(id)
+	open, auths := s.unresolvedGensLocked(id)
+	// A close the host refused whose refusal is not on disk yet is never
+	// cancelled here: the host kept that run.
+	var closes []uint64
+	for _, g := range open {
+		if !s.closeRefusing[vmRunKey{id, g}] {
+			closes = append(closes, g)
+		}
+	}
 	// An authorize whose generation is live was answered; only its line was lost.
 	var fence []uint64
 	for _, g := range auths {

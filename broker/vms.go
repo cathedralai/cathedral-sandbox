@@ -220,7 +220,10 @@ type vmStore struct {
 	authIntents  map[vmRunKey]vmRunLine
 	authRes      map[vmRunKey]bool
 	authAccepted map[vmRunKey]bool // sticky: an authorize the host accepted stays outstanding until its receipt
-	dirty        map[string]bool   // journals with an append that may have half happened
+	// closeRefusing: the host refused this close, but its refusal line is not
+	// on disk yet. Memory only, never reloaded from the journal (refuseCloseLocked).
+	closeRefusing map[vmRunKey]bool
+	dirty         map[string]bool // journals with an append that may have half happened
 
 	newID      func() string                        // newVMID; a test makes it repeat an id
 	appendHook func(file string, line []byte) error // tests: fail an append before it writes
@@ -1118,6 +1121,7 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	// Close intent first (vm-runs.jsonl), then the stop intent in vms.json.
+	held := s.closeRefusing[vmRunKey{id, gen}]
 	if err := s.appendCloseIntentLocked(id, rec.Account, rec.Host, gen); err != nil {
 		delete(s.busy, id)
 		s.mu.Unlock()
@@ -1129,6 +1133,9 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 	rec.DesiredState = vmStateStopped
 	if err := s.saveLocked(); err != nil {
 		rec.DesiredState = prev
+		if held {
+			s.closeRefusing[vmRunKey{id, gen}] = true // nothing was sent: the host's refusal still stands
+		}
 		delete(s.busy, id)
 		s.mu.Unlock()
 		log.Printf("vms: %s not saved before stop of %s: %v", vmsFile, id, err)
@@ -1163,7 +1170,13 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 			rec.LastError = "stop: " + cerr.code // stays stopped in intent; repeat the stop
 		} else {
 			rec.DesiredState = prev // the host refused this generation's stop
-			s.refuseCloseLocked(id, gen)
+			if err := s.refuseCloseLocked(id, gen); err != nil {
+				// Held in memory, never cancelled by this broker; a repeated
+				// stop gets the same refusal and records it.
+				_ = s.saveLocked()
+				writeErr(w, 500, "state_not_saved", "the host refused this stop but the broker could not record the refusal; repeat the stop")
+				return
+			}
 		}
 		_ = s.saveLocked()
 		if cerr.code == "stale_authorization" {
