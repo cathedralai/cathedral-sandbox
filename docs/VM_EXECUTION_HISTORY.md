@@ -1,6 +1,6 @@
 # VM execution history for billing settlement (AB#992)
 
-Status: spec r2 (r1 reviewed by Astra, 10 findings, all addressed below). Owner: Spock.
+Status: spec r3 (Astra r1: 10 findings; r2: 2 BLOCKER and 6 SHOULD, all addressed below). Owner: Spock.
 Consumer: the inactive VM billing worker in polariscomputer (PR 2296 stack, `ExecutionReader`
 in `polaris/services/vm_credit_settlement.py`). Rates and thresholds are not touched here
 (Toby, Core 26 Nov: contract defaults, frozen catalog quote).
@@ -72,13 +72,24 @@ anything that depends on it (H2, H5). Delete never removes it.
     rebuilt from the close line on every retry, so Stop and history always give the same
     `stopped_at`.
   - `stopped_at` stays integer unix seconds, as today, because it is the Stop evidence.
-- **H5. Cancel (r1 BLOCKER 5).** New idempotent `vm-ctl.sh cancel <name> <G>`:
-  - If G is above the authorized generation, or equals it with no `start` line, it fences G
-    by raising `closed_generation` to G and appends `close` (reason `cancelled`). It answers
-    with the close record. Later calls return the same record.
-  - If G has a `start` line, it refuses with `generation_started` (that is a Stop).
-  - The broker's `cancelVMRun` calls this instead of reading exit 3 as success. It stops
-    inventing `StoppedAt`.
+- **H4a. Closure is recovered before every decision (r2 BLOCKER 1).**
+  - `cmd_start`, `cmd_authorize`, `cancel` and `stop_locked` first recover closure under
+    the VM lock: if the file has a `close` line above `authorization.closed_generation`,
+    they raise it and rewrite `authorization.json` before deciding.
+  - `check-paid`, which only reads, refuses to launch a generation that has a `close` line.
+  - So a crash between a durable close and `authorization.json` can never let G start.
+- **H5. Cancel closes G in any state (r1 BLOCKER 5, r2 SHOULD 3, 4).** New idempotent
+  `vm-ctl.sh cancel <name> <G>`. Its check, fence and durable close all run under the same
+  VM lock as `cmd_start` and `cmd_authorize`:
+  - **G above the authorized generation:** it fences G by raising `closed_generation` to G
+    and appends `close`, reason `cancelled`.
+  - **G authorized with no start line:** it closes G the same way, as never started.
+  - **G with a start line** (including a launch that failed after its start line): it does a
+    generation-fenced stop. It stops the unit if running, then closes through `stop_locked`,
+    reason `cancelled`. History then bills from the start line, which is conservative.
+  - In every case it answers with the close record, and later calls return the same record.
+  - The broker closes generations only through `stop` or `cancel` and never invents a time
+    (B0).
 - **H6. Torn lines (r1 SHOULD 8).**
   - A final line with no newline is a write that never finished. Nothing depended on it
     (H2, H4), so readers ignore it and the next writer truncates it under the lock.
@@ -88,13 +99,13 @@ anything that depends on it (H2, H5). Delete never removes it.
 - **H8. Time (r1 SHOULD 10).**
   - Each line records the wall clock in microseconds, `boot_id`, `CLOCK_MONOTONIC`
     nanoseconds and `synced` (from `adjtimex`, the kernel's NTP sync state).
-  - `history` derives `started_at`:
-    - **Same boot** for start and close: `started_at = stopped_at_wall - (close.mono_ns -
-      start.mono_ns)`, in microseconds. The duration is exact and anchored on the Stop
-      time the bill already uses.
-    - **Different boots** (a reboot during the run): use `start.wall_us`, but only if
-      both lines were `synced`. Otherwise answer `history_unknown`.
-  - `started_at` is never later than `stopped_at`.
+  - `history` derives `started_at` only when both lines are `synced` (r2 BLOCKER 2).
+    Otherwise it answers `history_unknown`:
+    - **Same boot** for start and close: `started_at = close.wall_us - (close.mono_ns -
+      start.mono_ns) / 1000`. The duration is exact, and the anchor is the close line's
+      microsecond wall time, not the integer `stopped_at`.
+    - **Different boots** (a reboot during the run): `start.wall_us`.
+  - `started_at` is never later than the close time.
 - **H9. `vm-ctl.sh history <name> <G>`**, read-only, works after delete:
   - Closed G with G >= N answers `{"generation":G,"closed":true,"started_at":ISO-us|null,
     "stopped_at":S,"tracked_from":N,"close_reason":R,"history":"v2"}`.
@@ -103,12 +114,23 @@ anything that depends on it (H2, H5). Delete never removes it.
 
 ## Broker: per-generation receipts, eager history, tombstones
 
-- **B1. Stop receipts before the answer (r1 SHOULD 6).** Before Stop or cancel answers 200,
-  the broker appends `{"vm","account","host","generation","stopped_at","kind"}` to
-  `vm-runs.jsonl` in its state dir and fsyncs it. A failed write answers 500
-  `state_not_saved`, as today. This is the immutable per-generation record the later
-  history read is checked against. It does not depend on `vms.json`, which moves on to the
-  next run.
+Every append below is followed by fsync of the file and the state dir before the next step.
+
+- **B0. No invented times (r2 SHOULD 5).**
+  - `stopVM` and `cancelVMRun` stop using broker time for a host refusal
+    (`stale_authorization` or `generation_closed`).
+  - They call host `cancel` for that generation. It returns the canonical close, whether
+    the close was just made or made earlier (for example an H3 `superseded` close).
+- **B1. Stop receipts before anything else (r1 SHOULD 6, r2 SHOULD 6).**
+  - Once the host returns a close record, the broker appends
+    `{"vm","account","host","generation","stopped_at","kind"}` to `vm-runs.jsonl` and
+    makes it durable.
+  - Only then does it write the stopped state to `vms.json` and answer 200. A failed
+    append answers 500 `state_not_saved`, and `vms.json` is unchanged.
+  - Authorize and start of G+1 refuse with 409 `receipt_missing` while G is closed on
+    record without a B1 receipt.
+  - At broker start, a reconcile pass replays any VM whose `vms.json` shows a closed G
+    without a receipt by calling host `cancel G`, which returns the same close.
 - **B2. Eager history.**
   - Right after B1, the broker calls the host `history` once and appends the closed answer
     to `vm-history.jsonl`, keyed by `(vm, generation)`. It is never overwritten.
@@ -116,13 +138,18 @@ anything that depends on it (H2, H5). Delete never removes it.
     `vm-runs.jsonl`, and the next GET or the existing reconcile pass retries it.
   - An answer whose `stopped_at` differs from the B1 receipt is refused with
     `vm_history_mismatch` and logged. After H4 this means a bug or tampering.
-- **B3. Delete (r1 SHOULD 7).**
-  - `deleteVM` first closes the current generation through the normal Stop or cancel path
-    (B1), and stores history for every generation with a B1 receipt (B2).
+- **B3. Delete (r1 SHOULD 7, r2 SHOULD 7, 8).**
+  - `deleteVM` first works out the outstanding set: `Generation`, `AuthorizedGeneration`
+    and any unresolved start intent.
+  - It closes every member through host `cancel` (B0, B1), and stores history for every
+    generation with a B1 receipt (B2).
   - It refuses with 409 `history_not_stored` until every receipt has history or the host
     says `history_unknown`.
   - Then it deletes on the host and appends a tombstone `{"vm","account","host",
-    "deleted_at"}` to `vm-runs.jsonl`.
+    "deleted_at"}` to `vm-runs.jsonl` durably. Only after that does it remove the VM from
+    `vms.json`.
+  - A delete interrupted at any step replays from the start: cancel and history are
+    idempotent, and a host delete of a gone VM answers `existed:false`.
 - **B4. IDs are not reused (r1 SHOULD 9).** `newVMID` also checks `vm-runs.jsonl` (receipts
   and tombstones).
 - **B5. Route.**
@@ -153,6 +180,12 @@ anything that depends on it (H2, H5). Delete never removes it.
 ## Tests (each r1 finding has one)
 
 - **Host:**
+  - A crash after the close line and before `authorization.json`: start G, authorize and
+    `check-paid` all refuse.
+  - Cancel and start racing in both orders.
+  - A start line, then a failed launch, then cancel G: it closes, and history bills from the
+    start line.
+  - Unsynced lines give `history_unknown` in both time branches.
   - Rollout with a running G: stop G, then `history` is `history_unknown`, and a retried
     start of G stays unknown.
   - Authorize G+1 over a started G is refused; over an unstarted G it closes G as never
@@ -167,6 +200,11 @@ anything that depends on it (H2, H5). Delete never removes it.
   - Same-boot derivation; cross-boot with unsynced clocks is unknown.
   - Ordinary start and stop retries keep the first times.
 - **Broker:**
+  - A host refusal on stop or cancel stores the host's canonical close, never broker time.
+  - A crash between the B1 append and `vms.json` replays at start. G+1 is refused while G
+    has no receipt.
+  - Delete with an authorized, unstarted G2 cancels and records G2 first.
+  - An interrupted delete replays.
   - The B1 receipt is written before 200, and a failed write is 500.
   - A history fetch failure, then G+1 starts, then the G history read still matches the B1
     receipt.
