@@ -908,6 +908,159 @@ def test_cancel_retry_rewrites_stop_json_from_the_close_line(vm, monkeypatch):
     assert stop["reason"] == "cancelled" and vm.authjson()["closed_generation"] == 1
 
 
+# ---- Abandoned journal writers (SpockChaser HOLD on 8627f0f) ---------------------------------
+
+def closes(vm, name="vm1"):
+    return [e for e in vm.lines(name) if e["event"] == "close"]
+
+
+def late_append(vm, record, name="vm1"):
+    """An abandoned writer: it waits, then completes its append through the real function."""
+    release, done = threading.Event(), threading.Event()
+
+    def work():
+        release.wait(30)
+        try:
+            vm.m.history_append(name, record)
+        finally:
+            done.set()
+
+    threading.Thread(target=work, daemon=True).start()
+    return release, done
+
+
+def test_an_abandoned_close_append_finishing_after_a_stop_retry_leaves_one_close(vm, monkeypatch):
+    """Chaser's counterexample: enforce abandons its close append, a normal Stop retry closes the run,
+    then the abandoned append completes. One close, valid history, and Stop and history agree."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    a = vm.authjson()
+    a["paid_through"] = int(time.time()) - 5
+    (vm.root / "vm1" / "authorization.json").write_text(json.dumps(a))
+    gate, finished, calls = threading.Event(), threading.Event(), []
+    real = vm.m.history_append
+
+    def delayed(name, rec):
+        if rec["event"] == "close":
+            calls.append(rec)
+            if len(calls) == 1:  # only the enforce stop's append is the abandoned one
+                gate.wait(30)
+                try:
+                    return real(name, rec)
+                finally:
+                    finished.set()
+        return real(name, rec)
+
+    monkeypatch.setattr(vm.m, "HISTORY_BUDGET", 0.3, raising=False)
+    monkeypatch.setattr(vm.m, "history_append", delayed)
+    try:
+        first = vm.m.cmd_enforce([])
+        assert [e["error"] for e in first["errors"]] == ["history_stalled"]
+        assert closes(vm) == []
+        vm.m._stalled.discard("vm1")  # the retry is a different command, in a different process in real life
+        vm.clk.advance(30)
+        code, stopped = vm.stop()  # the normal Stop retry finds no close and appends one
+        assert code == 0 and len(closes(vm)) == 1
+    finally:
+        gate.set()
+    assert finished.wait(5)  # the abandoned append has now completed
+    assert len(closes(vm)) == 1 and vm.m.read_history("vm1")["corrupt"] is False
+    code, h = vm.history(1)
+    assert code == 0 and h["stopped_at"] == stopped["stopped_at"] == closes(vm)[0]["stopped_at"]
+
+
+def test_a_control_that_finishes_the_original_append_first_keeps_one_close(vm):
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    vm.clk.advance(30)
+    first = vm.m.append_close("vm1", 1, "paid_through")
+    vm.clk.advance(30)
+    code, stopped = vm.stop()
+    assert code == 0 and len(closes(vm)) == 1 and stopped["stopped_at"] == first["stopped_at"]
+    assert vm.history(1)[0] == 0
+
+
+def test_a_second_process_appending_the_same_close_makes_the_paused_writer_a_no_op(vm, tmp_path):
+    import subprocess
+
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    vm.clk.advance(10)
+    paused = {"event": "close", "generation": 1, "stopped_at": 111, "reason": "paid_through",
+              **vm.m.stamp()}
+    release, done = late_append(vm, paused)  # the first writer, paused before it takes the flock
+    other = dict(paused, stopped_at=222, reason="requested")
+    script = (
+        "import importlib.util, json, sys\n"
+        f"spec = importlib.util.spec_from_file_location('v', {str(KIT / 'vm_ctl.py')!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        f"print(json.dumps(m.history_append('vm1', {other!r})))\n")
+    p = subprocess.run([sys.executable, "-B", "-c", script], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    assert json.loads(p.stdout)["stopped_at"] == 222
+    release.set()
+    assert done.wait(5)
+    assert [(c["stopped_at"], c["reason"]) for c in closes(vm)] == [(222, "requested")]
+    assert vm.m.read_history("vm1")["corrupt"] is False and vm.history(1)[1]["stopped_at"] == 222
+
+
+def test_two_processes_racing_the_same_close_leave_one(vm):
+    import subprocess
+
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    script = (
+        "import importlib.util, json, sys\n"
+        f"spec = importlib.util.spec_from_file_location('v', {str(KIT / 'vm_ctl.py')!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "print(json.dumps(m.append_close('vm1', 1, sys.argv[1])))\n")
+    procs = [subprocess.Popen([sys.executable, "-B", "-c", script, f"r{i}"], stdout=subprocess.PIPE, text=True)
+             for i in range(4)]
+    outs = [json.loads(p.communicate(timeout=60)[0]) for p in procs]
+    assert len(closes(vm)) == 1 and vm.m.read_history("vm1")["corrupt"] is False
+    assert {o["stopped_at"] for o in outs} == {closes(vm)[0]["stopped_at"]}  # every caller saw the same close
+
+
+def test_a_late_close_completing_after_authorize_closed_the_generation_is_a_no_op(vm):
+    vm.create()
+    vm.auth(1)
+    late = {"event": "close", "generation": 1, "stopped_at": 5, "reason": "paid_through", **vm.m.stamp()}
+    release, done = late_append(vm, late)
+    vm.clk.advance(10)
+    assert vm.auth(2)[0] == 0  # closes the unstarted generation 1 as superseded
+    release.set()
+    assert done.wait(5)
+    assert [c["reason"] for c in closes(vm)] == ["superseded"]
+    code, h = vm.history(1)
+    assert code == 0 and h["close_reason"] == "superseded" and h["started_at"] is None
+
+
+def test_a_late_start_completing_after_the_generation_was_closed_is_a_no_op(vm):
+    vm.create()
+    vm.auth(1)
+    late = {"event": "start", "generation": 1, **vm.m.stamp()}
+    release, done = late_append(vm, late)
+    vm.clk.advance(10)
+    assert vm.auth(2)[0] == 0
+    release.set()
+    assert done.wait(5)
+    assert [e["event"] for e in vm.lines()] == ["tracked_from", "close"]  # no start after the close
+    code, h = vm.history(1)
+    assert code == 0 and h["started_at"] is None  # still a certified never-started
+
+
+def test_a_late_tracked_from_does_not_duplicate_the_first_line(vm):
+    vm.create()
+    release, done = late_append(vm, {"event": "tracked_from", "generation": 1})
+    release.set()
+    assert done.wait(5)
+    assert vm.lines() == [{"event": "tracked_from", "generation": 1}]
+
+
 def test_no_em_dashes_in_the_history_work():
     for f in (KIT / "vm_ctl.py", KIT / "README.md", Path(__file__)):
         assert chr(0x2014) not in f.read_text(), f

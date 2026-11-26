@@ -480,11 +480,28 @@ def hio(name: str, fn, *args):
     return box["v"]
 
 
-def history_append(name: str, record: dict) -> None:
+def recorded_event(h: dict, record: dict) -> dict | None:
+    """The journal event that makes appending `record` unnecessary or wrong, if any.
+
+    One tracked_from per file, one start and one close per generation, and no start after the
+    close of its generation. A writer that was abandoned on a timeout and finishes late, or a
+    second process doing the same step, finds the event already there and appends nothing."""
+    kind, g = record["event"], record.get("generation")
+    if kind == "tracked_from":
+        return next((e for e in h["events"] if e["event"] == "tracked_from"), None)
+    close = event_of(h, "close", g)
+    if kind == "close":
+        return close
+    return event_of(h, "start", g) or close
+
+
+def history_append(name: str, record: dict) -> dict:
     """H1: append one line (a torn tail is cut first), then fsync the file and the journal dir.
 
-    The journal's own flock makes read, cut and append one step, so even a writer outside the VM
-    lock can only cut bytes after the last newline it read under that lock, never a complete line."""
+    Returns the event now in the journal for this step: `record`, or the equivalent event that was
+    already there. The decision to append is made under the journal's flock, from the bytes read
+    under it, so it is atomic with every other writer in any process, and a late completion of an
+    abandoned append is a no-op. A line found here is fsynced before it is returned."""
     hdir = history_dir()
     hdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(history_path(name), os.O_RDWR | os.O_CREAT, 0o600)
@@ -492,13 +509,15 @@ def history_append(name: str, record: dict) -> None:
         fcntl.flock(fd, fcntl.LOCK_EX)
         size = os.fstat(fd).st_size
         data = os.pread(fd, size, 0) if size else b""
-        valid_len = parse_history(data)["valid_len"]
-        if valid_len != len(data):
-            os.ftruncate(fd, valid_len)  # only the unterminated tail: nothing depended on it
-        os.lseek(fd, valid_len, os.SEEK_SET)
-        line = (json.dumps(record, sort_keys=True) + "\n").encode()
-        while line:
-            line = line[os.write(fd, line):]
+        parsed = parse_history(data)
+        existing = recorded_event(parsed, record)
+        if existing is None:
+            if parsed["valid_len"] != len(data):
+                os.ftruncate(fd, parsed["valid_len"])  # only the unterminated tail: nothing depended on it
+            os.lseek(fd, parsed["valid_len"], os.SEEK_SET)
+            line = (json.dumps(record, sort_keys=True) + "\n").encode()
+            while line:
+                line = line[os.write(fd, line):]
         os.fsync(fd)
     finally:
         os.close(fd)  # drops the flock
@@ -507,6 +526,7 @@ def history_append(name: str, record: dict) -> None:
         os.fsync(dfd)
     finally:
         os.close(dfd)
+    return existing if existing is not None else record
 
 
 def ensure_tracked(name: str, d: Path) -> None:
@@ -542,8 +562,7 @@ def append_close(name: str, generation: int, reason: str) -> dict:
     now = stamp()
     line = {"event": "close", "generation": generation, "stopped_at": now["wall_us"] // 1_000_000,
             "reason": reason, **now}
-    history_append(name, line)
-    return line
+    return history_append(name, line)  # the close already there wins over this one
 
 
 def is_tracked(h: dict, generation: int) -> bool:
