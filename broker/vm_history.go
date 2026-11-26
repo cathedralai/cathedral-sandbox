@@ -73,7 +73,11 @@ type vmRunLine struct {
 	Accepted   *bool  `json:"accepted,omitempty"`
 	StoppedAt  int64  `json:"stopped_at,omitempty"`
 	Kind       string `json:"kind,omitempty"`
-	DeletedAt  int64  `json:"deleted_at,omitempty"`
+	// Disputed: vms.json held another stopped_at for this run than the host's
+	// close (an older broker's own clock). The receipt is the host's close;
+	// B5 answers 409 vm_receipt_mismatch so settlement stays pending.
+	Disputed  bool  `json:"disputed,omitempty"`
+	DeletedAt int64 `json:"deleted_at,omitempty"`
 }
 
 func (l vmRunLine) isTombstone() bool { return l.DeletedAt != 0 }
@@ -97,8 +101,10 @@ var vmStartedAtRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d
 // ---------------------------------------------------------------- files
 
 // appendJSONL appends one line and makes it durable: fsync of the file, then
-// of the dir. A write that fails part way is cut back, so the next append
-// never lands on a torn tail.
+// of the dir. Any failure after the write began marks the journal dirty: the
+// line may be on disk although the caller is told it failed. The next
+// settleLocked reloads the journal from disk, so a retry never writes a line
+// that is already there.
 func (s *vmStore) appendJSONL(name string, v any) error {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -113,34 +119,60 @@ func (s *vmStore) appendJSONL(name string, v any) error {
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return err
 	}
-	path := filepath.Join(s.dir, name)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
 	}
-	size := int64(-1)
-	if st, err := f.Stat(); err == nil {
-		size = st.Size()
-	}
-	cutBack := func() {
-		if size >= 0 {
-			_ = f.Truncate(size)
-		}
-	}
+	s.dirty[name] = true // cleared once the line is known durable
 	if _, err := f.Write(raw); err != nil {
-		cutBack()
 		f.Close()
 		return err
 	}
 	if err := durableSync(f); err != nil {
-		cutBack()
 		f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return syncDir(s.dir)
+	if err := syncDir(s.dir); err != nil {
+		return err
+	}
+	delete(s.dirty, name)
+	return nil
+}
+
+// settleLocked makes a journal trustworthy again after a failed append: it is
+// reloaded from disk with the startup rules (a torn tail is cut, the first
+// entry wins), memory is replaced by what the file holds, and the file and the
+// dir are fsynced again. Caller holds s.mu.
+func (s *vmStore) settleLocked(name string) error {
+	if !s.dirty[name] {
+		return nil
+	}
+	var err error
+	if name == vmRunsFile {
+		err = s.loadRunsFile()
+	} else {
+		err = s.loadHistFile()
+	}
+	if err != nil {
+		return err
+	}
+	if f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_RDONLY, 0); err == nil {
+		serr := durableSync(f)
+		f.Close()
+		if serr != nil {
+			return serr
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := syncDir(s.dir); err != nil {
+		return err
+	}
+	delete(s.dirty, name)
+	return nil
 }
 
 // readJSONL calls fn for each complete line. A final line without a newline
@@ -184,9 +216,26 @@ func decodeVMLine(line []byte, v any) error {
 
 // loadRuns reads both files into memory. Called by loadVMs.
 func (s *vmStore) loadRuns() error {
-	s.receipts, s.tombs, s.hist = map[vmRunKey]vmRunLine{}, map[string]vmRunLine{}, map[vmRunKey]vmHistoryLine{}
-	s.closeIntents, s.authIntents, s.authRes, s.closeRefused = map[vmRunKey]vmRunLine{}, map[vmRunKey]vmRunLine{}, map[vmRunKey]bool{}, map[vmRunKey]bool{}
-	err := readJSONL(filepath.Join(s.dir, vmRunsFile), func(line []byte) error {
+	s.dirty = map[string]bool{}
+	if err := s.loadRunsFile(); err != nil {
+		return err
+	}
+	return s.loadHistFile()
+}
+
+// loadRunsFile reads vm-runs.jsonl into memory, replacing what was there. On
+// an error memory is left as it was.
+func (s *vmStore) loadRunsFile() (err error) {
+	oldR, oldT, oldC, oldA, oldRes, oldAcc, oldRef := s.receipts, s.tombs, s.closeIntents, s.authIntents, s.authRes, s.authAccepted, s.closeRefused
+	defer func() {
+		if err != nil {
+			s.receipts, s.tombs, s.closeIntents, s.authIntents, s.authRes, s.authAccepted, s.closeRefused = oldR, oldT, oldC, oldA, oldRes, oldAcc, oldRef
+		}
+	}()
+	s.receipts, s.tombs = map[vmRunKey]vmRunLine{}, map[string]vmRunLine{}
+	s.closeIntents, s.authIntents = map[vmRunKey]vmRunLine{}, map[vmRunKey]vmRunLine{}
+	s.authRes, s.authAccepted, s.closeRefused = map[vmRunKey]bool{}, map[vmRunKey]bool{}, map[vmRunKey]bool{}
+	return readJSONL(filepath.Join(s.dir, vmRunsFile), func(line []byte) error {
 		var l vmRunLine
 		if err := decodeVMLine(line, &l); err != nil {
 			return err
@@ -220,6 +269,9 @@ func (s *vmStore) loadRuns() error {
 				s.closeRefused[k] = true
 			} else {
 				s.authRes[k] = *l.Accepted
+				if *l.Accepted {
+					s.authAccepted[k] = true // sticky: no later refusal erases it
+				}
 			}
 			return nil
 		}
@@ -234,16 +286,22 @@ func (s *vmStore) loadRuns() error {
 			return errors.New("bad receipt")
 		}
 		k := vmRunKey{l.VM, l.Generation}
-		if old, dup := s.receipts[k]; dup && old.StoppedAt != l.StoppedAt {
-			return fmt.Errorf("two stopped_at for %s generation %d", l.VM, l.Generation)
+		if old, dup := s.receipts[k]; dup {
+			if old.StoppedAt != l.StoppedAt {
+				return fmt.Errorf("two stopped_at for %s generation %d", l.VM, l.Generation)
+			}
+			return nil // first entry wins
 		}
 		s.receipts[k] = l
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return readJSONL(filepath.Join(s.dir, vmHistoryFile), func(line []byte) error {
+}
+
+// loadHistFile reads vm-history.jsonl into memory, first entry per key wins.
+func (s *vmStore) loadHistFile() error {
+	old := s.hist
+	s.hist = map[vmRunKey]vmHistoryLine{}
+	err := readJSONL(filepath.Join(s.dir, vmHistoryFile), func(line []byte) error {
 		var l vmHistoryLine
 		if err := decodeVMLine(line, &l); err != nil {
 			return err
@@ -257,11 +315,18 @@ func (s *vmStore) loadRuns() error {
 		}
 		return nil
 	})
+	if err != nil {
+		s.hist = old
+	}
+	return err
 }
 
 // appendCloseIntentLocked records that the broker is about to ask the host to
 // close (vm, gen). Idempotent; a receipt already resolves it. Caller holds s.mu.
 func (s *vmStore) appendCloseIntentLocked(vm, account, host string, gen uint64) error {
+	if err := s.settleLocked(vmRunsFile); err != nil {
+		return err
+	}
 	k := vmRunKey{vm, gen}
 	if _, ok := s.receipts[k]; ok {
 		return nil
@@ -284,6 +349,9 @@ func (s *vmStore) appendCloseIntentLocked(vm, account, host string, gen uint64) 
 // ran). The intent is answered, so it no longer blocks the next authorize.
 // This line is an addition to the spec's intent lines.
 func (s *vmStore) refuseCloseLocked(vm string, gen uint64) {
+	if err := s.settleLocked(vmRunsFile); err != nil {
+		return
+	}
 	k := vmRunKey{vm, gen}
 	if _, ok := s.closeIntents[k]; !ok || s.closeRefused[k] {
 		return
@@ -300,28 +368,42 @@ func (s *vmStore) refuseCloseLocked(vm string, gen uint64) {
 }
 
 // appendAuthIntentLocked records that the broker is about to send a host
-// authorize of a new generation. An open intent is not written twice.
-func (s *vmStore) appendAuthIntentLocked(vm, account, host string, gen uint64) error {
+// authorize of a new generation. It answers fresh=true when this call wrote
+// the intent. A generation already outstanding (an open intent, or one the host
+// accepted and no receipt closed yet) gets no new line: a later answer to a
+// retry must never erase what an earlier attempt may have done.
+func (s *vmStore) appendAuthIntentLocked(vm, account, host string, gen uint64) (fresh bool, err error) {
+	if err := s.settleLocked(vmRunsFile); err != nil {
+		return false, err
+	}
 	k := vmRunKey{vm, gen}
-	if s.authUnresolvedLocked(k) {
-		return nil
+	if s.authOutstandingLocked(k) {
+		return false, nil
 	}
 	l := vmRunLine{Intent: "authorize", VM: vm, Account: account, Host: host, Generation: gen}
 	if err := s.appendJSONL(vmRunsFile, l); err != nil {
 		log.Printf("vms: %s: authorize intent of %s generation %d not written: %v", vmRunsFile, vm, gen, err)
-		return err
+		return false, err
 	}
 	s.authIntents[k] = l
 	delete(s.authRes, k)
-	return nil
+	return true, nil
 }
 
-// resolveAuthLocked records the host's answer to an authorize. A host refusal
-// is an answer too: accepted false.
-func (s *vmStore) resolveAuthLocked(vm string, gen uint64, accepted bool) error {
+// resolveAuthLocked records the host's answer to an authorize. An acceptance
+// is final. A refusal is written only when this call wrote the intent (fresh):
+// a refused retry says nothing about an earlier attempt whose answer was lost
+// or accepted, so it never erases it.
+func (s *vmStore) resolveAuthLocked(vm string, gen uint64, accepted, fresh bool) error {
+	if err := s.settleLocked(vmRunsFile); err != nil {
+		return err
+	}
 	k := vmRunKey{vm, gen}
 	if _, ok := s.authIntents[k]; !ok {
 		return nil // a refresh of a tracked generation had no intent
+	}
+	if !accepted && !fresh {
+		return nil
 	}
 	if !s.authUnresolvedLocked(k) {
 		return nil
@@ -332,7 +414,23 @@ func (s *vmStore) resolveAuthLocked(vm string, gen uint64, accepted bool) error 
 		return err
 	}
 	s.authRes[k] = accepted
+	if accepted {
+		s.authAccepted[k] = true
+	}
 	return nil
+}
+
+// authOutstandingLocked: an authorize was dispatched for k and no receipt
+// closes it yet, unless the host refused it on a fresh dispatch. Open intents
+// and accepted ones both count: only a receipt retires them.
+func (s *vmStore) authOutstandingLocked(k vmRunKey) bool {
+	if _, ok := s.authIntents[k]; !ok {
+		return false
+	}
+	if _, closed := s.receipts[k]; closed {
+		return false
+	}
+	return s.authAccepted[k] || s.authUnresolvedLocked(k)
 }
 
 // authUnresolvedLocked: an authorize intent with no answer and no receipt (a
@@ -367,6 +465,7 @@ func (s *vmStore) unresolvedGensLocked(vm string) (closes, auths []uint64) {
 
 // openIntentLocked: any intent of vm is unresolved (the receipt_missing gate).
 func (s *vmStore) openIntentLocked(vm string) bool {
+	_ = s.settleLocked(vmRunsFile)
 	c, a := s.unresolvedGensLocked(vm)
 	return len(c)+len(a) > 0
 }
@@ -391,7 +490,10 @@ var errReceiptMismatch = errors.New("a receipt with another stopped_at is on rec
 // appendReceiptLocked makes the B1 receipt durable. The same receipt again is
 // a no-op; one with another stopped_at is refused and never overwritten.
 // Caller holds s.mu.
-func (s *vmStore) appendReceiptLocked(vm, account, host string, gen uint64, at int64, kind string) error {
+func (s *vmStore) appendReceiptLocked(vm, account, host string, gen uint64, at int64, kind string, disputed bool) error {
+	if err := s.settleLocked(vmRunsFile); err != nil {
+		return err
+	}
 	k := vmRunKey{vm, gen}
 	if old, ok := s.receipts[k]; ok {
 		if old.StoppedAt == at {
@@ -400,7 +502,7 @@ func (s *vmStore) appendReceiptLocked(vm, account, host string, gen uint64, at i
 		log.Printf("vms: %s generation %d: host close at %d, receipt on record at %d; refused", vm, gen, at, old.StoppedAt)
 		return errReceiptMismatch
 	}
-	l := vmRunLine{VM: vm, Account: account, Host: host, Generation: gen, StoppedAt: at, Kind: kind}
+	l := vmRunLine{VM: vm, Account: account, Host: host, Generation: gen, StoppedAt: at, Kind: kind, Disputed: disputed}
 	if err := s.appendJSONL(vmRunsFile, l); err != nil {
 		log.Printf("vms: %s not written for %s generation %d: %v", vmRunsFile, vm, gen, err)
 		return err
@@ -445,9 +547,9 @@ func (s *vmStore) hostCancel(ctx context.Context, h vmHostConfig, id string, gen
 // released here. apply moves the record to its closed state; rollback undoes
 // it in memory when vms.json cannot be saved (a stop keeps it: the receipt is
 // on disk and a repeated stop re-saves).
-func (s *vmStore) finishClose(ctx context.Context, w http.ResponseWriter, rec *vmRecord, gen uint64, at int64, kind string, apply func(*vmRecord), rollback bool) {
+func (s *vmStore) finishClose(ctx context.Context, w http.ResponseWriter, rec *vmRecord, gen uint64, at int64, kind string, disputed bool, apply func(*vmRecord), rollback bool) {
 	id := rec.ID
-	if err := s.appendReceiptLocked(rec.ID, rec.Account, rec.Host, gen, at, kind); err != nil {
+	if err := s.appendReceiptLocked(rec.ID, rec.Account, rec.Host, gen, at, kind, disputed); err != nil {
 		delete(s.busy, id)
 		s.mu.Unlock()
 		receiptErr(w, err)
@@ -483,6 +585,10 @@ func (s *vmStore) finishClose(ctx context.Context, w http.ResponseWriter, rec *v
 func (s *vmStore) storeHistory(ctx context.Context, vm string, gen uint64) (vmHistoryLine, *vmCallErr) {
 	k := vmRunKey{vm, gen}
 	s.mu.Lock()
+	if err := s.settleLocked(vmHistoryFile); err != nil {
+		s.mu.Unlock()
+		return vmHistoryLine{}, &vmCallErr{500, "state_not_saved", "the history journal could not be settled", false}
+	}
 	if hl, ok := s.hist[k]; ok {
 		s.mu.Unlock()
 		return hl, nil
@@ -507,6 +613,9 @@ func (s *vmStore) storeHistory(ctx context.Context, vm string, gen uint64) (vmHi
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.settleLocked(vmHistoryFile); err != nil {
+		return vmHistoryLine{}, &vmCallErr{500, "state_not_saved", "the history journal could not be settled", false}
+	}
 	if old, ok := s.hist[k]; ok { // a concurrent fetch stored it
 		return old, nil
 	}
@@ -577,6 +686,7 @@ func (s *vmStore) pendingHistory(ctx context.Context, vm string) {
 
 // receiptMissingLocked: the run is closed in vms.json but has no receipt.
 func (s *vmStore) receiptMissingLocked(rec *vmRecord) bool {
+	_ = s.settleLocked(vmRunsFile)
 	if rec.DesiredState != vmStateStopped || rec.Generation == 0 || rec.StoppedAt == 0 {
 		return false
 	}
@@ -585,21 +695,28 @@ func (s *vmStore) receiptMissingLocked(rec *vmRecord) bool {
 }
 
 // adoptReceiptsLocked is replay step 1: copy receipts forward into a stale
-// vms.json. A receipt for the run in Generation, or for the next one (a
-// cancel whose save was lost), moves the record to that closed run.
+// vms.json. A receipt for the record's current generation closes it whatever
+// state the record is in (running, starting or stopped without its time), and
+// a receipt for the next generation (a cancel whose save was lost) moves the
+// record to that closed run. It never applies a receipt over a newer
+// generation: only Generation and Generation+1 are looked at. Repeats while a
+// receipt applies, so a delete that closed G and G+1 is copied in full.
 func (s *vmStore) adoptReceiptsLocked(rec *vmRecord) bool {
-	if rec.DesiredState != vmStateStopped {
-		return false
+	changed := false
+	for {
+		g := rec.Generation
+		if rc, ok := s.receipts[vmRunKey{rec.ID, g}]; ok && g > 0 && (rec.DesiredState != vmStateStopped || rec.StoppedAt == 0) {
+			rec.DesiredState, rec.StoppedAt, rec.LastError = vmStateStopped, rc.StoppedAt, ""
+			changed = true
+			continue
+		}
+		if rc, ok := s.receipts[vmRunKey{rec.ID, g + 1}]; ok && rec.DesiredState == vmStateStopped {
+			rec.Generation, rec.StoppedAt, rec.Ran, rec.LastError = g+1, rc.StoppedAt, false, ""
+			changed = true
+			continue
+		}
+		return changed
 	}
-	if rc, ok := s.receipts[vmRunKey{rec.ID, rec.Generation}]; ok && rec.Generation > 0 && rec.StoppedAt == 0 {
-		rec.StoppedAt, rec.LastError = rc.StoppedAt, ""
-		return true
-	}
-	if rc, ok := s.receipts[vmRunKey{rec.ID, rec.Generation + 1}]; ok {
-		rec.Generation, rec.StoppedAt, rec.Ran, rec.LastError = rec.Generation+1, rc.StoppedAt, false, ""
-		return true
-	}
-	return false
 }
 
 // reconcileRuns settles one VM's runs, in the replay order of the spec: (1)
@@ -616,6 +733,8 @@ func (s *vmStore) reconcileRuns(ctx context.Context, id string) {
 		return
 	}
 	s.busy[id] = true
+	_ = s.settleLocked(vmRunsFile) // a failed append may have left a line on disk
+	_ = s.settleLocked(vmHistoryFile)
 	account, host := rec.Account, rec.Host
 	h, hostOK := s.hosts[host]
 	defer func() {
@@ -636,13 +755,28 @@ func (s *vmStore) reconcileRuns(ctx context.Context, id string) {
 	var fence []uint64
 	for _, g := range auths {
 		if rec.Generation == g && (rec.DesiredState == vmStateStarting || rec.DesiredState == vmStateRunning) {
-			if err := s.resolveAuthLocked(id, g, true); err != nil {
+			if err := s.resolveAuthLocked(id, g, true, false); err != nil {
 				log.Printf("vms: authorize intent of %s generation %d stays open: %v", id, g, err)
 			}
 			continue
 		}
 		fence = append(fence, g)
 	}
+	// An authorize the host accepted whose save never reached vms.json stays
+	// outstanding too (a refused retry cannot erase it): the replay fences it.
+	for k := range s.authAccepted {
+		if _, closed := s.receipts[k]; k.vm != id || closed || rec.Generation >= k.gen || rec.AuthorizedGeneration >= k.gen {
+			continue
+		}
+		dup := false
+		for _, g := range fence {
+			dup = dup || g == k.gen
+		}
+		if !dup {
+			fence = append(fence, k.gen)
+		}
+	}
+	sort.Slice(fence, func(i, j int) bool { return fence[i] < fence[j] })
 	s.mu.Unlock()
 
 	cancel := func(g uint64, step string) {
@@ -657,11 +791,19 @@ func (s *vmStore) reconcileRuns(ctx context.Context, id string) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if cur := s.recs[id]; cur != nil && cur.Generation == g && cur.StoppedAt != 0 && cur.StoppedAt != at {
-			// vms.json holds a time the host does not: never settle on it.
-			log.Printf("vms: replay of %s generation %d: host close at %d, vms.json says %d; no receipt written", id, g, at, cur.StoppedAt)
+			// vms.json holds a time the host does not (a legacy broker's own
+			// clock). The host's close is the receipt, marked disputed so B5 answers
+			// 409 and settlement stays pending; the old time is kept for audit.
+			log.Printf("vms: replay of %s generation %d: host close at %d, vms.json says %d; receipt written as disputed", id, g, at, cur.StoppedAt)
+			if err := s.appendReceiptLocked(id, account, host, g, at, vmReceiptCancel, true); err != nil {
+				log.Printf("vms: replay (%s) of %s generation %d: %v", step, id, g, err)
+				return
+			}
+			cur.LegacyStoppedAt, cur.StoppedAt = cur.StoppedAt, at
+			save("a disputed close")
 			return
 		}
-		if err := s.appendReceiptLocked(id, account, host, g, at, vmReceiptCancel); err != nil {
+		if err := s.appendReceiptLocked(id, account, host, g, at, vmReceiptCancel, false); err != nil {
 			log.Printf("vms: replay (%s) of %s generation %d: %v", step, id, g, err)
 		}
 	}
@@ -735,8 +877,11 @@ func (s *vmStore) deleteSteps(ctx context.Context, id string, h vmHostConfig) *v
 	}
 	// Every authorize that was not refused (a lost reply may have been accepted)
 	// and every close still open.
+	_ = s.settleLocked(vmRunsFile)
 	for k := range s.authIntents {
-		if acc, answered := s.authRes[k]; k.vm == id && (!answered || acc) {
+		// Dispatched and not closed by a receipt: outstanding, whatever a later
+		// retry was answered. A fresh refusal is the only thing that retires it.
+		if k.vm == id && s.authOutstandingLocked(k) {
 			set[k.gen] = true
 		}
 	}
@@ -779,7 +924,7 @@ func (s *vmStore) deleteSteps(ctx context.Context, id string, h vmHostConfig) *v
 			return cerr
 		}
 		s.mu.Lock()
-		if err := s.appendReceiptLocked(id, account, host, g, at, vmReceiptCancel); err != nil {
+		if err := s.appendReceiptLocked(id, account, host, g, at, vmReceiptCancel, false); err != nil {
 			s.mu.Unlock()
 			if errors.Is(err, errReceiptMismatch) {
 				return &vmCallErr{409, "vm_receipt_mismatch", "the host's close differs from the receipt on record", false}
@@ -834,6 +979,9 @@ func (s *vmStore) deleteSteps(ctx context.Context, id string, h vmHostConfig) *v
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 5. Tombstone, durable before the VM leaves vms.json.
+	if err := s.settleLocked(vmRunsFile); err != nil {
+		return &vmCallErr{500, "state_not_saved", "the journal could not be settled; repeat the delete", false}
+	}
 	if _, done := s.tombs[id]; !done {
 		l := vmRunLine{VM: id, Account: account, Host: host, DeletedAt: s.now().Unix()}
 		if err := s.appendJSONL(vmRunsFile, l); err != nil {
@@ -866,10 +1014,19 @@ func (b *broker) getVMRun(w http.ResponseWriter, r *http.Request, id, genText st
 	}
 	k := vmRunKey{id, gen}
 	s.mu.Lock()
+	serr := s.settleLocked(vmRunsFile)
 	rc, ok := s.receipts[k]
 	s.mu.Unlock()
+	if serr != nil {
+		writeErr(w, 500, "state_not_saved", "the run journal could not be settled")
+		return
+	}
 	if !ok {
 		writeErr(w, 404, "run_not_found", "no receipt for this run")
+		return
+	}
+	if rc.Disputed {
+		writeErr(w, 409, "vm_receipt_mismatch", "an older broker recorded another stopped_at for this run than the host's close; settle it by hand")
 		return
 	}
 	hl, cerr := s.storeHistory(r.Context(), id, gen)

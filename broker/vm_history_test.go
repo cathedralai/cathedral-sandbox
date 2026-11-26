@@ -499,24 +499,6 @@ func TestVMHistoryReceiptMissingGateAndReplayAtStart(t *testing.T) {
 	c3.must(t, "start", map[string]any{"generation": 2})
 }
 
-// B1: a replay whose host close differs from vms.json writes no receipt: the
-// broker never settles on a time the host does not hold.
-func TestVMHistoryReplayRefusesDifferentHostTime(t *testing.T) {
-	c := newHistCase(t)
-	c.run(t)
-	c.must(t, "stop", map[string]any{"generation": 1})
-	os.Remove(filepath.Join(c.tb.b.cfg.StateDir, vmRunsFile))
-	c.host.set(func(h *histHost) { h.closed[1] = histStopBase + 500 })
-	tb2 := c.tb.restart(t, true)
-	if len(readRunsFile(t, tb2)) != 0 {
-		t.Fatal("receipt written for a time the host does not hold")
-	}
-	c2 := &histCase{tb: tb2, host: c.host, id: c.id, base: c.base}
-	if st, doc := c2.post(t, "stop", map[string]any{"generation": 1}); st != 409 || vmErrCode(doc) != "vm_receipt_mismatch" {
-		t.Fatalf("repeat stop: %d %v", st, doc)
-	}
-}
-
 // B1: a repeated Stop of a run closed on record without a receipt makes it.
 func TestVMHistoryRepeatedStopMakesMissingReceipt(t *testing.T) {
 	c := newHistCase(t)
@@ -1217,4 +1199,263 @@ func TestVMHistoryRefusedStopOfRunningRunLeavesNoOpenIntent(t *testing.T) {
 		t.Fatalf("replay cancelled a live run: %v", c.host.cancels)
 	}
 	_ = tb2
+}
+
+// ---------------------------------------------------------------- Astra impl r1
+
+// setLegacyStoppedAt rewrites vms.json as an older broker left it: a closed run
+// with its own stopped_at, and no receipt or history files.
+func setLegacyStoppedAt(t *testing.T, tb *vmTestBroker, id string, at int64) {
+	t.Helper()
+	path := filepath.Join(tb.b.cfg.StateDir, vmsFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc vmsFileDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for i := range doc.VMs {
+		if doc.VMs[i].ID == id {
+			doc.VMs[i].StoppedAt = at
+		}
+	}
+	raw, _ = json.Marshal(doc)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(filepath.Join(tb.b.cfg.StateDir, vmRunsFile))
+	os.Remove(filepath.Join(tb.b.cfg.StateDir, vmHistoryFile))
+}
+
+// Fix 1 (BLOCKER): G2 was accepted and its resolution is durable; the crash came
+// before AuthorizedGeneration=2 was saved. A retry with a lower paid_through is
+// refused. The refusal must not erase the acceptance: delete still cancels G2,
+// and B5 serves it.
+func TestVMHistoryRefusedRetryDoesNotEraseAcceptedGenerationFromDelete(t *testing.T) {
+	c := newHistCase(t)
+	c.run(t)
+	c.must(t, "stop", map[string]any{"generation": 1})
+	c.tb.b.vms.saveHook = func() error { return errors.New("crash") }
+	if st, _ := c.post(t, "authorize", map[string]any{"generation": 2, "paid_through": c.tb.now.Unix() + 600}); st != 500 {
+		t.Fatalf("authorize with the save failing: %d", st)
+	}
+	c.tb.b.vms.saveHook = nil
+	tb := c.tb.restart(t, false) // the crash: vms.json never got AuthorizedGeneration=2
+	c = &histCase{tb: tb, host: c.host, id: c.id, base: c.base}
+	if rec := onDiskRecord(t, tb, c.id); rec.AuthorizedGeneration != 1 {
+		t.Fatalf("vms.json: %+v", rec)
+	}
+	// The retry with a lower paid_through is refused by the host.
+	tb.b.vms.exec = execFunc(func(args []string) ([]byte, int, error) {
+		if args[0] == "authorize" {
+			return []byte(`{"error":"paid_through_lower"}`), vmExitStale, nil
+		}
+		return c.host.answer(args)
+	})
+	if st, doc := c.post(t, "authorize", map[string]any{"generation": 2, "paid_through": tb.now.Unix() + 100}); st != 409 {
+		t.Fatalf("retry: %d %v", st, doc)
+	}
+	tb.b.vms.exec = tb.host
+	tb2 := tb.restart(t, false) // and it survives another restart
+	c2 := &histCase{tb: tb2, host: c.host, id: c.id, base: c.base}
+	if st, doc := tb2.call(t, "operator-key", "DELETE", c.base, map[string]any{"confirm": c.id}); st != 200 {
+		t.Fatalf("delete: %d %v", st, doc)
+	}
+	if got := c.host.cancels; len(got) != 1 || got[0] != 2 {
+		t.Fatalf("host cancels: %v, want generation 2 fenced", got)
+	}
+	if st, doc := tb2.call(t, "operator-key", "GET", c2.base+"/runs/2", nil); st != 200 || doc["generation"] != float64(2) {
+		t.Fatalf("B5 for G2: %d %v", st, doc)
+	}
+}
+
+// Fix 1: the replay at start applies the same rule: an accepted generation
+// vms.json never recorded is fenced, whatever a later retry was answered.
+func TestVMHistoryReplayFencesAcceptedUnrecordedGeneration(t *testing.T) {
+	c := newHistCase(t)
+	c.run(t)
+	c.must(t, "stop", map[string]any{"generation": 1})
+	c.tb.b.vms.saveHook = func() error { return errors.New("crash") }
+	c.post(t, "authorize", map[string]any{"generation": 2, "paid_through": c.tb.now.Unix() + 600})
+	c.tb.b.vms.saveHook = nil
+	tb := c.tb.restart(t, false)
+	tb.b.vms.exec = execFunc(func(args []string) ([]byte, int, error) {
+		if args[0] == "authorize" {
+			return []byte(`{"error":"paid_through_lower"}`), vmExitStale, nil
+		}
+		return c.host.answer(args)
+	})
+	(&histCase{tb: tb, host: c.host, id: c.id, base: c.base}).post(t, "authorize", map[string]any{"generation": 2, "paid_through": tb.now.Unix() + 100})
+	tb.b.vms.exec = tb.host
+	tb2 := tb.restart(t, true)
+	if got := c.host.cancels; len(got) != 1 || got[0] != 2 {
+		t.Fatalf("host cancels: %v", got)
+	}
+	if rec := onDiskRecord(t, tb2, c.id); rec.Generation != 2 || rec.StoppedAt != histCancelBase+2 {
+		t.Fatalf("vms.json: %+v", rec)
+	}
+}
+
+// Fix 2: a receipt for the record's current generation is applied whatever the
+// prior state, at replay and on a GET; never over a newer generation.
+func TestVMHistoryReceiptAppliedWhenVMsJSONStillSaysRunning(t *testing.T) {
+	for _, op := range []string{"stop", "delete"} {
+		for _, via := range []string{"replay", "get"} {
+			t.Run(op+" "+via, func(t *testing.T) {
+				c := newHistCase(t)
+				c.run(t)
+				vmsPath := filepath.Join(c.tb.b.cfg.StateDir, vmsFile)
+				running, _ := os.ReadFile(vmsPath)
+				switch op {
+				case "stop":
+					c.must(t, "stop", map[string]any{"generation": 1})
+					if err := os.WriteFile(vmsPath, running, 0o600); err != nil { // crash: vms.json never saw the stop
+						t.Fatal(err)
+					}
+				case "delete":
+					c.tb.b.vms.saveHook = func() error { return errors.New("crash") }
+					if st, _ := c.tb.call(t, "operator-key", "DELETE", c.base, map[string]any{"confirm": c.id}); st == 200 {
+						t.Fatal("delete went through")
+					}
+					c.tb.b.vms.saveHook = nil
+				}
+				if rec := onDiskRecord(t, c.tb, c.id); rec.DesiredState != vmStateRunning || rec.StoppedAt != 0 {
+					t.Fatalf("setup: %+v", rec)
+				}
+				tb2 := c.tb.restart(t, via == "replay")
+				if via == "get" {
+					if st, _ := tb2.call(t, "operator-key", "GET", c.base, nil); st != 200 {
+						t.Fatal("get")
+					}
+				}
+				want := readRunsFile(t, tb2)[0].StoppedAt
+				if rec := onDiskRecord(t, tb2, c.id); rec.DesiredState != vmStateStopped || rec.StoppedAt != want || rec.Generation != 1 {
+					t.Fatalf("vms.json after %s: %+v (receipt %d)", via, rec, want)
+				}
+			})
+		}
+	}
+	// A receipt of an older generation never touches a newer run.
+	c := newHistCase(t)
+	c.run(t)
+	c.must(t, "stop", map[string]any{"generation": 1})
+	c.run(t)
+	tb2 := c.tb.restart(t, true)
+	if rec := onDiskRecord(t, tb2, c.id); rec.DesiredState != vmStateRunning || rec.Generation != 2 || rec.StoppedAt != 0 {
+		t.Fatalf("a receipt of generation 1 changed run 2: %+v", rec)
+	}
+}
+
+// Fix 3: a legacy stopped_at that the host's close does not match is a disputed
+// run, not a wedge: the host's close is the receipt, the old time stays for
+// audit, later runs go on, and B5 answers 409 for that run only.
+func TestVMHistoryLegacyMismatchIsDisputedNotWedged(t *testing.T) {
+	for _, via := range []string{"replay", "repeated stop"} {
+		t.Run(via, func(t *testing.T) {
+			c := newHistCase(t)
+			c.run(t)
+			c.must(t, "stop", map[string]any{"generation": 1})
+			legacy := int64(histStopBase + 1 + 4000)
+			setLegacyStoppedAt(t, c.tb, c.id, legacy)
+			tb := c.tb.restart(t, via == "replay")
+			c = &histCase{tb: tb, host: c.host, id: c.id, base: c.base}
+			if via == "repeated stop" {
+				if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(histStopBase+1) {
+					t.Fatalf("repeated stop: %d %v", st, doc)
+				}
+			}
+			rs := c.runs(t)
+			if len(rs) != 1 || !rs[0].Disputed || rs[0].StoppedAt != histStopBase+1 {
+				t.Fatalf("receipt: %+v", rs)
+			}
+			rec := onDiskRecord(t, tb, c.id)
+			if rec.LegacyStoppedAt != legacy || rec.StoppedAt != histStopBase+1 {
+				t.Fatalf("record: %+v", rec)
+			}
+			// Later generations are allowed.
+			c.authorize(t, 2)
+			c.must(t, "start", map[string]any{"generation": 2})
+			c.must(t, "stop", map[string]any{"generation": 2})
+			// B5: 409 for the disputed run, 200 for the next.
+			st, doc := tb.call(t, "operator-key", "GET", c.base+"/runs/1", nil)
+			if st != 409 || vmErrCode(doc) != "vm_receipt_mismatch" {
+				t.Fatalf("/runs/1: %d %v", st, doc)
+			}
+			if st, doc := tb.call(t, "operator-key", "GET", c.base+"/runs/2", nil); st != 200 {
+				t.Fatalf("/runs/2: %d %v", st, doc)
+			}
+			// It stays disputed across a restart.
+			tb2 := tb.restart(t, true)
+			if st, doc := tb2.call(t, "operator-key", "GET", c.base+"/runs/1", nil); st != 409 || vmErrCode(doc) != "vm_receipt_mismatch" {
+				t.Fatalf("/runs/1 after restart: %d %v", st, doc)
+			}
+		})
+	}
+}
+
+// Fix 4: a dir fsync that fails after the file fsync leaves the line on disk.
+// The retry must not write it again, and the answer is the same before and
+// after a restart.
+func TestVMHistoryDirFsyncFailureDoesNotDuplicateJournalLines(t *testing.T) {
+	for _, journal := range []string{vmRunsFile, vmHistoryFile} {
+		t.Run(journal, func(t *testing.T) {
+			c := newHistCase(t)
+			c.run(t)
+			armed := false
+			failed := 0
+			cmd := "stop"
+			if journal == vmHistoryFile {
+				cmd = "history"
+			}
+			c.tb.b.vms.exec = execFunc(func(args []string) ([]byte, int, error) {
+				if args[0] == cmd && failed == 0 {
+					armed = true // the next dir fsync is the journal's own
+				}
+				return c.host.answer(args)
+			})
+			orig := durableSync
+			defer func() { durableSync = orig }()
+			durableSync = func(f *os.File) error {
+				if st, err := f.Stat(); err == nil && st.IsDir() && armed {
+					armed = false
+					failed++
+					return errors.New("dir fsync failed")
+				}
+				return orig(f)
+			}
+			stopAt := float64(histStopBase + 1)
+			st, doc := c.post(t, "stop", map[string]any{"generation": 1})
+			if journal == vmRunsFile {
+				if st != 500 || failed != 1 {
+					t.Fatalf("stop with a failing dir fsync: %d %v failed=%d", st, doc, failed)
+				}
+				if st, doc = c.post(t, "stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != stopAt {
+					t.Fatalf("retry: %d %v", st, doc)
+				}
+			} else if st != 200 || failed != 1 { // history never fails the Stop
+				t.Fatalf("stop: %d %v failed=%d", st, doc, failed)
+			}
+			before := map[string]any{}
+			_, before = c.tb.call(t, "operator-key", "GET", c.base+"/runs/1", nil)
+			if before["stopped_at"] != stopAt {
+				t.Fatalf("route: %v", before)
+			}
+			count := func(tb *vmTestBroker) (receipts, hist int) {
+				return len(readRunsFile(t, tb)), len(readHistFile(t, tb))
+			}
+			if r, h := count(c.tb); r != 1 || h != 1 {
+				t.Fatalf("lines: %d receipts, %d history (want 1 and 1)", r, h)
+			}
+			tb2 := c.tb.restart(t, true)
+			_, after := tb2.call(t, "operator-key", "GET", c.base+"/runs/1", nil)
+			if fmt.Sprint(before) != fmt.Sprint(after) {
+				t.Fatalf("answer changed over a restart:\n%v\n%v", before, after)
+			}
+			if r, h := count(tb2); r != 1 || h != 1 {
+				t.Fatalf("lines after restart: %d receipts, %d history", r, h)
+			}
+		})
+	}
 }

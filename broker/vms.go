@@ -174,6 +174,9 @@ type vmRecord struct {
 	DesiredState         string `json:"desired_state"`
 	CreatedAt            int64  `json:"created_at"`
 	StoppedAt            int64  `json:"stopped_at,omitempty"` // the host's effective stop time
+	// LegacyStoppedAt: a stopped_at an older broker kept for this run that the
+	// host's close record did not match. Kept for audit; the run is disputed.
+	LegacyStoppedAt int64 `json:"legacy_stopped_at,omitempty"`
 	// Ran: the host confirmed this generation running (start answer or GET
 	// reconcile). A run that never ran may be closed at now when the host
 	// never held it; one that ran keeps its host stop time only.
@@ -216,6 +219,8 @@ type vmStore struct {
 	closeRefused map[vmRunKey]bool
 	authIntents  map[vmRunKey]vmRunLine
 	authRes      map[vmRunKey]bool
+	authAccepted map[vmRunKey]bool // sticky: an authorize the host accepted stays outstanding until its receipt
+	dirty        map[string]bool   // journals with an append that may have half happened
 
 	newID      func() string                        // newVMID; a test makes it repeat an id
 	appendHook func(file string, line []byte) error // tests: fail an append before it writes
@@ -883,8 +888,10 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 	// reply must never leave an open generation on the host that no line names.
 	// A refresh of the tracked generation has no intent (cancelling it would
 	// close a run that is live).
+	fresh := false
 	if gen > rec.AuthorizedGeneration {
-		if err := s.appendAuthIntentLocked(id, rec.Account, rec.Host, gen); err != nil {
+		var err error
+		if fresh, err = s.appendAuthIntentLocked(id, rec.Account, rec.Host, gen); err != nil {
 			delete(s.busy, id)
 			s.mu.Unlock()
 			writeErr(w, 500, "state_not_saved", "the authorization could not be recorded; nothing was sent to the host")
@@ -902,13 +909,13 @@ func (b *broker) authorizeVM(w http.ResponseWriter, r *http.Request, id string) 
 		if cerr.unknown {
 			rec.LastError = "authorize: " + cerr.code // the intent stays open: replay fences it
 			_ = s.saveLocked()
-		} else if err := s.resolveAuthLocked(id, gen, false); err != nil {
+		} else if err := s.resolveAuthLocked(id, gen, false, fresh); err != nil {
 			log.Printf("vms: refused authorize of %s generation %d not resolved: %v", id, gen, err)
 		}
 		cerr.write(w)
 		return
 	}
-	if err := s.resolveAuthLocked(id, gen, true); err != nil {
+	if err := s.resolveAuthLocked(id, gen, true, fresh); err != nil {
 		writeErr(w, 500, "state_not_saved", "the host took the authorization but the broker could not record it; repeat it")
 		return
 	}
@@ -1072,13 +1079,13 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 				return
 			}
 			if at != stored {
-				log.Printf("vms: %s generation %d: host close at %d, vms.json says %d; no receipt written", id, gen, at, stored)
-				delete(s.busy, id)
-				s.mu.Unlock()
-				writeErr(w, 409, "vm_receipt_mismatch", "the host's close of this run differs from the stopped_at on record; not changed")
+				// A legacy time: the host's close is the receipt, marked disputed;
+				// the old time stays in the record for audit (B5 answers 409).
+				log.Printf("vms: %s generation %d: host close at %d, vms.json says %d; receipt written as disputed", id, gen, at, stored)
+				s.finishClose(r.Context(), w, rec, gen, at, vmReceiptCancel, true, func(r *vmRecord) { r.LegacyStoppedAt, r.StoppedAt = stored, at }, false)
 				return
 			}
-			s.finishClose(r.Context(), w, rec, gen, at, vmReceiptCancel, func(*vmRecord) {}, false)
+			s.finishClose(r.Context(), w, rec, gen, at, vmReceiptCancel, false, func(*vmRecord) {}, false)
 			return
 		}
 		err := s.saveLocked()
@@ -1158,7 +1165,7 @@ func (b *broker) stopVM(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	// B1: the receipt is durable before vms.json shows the stop and before the 200.
-	s.finishClose(r.Context(), w, rec, gen, at, kind, func(r *vmRecord) { r.StoppedAt, r.LastError = at, "" }, false)
+	s.finishClose(r.Context(), w, rec, gen, at, kind, false, func(r *vmRecord) { r.StoppedAt, r.LastError = at, "" }, false)
 }
 
 // cancelVMRun closes the next run of a stopped VM before it started (its
@@ -1198,7 +1205,7 @@ func (b *broker) cancelVMRun(w http.ResponseWriter, r *http.Request, rec *vmReco
 		cerr.write(w)
 		return
 	}
-	s.finishClose(r.Context(), w, rec, gen, at, vmReceiptCancel, func(r *vmRecord) {
+	s.finishClose(r.Context(), w, rec, gen, at, vmReceiptCancel, false, func(r *vmRecord) {
 		r.Generation, r.StoppedAt, r.LastError = gen, at, ""
 	}, true)
 }
