@@ -54,6 +54,11 @@ EOV
   if [ "${ROOM_SEALED_SECRETS:-0}" = 1 ]; then
     echo "CATHEDRAL_SEALED_SECRETS_DIR=/run/room-secrets"
   fi
+  # In-room report call (AB#1001): a per-room directory for the report socket, mounted
+  # read-only at /run/cathedral. Dedicated hotels only; the API ignores it elsewhere too.
+  if [ "${ROOM_IN_ROOM_ATTEST:-0}" = 1 ] && [ "${CATHEDRAL_HOTEL_TENANCY:-shared}" = dedicated ]; then
+    echo "CATHEDRAL_ROOM_ATTEST_DIR=/run/room-attest"
+  fi
   # AB#650 Gate S.1: per-guest image ownership on the hotel Docker store, and
   # Option A — refuse hotel-side builds on shared sealed hotels.
   if [ -n "${ROOM_DATA_DIR:-}" ]; then

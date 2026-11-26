@@ -85,3 +85,27 @@ def test_open_owner_gate_is_written_into_the_measured_config(tun):
     result = measured_config(SEALED_HOTEL_TENANCY="dedicated", SEALED_ROOM_ALLOW_TUN=tun, SEALED_OWNER_GATE="open")
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"CATHEDRAL_HOTEL_TENANCY=dedicated\nROOM_ALLOW_TUN={tun}\nCATHEDRAL_OWNER_GATE=open"
+
+
+def _runsc_flags(tenancy: str) -> str:
+    start = BUILD.index('if [ "$TENANCY" = dedicated ]; then\n  # --host-uds')
+    block = BUILD[start:BUILD.index("\nfi\n", start) + 4]
+    result = subprocess.run(["bash", "-eu", "-c", f'TENANCY={tenancy}\n{block}\nprintf "%s" "$ROOM_RUNSC_FLAGS"'],
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_dedicated_runsc_flags_open_host_uds_and_keep_prefer_emulated():
+    flags = _runsc_flags("dedicated").split()
+    assert "--host-uds=open" in flags
+    assert "--character-device-policy=prefer-emulated" in flags  # dropped later, after the reseal
+
+
+def test_shared_runsc_flags_are_unchanged():
+    assert _runsc_flags("shared") == "--platform=systrap --overlay2=none --net-raw"
+
+
+def test_in_room_attest_line_is_dedicated_only_and_outside_the_measured_block():
+    assert '[ "$TENANCY" != dedicated ] || echo "ROOM_IN_ROOM_ATTEST=1" >>' in BUILD
+    assert "ROOM_IN_ROOM_ATTEST" not in measured_config(SEALED_HOTEL_TENANCY="dedicated").stdout
