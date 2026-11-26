@@ -344,16 +344,18 @@ def _valid_event(e: dict) -> bool:
     return kind == "start" or (_is_int(e.get("stopped_at")) and isinstance(e.get("reason"), str))
 
 
-def sync_history(name: str) -> None:
-    """Make what a reader is about to trust durable: fsync the journal file and its directory.
+def read_synced(name: str) -> bytes | None:
+    """Read the journal, then fsync that same descriptor and the directory: what comes back is durable.
 
-    A line written before a crash may be in the page cache only (written, not yet fsynced), and a
-    power loss would then drop it after a decision was taken from it."""
+    Sync must follow the read. A reader outside the journal lock could otherwise fsync, then read a
+    close appended just after, and trust a line a power loss would still drop. None: no file."""
     try:
         fd = os.open(history_path(name), os.O_RDONLY)
     except FileNotFoundError:
-        return
+        return None
     try:
+        with os.fdopen(os.dup(fd), "rb") as f:
+            data = f.read()
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -362,6 +364,7 @@ def sync_history(name: str) -> None:
         os.fsync(dfd)
     finally:
         os.close(dfd)
+    return data
 
 
 def read_history(name: str, durable: bool = True) -> dict:
@@ -371,12 +374,12 @@ def read_history(name: str, durable: bool = True) -> dict:
      "corrupt": bool, "tracked_from": int | None}. An unterminated final line is ignored.
     Corrupt means a complete line that is malformed, or a shape no writer produces (a second
     first line, a duplicate start or close, a start after its close): the whole file is unknown.
-    durable: fsync first, so no decision rests on a line a power loss could still drop."""
-    if durable:
-        sync_history(name)
+    durable: read a snapshot, then fsync it, so no decision rests on a line a power loss could drop."""
     try:
-        data = history_path(name).read_bytes()
+        data = read_synced(name) if durable else history_path(name).read_bytes()
     except FileNotFoundError:
+        data = None
+    if data is None:
         return {"events": [], "valid_len": 0, "exists": False, "corrupt": False, "tracked_from": None}
     return parse_history(data)
 

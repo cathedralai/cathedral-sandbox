@@ -910,3 +910,30 @@ def test_cancel_retry_rewrites_stop_json_from_the_close_line(vm, monkeypatch):
 def test_no_em_dashes_in_the_history_work():
     for f in (KIT / "vm_ctl.py", KIT / "README.md", Path(__file__)):
         assert chr(0x2014) not in f.read_text(), f
+
+
+# ---- Review fixes (Astra impl r2) -------------------------------------------------------------
+
+def test_a_reader_never_trusts_a_close_appended_after_its_snapshot(vm, monkeypatch):
+    """r1 #1: an unlocked reader that fsyncs before reading can see a later, unsynced close."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    vm.clk.advance(5)
+    vm.stop()
+    raw = vm.hfile().read_bytes()
+    lines = raw.splitlines(keepends=True)
+    assert json.loads(lines[-1])["event"] == "close"
+    vm.hfile().write_bytes(b"".join(lines[:-1]))
+    real_fsync, fired = os.fsync, []
+
+    def append_then_sync(fd):
+        if not fired:  # a writer lands its close between the reader's snapshot and its fsync
+            fired.append(1)
+            with open(vm.hfile(), "ab") as f:
+                f.write(lines[-1])
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", append_then_sync)
+    h = vm.m.read_history("vm1")
+    assert fired and not [e for e in h["events"] if e["event"] == "close"]
