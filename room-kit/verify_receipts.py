@@ -225,6 +225,21 @@ signed fields (measurement, chip id, REPORT_ID, policy, launch and reported TCB)
 with what it admitted. It refuses a policy with the migration agent bit (18). It takes only --ark-sha256,
 --kds-cache, --product, --min-tcb and --expected-chip-id (checked as in list mode); any other flag is exit 2.
 
+Room report mode (--room-report FILE --nonce HEX128 --ark-sha256 HEX, AB#1001) checks one in-room SNP report
+answer (docs/IN_ROOM_REPORT_CALL.md). The file is a JSON object: statement (schema cathedral.room.report/v1,
+hotel, binding_sha256, sandbox_id, incarnation, caller_report_data_hex, requested_at), statement_sig_b64 (base64
+Ed25519 signature of the room's receipt key over canonical(statement); the signature encoding of a receipt),
+optional statement_sha256, report_b64 (the fresh report), cert_chain (DER base64 vcek, ask, ark, or null for a KDS
+fetch), create_receipt (the room's signed create receipt) and attestation (GET /room/attestation as served).
+REPORT_DATA = SHA-512(b"cathedral.room.report/v1\0" || canonical(statement)). Every check must pass: the boot
+report (AMD chain, binding commitment, --expected-measurement, --approved-list); the statement (exact members,
+this binding and hotel, caller_report_data_hex equal to --nonce, signature under the binding's receipt key);
+the create receipt (same key and binding, a successful create of the statement's room, receipt_sha256 equal to
+incarnation); the fresh report (REPORT_DATA is the formula, AMD chain, measurement equal to the binding's, chip id
+equal to the boot report's, REPORT_ID nonzero and equal to the boot report's: the same launch). It takes only
+--nonce, --ark-sha256, --kds-cache, --product, --min-tcb, --expected-chip-id, --expected-measurement and
+--approved-list with --hotel and its options.
+
 When receipts name a binding_sha256 other than the live attestation, pass --broker and
 --operator-key-file so GET /v1/broker/bindings/<sha> can load each archived binding.
 The archive holds binding JSON only (no SNP report); those checks cover signatures only.
@@ -265,6 +280,12 @@ INSTALL_PURPOSE = "hotel-key-install"
 HEX64 = re.compile(r"[0-9a-f]{64}")
 ORIGIN_MAX_BYTES = 64 * 1024
 DEDICATED_HOST_DATA_DOMAIN = b"cathedral-dedicated-v1\0"
+# In-room SNP report (docs/IN_ROOM_REPORT_CALL.md). room_receipts.py makes the same bytes; this file shares no
+# code with it (a customer runs this one alone), so tests/test_verify_receipts_room_report.py pins both.
+ROOM_REPORT_SCHEMA = "cathedral.room.report/v1"
+ROOM_REPORT_DOMAIN = b"cathedral.room.report/v1\0"
+ROOM_REPORT_MEMBERS = ("schema", "hotel", "binding_sha256", "sandbox_id", "incarnation", "caller_report_data_hex",
+                       "requested_at")
 DEDICATED_V2_HOST_DATA_DOMAIN = b"cathedral-dedicated-v2\0"
 SANDBOX_LINK_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # room_receipts.py
 ONESHOT_BUNDLE_SCHEMA = "cathedral_oneshot_bundle_v1"
@@ -656,7 +677,8 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
 
 def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: str,
                         ark_sha256: str | list[str] | None, min_tcb: dict | None = None,
-                        expected_chip_id: str | None = None, approved_list: dict | None = None) -> dict:
+                        expected_chip_id: str | None = None, approved_list: dict | None = None,
+                        certs: dict | None = None) -> dict:
     """One POST /room/attest answer: REPORT_DATA is the caller's, debug is off, the AMD chain signs the report.
 
     Only the signed report is read. The answer's other members (binding_sha256, measurement) are the hotel's
@@ -675,7 +697,7 @@ def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: s
     need(not rep["policy"] & (1 << 19), "guest policy allows debug")
     need(not rep["policy"] & MIGRATION_AGENT_BIT, "guest policy allows a migration agent (bit 18)")
     need(bool(ark_sha256), "a fresh report needs --ark-sha256: an unpinned chain proves nothing")
-    amd = verify_amd(report, rep, product(rep, prod), cache, ark_sha256)
+    amd = verify_amd(report, rep, product(rep, prod), cache, ark_sha256, certs)
     pins = check_report_pins(report, rep, min_tcb, expected_chip_id)
     listed = check_approved_list(approved_list, report, rep, None) if approved_list else "not checked"
     return {"fresh_report": {"report_data_hex": rep["report_data"].hex(), "measurement": rep["measurement"],
@@ -684,6 +706,109 @@ def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: s
                              "reported_tcb": rep["reported_tcb"].hex(), "report_version": rep["version"]},
             "attestation": {"amd": amd}, "tcb_floor": pins.pop("tcb_floor", "not checked"), "approved_list": listed,
             **pins}
+
+
+def room_report_data(statement: dict) -> bytes:
+    """REPORT_DATA of an in-room report: SHA-512 over the domain and the canonical signed statement."""
+    return hashlib.sha512(ROOM_REPORT_DOMAIN + canonical(statement)).digest()
+
+
+def _ed25519_verify(key: Ed25519PublicKey, signature_b64, message: bytes, what: str) -> None:
+    need(isinstance(signature_b64, str), f"{what}: no signature string")
+    try:
+        key.verify(base64.b64decode(signature_b64, validate=True), message)
+    except (InvalidSignature, ValueError) as exc:
+        raise Fail(f"{what}: signature does not verify with the binding's receipt key") from exc
+
+
+def _check_room_statement(statement) -> None:
+    need(isinstance(statement, dict), "the statement is not an object")
+    need(statement.get("schema") == ROOM_REPORT_SCHEMA, f"the statement schema is not {ROOM_REPORT_SCHEMA}")
+    need(set(statement) == set(ROOM_REPORT_MEMBERS),
+         "the statement does not have exactly " + ", ".join(ROOM_REPORT_MEMBERS))
+    for name in ("hotel", "sandbox_id"):
+        need(isinstance(statement[name], str) and statement[name] != "", f"the statement {name} is not a string")
+    for name, size in (("binding_sha256", 64), ("incarnation", 64), ("caller_report_data_hex", 128)):
+        need(isinstance(statement[name], str) and re.fullmatch(f"[0-9a-f]{{{size}}}", statement[name]) is not None,
+             f"the statement {name} is not {size} lower-case hex characters")
+    need(_is_int(statement["requested_at"]) and statement["requested_at"] >= 0,
+         "the statement requested_at is not a non-negative integer")
+
+
+def verify_room_report(answer, nonce: str, prod: str | None, cache: str, ark_sha256: str | list[str] | None,
+                       expected_measurement: list[str] | None = None, min_tcb: dict | None = None,
+                       expected_chip_id: str | None = None, approved_list: dict | None = None) -> dict:
+    """One in-room report answer (docs/IN_ROOM_REPORT_CALL.md): a statement the room's receipt key signed, a fresh
+    SNP report whose REPORT_DATA commits to it, the room's create receipt and the boot attestation. It shows the
+    code that signed the statement runs in the room named in it, on the chip and launch of the boot report."""
+    need(isinstance(answer, dict), "the room report answer is not a JSON object")
+    need(isinstance(nonce, str) and re.fullmatch(r"[0-9a-fA-F]{128}", nonce) is not None,
+         "--nonce must be 128 hex characters (64 bytes)")
+    nonce = nonce.lower()
+    need(bool(ark_sha256), "a room report needs --ark-sha256: an unpinned chain proves nothing")
+    att, statement, create = answer.get("attestation"), answer.get("statement"), answer.get("create_receipt")
+    # 1. The boot attestation: AMD chain, binding commitment, measurement, optional pins and approved list.
+    check_attestation_shape(att)
+    need(not is_hotel_level(att), "the boot attestation is a level 1 binding: it has no SNP report")
+    binding, bsha = att["binding"], att["binding_sha256"]
+    boot_out = verify_attestation(att, expected_measurement, prod, cache, ark_sha256, False,
+                                  min_tcb=min_tcb, expected_chip_id=expected_chip_id)
+    boot_report = base64.b64decode(att["report_b64"])
+    boot_rep = parse_report(boot_report)
+    if approved_list:
+        boot_out["approved_list"] = check_approved_list(approved_list, boot_report, boot_rep, binding)
+    # 2. The statement: exact shape, this binding, this caller's nonce, signed by the binding's receipt key.
+    _check_room_statement(statement)
+    need(statement["binding_sha256"] == bsha, "the statement names another binding than the boot attestation")
+    need(statement["hotel"] == binding.get("hotel"), "the statement names another hotel than the binding")
+    need(statement["caller_report_data_hex"] == nonce, "the statement does not carry the nonce sent")
+    key = Ed25519PublicKey.from_public_bytes(base64.b64decode(binding["receipt_key_ed25519_b64"]))
+    _ed25519_verify(key, answer.get("statement_sig_b64"), canonical(statement), "the statement")
+    if "statement_sha256" in answer:
+        need(answer["statement_sha256"] == sha(canonical(statement)), "statement_sha256 is not the statement's hash")
+    # 3. The room's create receipt: same key, same binding, the incarnation and room the statement names.
+    need(isinstance(create, dict) and isinstance(create.get("statement"), dict), "the create receipt is not a "
+         "receipt with a statement")
+    cst = create["statement"]
+    need(cst.get("schema") == SEALED_RECEIPT_SCHEMA, f"the create receipt is not a {SEALED_RECEIPT_SCHEMA} statement")
+    need(cst.get("binding_sha256") == bsha, "the create receipt names another binding")
+    need(cst.get("action") == "create" and _is_int(cst.get("status")) and 200 <= cst["status"] < 300,
+         "the create receipt is not a successful create")
+    need(create.get("receipt_sha256") == sha(canonical(cst)), "the create receipt's receipt_sha256 mismatch")
+    _ed25519_verify(key, create.get("signature_b64"), canonical(cst), "the create receipt")
+    need(create["receipt_sha256"] == statement["incarnation"],
+         "the create receipt is not the incarnation the statement names")
+    need(cst.get("sandbox_id") == statement["sandbox_id"], "the create receipt is for another room than the statement")
+    # 4. The fresh report: its REPORT_DATA is the formula over the signed statement, so the room's key vouched
+    # for this report; then the AMD chain, and the same launch and chip as the boot report.
+    raw = answer.get("report_b64")
+    need(isinstance(raw, str) and raw != "", "the room report answer has no report_b64")
+    try:
+        fresh_report = base64.b64decode(raw, validate=True)
+    except ValueError as exc:
+        raise Fail("the fresh report's report_b64 is not base64") from exc
+    fresh_rep = parse_report(fresh_report)
+    expected_data = room_report_data(statement)
+    need(fresh_rep["report_data"] == expected_data, "fresh REPORT_DATA is not the formula over the signed statement")
+    chain = answer.get("cert_chain")
+    need(chain is None or isinstance(chain, dict), "cert_chain is neither null nor an object")
+    fresh = verify_fresh_report({"report_b64": raw}, expected_data.hex(), prod, cache, ark_sha256, min_tcb,
+                                expected_chip_id, None, chain)
+    need(fresh["fresh_report"]["measurement"] == binding["measurement"],
+         "fresh report measurement differs from the binding's")
+    need(fresh_rep["chip_id"] == boot_rep["chip_id"], "fresh report chip id differs from the boot report's")
+    report_id, boot_report_id = fresh_report[0x140:0x160], boot_report[0x140:0x160]
+    need(report_id != bytes(32), "fresh report REPORT_ID is zero")
+    need(report_id == boot_report_id, "fresh report REPORT_ID differs from the boot report's: another launch")
+    return {"room_report": {"hotel": statement["hotel"], "sandbox_id": statement["sandbox_id"],
+                            "incarnation": statement["incarnation"], "binding_sha256": bsha,
+                            "requested_at": statement["requested_at"], "caller_report_data_hex": nonce,
+                            "statement_sha256": sha(canonical(statement)),
+                            "report_data_hex": expected_data.hex()},
+            "boot_attestation": boot_out, "fresh_report": fresh["fresh_report"],
+            "fresh_amd": fresh["attestation"]["amd"], "tcb_floor": fresh["tcb_floor"],
+            "checked": "boot report, AMD chain and binding; statement and create receipt signatures under the "
+                       "binding's receipt key; fresh report chain, REPORT_DATA formula, measurement, chip and launch"}
 
 
 def is_hotel_level(att: dict) -> bool:
@@ -2739,6 +2864,8 @@ def main() -> int:
                                                 "receipt names it")
     ap.add_argument("--fresh-report", help="fresh report mode: an answer of POST /room/attest to check (AB#947)")
     ap.add_argument("--report-data-hex", help="fresh report mode: the 64 bytes (128 hex) sent as REPORT_DATA")
+    ap.add_argument("--room-report", help="in-room report mode: an in-room SNP report answer to check")
+    ap.add_argument("--nonce", help="in-room report mode: the 64 bytes (128 hex) the room asked to be signed")
     a = ap.parse_args()
     try:
         a.min_tcb_floors = parse_min_tcb(a.min_tcb)
@@ -2772,6 +2899,37 @@ def main() -> int:
         a.list_opts = {"path": a.approved_list, "pins": a.approved_list_pins, "at": a.at,
                        "previous_release": a.previous_release, "previous_digest": a.previous_digest,
                        "require_release": a.require_release, "hotel": a.hotel}
+    if a.room_report is not None or a.nonce is not None:
+        allowed = ("room_report", "nonce", "ark_sha256", "kds_cache", "product", "min_tcb", "min_tcb_floors",
+                   "expected_chip_id", "expected_measurement", "approved_list", "approved_list_schema",
+                   "approved_list_pins", "at", "previous_release", "previous_digest", "require_release", "hotel",
+                   "list_opts")
+        clash = [flag for flag, value in vars(a).items()
+                 if flag not in allowed and value is not None and value is not False and value != []]
+        if clash:
+            ap.error("--room-report takes only --nonce, --ark-sha256, --kds-cache, --product, --min-tcb, "
+                     "--expected-chip-id, --expected-measurement and --approved-list with --hotel and its "
+                     "options; not " + ", ".join("--" + f.replace("_", "-") for f in clash))
+        if a.hotel is not None and a.approved_list is None:
+            ap.error("--room-report takes --hotel only with --approved-list")
+        if not a.room_report or a.nonce is None:
+            ap.error("--room-report FILE and --nonce HEX go together")
+        try:
+            out = verify_room_report(read_document(a.room_report, "room report answer"), a.nonce, a.product,
+                                     a.kds_cache or os.path.expanduser("~/.cache/amd-kds"), a.ark_sha256,
+                                     a.expected_measurement, a.min_tcb_floors, a.expected_chip_id, a.list_opts)
+        except Fail as exc:
+            print(json.dumps({"verdict": "FAIL", "reason": str(exc)}))
+            return 1
+        except InvalidSignature:  # a certificate of cert_chain, or of the KDS cache, not signed by its issuer
+            print(json.dumps({"verdict": "FAIL", "reason": "an AMD certificate is not signed by the one above it "
+                                                           "in the chain"}))
+            return 1
+        except (KeyError, TypeError, AttributeError, IndexError, ValueError) as exc:
+            print(json.dumps({"verdict": "FAIL", "reason": f"internal error: {type(exc).__name__}"}))
+            return 1
+        print(json.dumps({"verdict": "PASS", **out}, indent=1))
+        return 0
     if a.fresh_report is not None or a.report_data_hex is not None:
         # Fresh report mode reads the signed report and nothing else: every other flag would be a check
         # the caller believes ran.
