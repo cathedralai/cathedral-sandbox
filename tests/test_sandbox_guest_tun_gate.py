@@ -1,4 +1,4 @@
-"""URnetwork TUN gate: hotel config decides tenancy, never a request label; no room gets /dev/sev-guest."""
+"""Dedicated hotel gates: hotel env decides tenancy; shared pool never gets TUN or /dev/sev-guest."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,13 +22,20 @@ def _args(request):
 
 
 @pytest.fixture()
-def tun_device(monkeypatch):
+def tun_and_sev(monkeypatch):
     real = Path.exists
-    monkeypatch.setattr(Path, "exists", lambda self: True if str(self) == "/dev/net/tun" else real(self))
+
+    def exists(self):
+        path = str(self)
+        if path in ("/dev/net/tun", "/dev/sev-guest"):
+            return True
+        return real(self)
+
+    monkeypatch.setattr(Path, "exists", exists)
 
 
 @pytest.mark.parametrize("env", [{}, {"ROOM_ALLOW_TUN": "1"}, {"CATHEDRAL_HOTEL_TENANCY": "dedicated"}])
-def test_tun_is_refused_unless_the_hotel_is_dedicated_and_allows_it(monkeypatch, tun_device, env):
+def test_tun_is_refused_unless_the_hotel_is_dedicated_and_allows_it(monkeypatch, tun_and_sev, env):
     for key in ("ROOM_ALLOW_TUN", "CATHEDRAL_HOTEL_TENANCY", "ROOM_EXPOSE_SEV_GUEST"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -38,21 +45,37 @@ def test_tun_is_refused_unless_the_hotel_is_dedicated_and_allows_it(monkeypatch,
     assert refused.value.code == "tun_requires_dedicated"
 
 
-def test_a_request_label_cannot_make_a_shared_hotel_dedicated(monkeypatch, tun_device):
+def test_a_request_label_cannot_make_a_shared_hotel_dedicated(monkeypatch, tun_and_sev):
     monkeypatch.delenv("CATHEDRAL_HOTEL_TENANCY", raising=False)
     monkeypatch.setenv("ROOM_ALLOW_TUN", "1")
-    monkeypatch.setenv("ROOM_EXPOSE_SEV_GUEST", "1")
-    request = _req(network_capability="tun", labels={"cathedral.tenancy": "dedicated",
-                                                     "cathedral.attestation_device": "sev_guest"})
+    monkeypatch.delenv("ROOM_EXPOSE_SEV_GUEST", raising=False)
+    request = _req(
+        network_capability="tun",
+        labels={"cathedral.tenancy": "dedicated", "cathedral.attestation_device": "sev_guest"},
+    )
     with pytest.raises(SandboxOpError):
         _args(request)
+    # Labels alone never expose TUN or sev-guest on a shared hotel.
     assert _args(_req(labels={"cathedral.tenancy": "dedicated", "cathedral.attestation_device": "sev_guest"})) == ()
 
 
-def test_a_dedicated_hotel_that_allows_tun_gets_it_and_never_sev_guest(monkeypatch, tun_device):
+def test_dedicated_hotel_gets_tun_and_sev_guest(monkeypatch, tun_and_sev):
     monkeypatch.setenv("CATHEDRAL_HOTEL_TENANCY", "dedicated")
     monkeypatch.setenv("ROOM_ALLOW_TUN", "1")
-    monkeypatch.setenv("ROOM_EXPOSE_SEV_GUEST", "1")
-    args = _args(_req(network_capability="tun", labels={"cathedral.attestation_device": "sev_guest"}))
+    monkeypatch.delenv("ROOM_EXPOSE_SEV_GUEST", raising=False)
+    args = _args(_req(network_capability="tun", image=ImageSource(image="ghcr.io/you/app@sha256:" + "ab" * 32)))
     assert "--cap-add=NET_ADMIN" in args and "--device=/dev/net/tun:/dev/net/tun" in args
+    assert "--device=/dev/sev-guest:/dev/sev-guest" in args
+
+
+def test_dedicated_sev_guest_can_be_opted_out(monkeypatch, tun_and_sev):
+    monkeypatch.setenv("CATHEDRAL_HOTEL_TENANCY", "dedicated")
+    monkeypatch.setenv("ROOM_EXPOSE_SEV_GUEST", "0")
+    args = _args(_req())
     assert not any("sev-guest" in a for a in args)
+
+
+def test_shared_hotel_never_gets_sev_guest_even_if_device_exists(monkeypatch, tun_and_sev):
+    monkeypatch.delenv("CATHEDRAL_HOTEL_TENANCY", raising=False)
+    monkeypatch.delenv("ROOM_EXPOSE_SEV_GUEST", raising=False)
+    assert _args(_req()) == ()
