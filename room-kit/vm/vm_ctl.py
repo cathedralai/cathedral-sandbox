@@ -18,7 +18,7 @@ so it holds with the API and the broker down:
 - enforce (a timer, every 30 s) stops any running VM past paid_through. Disks
   are kept; only delete --confirm <name> removes one.
 
-Execution history (AB#992, docs/VM_EXECUTION_HISTORY.md H1 to H9): <root>/history/<name>.jsonl
+Execution history (AB#992, docs/VM_EXECUTION_HISTORY.md H1 to H9): <root>/.history/<name>.jsonl
 is an append-only record, outside the VM directory, that delete never removes. A start
 line is durable before a run launches and a close line is durable before the run's
 authorization and stop evidence are written, so billing settlement can read one exact
@@ -79,7 +79,7 @@ def out(obj: dict) -> None:
 
 
 def check_name(name: str) -> str:
-    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+    if name == ".history" or not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise Refusal("invalid_name", "name must match ^[a-z0-9][a-z0-9-]{0,40}$")
     return name
 
@@ -249,8 +249,11 @@ def paid_refusal(a: dict, now: int) -> Refusal | None:
 
 # ---- execution history (AB#992) -------------------------------------------------------
 
+HISTORY_DIR_NAME = ".history"  # a leading dot can never match NAME_RE, so no VM name can collide
+
+
 def history_dir() -> Path:
-    return root() / "history"
+    return root() / HISTORY_DIR_NAME
 
 
 def history_path(name: str) -> Path:
@@ -265,6 +268,14 @@ def mono_ns() -> int:
     return time.monotonic_ns()
 
 
+def boot_ns() -> int | None:
+    """CLOCK_BOOTTIME: like CLOCK_MONOTONIC but it keeps counting through suspend."""
+    try:
+        return time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return None
+
+
 def boot_id() -> str | None:
     try:
         return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
@@ -273,7 +284,6 @@ def boot_id() -> str | None:
 
 
 MAX_CLOCK_ERROR_US = 1_000_000
-SLEW_PPM = 500
 
 
 def kernel_clock() -> tuple[bool, int | None]:
@@ -311,7 +321,8 @@ def kernel_clock() -> tuple[bool, int | None]:
 
 def stamp() -> dict:
     synced, maxerror_us = kernel_clock()
-    return {"wall_us": wall_us(), "boot_id": boot_id(), "mono_ns": mono_ns(), "synced": bool(synced),
+    return {"wall_us": wall_us(), "boot_id": boot_id(), "mono_ns": mono_ns(), "boot_ns": boot_ns(),
+            "synced": bool(synced),
             "maxerror_us": maxerror_us}
 
 
@@ -327,23 +338,50 @@ def _valid_event(e: dict) -> bool:
         return False
     if not (_is_int(e.get("wall_us")) and _is_int(e.get("mono_ns")) and isinstance(e.get("synced"), bool)
             and (e.get("boot_id") is None or isinstance(e["boot_id"], str))
-            and (e.get("maxerror_us") is None or _is_int(e["maxerror_us"]))):
+            and (e.get("maxerror_us") is None or _is_int(e["maxerror_us"]))
+            and (e.get("boot_ns") is None or _is_int(e["boot_ns"]))):
         return False
     return kind == "start" or (_is_int(e.get("stopped_at")) and isinstance(e.get("reason"), str))
 
 
-def read_history(name: str) -> dict:
+def sync_history(name: str) -> None:
+    """Make what a reader is about to trust durable: fsync the journal file and its directory.
+
+    A line written before a crash may be in the page cache only (written, not yet fsynced), and a
+    power loss would then drop it after a decision was taken from it."""
+    try:
+        fd = os.open(history_path(name), os.O_RDONLY)
+    except FileNotFoundError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dfd = os.open(history_dir(), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def read_history(name: str, durable: bool = True) -> dict:
     """The history file as readers see it (H6).
 
     {"events": parsed lines, "valid_len": bytes up to the last newline, "exists": bool,
      "corrupt": bool, "tracked_from": int | None}. An unterminated final line is ignored.
     Corrupt means a complete line that is malformed, or a shape no writer produces (a second
-    first line, a duplicate start or close, a start after its close): the whole file is unknown."""
-    path = history_path(name)
+    first line, a duplicate start or close, a start after its close): the whole file is unknown.
+    durable: fsync first, so no decision rests on a line a power loss could still drop."""
+    if durable:
+        sync_history(name)
     try:
-        data = path.read_bytes()
+        data = history_path(name).read_bytes()
     except FileNotFoundError:
         return {"events": [], "valid_len": 0, "exists": False, "corrupt": False, "tracked_from": None}
+    return parse_history(data)
+
+
+def parse_history(data: bytes) -> dict:
     valid_len = data.rfind(b"\n") + 1
     events, corrupt, seen = [], False, set()
     for raw in data[:valid_len].splitlines():
@@ -376,24 +414,27 @@ def event_of(h: dict, kind: str, generation: int) -> dict | None:
 
 
 def history_append(name: str, record: dict) -> None:
-    """H1: append one line (a torn tail is cut first), then fsync the file and history/.
+    """H1: append one line (a torn tail is cut first), then fsync the file and the journal dir.
 
-    Callers hold the VM lock (create holds the global lock), so there is one writer."""
+    The journal's own flock makes read, cut and append one step, so even a writer outside the VM
+    lock can only cut bytes after the last newline it read under that lock, never a complete line."""
     hdir = history_dir()
     hdir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = history_path(name)
-    valid_len = read_history(name)["valid_len"]
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(history_path(name), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        if os.fstat(fd).st_size != valid_len:
-            os.ftruncate(fd, valid_len)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        size = os.fstat(fd).st_size
+        data = os.pread(fd, size, 0) if size else b""
+        valid_len = parse_history(data)["valid_len"]
+        if valid_len != len(data):
+            os.ftruncate(fd, valid_len)  # only the unterminated tail: nothing depended on it
         os.lseek(fd, valid_len, os.SEEK_SET)
         line = (json.dumps(record, sort_keys=True) + "\n").encode()
         while line:
             line = line[os.write(fd, line):]
         os.fsync(fd)
     finally:
-        os.close(fd)
+        os.close(fd)  # drops the flock
     dfd = os.open(hdir, os.O_RDONLY)
     try:
         os.fsync(dfd)
@@ -440,6 +481,13 @@ def append_close(name: str, generation: int, reason: str) -> dict:
 
 def is_tracked(h: dict, generation: int) -> bool:
     return h["tracked_from"] is not None and not h["corrupt"] and generation >= h["tracked_from"]
+
+
+def refuse_if_running(name: str, generation: int) -> None:
+    """A newer generation may only replace a run whose unit is down, tracked or not: otherwise the
+    old run keeps executing while its history says it never started."""
+    if unit_active(name):
+        raise Refusal("generation_open", f"generation {generation} is still running: stop it first", 3)
 
 
 def close_open_generation(name: str, d: Path, a: dict, reason: str) -> None:
@@ -663,21 +711,28 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
             "VM_BASE_IMAGE": str(image), "VM_BASE_SHA256": digest, "VM_CREATED_AT": str(int(time.time())),
         }
         d.mkdir(mode=0o700)
-        try:
-            (d / "run").mkdir(mode=0o700)
-            make_seed(d, name, key, env)
-            run("qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(image),
-                str(d / "disk.qcow2"), f"{disk}G")
-            write_atomic(d / "authorization.json",
-                         json.dumps({"generation": 0, "paid_through": 0, "closed_generation": 0}) + "\n")
-            write_atomic(d / "vm.env", "".join(f"{k}='{v}'\n" for k, v in env.items()), 0o644)
-            write_unit(name, d)
-            ensure_enforce_timer()
-            history_append(name, {"event": "tracked_from", "generation": 1})
-        except BaseException:
-            shutil.rmtree(d, ignore_errors=True)
-            (unit_dir() / unit_name(name)).unlink(missing_ok=True)
-            raise
+        # The VM lock is held from before anything is published until create is done, and the
+        # journal is initialised before vm.env makes the VM visible: no command can append to a
+        # journal that create is still starting.
+        with Lock(d / ".lock"):
+            try:
+                (d / "run").mkdir(mode=0o700)
+                make_seed(d, name, key, env)
+                run("qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(image),
+                    str(d / "disk.qcow2"), f"{disk}G")
+                write_atomic(d / "authorization.json",
+                             json.dumps({"generation": 0, "paid_through": 0, "closed_generation": 0}) + "\n")
+                history_append(name, {"event": "tracked_from", "generation": 1})
+                write_atomic(d / "vm.env", "".join(f"{k}='{v}'\n" for k, v in env.items()), 0o644)
+                write_unit(name, d)
+                ensure_enforce_timer()
+            except BaseException:
+                h = read_history(name, durable=False)
+                if [e["event"] for e in h["events"]] == ["tracked_from"]:
+                    history_path(name).unlink(missing_ok=True)  # nothing ran: do not burn the name
+                shutil.rmtree(d, ignore_errors=True)
+                (unit_dir() / unit_name(name)).unlink(missing_ok=True)
+                raise
     return status_of(name)
 
 
@@ -699,6 +754,7 @@ def cmd_authorize(args: list[str]) -> dict:
         if gen == a["generation"] and paid < a["paid_through"]:
             raise Refusal("paid_through_lower", f"paid_through {paid} is below {a['paid_through']}", 3)
         if gen > a["generation"]:
+            refuse_if_running(name, a["generation"])
             close_open_generation(name, d, a, "superseded")
         changed = (gen, paid) != (a["generation"], a["paid_through"])
         if changed:
@@ -715,13 +771,16 @@ def cmd_check_paid(args: list[str]) -> dict:
     if refusal:
         raise refusal
     # H2: no launch of a tracked generation without a durable start line, and none after a durable
-    # close line (it is authoritative even when authorization.json missed it). Read only: the
-    # generation open at upgrade, or a file no reader can trust, is not gated (history_unknown).
+    # close line (it is authoritative even when authorization.json missed it), and none from a
+    # corrupt journal. Read only. No journal at all is a VM from before the upgrade: not gated.
     h = read_history(name)
     g = a["generation"]
+    if event_of(h, "close", g):  # any parsable close line, even in a file that is corrupt elsewhere
+        raise Refusal("generation_closed", "this run has a close line; authorize a new generation", 3)
+    if h["corrupt"]:
+        sys.stderr.write(f"history: {name}: corrupt journal, launch of generation {g} refused\n")
+        raise Refusal("history_corrupt", f"the history journal of {name} is corrupt: no launch", 3)
     if is_tracked(h, g):
-        if event_of(h, "close", g):
-            raise Refusal("generation_closed", "this run has a close line; authorize a new generation", 3)
         if not event_of(h, "start", g):
             raise Refusal("start_not_recorded", f"generation {g} has no start line: use vm-ctl start", 3)
     return {"name": name, "paid": True}
@@ -752,6 +811,8 @@ def cmd_start(args: list[str]) -> dict:
         # H2: the start line is durable before anything can launch the run.
         g = auth_of(d)["generation"]
         h = read_history(name)
+        if h["corrupt"]:
+            raise Refusal("history_corrupt", f"the history journal of {name} is corrupt: no launch", 3)
         if is_tracked(h, g) and not event_of(h, "start", g):
             history_append(name, {"event": "start", "generation": g, **stamp()})
         (d / "started").touch()
@@ -772,23 +833,29 @@ def wait_inactive(name: str, seconds: float) -> bool:
 
 
 def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> dict:
-    a = recover_closure(name, d)
-    previous = read_json(d / "stop.json", {})
+    # The physical stop comes first and never depends on history I/O (the credit cutoff). It always
+    # runs disable and stop, even for a unit that looks inactive: a start job queued by a reboot
+    # relaunch can still be pending, and `systemctl stop` cancels it.
     was_running = unit_active(name)
     # Disable first: whatever happens next, a host reboot must not bring it back.
     systemctl("disable", "-q", unit_name(name))
     graceful = False
+    marker = d / "run" / "powerdown-sent"
     if was_running:
         # The unit's ExecStop would ask again and wait again; this marker says it was asked.
-        marker = d / "run" / "powerdown-sent"
         marker.touch()
-        try:
+    try:
+        if was_running:
             graceful = qmp(name, "system_powerdown") and wait_inactive(name, STOP_WAIT if wait is None else wait)
-            systemctl("stop", unit_name(name))
-        finally:
-            marker.unlink(missing_ok=True)
-        if unit_active(name):
-            raise Refusal("stop_failed", f"{unit_name(name)} is still active", 1)
+        systemctl("stop", unit_name(name))
+    finally:
+        marker.unlink(missing_ok=True)
+    if unit_active(name):
+        raise Refusal("stop_failed", f"{unit_name(name)} is still active", 1)
+    # Only now history: it may raise, with the VM already stopped.
+    begin(name, d)
+    a = auth_of(d)
+    previous = read_json(d / "stop.json", {})
     g = a["generation"]
     h = read_history(name)
     if is_tracked(h, g):
@@ -816,7 +883,6 @@ def cmd_stop(args: list[str]) -> dict:
     name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
-        begin(name, d)
         check_generation(opts, auth_of(d))
         return stop_locked(name, d, "requested")
 
@@ -863,7 +929,6 @@ def cmd_delete(args: list[str]) -> dict:
             return {"name": name, "deleted": True, "existed": False}
         d = vm_dir(name)
         with Lock(d / ".lock"):
-            begin(name, d)
             stop_locked(name, d, "deleted")
             run(str(KIT / "vm-net.sh"), "down", str(d / "vm.env"), check=False)
             (unit_dir() / unit_name(name)).unlink(missing_ok=True)
@@ -890,6 +955,11 @@ def cmd_cancel(args: list[str]) -> dict:
         begin(name, d)
         a = auth_of(d)
         done = event_of(read_history(name), "close", g)
+        if done and g == a["generation"]:
+            # A retry of the current generation: rewrite closed_generation and stop.json from the
+            # close line (a crash may have left them stale), through the same path as stop.
+            stop_locked(name, d, "cancelled")
+            return close_record(name, done)
         if done:
             return close_record(name, done)
         if g < a["generation"]:
@@ -903,6 +973,7 @@ def cmd_cancel(args: list[str]) -> dict:
                     "close_reason": ev["reason"]}
         # G was never authorized here. An open, unstarted lower generation is closed first, as
         # authorize does; a started one must be stopped first.
+        refuse_if_running(name, a["generation"])
         close_open_generation(name, d, a, "superseded")
         if not is_tracked(read_history(name), g):
             raise Refusal("history_unknown", f"generation {g} is not tracked", 3)
@@ -924,18 +995,21 @@ def clock_error(line: dict) -> int:
 def lower_bound_start(start: dict, close: dict) -> tuple[int, int]:
     """H8: (started_at in microseconds, total error subtracted), a lower bound on the real start.
 
-    Same boot: the monotonic duration anchored on the close wall time, widened by the close
-    line's clock error and 500 ppm for NTP slewing of CLOCK_MONOTONIC. Different boots: the
-    start line's wall time less its own clock error."""
+    Same boot: elapsed CLOCK_BOOTTIME (it counts suspend), widened for a clock that runs 500 ppm
+    slow (divide by 0.9995), anchored on the close wall time less its clock error, and never later
+    than the start line's own wall time less its error. Different boots: the start line's wall
+    time less its clock error."""
     if start["boot_id"] is not None and start["boot_id"] == close["boot_id"]:
-        delta_ns = close["mono_ns"] - start["mono_ns"]
+        if start.get("boot_ns") is None or close.get("boot_ns") is None:
+            raise Refusal("history_unknown", "no boot-time clock on the lines", 3)
+        delta_ns = close["boot_ns"] - start["boot_ns"]
         if delta_ns < 0:
-            raise Refusal("history_unknown", "monotonic clock went backwards", 3)
-        clock_error(start)  # both lines are used: a start on an unsynced clock is not trusted
-        err = clock_error(close)
+            raise Refusal("history_unknown", "boot clock went backwards", 3)
+        start_err, close_err = clock_error(start), clock_error(close)
         elapsed = -(-delta_ns // 1000)
-        widened = -(-elapsed * (1_000_000 + SLEW_PPM) // 1_000_000)
-        return close["wall_us"] - err - widened, err + widened - elapsed
+        widened = -(-elapsed * 10_000 // 9_995)
+        started_us = min(close["wall_us"] - close_err - widened, start["wall_us"] - start_err)
+        return started_us, close["wall_us"] - elapsed - started_us
     if start["boot_id"] is None or close["boot_id"] is None:
         raise Refusal("history_unknown", "boot id unavailable", 3)
     err = clock_error(start)
@@ -998,7 +1072,7 @@ def cmd_enforce(args: list[str]) -> dict:
         d = root() / name
         try:
             with Lock(d / ".lock", wait=20):
-                begin_best_effort(name, d)
+                # No history I/O before the stop: stop_locked does the physical cutoff first.
                 # Re-check under the lock: an authorize may have landed since the scan.
                 if unit_active(name) and paid_refusal(auth_of(d), int(time.time())):
                     ev = stop_locked(name, d, "paid_through", CUTOFF_WAIT)

@@ -4,10 +4,12 @@ Most tests run vm_ctl in process so a crash can be simulated by raising inside a
 retrying. Fake systemctl and friends as in test_ab991_vm_runtime.py; clocks are patched."""
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -25,10 +27,12 @@ class Clock:
 
     def __init__(self):
         self.wall, self.mono, self.boot, self.synced, self.maxerror = T0, 5_000_000_000, BOOT_A, True, 1000
+        self.bootns = 7_000_000_000  # CLOCK_BOOTTIME: mono plus suspended time
 
     def advance(self, seconds: float):
         self.wall += int(seconds * 1_000_000)
         self.mono += int(seconds * 1_000_000_000)
+        self.bootns += int(seconds * 1_000_000_000)
 
 
 @pytest.fixture
@@ -55,6 +59,7 @@ def vm(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "wall_us", lambda: clock.wall)
     monkeypatch.setattr(mod, "mono_ns", lambda: clock.mono)
     monkeypatch.setattr(mod, "boot_id", lambda: clock.boot)
+    monkeypatch.setattr(mod, "boot_ns", lambda: clock.bootns)
     monkeypatch.setattr(mod, "kernel_clock", lambda: (clock.synced, clock.maxerror))
 
     class H:
@@ -92,10 +97,10 @@ def vm(tmp_path, monkeypatch):
             return self.run(mod.cmd_check_paid, name)
 
         def lines(self, name="vm1"):
-            return [json.loads(x) for x in (self.root / "history" / f"{name}.jsonl").read_text().splitlines()]
+            return [json.loads(x) for x in (self.root / ".history" / f"{name}.jsonl").read_text().splitlines()]
 
         def hfile(self, name="vm1"):
-            return self.root / "history" / f"{name}.jsonl"
+            return self.root / ".history" / f"{name}.jsonl"
 
         def authjson(self, name="vm1"):
             return json.loads((self.root / name / "authorization.json").read_text())
@@ -107,16 +112,17 @@ def vm(tmp_path, monkeypatch):
             """A VM made by the code before AB#992: no history file, authorization as it was."""
             assert self.create()[0] == 0
             self.hfile().unlink()
-            (self.root / "history").rmdir()
+            (self.root / ".history").rmdir()
             a = {"generation": generation, "paid_through": self.paid if generation else 0, "closed_generation": 0}
             (self.root / "vm1" / "authorization.json").write_text(json.dumps(a))
 
     return H()
 
 
-def lower(wall_us: int, elapsed_us: int, maxerror_us: int = 1000) -> int:
-    """The spec's same-boot lower bound, written out independently of the code under test."""
-    return wall_us - maxerror_us - -(-elapsed_us * 1_000_500 // 1_000_000)
+def lower(close_wall_us: int, elapsed_us: int, start_wall_us: int = T0, maxerror_us: int = 1000) -> int:
+    """The r4.1 same-boot lower bound, written out independently of the code under test."""
+    widened = -(-elapsed_us * 10_000 // 9_995)  # elapsed / 0.9995, rounded up
+    return min(close_wall_us - maxerror_us - widened, start_wall_us - maxerror_us)
 
 
 def crash_on(monkeypatch, mod, attr, when):
@@ -486,9 +492,12 @@ def test_same_boot_derivation_is_exact_and_anchored_on_the_close_wall_time(vm):
     vm.stop()
     close = vm.lines()[-1]
     code, h = vm.history(1)
-    expected = lower(close["wall_us"], 600_000_000)
+    start = vm.lines()[1]
+    expected = lower(close["wall_us"], 600_000_000, start["wall_us"])
     assert code == 0 and h["started_at"] == vm.m.iso_us(expected)
-    assert h["started_at_error_us"] == 1000 + 300_000  # clock error + 500 ppm of 600 s
+    # The close wall time stepped 2 s ahead, so the start line's own wall time less its error wins.
+    assert expected == start["wall_us"] - 1000
+    assert h["started_at_error_us"] == close["wall_us"] - 600_000_000 - expected == 2_001_000
     assert h["started_at"].endswith("Z") and "." in h["started_at"]
     assert set(h) == {"generation", "closed", "started_at", "started_at_error_us", "stopped_at", "tracked_from",
                       "close_reason", "history"}
@@ -514,22 +523,58 @@ def test_cross_boot_uses_the_start_wall_time_only_when_both_lines_are_synced(vm)
 
 
 @pytest.mark.parametrize("fast_us", [0, 1000, -1000])
-@pytest.mark.parametrize("slew", [1.0, 1.0004, 0.9996])
+@pytest.mark.parametrize("slew", [1.0, 1.0005, 0.9995])
 def test_a_wall_clock_off_by_up_to_maxerror_never_yields_a_start_after_the_real_one(vm, fast_us, slew):
     """Real start is T0. The wall clock reads real time plus fast_us at the close (|fast_us| <= maxerror),
-    and CLOCK_MONOTONIC runs slew times real elapsed time, within 500 ppm."""
+    and the kernel clocks run slew times real elapsed time, within 500 ppm."""
     vm.create()
     vm.auth(1)
     vm.start()
     real_elapsed_us = 3_600_000_000
     vm.clk.wall = T0 + real_elapsed_us + fast_us
     vm.clk.mono += int(real_elapsed_us * slew * 1000)
+    vm.clk.bootns += int(real_elapsed_us * slew * 1000)
     vm.stop()
     code, h = vm.history(1)
     started_us = int(vm.m.datetime.datetime.strptime(h["started_at"], "%Y-%m-%dT%H:%M:%S.%fZ")
                      .replace(tzinfo=vm.m.datetime.timezone.utc).timestamp() * 1_000_000)
     assert code == 0 and started_us <= T0, (started_us - T0)
     assert h["started_at_error_us"] > 0
+
+
+def started_us_of(vm, h):
+    return int(vm.m.datetime.datetime.strptime(h["started_at"], "%Y-%m-%dT%H:%M:%S.%fZ")
+               .replace(tzinfo=vm.m.datetime.timezone.utc).timestamp() * 1_000_000)
+
+
+def test_a_suspend_gap_is_counted_through_clock_boottime(vm):
+    """CLOCK_MONOTONIC stops while the host is suspended; the wall clock and CLOCK_BOOTTIME do not."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    vm.clk.advance(100)
+    vm.clk.wall += 3_600_000_000  # one hour asleep
+    vm.clk.bootns += 3_600_000_000_000
+    vm.stop()
+    code, h = vm.history(1)
+    assert code == 0 and started_us_of(vm, h) <= T0, started_us_of(vm, h) - T0
+    # What the old monotonic-based rule would have said is an hour too late.
+    close, start = vm.lines()[-1], vm.lines()[1]
+    assert close["wall_us"] - (close["mono_ns"] - start["mono_ns"]) // 1000 > T0 + 3_000_000_000
+
+
+def test_a_clock_running_500_ppm_slow_over_a_day_still_gives_a_lower_bound(vm):
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    day_us = 86_400_000_000
+    slow_ns = day_us * 1000 * 9995 // 10_000  # 0.9995 of real time
+    vm.clk.wall = T0 + day_us
+    vm.clk.mono += slow_ns
+    vm.clk.bootns += slow_ns
+    vm.stop()
+    code, h = vm.history(1)
+    assert code == 0 and started_us_of(vm, h) <= T0 - 1000 + 1, started_us_of(vm, h) - T0
 
 
 @pytest.mark.parametrize("bad", [None, "missing", 1_000_001, -1])
@@ -557,7 +602,7 @@ def test_a_maxerror_of_exactly_one_second_is_accepted(vm):
     vm.clk.advance(60)
     vm.stop()
     code, h = vm.history(1)
-    assert code == 0 and h["started_at_error_us"] == 1_000_000 + 30_000
+    assert code == 0 and h["started_at_error_us"] == 1_030_016  # 1 s clock error + 60 s / 0.9995 less 60 s
 
 
 def test_the_adjtimex_reader_fails_closed_off_linux_and_never_raises(tmp_path, monkeypatch):
@@ -637,15 +682,226 @@ def test_history_works_through_the_cli_and_the_broker_forced_command(vm, tmp_pat
     assert p.returncode == 3 and json.loads(p.stdout)["error"] == "history_open"
 
 
-def test_the_cutoff_does_not_depend_on_history_io(vm, monkeypatch):
+def test_the_cutoff_stops_the_unit_even_when_history_io_fails(vm, monkeypatch):
     vm.create()
     vm.auth(1)
     vm.start()
     a = vm.authjson()
     a["paid_through"] = int(time.time()) - 5
     (vm.root / "vm1" / "authorization.json").write_text(json.dumps(a))
-    monkeypatch.setattr(vm.m, "begin", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
-    assert vm.m.cmd_enforce([])["stopped"][0]["generation"] == 1
+    monkeypatch.setattr(vm.m, "read_history", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    out = vm.m.cmd_enforce([])
+    assert not vm.systemd()["cathedral-vm-vm1.service"]["active"]
+    assert not vm.systemd()["cathedral-vm-vm1.service"]["enabled"]
+    assert out["errors"][0]["name"] == "vm1"  # the history failure is reported after the stop
+
+
+def test_stop_and_delete_also_stop_before_touching_history(vm, monkeypatch):
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    monkeypatch.setattr(vm.m, "read_history", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError):
+        vm.stop()
+    assert not vm.systemd()["cathedral-vm-vm1.service"]["active"]
+
+
+# ---- Review fixes (Astra impl r1) -------------------------------------------------------------
+
+def test_a_retry_fsyncs_the_journal_before_it_launches_on_a_line_it_did_not_sync(vm, monkeypatch):
+    """Finding 1: a start line written but never fsynced must not be trusted by a retry's launch."""
+    vm.create()
+    vm.auth(1)
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: None)  # the start line is written, never fsynced
+    crash_on(monkeypatch, vm.m, "systemctl", lambda *a, **k: a[0] == "start")
+    with pytest.raises(RuntimeError):
+        vm.start()
+    events = []
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    real_systemctl = vm.m.systemctl
+    monkeypatch.setattr(vm.m, "systemctl", lambda *a, **k: (events.append("systemctl " + a[0]),
+                                                           real_systemctl(*a, **k))[1])
+    assert vm.start()[0] == 0
+    assert "fsync" in events and events.index("fsync") < events.index("systemctl enable"), events
+
+
+@pytest.mark.parametrize("reader", ["check_paid", "history"])
+def test_every_reader_fsyncs_the_journal_before_it_answers(vm, monkeypatch, reader):
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    if reader == "history":
+        vm.clk.advance(5)
+        vm.stop()
+    events = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    getattr(vm, reader)(*([] if reader == "check_paid" else [1]))
+    assert events.count("fsync") >= 2  # the file and the directory
+
+
+def test_create_holds_the_vm_lock_and_initialises_history_before_publishing_vm_env(vm, monkeypatch):
+    """Finding 2: no command can append to a journal that create is still starting."""
+    seen = {}
+    real = vm.m.history_append
+
+    def spy(name, record):
+        d = vm.root / name
+        seen["env_published"] = (d / "vm.env").exists()
+        fd = os.open(d / ".lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            seen["lock_held"] = False
+        except BlockingIOError:
+            seen["lock_held"] = True
+        finally:
+            os.close(fd)
+        return real(name, record)
+
+    monkeypatch.setattr(vm.m, "history_append", spy)
+    assert vm.create()[0] == 0
+    assert seen == {"env_published": False, "lock_held": True}
+    assert (vm.root / "vm1" / "vm.env").exists()
+
+
+def test_a_failed_create_does_not_burn_the_name(vm, monkeypatch):
+    crash_on(monkeypatch, vm.m, "write_unit", lambda *a, **k: True)
+    with pytest.raises(RuntimeError):
+        vm.create()
+    assert not vm.hfile().exists() and not (vm.root / "vm1").exists()
+    assert vm.create()[0] == 0
+
+
+def test_history_append_waits_for_the_journal_lock_and_never_cuts_a_complete_line(vm):
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    before = vm.hfile().read_bytes()
+    fd = os.open(vm.hfile(), os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # another writer is mid-append
+    done = threading.Event()
+
+    def writer():
+        vm.m.history_append("vm1", {"event": "start", "generation": 9, **vm.m.stamp()})
+        done.set()
+
+    t = threading.Thread(target=writer)
+    t.start()
+    assert not done.wait(0.5)  # blocked on the journal lock
+    os.close(fd)
+    t.join(5)
+    assert done.is_set() and vm.hfile().read_bytes().startswith(before)
+
+
+def test_the_journal_dir_cannot_collide_with_a_vm_named_history(vm):
+    """Finding 3: journals live in <root>/.history; a VM called history is an ordinary VM."""
+    assert vm.m.history_dir() == vm.root / ".history"
+    for bad in (".history", ".x"):
+        with pytest.raises(vm.m.Refusal):
+            vm.m.check_name(bad)
+    assert vm.create()[0] == 0
+    code, _ = vm.create("history", port="22002")
+    assert code == 0 and (vm.root / "history" / "vm.env").exists()
+    assert (vm.root / ".history" / "vm1.jsonl").exists() and (vm.root / ".history" / "history.jsonl").exists()
+    vm.auth(1, "history")
+    vm.start("history")
+    vm.clk.advance(30)
+    assert vm.run(vm.m.cmd_delete, "history", "--confirm", "history")[0] == 0
+    assert not (vm.root / "history").exists()
+    assert vm.lines("vm1") == [{"event": "tracked_from", "generation": 1}]  # the other journal is untouched
+    assert vm.history(1, "history")[0] == 0  # and its own survives the delete
+    assert vm.create("history", port="22002")[1]["error"] == "exists"  # the name is not reused
+    assert vm.history(1, "history")[0] == 0 and (vm.root / ".history" / "vm1.jsonl").exists()
+
+
+def test_authorize_over_a_running_legacy_generation_is_refused(vm):
+    """Finding 4: G1 runs untracked at the upgrade; G2 must not certify it never started."""
+    vm.legacy_vm(generation=1)
+    assert vm.start()[0] == 0
+    code, out = vm.auth(2)
+    assert code == 3 and out["error"] == "generation_open"
+    assert vm.authjson()["generation"] == 1
+    assert vm.cancel(3)[1]["error"] == "generation_open"  # a fence above it is no way around that
+    assert vm.stop()[0] == 0
+    assert vm.auth(2)[0] == 0  # down: the inactive untracked generation is replaced
+    assert vm.history(1) == (3, {"error": "history_unknown"})  # and stays unknown
+
+
+def test_stop_always_stops_the_unit_and_verifies_it_inactive(vm, monkeypatch):
+    """Finding 5: the unit looks inactive but a queued start job is pending."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    calls, state = [], {"stopped": False}
+    real_systemctl = vm.m.systemctl
+
+    def spy(*a, **k):
+        calls.append(a[0])
+        if a[0] == "stop":
+            state["stopped"] = True
+        return real_systemctl(*a, **k)
+
+    monkeypatch.setattr(vm.m, "systemctl", spy)
+    monkeypatch.setattr(vm.m, "unit_active", lambda n: False if not state["stopped"] else state.get("late", False))
+    assert vm.stop()[0] == 0
+    assert "disable" in calls and "stop" in calls
+    # The start job was not cancelled: the unit comes up after the stop. No close line, stop_failed.
+    vm2 = state
+    vm2["stopped"] = False
+    vm2["late"] = True
+    code, out = vm.stop()
+    assert code == 1 and out["error"] == "stop_failed"
+
+
+def test_stop_failed_writes_no_close_line(vm, monkeypatch):
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    monkeypatch.setattr(vm.m, "unit_active", lambda n: True)
+    monkeypatch.setattr(vm.m, "qmp", lambda *a, **k: False)
+    code, out = vm.stop()
+    assert code == 1 and out["error"] == "stop_failed"
+    assert [e["event"] for e in vm.lines()] == ["tracked_from", "start"]
+
+
+def test_check_paid_fails_closed_on_a_corrupt_journal(vm):
+    """Finding 6."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    lines = vm.hfile().read_text().splitlines()
+    vm.hfile().write_text(lines[0] + "\n{not json\n" + lines[1] + "\n")
+    code, out = vm.check_paid()
+    assert code == 3 and out["error"] == "history_corrupt"
+    assert vm.start()[1]["error"] == "history_corrupt"
+    # A parsable close line for the current generation refuses first, whatever else is wrong.
+    close = {"event": "close", "generation": 1, "stopped_at": 1, "reason": "requested", "wall_us": 1,
+             "boot_id": None, "mono_ns": 1, "boot_ns": 1, "synced": True, "maxerror_us": 1}
+    vm.hfile().write_text(lines[0] + "\n{not json\n" + json.dumps(close) + "\n")
+    code, out = vm.check_paid()
+    assert code == 3 and out["error"] == "generation_closed"
+    # No journal at all is a VM from before the upgrade: not corrupt, not gated.
+    vm.hfile().unlink()
+    assert vm.check_paid()[0] == 0
+
+
+def test_cancel_retry_rewrites_stop_json_from_the_close_line(vm, monkeypatch):
+    """Finding 9: a crash after the close and authorization left stop.json stale or missing."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    vm.clk.advance(30)
+    crash_on(monkeypatch, vm.m, "write_atomic", lambda p, *a, **k: Path(p).name == "stop.json")
+    with pytest.raises(RuntimeError):
+        vm.cancel(1)
+    assert not (vm.root / "vm1" / "stop.json").exists()
+    vm.clk.advance(500)
+    code, rec = vm.cancel(1)
+    close = [e for e in vm.lines() if e["event"] == "close"][0]
+    stop = json.loads((vm.root / "vm1" / "stop.json").read_text())
+    assert code == 0 and rec["stopped_at"] == close["stopped_at"] == stop["stopped_at"]
+    assert stop["reason"] == "cancelled" and vm.authjson()["closed_generation"] == 1
 
 
 def test_no_em_dashes_in_the_history_work():

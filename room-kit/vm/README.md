@@ -71,7 +71,8 @@ sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the 
 One durable fact per run for billing settlement: when it started, or proof it never did.
 Spec: `docs/VM_EXECUTION_HISTORY.md` (H1 to H9).
 
-- `$VM_ROOT/history/<name>.jsonl`, mode 0600, outside the VM directory, append-only. Every
+- `$VM_ROOT/.history/<name>.jsonl`, mode 0600, outside the VM directory (the leading dot cannot match
+  a VM name), append-only, one flock per append. Every
   line is fsynced (file and `history/`) before anything that depends on it. `delete` keeps it,
   and `create` refuses a name that has one.
 - Lines: `tracked_from` (first line, written under the VM lock by the first command after the
@@ -79,12 +80,17 @@ Spec: `docs/VM_EXECUTION_HISTORY.md` (H1 to H9).
   carries `wall_us`, `boot_id`, `mono_ns` and `synced` (kernel NTP state from `adjtimex`).
 - `start` writes the `start` line before `systemctl enable` or `start`. The unit's
   `check-paid` refuses a launch when the current generation has no `start` line, or has a
-  `close` line, so a reboot relaunch cannot skip either.
+  `close` line, or when the journal is corrupt (`history_corrupt`), so a reboot relaunch cannot skip
+  any of them. A VM with no journal at all (from before the upgrade) is not gated. Every path that
+  decides from the journal (`start`, `stop`, `cancel`, `check-paid`, `history`) fsyncs the file and
+  directory first, so it never acts on a line a power loss could drop.
 - A durable `close` line is authoritative. Every command that decides something first
   raises `closed_generation` to the highest close line.
-- `authorize G'` over an open G: exit 3 `generation_open` if G was started, else G is closed as
-  never started (reason `superseded`).
-- `stop` appends the `close` line first (reusing one if present), then writes
+- `authorize G'` over an open G: exit 3 `generation_open` if the unit is active (tracked or
+  not) or G was started, else G is closed as never started (reason `superseded`).
+- `stop` first runs `disable` and `stop` on the unit whatever it looks like (a queued start job is
+  cancelled), verifies it inactive (`stop_failed` otherwise), and only then touches history, so
+  the credit cutoff never depends on history I/O. It appends the `close` line first (reusing one if present), then writes
   `authorization.json` and `stop.json` from it, so every retry returns the same `stopped_at`.
 - `cancel <name> <G>` is idempotent and closes G in any state: above the authorized
   generation it is fenced, the authorized one is stopped (reason `cancelled`). It returns
@@ -93,9 +99,11 @@ Spec: `docs/VM_EXECUTION_HISTORY.md` (H1 to H9).
 - `history <name> <G>` (no lock): closed G at or above `tracked_from` answers
   `{generation, closed, started_at, stopped_at, tracked_from, close_reason, history: "v2"}`.
   `started_at` is ISO 8601 with microseconds and `Z`, or null when the run never started, and is a
-  conservative lower bound: never later than real execution. Same boot:
-  `close.wall_us - close.maxerror_us - ceil(elapsed_us * 1.0005)` (500 ppm for NTP slewing of the
-  monotonic clock). Different boots: `start.wall_us - start.maxerror_us`. `started_at_error_us` is the
+  conservative lower bound: never later than real execution. Same boot: the lesser of
+  `close.wall_us - close.maxerror_us - ceil(elapsed_us / 0.9995)` and
+  `start.wall_us - start.maxerror_us`, where `elapsed_us` comes from `boot_ns`
+  (`CLOCK_BOOTTIME`, which counts suspend) and 0.9995 covers a clock 500 ppm slow.
+  Different boots: `start.wall_us - start.maxerror_us`. `started_at_error_us` is the
   total subtracted. `maxerror_us` is `adjtimex` `.maxerror`; a line used must be `synced` with
   `maxerror_us` present and at most 1 s, else `history_unknown`. Exit 3 `history_open` while G is
   open; exit 3 `history_unknown` for G below `tracked_from`, a corrupt file, a missing first line,
