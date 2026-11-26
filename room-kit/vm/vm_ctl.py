@@ -26,6 +26,7 @@ start time, or proof that a run never started, from `history <name> <generation>
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -54,6 +55,10 @@ STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
 # Credit cutoff: a short grace, and every expired VM at once, so one guest that ignores
 # the powerdown cannot keep the next one running past its paid_through.
 CUTOFF_WAIT = int(os.environ.get("VM_CUTOFF_WAIT", "15"))
+# History is best effort inside enforce: one VM's history I/O gets this long (a pass-wide window for
+# the sweep), then it is abandoned so a stalled disk cannot hold the oneshot service or a VM lock.
+HISTORY_BUDGET = float(os.environ.get("VM_HISTORY_BUDGET", "5"))
+HISTORY_SWEEP_BUDGET = float(os.environ.get("VM_HISTORY_SWEEP_BUDGET", "15"))
 
 
 class Refusal(Exception):
@@ -425,6 +430,56 @@ def event_of(h: dict, kind: str, generation: int) -> dict | None:
     return None
 
 
+class HistoryStalled(OSError):
+    """History I/O did not answer within the enforce budget; the caller moves on."""
+
+
+_hist = threading.local()
+_stalled: set[str] = set()  # VMs with an abandoned journal call still in flight in this process
+
+
+@contextlib.contextmanager
+def history_budget(seconds: float):
+    _hist.seconds, _hist.deadline = seconds, None
+    try:
+        yield
+    finally:
+        _hist.seconds = _hist.deadline = None
+
+
+def hio(name: str, fn, *args):
+    """Run one journal call; inside a history_budget, give up on it when the budget is spent.
+
+    Only pure journal I/O goes through here (read, append). State changes stay on the caller's
+    thread under the VM lock, so an abandoned call can finish later without racing an authorize.
+    One abandoned call per VM per process: a second would race it into a duplicate line."""
+    seconds = getattr(_hist, "seconds", None)
+    if seconds is None:
+        return fn(*args)
+    if getattr(_hist, "deadline", None) is None:
+        _hist.deadline = time.monotonic() + seconds  # starts at the first history call, after the stop
+    remaining = _hist.deadline - time.monotonic()
+    if name in _stalled or remaining <= 0:
+        raise HistoryStalled(f"history for {name} is stalled")
+    box: dict = {}
+
+    def work():
+        try:
+            box["v"] = fn(*args)
+        except BaseException as e:
+            box["e"] = e
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(remaining)
+    if t.is_alive():
+        _stalled.add(name)
+        raise HistoryStalled(f"history for {name} did not answer in {seconds:g}s")
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
+
+
 def history_append(name: str, record: dict) -> None:
     """H1: append one line (a torn tail is cut first), then fsync the file and the journal dir.
 
@@ -456,15 +511,15 @@ def history_append(name: str, record: dict) -> None:
 
 def ensure_tracked(name: str, d: Path) -> None:
     """H1: the first command to touch a VM after the upgrade writes tracked_from."""
-    h = read_history(name)
+    h = hio(name, read_history, name)
     if h["events"] or (h["exists"] and h["corrupt"]):
         return
-    history_append(name, {"event": "tracked_from", "generation": auth_of(d)["generation"] + 1})
+    hio(name, history_append, name, {"event": "tracked_from", "generation": auth_of(d)["generation"] + 1})
 
 
 def recover_closure(name: str, d: Path) -> dict:
     """A durable close line is authoritative: raise closed_generation to it before deciding anything."""
-    a, h = auth_of(d), read_history(name)
+    a, h = auth_of(d), hio(name, read_history, name)
     closed = max((e["generation"] for e in h["events"] if e["event"] == "close"), default=0)
     if closed > a.get("closed_generation", 0):
         a["closed_generation"] = closed
@@ -662,6 +717,9 @@ Description=Cathedral customer VMs: stop any VM past paid_through
 [Service]
 Type=oneshot
 Environment=VM_ROOT={root()}
+# A oneshot has no start timeout by default and a timer never starts a second copy of a running
+# service: a wedged pass would end every later credit cutoff. The pass bounds its own history I/O.
+TimeoutStartSec=180
 ExecStart={KIT / 'vm-ctl.sh'} enforce
 """, 0o644)
     write_atomic(timer, """[Unit]
@@ -871,15 +929,25 @@ def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> d
     if unit_active(name):
         raise Refusal("stop_failed", f"{unit_name(name)} is still active", 1)
     # Only now history: it may raise, with the VM already stopped.
-    begin(name, d)
-    a = auth_of(d)
-    previous = read_json(d / "stop.json", {})
-    g = a["generation"]
-    h = read_history(name)
-    if is_tracked(h, g):
-        # H4: the close line is the one record of this stop. Reuse it, or write it first and make
-        # it durable; authorization.json and stop.json are then rebuilt from it on every retry.
-        close = event_of(h, "close", g) or append_close(name, g, reason)
+    try:
+        begin(name, d)
+        a = auth_of(d)
+        previous = read_json(d / "stop.json", {})
+        g = a["generation"]
+        h = hio(name, read_history, name)
+        close = None
+        if is_tracked(h, g):
+            # H4: the close line is the one record of this stop. Reuse it, or write it first and make
+            # it durable; authorization.json and stop.json are then rebuilt from it on every retry.
+            close = event_of(h, "close", g) or hio(name, append_close, name, g, reason)
+    except HistoryStalled:
+        # Enforce only: the unit is down and the journal is not answering. Leave the close to the
+        # next stop, cancel, delete or authorize (each runs stop_locked or recover_closure again).
+        a = auth_of(d)
+        return {"name": name, "stopped_at": int(time.time()), "generation": a["generation"],
+                "paid_through": a["paid_through"], "reason": reason, "was_running": was_running,
+                "graceful": graceful, "state": "stopped", "history_pending": True}
+    if close is not None:
         stopped_at, reason = close["stopped_at"], close["reason"]
     elif not was_running and previous.get("generation") == g:
         # Opened before the upgrade (no history): the same run, stopped before: repeat the same evidence.
@@ -1093,8 +1161,11 @@ def cmd_enforce(args: list[str]) -> dict:
                 # No history I/O before the stop: stop_locked does the physical cutoff first.
                 # Re-check under the lock: an authorize may have landed since the scan.
                 if unit_active(name) and paid_refusal(auth_of(d), int(time.time())):
-                    ev = stop_locked(name, d, "paid_through", CUTOFF_WAIT)
+                    with history_budget(HISTORY_BUDGET):
+                        ev = stop_locked(name, d, "paid_through", CUTOFF_WAIT)
                     stopped.append({"name": name, "stopped_at": ev["stopped_at"], "generation": ev["generation"]})
+                    if ev.get("history_pending"):
+                        errors.append({"name": name, "error": "history_stalled", "detail": "stopped; close pending"})
         except Refusal as e:
             errors.append({"name": name, "error": e.error, "detail": e.detail})
         except Exception as e:  # one VM's failure must not hide or skip the others
@@ -1133,11 +1204,15 @@ def cmd_enforce(args: list[str]) -> dict:
         t.start()
     for t in threads:
         t.join()
-    # History after every stop: a stalled journal read must not delay a credit cutoff.
+    # History after every stop, inside a pass-wide window: a stalled journal must neither delay a
+    # cutoff nor keep this service running into the next timer tick (systemd would not start one).
+    sweep_end = time.monotonic() + HISTORY_SWEEP_BUDGET
     for name in names:
+        if name in _stalled or time.monotonic() >= sweep_end:
+            continue
         d = root() / name
         try:
-            with Lock(d / ".lock", wait=20):
+            with Lock(d / ".lock", wait=5), history_budget(HISTORY_BUDGET):
                 begin_best_effort(name, d)
         except Exception as e:
             sys.stderr.write(f"history: {name}: {type(e).__name__}: {e}\n")

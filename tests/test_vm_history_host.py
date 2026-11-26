@@ -990,3 +990,86 @@ def test_a_unit_that_exists_still_gets_the_unconditional_stop(vm, monkeypatch):
     monkeypatch.setattr(vm.m, "systemctl", lambda *a, **k: (calls.append(a[0]), real(*a, **k))[1])
     assert vm.stop()[0] == 0  # never started: the unit file exists
     assert "disable" in calls and "stop" in calls
+
+
+# ---- Review fixes (Chaser HOLD at 9ae381e): stalled history must not hold the cutoff ----------
+
+def run_pass(vm, limit=5.0):
+    """One enforce pass in a thread: a pass that hangs on history I/O fails the test instead of the run."""
+    box = {}
+    t = threading.Thread(target=lambda: box.update(out=vm.m.cmd_enforce([])), daemon=True)
+    t.start()
+    t.join(limit)
+    return None if t.is_alive() else box["out"]
+
+
+def fake_wall(vm, monkeypatch):
+    """A controlled time.time() for the paid_through checks, with the rest of time untouched."""
+    import types
+    state = {"now": int(time.time())}
+    shim = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("_")})
+    shim.time = lambda: state["now"]
+    monkeypatch.setattr(vm.m, "time", shim)
+    return state
+
+
+def test_a_stalled_history_read_in_the_sweep_does_not_hold_the_next_cutoff_pass(vm, monkeypatch):
+    """Reviewer counterexample: funded at scan time, expires while the sweep is stuck on a history read."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    wall = fake_wall(vm, monkeypatch)
+    a = vm.authjson()
+    a["paid_through"] = wall["now"] + 10
+    (vm.root / "vm1" / "authorization.json").write_text(json.dumps(a))
+    release = threading.Event()
+    real = vm.m.read_history
+    monkeypatch.setattr(vm.m, "HISTORY_BUDGET", 0.3, raising=False)
+    monkeypatch.setattr(vm.m, "read_history", lambda *a, **k: (release.wait(30), real(*a, **k))[1])
+    try:
+        first = run_pass(vm)
+        assert first is not None, "the first pass never returned: history I/O holds the cutoff service"
+        assert vm.systemd()["cathedral-vm-vm1.service"]["active"]  # not expired yet
+        wall["now"] += 61
+        vm.clk.advance(61)
+        second = run_pass(vm)
+        assert second is not None, "the second pass never returned"
+        assert [s["name"] for s in second["stopped"]] == ["vm1"]
+        assert not vm.systemd()["cathedral-vm-vm1.service"]["active"]
+    finally:
+        release.set()
+
+
+def test_a_stalled_close_write_in_the_stop_path_neither_holds_the_pass_nor_the_next_one(vm, monkeypatch):
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    a = vm.authjson()
+    a["paid_through"] = int(time.time()) - 5
+    (vm.root / "vm1" / "authorization.json").write_text(json.dumps(a))
+    release = threading.Event()
+    real = vm.m.history_append
+    monkeypatch.setattr(vm.m, "HISTORY_BUDGET", 0.3, raising=False)
+    monkeypatch.setattr(vm.m, "history_append",
+                        lambda name, rec: (release.wait(30), real(name, rec))[1] if rec["event"] == "close"
+                        else real(name, rec))
+    try:
+        first = run_pass(vm)
+        assert first is not None, "the pass never returned: the stop thread joined a stalled close write"
+        assert not vm.systemd()["cathedral-vm-vm1.service"]["active"]
+        assert [s["name"] for s in first["stopped"]] == ["vm1"]
+        assert [e["error"] for e in first["errors"]] == ["history_stalled"]  # the close is still pending
+        assert run_pass(vm) is not None  # and a later pass is not held either
+    finally:
+        release.set()
+    # Once the journal answers again the close lands exactly once and history reads clean.
+    time.sleep(0.3)
+    assert len([e for e in vm.lines() if e["event"] == "close"]) == 1
+    assert vm.m.read_history("vm1")["corrupt"] is False
+
+
+def test_the_enforce_service_has_a_start_timeout_so_a_wedged_pass_cannot_block_the_timer(vm, monkeypatch):
+    Path(os.environ["SYSTEMD_UNIT_DIR"]).mkdir(parents=True, exist_ok=True)
+    vm.m.ensure_enforce_timer()
+    text = (Path(os.environ["SYSTEMD_UNIT_DIR"]) / "cathedral-vm-enforce.service").read_text()
+    assert "Type=oneshot" in text and "TimeoutStartSec=" in text
