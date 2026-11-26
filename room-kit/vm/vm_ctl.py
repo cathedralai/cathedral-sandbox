@@ -1090,7 +1090,6 @@ def cmd_enforce(args: list[str]) -> dict:
         d = root() / name
         try:
             with Lock(d / ".lock", wait=20):
-                begin_best_effort(name, d)
                 if not unit_active(name):
                     # A failed "down" (or a crash) can leave the public SSH forward of a
                     # stopped VM behind, holding the port. Only for a VM that is stopped on
@@ -1119,6 +1118,14 @@ def cmd_enforce(args: list[str]) -> dict:
         t.start()
     for t in threads:
         t.join()
+    # History after every stop: a stalled journal read must not delay a credit cutoff.
+    for name in names:
+        d = root() / name
+        try:
+            with Lock(d / ".lock", wait=20):
+                begin_best_effort(name, d)
+        except Exception as e:
+            sys.stderr.write(f"history: {name}: {type(e).__name__}: {e}\n")
     result = {"checked": len(names), "stopped": stopped, "at": int(time.time())}
     if errors:
         result["errors"] = errors

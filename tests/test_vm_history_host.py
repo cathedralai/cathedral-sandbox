@@ -937,3 +937,21 @@ def test_a_reader_never_trusts_a_close_appended_after_its_snapshot(vm, monkeypat
     monkeypatch.setattr(os, "fsync", append_then_sync)
     h = vm.m.read_history("vm1")
     assert fired and not [e for e in h["events"] if e["event"] == "close"]
+
+
+def test_enforce_stops_every_expired_vm_before_any_history_io(vm, monkeypatch):
+    """r1 #8: the serial prerequisite scan must not touch history before a cutoff starts."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    a = vm.authjson()
+    a["paid_through"] = int(time.time()) - 5
+    (vm.root / "vm1" / "authorization.json").write_text(json.dumps(a))
+    events = []
+    real_systemctl, real_begin = vm.m.systemctl, vm.m.begin_best_effort
+    monkeypatch.setattr(vm.m, "systemctl", lambda *a, **k: (events.append("systemctl " + a[0]),
+                                                           real_systemctl(*a, **k))[1])
+    monkeypatch.setattr(vm.m, "begin_best_effort", lambda *a: (events.append("history"), real_begin(*a))[1])
+    out = vm.m.cmd_enforce([])
+    assert out["stopped"] and "history" in events  # history is still attempted, after
+    assert events.index("systemctl stop") < events.index("history"), events
