@@ -8,6 +8,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -955,3 +956,37 @@ def test_enforce_stops_every_expired_vm_before_any_history_io(vm, monkeypatch):
     out = vm.m.cmd_enforce([])
     assert out["stopped"] and "history" in events  # history is still attempted, after
     assert events.index("systemctl stop") < events.index("history"), events
+
+
+def test_delete_retry_after_the_unit_was_removed_but_the_directory_was_not(vm, monkeypatch):
+    """r2 SHOULD 3: stop and disable fail on a missing unit, so cleanup must treat it as stopped."""
+    vm.create()
+    vm.auth(1)
+    vm.start()
+    crash_on(monkeypatch, vm.m.shutil, "rmtree", lambda *a, **k: True)
+    with pytest.raises(RuntimeError):
+        vm.run(vm.m.cmd_delete, "vm1", "--confirm", "vm1")
+    assert not (vm.root.parent / "units" / "cathedral-vm-vm1.service").exists()
+    real, calls = vm.m.systemctl, []
+
+    def missing_unit(*a, **k):
+        calls.append(a[0])
+        if a[0] == "show":
+            out = "inactive\n" if "--value" in a else "LoadState=not-found\nActiveState=inactive\n"
+            return subprocess.CompletedProcess(a, 0, out, "")
+        if a[0] in ("stop", "disable") and a[-1].startswith("cathedral-vm-vm1"):
+            raise vm.m.Refusal("command_failed", f"systemctl {a[0]}: Unit not loaded", 1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(vm.m, "systemctl", missing_unit)
+    assert vm.run(vm.m.cmd_delete, "vm1", "--confirm", "vm1")[0] == 0
+    assert not (vm.root / "vm1").exists()
+
+
+def test_a_unit_that_exists_still_gets_the_unconditional_stop(vm, monkeypatch):
+    vm.create()
+    vm.auth(1)
+    calls, real = [], vm.m.systemctl
+    monkeypatch.setattr(vm.m, "systemctl", lambda *a, **k: (calls.append(a[0]), real(*a, **k))[1])
+    assert vm.stop()[0] == 0  # never started: the unit file exists
+    assert "disable" in calls and "stop" in calls

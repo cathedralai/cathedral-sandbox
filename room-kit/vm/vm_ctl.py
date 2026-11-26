@@ -210,6 +210,15 @@ def unit_active(name: str) -> bool:
     return state in ("active", "activating", "reloading", "deactivating")
 
 
+def unit_absent(name: str) -> bool:
+    """True only when the unit file is gone and systemd positively reports it not loaded and inactive."""
+    if (unit_dir() / unit_name(name)).exists():
+        return False
+    p = systemctl("show", "-p", "LoadState", "-p", "ActiveState", unit_name(name), check=False)
+    props = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+    return p.returncode == 0 and props.get("LoadState") == "not-found" and props.get("ActiveState") == "inactive"
+
+
 def qmp(name: str, command: str, timeout: float = 5) -> bool:
     """Send one QMP command; False when QEMU is not there to take it."""
     path = root() / name / "run" / "qmp.sock"
@@ -840,8 +849,13 @@ def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> d
     # runs disable and stop, even for a unit that looks inactive: a start job queued by a reboot
     # relaunch can still be pending, and `systemctl stop` cancels it.
     was_running = unit_active(name)
+    # A delete that removed the unit and reloaded systemd, then crashed before removing the VM
+    # directory, leaves nothing to disable or stop; both fail on a missing unit. Only a positively
+    # verified absent, inactive unit gets this: any other unit still takes the unconditional stop.
+    unit_gone = not was_running and unit_absent(name)
     # Disable first: whatever happens next, a host reboot must not bring it back.
-    systemctl("disable", "-q", unit_name(name))
+    if not unit_gone:
+        systemctl("disable", "-q", unit_name(name))
     graceful = False
     marker = d / "run" / "powerdown-sent"
     if was_running:
@@ -850,7 +864,8 @@ def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> d
     try:
         if was_running:
             graceful = qmp(name, "system_powerdown") and wait_inactive(name, STOP_WAIT if wait is None else wait)
-        systemctl("stop", unit_name(name))
+        if not unit_gone:
+            systemctl("stop", unit_name(name))
     finally:
         marker.unlink(missing_ok=True)
     if unit_active(name):
