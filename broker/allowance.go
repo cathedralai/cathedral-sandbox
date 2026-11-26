@@ -521,6 +521,12 @@ func (b *broker) unresolvedLocked(h *hotel, batchID string) int {
 // answer). A record without a hold (a guest that is not metered) never
 // stays. Caller holds b.mu.
 func (b *broker) holdsLocked(h *hotel, batchID string, ub *unreapedBatch, asked time.Time) bool {
+	if ub.unsettled && ub.lostHold {
+		// settleUncertain has not recorded this request's real outcome yet: the
+		// attempt count reads zero meanwhile, which must not release the hold
+		// (pin_only.go, Astra r4).
+		return true
+	}
 	return asked.Before(ub.holdUntil) && b.unresolvedLocked(h, batchID) > 0
 }
 
