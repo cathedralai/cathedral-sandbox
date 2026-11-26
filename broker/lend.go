@@ -286,7 +286,17 @@ func foreignRooms(h *hotel, owner string) int {
 // creates would land next to those rooms and stay there. Caller holds b.mu
 // and not h.cfgMu.
 func reserveErr(h *hotel, owner string) *apiErr {
-	if owner == "" || owner == h.reservedFor() || hotelClass(h) != classSealed {
+	cur := h.reservedFor()
+	if owner == cur || hotelClass(h) != classSealed {
+		return nil // the same owner is no change
+	}
+	if owner == "" {
+		// A release is a reserved_for change too (B5): it opens the hotel to
+		// shared placement, so work the owner has in flight must be over.
+		// The owner's own rooms may stay, as before.
+		if n := h.creating + h.queued + h.claims; n > 0 {
+			return &apiErr{409, "rooms_active", fmt.Sprintf("hotel %s has %d creates or calls in flight; wait until they end, then release it", h.cfg.ID, n)}
+		}
 		return nil
 	}
 	// h.claims: a prefetch or workspace create selected h before this change

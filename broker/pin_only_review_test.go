@@ -191,3 +191,52 @@ func TestPinOnlyNeedsADurableStateDir(t *testing.T) {
 		t.Fatalf("-check-config with a state_dir: %v", err)
 	}
 }
+
+// Finding 5: a release (reserved_for null) is a reserved_for change: refused
+// while creates, queued creates or claims are outstanding, and pin_only stays.
+func TestReleaseIsRefusedWhileCreatesOrClaimsAreOutstanding(t *testing.T) {
+	tc := pinChain(t)
+	for _, field := range []string{"creating", "queued", "claims"} {
+		setHotel(tc, "a", func(h *hotel) {
+			switch field {
+			case "creating":
+				h.creating = 1
+			case "queued":
+				h.queued = 1
+			default:
+				h.claims = 1
+			}
+		})
+		status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil})
+		if status != 409 || errCode(doc) != "rooms_active" {
+			t.Fatalf("%s: release: %d %v", field, status, doc)
+		}
+		if !tc.b.hotelByID("a").pinOnly() || tc.b.hotelByID("a").reservedFor() != "g2" {
+			t.Fatalf("%s: a refused release changed the hotel", field)
+		}
+		// The same owner is no change and stays allowed.
+		if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2"}); status != 200 {
+			t.Fatalf("%s: same owner: %d %v", field, status, doc)
+		}
+		setHotel(tc, "a", func(h *hotel) { h.creating, h.queued, h.claims = 0, 0, 0 })
+	}
+	// An ordinary reserved hotel (not pin_only) is refused the same way, and
+	// released once idle; its own rooms never blocked a release.
+	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": "g1"}); status != 200 {
+		t.Fatalf("reserve b: %d %v", status, doc)
+	}
+	setHotel(tc, "b", func(h *hotel) {
+		h.claims = 1
+		h.rooms["x1"] = &room{h: h, guest: "g1", hid: "x1", id: "b.x1", state: stRunning}
+	})
+	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": nil}); status != 409 {
+		t.Fatalf("plain hotel, claim held: %d %v", status, doc)
+	}
+	setHotel(tc, "b", func(h *hotel) { h.claims = 0 })
+	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": nil}); status != 200 {
+		t.Fatalf("plain hotel, idle apart from its own room: %d %v", status, doc)
+	}
+	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil}); status != 200 || doc["pin_only"] != false {
+		t.Fatalf("idle release: %d %v", status, doc)
+	}
+}
