@@ -314,19 +314,8 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 	// As the guest (AB#859): the hotel grants the image to the guest, and the
 	// guest's creates of it then prefer the hotels that hold it.
 	for _, ht := range b.hotelList() {
-		if !g.limitsAllow(b, ht.cfg.ID) { // never touch a hotel outside the guest's list
-			continue
-		}
-		b.mu.Lock()
-		full, gen := b.prefetchDiskFull(ht), ht.warmGen
-		// A pin_only hotel takes no unmarked work; the claim is taken in the
-		// same hold as the check (pin_only.go, AB#982).
-		skip := full || ht.pinOnly() // AB#861 for full
-		if !skip {
-			ht.claim()
-		}
-		b.mu.Unlock()
-		if skip {
+		gen, ok := b.claimForImport(g, ht)
+		if !ok {
 			continue
 		}
 		go func(ht *hotel) {
@@ -335,6 +324,21 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 		}(ht)
 	}
 	writeJSON(w, 200, map[string]any{"image_id": img.ID, "state": "ready", "image": img.Ref})
+}
+
+// claimForImport decides whether the compat image import may pull on ht as g
+// and takes the claim in the same b.mu hold: the hotel is in the guest's list
+// now (a reservation made a moment ago counts), is not pin_only, and its
+// scratch is not full (AB#861). It returns ht.warmGen for the pull. The caller
+// releases the claim (pin_only.go, AB#982).
+func (b *broker) claimForImport(g *guestState, ht *hotel) (gen int, ok bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !g.allowsHotel(ht) || ht.pinOnly() || b.prefetchDiskFull(ht) {
+		return 0, false
+	}
+	ht.claim()
+	return ht.warmGen, true
 }
 
 // compatIdem runs fn at most once per guest + Idempotency-Key and replays its answer.

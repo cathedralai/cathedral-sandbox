@@ -240,3 +240,35 @@ func TestReleaseIsRefusedWhileCreatesOrClaimsAreOutstanding(t *testing.T) {
 		t.Fatalf("idle release: %d %v", status, doc)
 	}
 }
+
+// Finding 6: the import decides and claims in one b.mu hold, on the hotel's
+// ownership as it is then. (The gap between the old limitsAllow and the claim
+// cannot be forced from outside; this pins the single-hold decision.)
+func TestCompatImportClaimsOnlyWhereTheGuestMayPull(t *testing.T) {
+	tc := pinChain(t)
+	g1, g2 := tc.b.guests["g1"], tc.b.guests["g2"]
+	a, b := tc.b.hotelByID("a"), tc.b.hotelByID("b")
+	if _, ok := tc.b.claimForImport(g1, a); ok {
+		t.Fatal("g1 may not pull on a hotel reserved for g2")
+	}
+	if _, ok := tc.b.claimForImport(g2, a); ok {
+		t.Fatal("the owner's unmarked import must not pull on a pin_only hotel")
+	}
+	// b is idle and in the pool; reserve it for g2 and g1 loses it at once.
+	if _, ok := tc.b.claimForImport(g1, b); !ok {
+		t.Fatal("g1 should pull on a pool hotel")
+	}
+	tc.b.releaseClaim(b)
+	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": "g2"}); status != 200 {
+		t.Fatalf("reserve b: %d %v", status, doc)
+	}
+	if _, ok := tc.b.claimForImport(g1, b); ok {
+		t.Fatal("g1 claimed a hotel just reserved for g2")
+	}
+	tc.b.mu.Lock()
+	n := a.claims + b.claims
+	tc.b.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("claims left behind: %d", n)
+	}
+}
