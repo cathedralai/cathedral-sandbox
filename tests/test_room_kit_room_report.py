@@ -62,9 +62,13 @@ class FakeApi:
         self.states: dict[str, str | None] = {}
         self.down = False
         self.calls: list[str] = []
+        self.during = None  # runs once inside the next call, as a change landing during API I/O would
 
     def __call__(self, path: str, timeout: float, total: float | None = None):
         self.calls.append(path)
+        during, self.during = self.during, None
+        if during is not None:
+            during()
         if self.down:
             return None
         state = self.states.get(path.rsplit("/", 1)[-1])
@@ -287,6 +291,27 @@ def test_a_create_replayed_during_the_report_is_409(hotel) -> None:
     assert status == 200 and doc["statement"]["incarnation"] == doc["create_receipt"]["receipt_sha256"]
 
 
+@pytest.mark.parametrize("change, status, error", [
+    ("delete", 410, "room_gone"),
+    ("create", 409, "retry"),
+    ("room_end", 410, "room_gone"),
+])
+def test_a_ledger_change_during_the_final_api_check_gets_no_statement(hotel, change, status, error) -> None:
+    # SpockChaser on #761: the final check reads the ledger before its API call; a change landing during
+    # that call (the API still says running) must not get a signed statement.
+    ledger, _reports, root, api, tsm = hotel
+    started(hotel)
+    landed = []
+
+    def change_now() -> None:
+        landed.append(ledger.sign({"action": change, "sandbox_id": ROOM, "status": 204 if change != "create" else 201}))
+
+    tsm.during = lambda: setattr(api, "during", change_now)  # fires inside the API call after the chip read
+    got, _h, doc = post(sock(root), {"report_data_hex": NONCE.hex()})
+    assert landed and got == status and doc["error"] == error
+    assert "statement_sig_b64" not in doc
+
+
 # -- the chip
 
 
@@ -329,6 +354,49 @@ def test_a_stalled_read_keeps_the_chip_slot_past_the_rooms_answer(hotel, monkeyp
         time.sleep(0.02)
     assert not reports.scheduler.busy and not reports.active
     assert len(tsm.inputs) == reads  # the expired request was dropped, not run late
+
+
+def test_an_expired_waiter_leaves_the_queue_and_never_reads_the_chip(hotel, monkeypatch) -> None:
+    # SpockChaser on #761: a request queued behind a busy chip gets 503 at its deadline and its worker
+    # must leave the queue then, not read the chip once the slot frees.
+    _ledger, reports, root, _api, tsm = hotel
+    monkeypatch.setattr(rr, "ROOM_REPORT_DEADLINE_SECONDS", 0.3)
+    started(hotel)
+    sched = reports.scheduler
+    sched.acquire(sched.HOTEL)  # the hotel route holds the chip
+    reads = len(tsm.inputs)
+    assert post(sock(root), {"report_data_hex": NONCE.hex()})[2] == {"error": "room_report_slow"}
+    deadline = time.monotonic() + 5
+    while (any(sched.waiting) or reports.active) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert sched.waiting == [0, 0, 0] and not reports.active  # gone from the queue while the chip is still held
+    sched.release()
+    time.sleep(0.3)
+    assert len(tsm.inputs) == reads and not sched.busy
+    assert post(sock(root), {"report_data_hex": NONCE.hex()})[0] == 200  # the room can ask again at once
+
+
+def test_a_waiter_that_gives_up_lets_a_lower_priority_through() -> None:
+    sched = rr.ReportScheduler()
+    assert sched.acquire(sched.HOTEL)
+    gave_up = threading.Event()
+    got = threading.Event()
+
+    def broker() -> None:
+        if not sched.acquire(sched.BROKER, time.monotonic() + 0.2):
+            gave_up.set()
+
+    def room() -> None:
+        sched.acquire(sched.ROOM)
+        got.set()
+
+    threading.Thread(target=broker, daemon=True).start()
+    time.sleep(0.05)
+    threading.Thread(target=room, daemon=True).start()
+    assert gave_up.wait(5)
+    sched.release()
+    assert got.wait(5)  # the broker that gave up does not hold the room back
+    sched.release()
 
 
 def test_hotel_attest_route_takes_the_scheduler_with_broker_first(hotel, monkeypatch) -> None:

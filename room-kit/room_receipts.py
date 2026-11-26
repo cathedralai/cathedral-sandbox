@@ -3198,13 +3198,21 @@ class ReportScheduler:
         self.busy = False
         self.waiting = [0, 0, 0]
 
-    def acquire(self, priority: int) -> None:
+    def acquire(self, priority: int, deadline: float | None = None) -> bool:
+        """Take the slot. With *deadline* (time.monotonic), give up when it passes and leave the queue."""
         with self.cond:
             self.waiting[priority] += 1
             try:
                 while self.busy or any(self.waiting[p] for p in range(priority)):
-                    self.cond.wait()
+                    if deadline is None:
+                        self.cond.wait()
+                        continue
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return False
+                    self.cond.wait(left)
                 self.busy = True
+                return True
             finally:
                 self.waiting[priority] -= 1
 
@@ -3432,26 +3440,30 @@ class RoomReports:
             result: dict = {}
             done = threading.Event()
             expired = threading.Event()  # the room got its answer (503); a read not yet begun is skipped
+            deadline = time.monotonic() + ROOM_REPORT_DEADLINE_SECONDS
 
             def work() -> None:
-                # The slot and the room's place are held until the read returns, even past the
-                # room's deadline: a stalled read never lets a second in-room read in.
-                self.scheduler.acquire(ReportScheduler.ROOM)
+                # A waiter leaves the queue at the room's deadline without touching the chip. Once the
+                # read starts, the slot and the room's place are held until it returns, even past the
+                # deadline: a stalled read never lets a second in-room read in.
+                acquired = False
                 try:
-                    if expired.is_set():
-                        return  # waited past its deadline in the queue: no chip work for a gone caller
+                    acquired = self.scheduler.acquire(ReportScheduler.ROOM, deadline)
+                    if not acquired or expired.is_set():
+                        return  # no chip work for a caller that already has its 503
                     result["out"] = self.ledger.attest(room_report_data(statement))
                 except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's
                     result["error"] = exc
                 finally:
-                    self.scheduler.release()
+                    if acquired:
+                        self.scheduler.release()
                     with self.lock:
                         self.active.discard(room)
                     done.set()
 
             threading.Thread(target=work, daemon=True, name=f"room-report-work-{room}").start()
             handed_off = True
-            if not done.wait(ROOM_REPORT_DEADLINE_SECONDS):
+            if not done.wait(max(0.0, deadline - time.monotonic())) or not result:
                 expired.set()
                 return 503, {"error": "room_report_slow"}, {"Retry-After": str(int(ROOM_REPORT_DEADLINE_SECONDS))}
             if "error" in result:
@@ -3463,11 +3475,25 @@ class RoomReports:
                 return refused
             if again != incarnation:
                 return 409, {"error": "retry", "message": "the room was made again during the report"}, {}
+            attestation = self.ledger.attestation()
+            # Fence: the ledger did not wait for the API call above. Read it again and sign under its lock,
+            # so a signed delete or a new create that landed during that call gets no statement.
+            with self.ledger.lock:
+                now = self.ledger.incarnations.get(room)
+                unusable = room in self.ledger.reaping or room in self.ledger.broken
+                signature = self.ledger.key.sign(canonical(statement)) \
+                    if now == incarnation and not unusable else None
+            if now is None:
+                return self._gone(room)
+            if now != incarnation:
+                return 409, {"error": "retry", "message": "the room was made again during the report"}, {}
+            if signature is None:
+                return 503, {"error": "room_not_ready"}, {"Retry-After": "5"}
             out = result["out"]
             answer = {**out, "statement": statement,
-                      "statement_sig_b64": b64(self.ledger.key.sign(canonical(statement))),
+                      "statement_sig_b64": b64(signature),
                       "statement_sha256": sha(canonical(statement)),
-                      "create_receipt": receipt, "attestation": self.ledger.attestation()}
+                      "create_receipt": receipt, "attestation": attestation}
             if out.get("cert_chain") is None:
                 fields = report_fields(base64.b64decode(out["report_b64"]))
                 answer["chip_id"], answer["reported_tcb"] = fields["chip_id"], fields["reported_tcb"]
