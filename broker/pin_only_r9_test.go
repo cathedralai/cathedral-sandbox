@@ -23,8 +23,9 @@ func TestOwnerChangeOfAPinOnlyHotelNeedsADrain(t *testing.T) {
 		if status != 409 || errCode(doc) != "owner_change_needs_drain" {
 			t.Fatalf("%s undrained: %d %v", c.name, status, doc)
 		}
-		if msg := doc["error"].(map[string]any)["message"].(string); !strings.Contains(msg, "drain the hotel") {
-			t.Fatalf("%s: the reason does not name the procedure: %s", c.name, msg)
+		if msg := doc["error"].(map[string]any)["message"].(string); !strings.Contains(msg, "before drain") ||
+			!strings.Contains(msg, "not terminal proof") || !strings.Contains(msg, "drain the hotel") {
+			t.Fatalf("%s: the reason must put customer-work checks before drain: %s", c.name, msg)
 		}
 		wantReservation(t, getHotelDoc(t, tc, "a"), "g2", "owner:g2", 1)
 	}

@@ -824,7 +824,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		if changesOwner {
 			b.mu.Unlock()
 			writeErr(w, 409, "owner_change_needs_drain", "hotel "+h.cfg.ID+" is pin_only: an owner change (reserved_for, reservation_ref, release, lend or pin_only off) needs the hotel drained first. "+
-				"Operator procedure: drain the hotel, lock out the old owner, wait for the restart guard to show zero rooms with count_known, check the hotel-side workspace and image-pull lists, then send the one PATCH")
+				"Operator procedure: check all customer work on the hotel (hotel-side workspace and image-pull lists) before drain — a timeout or zero room count is not terminal proof. Then drain the hotel, lock out the old owner, wait for the restart guard to show zero rooms with count_known, then send the one PATCH")
 			return
 		}
 	}
