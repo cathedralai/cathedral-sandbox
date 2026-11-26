@@ -25,6 +25,8 @@ sudo ./vm-ctl.sh authorize vm1 <paid_through_unix> <generation>
 sudo ./vm-ctl.sh start vm1                  # ssh -p 22001 cathedral@<host>
 sudo ./vm-ctl.sh reboot|stop|status vm1
 sudo ./vm-ctl.sh list | enforce
+sudo ./vm-ctl.sh cancel vm1 <generation>    # close a run in any state (see Execution history)
+./vm-ctl.sh history vm1 <generation>         # read only, works after delete
 sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the disk
 ```
 
@@ -63,6 +65,42 @@ sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the 
   `paid_through` is stopped (reason `paid_through`) and keeps its disk. It
   also restores a running VM's link rules after a firewall reload. None of
   this needs the API or the broker.
+
+## Execution history (AB#992)
+
+One durable fact per run for billing settlement: when it started, or proof it never did.
+Spec: `docs/VM_EXECUTION_HISTORY.md` (H1 to H9).
+
+- `$VM_ROOT/history/<name>.jsonl`, mode 0600, outside the VM directory, append-only. Every
+  line is fsynced (file and `history/`) before anything that depends on it. `delete` keeps it,
+  and `create` refuses a name that has one.
+- Lines: `tracked_from` (first line, written under the VM lock by the first command after the
+  upgrade: 1 for a new VM, else `generation + 1`), `start`, `close`. Each start and close line
+  carries `wall_us`, `boot_id`, `mono_ns` and `synced` (kernel NTP state from `adjtimex`).
+- `start` writes the `start` line before `systemctl enable` or `start`. The unit's
+  `check-paid` refuses a launch when the current generation has no `start` line, or has a
+  `close` line, so a reboot relaunch cannot skip either.
+- A durable `close` line is authoritative. Every command that decides something first
+  raises `closed_generation` to the highest close line.
+- `authorize G'` over an open G: exit 3 `generation_open` if G was started, else G is closed as
+  never started (reason `superseded`).
+- `stop` appends the `close` line first (reusing one if present), then writes
+  `authorization.json` and `stop.json` from it, so every retry returns the same `stopped_at`.
+- `cancel <name> <G>` is idempotent and closes G in any state: above the authorized
+  generation it is fenced, the authorized one is stopped (reason `cancelled`). It returns
+  `{name, generation, closed, stopped_at, close_reason}`; a repeat returns the same record.
+  Cancelling above a started generation is refused (`generation_open`).
+- `history <name> <G>` (no lock): closed G at or above `tracked_from` answers
+  `{generation, closed, started_at, stopped_at, tracked_from, close_reason, history: "v2"}`.
+  `started_at` is ISO 8601 with microseconds and `Z`, or null when the run never started, and is a
+  conservative lower bound: never later than real execution. Same boot:
+  `close.wall_us - close.maxerror_us - ceil(elapsed_us * 1.0005)` (500 ppm for NTP slewing of the
+  monotonic clock). Different boots: `start.wall_us - start.maxerror_us`. `started_at_error_us` is the
+  total subtracted. `maxerror_us` is `adjtimex` `.maxerror`; a line used must be `synced` with
+  `maxerror_us` present and at most 1 s, else `history_unknown`. Exit 3 `history_open` while G is
+  open; exit 3 `history_unknown` for G below `tracked_from`, a corrupt file, a missing first line,
+  an untrusted clock or an unbounded start.
+- A final line with no newline is a torn write: readers ignore it and the next writer cuts it.
 
 ## Broker access
 

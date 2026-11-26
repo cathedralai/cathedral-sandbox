@@ -17,9 +17,16 @@ so it holds with the API and the broker down:
   a fresh generation and an old authorization cannot revive the VM.
 - enforce (a timer, every 30 s) stops any running VM past paid_through. Disks
   are kept; only delete --confirm <name> removes one.
+
+Execution history (AB#992, docs/VM_EXECUTION_HISTORY.md H1 to H9): <root>/history/<name>.jsonl
+is an append-only record, outside the VM directory, that delete never removes. A start
+line is durable before a run launches and a close line is durable before the run's
+authorization and stop evidence are written, so billing settlement can read one exact
+start time, or proof that a run never started, from `history <name> <generation>`.
 """
 from __future__ import annotations
 
+import datetime
 import fcntl
 import hashlib
 import ipaddress
@@ -41,7 +48,8 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 KEY_TYPES = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa")
 NET = ipaddress.IPv4Network("10.216.0.0/16")
 SLOTS = NET.num_addresses // 4
-COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce")
+COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce",
+            "cancel", "history")
 STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
 # Credit cutoff: a short grace, and every expired VM at once, so one guest that ignores
 # the powerdown cannot keep the next one running past its paid_through.
@@ -239,6 +247,219 @@ def paid_refusal(a: dict, now: int) -> Refusal | None:
     return None
 
 
+# ---- execution history (AB#992) -------------------------------------------------------
+
+def history_dir() -> Path:
+    return root() / "history"
+
+
+def history_path(name: str) -> Path:
+    return history_dir() / f"{check_name(name)}.jsonl"
+
+
+def wall_us() -> int:
+    return time.time_ns() // 1000
+
+
+def mono_ns() -> int:
+    return time.monotonic_ns()
+
+
+def boot_id() -> str | None:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+    except OSError:
+        return None
+
+
+MAX_CLOCK_ERROR_US = 1_000_000
+SLEW_PPM = 500
+
+
+def kernel_clock() -> tuple[bool, int | None]:
+    """(synced, maxerror_us) from adjtimex(2) with modes=0 (read only).
+
+    synced means the kernel returned no TIME_ERROR and STA_UNSYNC is clear; maxerror_us is
+    struct timex .maxerror, the kernel's bound on the wall clock error. Any doubt (not Linux x86_64
+    layout, call failed) is (False, None): such a line can only make history_unknown."""
+    try:
+        import ctypes
+
+        if ctypes.sizeof(ctypes.c_long) != 8 or not sys.platform.startswith("linux"):
+            return False, None
+
+        class Timex(ctypes.Structure):
+            _fields_ = [("modes", ctypes.c_uint), ("offset", ctypes.c_long), ("freq", ctypes.c_long),
+                        ("maxerror", ctypes.c_long), ("esterror", ctypes.c_long), ("status", ctypes.c_int),
+                        ("constant", ctypes.c_long), ("precision", ctypes.c_long), ("tolerance", ctypes.c_long),
+                        ("time_sec", ctypes.c_long), ("time_usec", ctypes.c_long), ("tick", ctypes.c_long),
+                        ("ppsfreq", ctypes.c_long), ("jitter", ctypes.c_long), ("shift", ctypes.c_int),
+                        ("stabil", ctypes.c_long), ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long),
+                        ("errcnt", ctypes.c_long), ("stbcnt", ctypes.c_long), ("tai", ctypes.c_int),
+                        ("pad", ctypes.c_int * 11), ("spare", ctypes.c_char * 256)]
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        tx = Timex()  # modes 0: read only
+        state = libc.adjtimex(ctypes.byref(tx))
+        if not 0 <= state <= 5:
+            return False, None
+        # TIME_ERROR (5) is what the kernel returns while STA_UNSYNC (0x40) is set.
+        return state < 5 and not tx.status & 0x40, int(tx.maxerror)
+    except Exception:
+        return False, None
+
+
+def stamp() -> dict:
+    synced, maxerror_us = kernel_clock()
+    return {"wall_us": wall_us(), "boot_id": boot_id(), "mono_ns": mono_ns(), "synced": bool(synced),
+            "maxerror_us": maxerror_us}
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _valid_event(e: dict) -> bool:
+    kind = e.get("event")
+    if kind == "tracked_from":
+        return _is_int(e.get("generation")) and e["generation"] >= 1
+    if kind not in ("start", "close") or not _is_int(e.get("generation")) or e["generation"] < 1:
+        return False
+    if not (_is_int(e.get("wall_us")) and _is_int(e.get("mono_ns")) and isinstance(e.get("synced"), bool)
+            and (e.get("boot_id") is None or isinstance(e["boot_id"], str))
+            and (e.get("maxerror_us") is None or _is_int(e["maxerror_us"]))):
+        return False
+    return kind == "start" or (_is_int(e.get("stopped_at")) and isinstance(e.get("reason"), str))
+
+
+def read_history(name: str) -> dict:
+    """The history file as readers see it (H6).
+
+    {"events": parsed lines, "valid_len": bytes up to the last newline, "exists": bool,
+     "corrupt": bool, "tracked_from": int | None}. An unterminated final line is ignored.
+    Corrupt means a complete line that is malformed, or a shape no writer produces (a second
+    first line, a duplicate start or close, a start after its close): the whole file is unknown."""
+    path = history_path(name)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return {"events": [], "valid_len": 0, "exists": False, "corrupt": False, "tracked_from": None}
+    valid_len = data.rfind(b"\n") + 1
+    events, corrupt, seen = [], False, set()
+    for raw in data[:valid_len].splitlines():
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            corrupt = True
+            continue
+        if not isinstance(e, dict) or not _valid_event(e):
+            corrupt = True
+            continue
+        key = (e["event"], 0 if e["event"] == "tracked_from" else e["generation"])
+        if key in seen or (not events and e["event"] != "tracked_from") or \
+                (e["event"] == "start" and ("close", e["generation"]) in seen):
+            corrupt = True
+        seen.add(key)
+        events.append(e)
+    first = events[0] if events and events[0]["event"] == "tracked_from" else None
+    if valid_len and not first:
+        corrupt = True
+    return {"events": events, "valid_len": valid_len, "exists": True, "corrupt": corrupt,
+            "tracked_from": first["generation"] if first else None}
+
+
+def event_of(h: dict, kind: str, generation: int) -> dict | None:
+    for e in h["events"]:
+        if e["event"] == kind and e["generation"] == generation:
+            return e
+    return None
+
+
+def history_append(name: str, record: dict) -> None:
+    """H1: append one line (a torn tail is cut first), then fsync the file and history/.
+
+    Callers hold the VM lock (create holds the global lock), so there is one writer."""
+    hdir = history_dir()
+    hdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = history_path(name)
+    valid_len = read_history(name)["valid_len"]
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.fstat(fd).st_size != valid_len:
+            os.ftruncate(fd, valid_len)
+        os.lseek(fd, valid_len, os.SEEK_SET)
+        line = (json.dumps(record, sort_keys=True) + "\n").encode()
+        while line:
+            line = line[os.write(fd, line):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dfd = os.open(hdir, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def ensure_tracked(name: str, d: Path) -> None:
+    """H1: the first command to touch a VM after the upgrade writes tracked_from."""
+    h = read_history(name)
+    if h["events"] or (h["exists"] and h["corrupt"]):
+        return
+    history_append(name, {"event": "tracked_from", "generation": auth_of(d)["generation"] + 1})
+
+
+def recover_closure(name: str, d: Path) -> dict:
+    """A durable close line is authoritative: raise closed_generation to it before deciding anything."""
+    a, h = auth_of(d), read_history(name)
+    closed = max((e["generation"] for e in h["events"] if e["event"] == "close"), default=0)
+    if closed > a.get("closed_generation", 0):
+        a["closed_generation"] = closed
+        write_atomic(d / "authorization.json", json.dumps(a, sort_keys=True) + "\n")
+    return a
+
+
+def begin(name: str, d: Path) -> None:
+    """First thing under the VM lock in every command that decides something."""
+    ensure_tracked(name, d)
+    recover_closure(name, d)
+
+
+def close_record(name: str, close: dict) -> dict:
+    return {"name": name, "generation": close["generation"], "closed": True,
+            "stopped_at": close["stopped_at"], "close_reason": close["reason"]}
+
+
+def append_close(name: str, generation: int, reason: str) -> dict:
+    now = stamp()
+    line = {"event": "close", "generation": generation, "stopped_at": now["wall_us"] // 1_000_000,
+            "reason": reason, **now}
+    history_append(name, line)
+    return line
+
+
+def is_tracked(h: dict, generation: int) -> bool:
+    return h["tracked_from"] is not None and not h["corrupt"] and generation >= h["tracked_from"]
+
+
+def close_open_generation(name: str, d: Path, a: dict, reason: str) -> None:
+    """H3: close the authorized generation as never started, or refuse when it has a start line.
+
+    Only for a tracked, open generation; one opened before the upgrade is replaced as before."""
+    g = a["generation"]
+    if g < 1 or g <= a.get("closed_generation", 0):
+        return
+    h = read_history(name)
+    if not is_tracked(h, g):
+        return
+    if event_of(h, "start", g):
+        raise Refusal("generation_open", f"generation {g} was started: stop it before moving on", 3)
+    if not event_of(h, "close", g):
+        append_close(name, g, reason)
+    a["closed_generation"] = g
+    write_atomic(d / "authorization.json", json.dumps(a, sort_keys=True) + "\n")
+
+
 # ---- status ---------------------------------------------------------------------
 
 def status_of(name: str) -> dict:
@@ -427,6 +648,8 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
         d = root() / name
         if d.exists() or d.is_symlink():
             raise Refusal("exists", f"VM {name} exists", 5)
+        if history_path(name).exists():
+            raise Refusal("exists", f"name {name} was used before: its history is kept, pick a new name", 5)
         slot = allocate(port)
         digest = sha256_file(image)
         if pinned and digest != pinned:
@@ -450,6 +673,7 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
             write_atomic(d / "vm.env", "".join(f"{k}='{v}'\n" for k, v in env.items()), 0o644)
             write_unit(name, d)
             ensure_enforce_timer()
+            history_append(name, {"event": "tracked_from", "generation": 1})
         except BaseException:
             shutil.rmtree(d, ignore_errors=True)
             (unit_dir() / unit_name(name)).unlink(missing_ok=True)
@@ -466,6 +690,7 @@ def cmd_authorize(args: list[str]) -> dict:
     gen = check_int(opts["_"][2], "generation", 1, 2**53)
     d = vm_dir(name)
     with Lock(d / ".lock"):
+        begin(name, d)
         a = auth_of(d)
         if gen < a["generation"]:
             raise Refusal("stale_generation", f"generation {gen} is older than {a['generation']}", 3)
@@ -473,6 +698,8 @@ def cmd_authorize(args: list[str]) -> dict:
             raise Refusal("generation_closed", f"generation {gen} was stopped and cannot run again", 3)
         if gen == a["generation"] and paid < a["paid_through"]:
             raise Refusal("paid_through_lower", f"paid_through {paid} is below {a['paid_through']}", 3)
+        if gen > a["generation"]:
+            close_open_generation(name, d, a, "superseded")
         changed = (gen, paid) != (a["generation"], a["paid_through"])
         if changed:
             a.update(generation=gen, paid_through=paid, authorized_at=int(time.time()))
@@ -482,9 +709,21 @@ def cmd_authorize(args: list[str]) -> dict:
 
 def cmd_check_paid(args: list[str]) -> dict:
     name = check_name(parse_opts(args, set(), 1)["_"][0])
-    refusal = paid_refusal(auth_of(vm_dir(name)), int(time.time()))
+    d = vm_dir(name)
+    a = auth_of(d)
+    refusal = paid_refusal(a, int(time.time()))
     if refusal:
         raise refusal
+    # H2: no launch of a tracked generation without a durable start line, and none after a durable
+    # close line (it is authoritative even when authorization.json missed it). Read only: the
+    # generation open at upgrade, or a file no reader can trust, is not gated (history_unknown).
+    h = read_history(name)
+    g = a["generation"]
+    if is_tracked(h, g):
+        if event_of(h, "close", g):
+            raise Refusal("generation_closed", "this run has a close line; authorize a new generation", 3)
+        if not event_of(h, "start", g):
+            raise Refusal("start_not_recorded", f"generation {g} has no start line: use vm-ctl start", 3)
     return {"name": name, "paid": True}
 
 
@@ -505,10 +744,16 @@ def cmd_start(args: list[str]) -> dict:
     name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
+        begin(name, d)
         check_generation(opts, auth_of(d))
         refusal = paid_refusal(auth_of(d), int(time.time()))
         if refusal:
             raise refusal
+        # H2: the start line is durable before anything can launch the run.
+        g = auth_of(d)["generation"]
+        h = read_history(name)
+        if is_tracked(h, g) and not event_of(h, "start", g):
+            history_append(name, {"event": "start", "generation": g, **stamp()})
         (d / "started").touch()
         # Enabled while it should run, so it comes back after a host reboot.
         systemctl("enable", "-q", unit_name(name))
@@ -527,7 +772,7 @@ def wait_inactive(name: str, seconds: float) -> bool:
 
 
 def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> dict:
-    a = auth_of(d)
+    a = recover_closure(name, d)
     previous = read_json(d / "stop.json", {})
     was_running = unit_active(name)
     # Disable first: whatever happens next, a host reboot must not bring it back.
@@ -544,15 +789,22 @@ def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> d
             marker.unlink(missing_ok=True)
         if unit_active(name):
             raise Refusal("stop_failed", f"{unit_name(name)} is still active", 1)
-    if not was_running and previous.get("generation") == a["generation"]:
-        # The same run, stopped before: repeat the same evidence.
+    g = a["generation"]
+    h = read_history(name)
+    if is_tracked(h, g):
+        # H4: the close line is the one record of this stop. Reuse it, or write it first and make
+        # it durable; authorization.json and stop.json are then rebuilt from it on every retry.
+        close = event_of(h, "close", g) or append_close(name, g, reason)
+        stopped_at, reason = close["stopped_at"], close["reason"]
+    elif not was_running and previous.get("generation") == g:
+        # Opened before the upgrade (no history): the same run, stopped before: repeat the same evidence.
         stopped_at, reason = previous["stopped_at"], previous.get("reason", reason)
     else:
         stopped_at = int(time.time())
     # Close the run: this generation (and any older) can never start again.
-    a["closed_generation"] = max(a.get("closed_generation", 0), a["generation"])
+    a["closed_generation"] = max(a.get("closed_generation", 0), g)
     write_atomic(d / "authorization.json", json.dumps(a, sort_keys=True) + "\n")
-    evidence = {"name": name, "stopped_at": stopped_at, "generation": a["generation"],
+    evidence = {"name": name, "stopped_at": stopped_at, "generation": g,
                 "paid_through": a["paid_through"], "reason": reason,
                 "was_running": was_running, "graceful": graceful}
     write_atomic(d / "stop.json", json.dumps(evidence, sort_keys=True) + "\n")
@@ -564,6 +816,7 @@ def cmd_stop(args: list[str]) -> dict:
     name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
+        begin(name, d)
         check_generation(opts, auth_of(d))
         return stop_locked(name, d, "requested")
 
@@ -586,6 +839,7 @@ def cmd_reboot(args: list[str]) -> dict:
     name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
+        begin(name, d)
         check_generation(opts, auth_of(d))
         if not unit_active(name):
             raise Refusal("not_running", f"VM {name} is not running", 5)
@@ -609,6 +863,7 @@ def cmd_delete(args: list[str]) -> dict:
             return {"name": name, "deleted": True, "existed": False}
         d = vm_dir(name)
         with Lock(d / ".lock"):
+            begin(name, d)
             stop_locked(name, d, "deleted")
             run(str(KIT / "vm-net.sh"), "down", str(d / "vm.env"), check=False)
             (unit_dir() / unit_name(name)).unlink(missing_ok=True)
@@ -624,6 +879,100 @@ def cmd_delete(args: list[str]) -> dict:
     return {"name": name, "deleted": True}
 
 
+def cmd_cancel(args: list[str]) -> dict:
+    """H5: close generation G in any state. Above the authorized generation it is fenced; the
+    authorized one is stopped (a never-started one just closes). A repeat returns the same record."""
+    opts = parse_opts(args, set(), 2)
+    name = check_name(opts["_"][0])
+    g = check_int(opts["_"][1], "generation", 1, 2**53)
+    d = vm_dir(name)
+    with Lock(d / ".lock"):
+        begin(name, d)
+        a = auth_of(d)
+        done = event_of(read_history(name), "close", g)
+        if done:
+            return close_record(name, done)
+        if g < a["generation"]:
+            raise Refusal("stale_generation", f"generation {g} is older than {a['generation']}", 3)
+        if g == a["generation"]:
+            ev = stop_locked(name, d, "cancelled")
+            done = event_of(read_history(name), "close", g)
+            if done:
+                return close_record(name, done)
+            return {"name": name, "generation": g, "closed": True, "stopped_at": ev["stopped_at"],
+                    "close_reason": ev["reason"]}
+        # G was never authorized here. An open, unstarted lower generation is closed first, as
+        # authorize does; a started one must be stopped first.
+        close_open_generation(name, d, a, "superseded")
+        if not is_tracked(read_history(name), g):
+            raise Refusal("history_unknown", f"generation {g} is not tracked", 3)
+        done = append_close(name, g, "cancelled")
+        a = auth_of(d)
+        a["closed_generation"] = max(a.get("closed_generation", 0), g)
+        write_atomic(d / "authorization.json", json.dumps(a, sort_keys=True) + "\n")
+        return close_record(name, done)
+
+
+def clock_error(line: dict) -> int:
+    """maxerror_us of a line whose clock is trusted, else history_unknown."""
+    err = line.get("maxerror_us")
+    if not line["synced"] or err is None or not 0 <= err <= MAX_CLOCK_ERROR_US:
+        raise Refusal("history_unknown", f"the {line['event']} line has no trusted clock bound", 3)
+    return err
+
+
+def lower_bound_start(start: dict, close: dict) -> tuple[int, int]:
+    """H8: (started_at in microseconds, total error subtracted), a lower bound on the real start.
+
+    Same boot: the monotonic duration anchored on the close wall time, widened by the close
+    line's clock error and 500 ppm for NTP slewing of CLOCK_MONOTONIC. Different boots: the
+    start line's wall time less its own clock error."""
+    if start["boot_id"] is not None and start["boot_id"] == close["boot_id"]:
+        delta_ns = close["mono_ns"] - start["mono_ns"]
+        if delta_ns < 0:
+            raise Refusal("history_unknown", "monotonic clock went backwards", 3)
+        clock_error(start)  # both lines are used: a start on an unsynced clock is not trusted
+        err = clock_error(close)
+        elapsed = -(-delta_ns // 1000)
+        widened = -(-elapsed * (1_000_000 + SLEW_PPM) // 1_000_000)
+        return close["wall_us"] - err - widened, err + widened - elapsed
+    if start["boot_id"] is None or close["boot_id"] is None:
+        raise Refusal("history_unknown", "boot id unavailable", 3)
+    err = clock_error(start)
+    started_us = start["wall_us"] - err
+    if close["synced"] and started_us > close["wall_us"]:
+        raise Refusal("history_unknown", "start is later than stop", 3)
+    return started_us, err
+
+
+def iso_us(us: int) -> str:
+    t = datetime.datetime(1970, 1, 1) + datetime.timedelta(microseconds=us)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def cmd_history(args: list[str]) -> dict:
+    """H8, H9: read only, no lock, works after delete."""
+    opts = parse_opts(args, set(), 2)
+    name = check_name(opts["_"][0])
+    g = check_int(opts["_"][1], "generation", 1, 2**53)
+    h = read_history(name)
+    n = h["tracked_from"]
+    if not h["exists"] or h["corrupt"] or n is None or g < n:
+        raise Refusal("history_unknown", f"no trustworthy history for generation {g}", 3)
+    close = event_of(h, "close", g)
+    if close is None:
+        raise Refusal("history_open", f"generation {g} is not closed", 3)
+    start = event_of(h, "start", g)
+    started_at, error_us = None, None
+    if start is not None:
+        started_us, error_us = lower_bound_start(start, close)
+        # stopped_at is the close time floored to seconds: never report a start after it.
+        started_us = min(started_us, close["stopped_at"] * 1_000_000)
+        started_at = iso_us(started_us)
+    return {"generation": g, "closed": True, "started_at": started_at, "started_at_error_us": error_us,
+            "stopped_at": close["stopped_at"], "tracked_from": n, "close_reason": close["reason"], "history": "v2"}
+
+
 def cmd_status(args: list[str]) -> dict:
     return status_of(check_name(parse_opts(args, set(), 1)["_"][0]))
 
@@ -631,6 +980,14 @@ def cmd_status(args: list[str]) -> dict:
 def cmd_list(args: list[str]) -> dict:
     parse_opts(args, set(), 0)
     return {"vms": [status_of(n) for n in all_vms()]}
+
+
+def begin_best_effort(name: str, d: Path) -> None:
+    """The credit cutoff must never depend on history I/O: a failure here is logged, not raised."""
+    try:
+        begin(name, d)
+    except Exception as e:
+        sys.stderr.write(f"history: {name}: {type(e).__name__}: {e}\n")
 
 
 def cmd_enforce(args: list[str]) -> dict:
@@ -641,6 +998,7 @@ def cmd_enforce(args: list[str]) -> dict:
         d = root() / name
         try:
             with Lock(d / ".lock", wait=20):
+                begin_best_effort(name, d)
                 # Re-check under the lock: an authorize may have landed since the scan.
                 if unit_active(name) and paid_refusal(auth_of(d), int(time.time())):
                     ev = stop_locked(name, d, "paid_through", CUTOFF_WAIT)
@@ -655,6 +1013,7 @@ def cmd_enforce(args: list[str]) -> dict:
         d = root() / name
         try:
             with Lock(d / ".lock", wait=20):
+                begin_best_effort(name, d)
                 if not unit_active(name):
                     # A failed "down" (or a crash) can leave the public SSH forward of a
                     # stopped VM behind, holding the port. Only for a VM that is stopped on
@@ -744,7 +1103,8 @@ def main(argv: list[str]) -> int:
         handlers = {
             "authorize": cmd_authorize, "start": cmd_start, "stop": cmd_stop, "reboot": cmd_reboot,
             "delete": cmd_delete, "status": cmd_status, "list": cmd_list, "enforce": cmd_enforce,
-            "check-paid": cmd_check_paid, "powerdown": cmd_powerdown,
+            "check-paid": cmd_check_paid, "powerdown": cmd_powerdown, "cancel": cmd_cancel,
+            "history": cmd_history,
         }
         if cmd == "create":
             out(cmd_create(rest, key_text))
