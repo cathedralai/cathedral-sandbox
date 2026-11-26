@@ -3431,12 +3431,15 @@ class RoomReports:
                          "requested_at": int(time.time())}
             result: dict = {}
             done = threading.Event()
+            expired = threading.Event()  # the room got its answer (503); a read not yet begun is skipped
 
             def work() -> None:
                 # The slot and the room's place are held until the read returns, even past the
                 # room's deadline: a stalled read never lets a second in-room read in.
                 self.scheduler.acquire(ReportScheduler.ROOM)
                 try:
+                    if expired.is_set():
+                        return  # waited past its deadline in the queue: no chip work for a gone caller
                     result["out"] = self.ledger.attest(room_report_data(statement))
                 except Exception as exc:  # noqa: BLE001 a TSM failure is the hotel's
                     result["error"] = exc
@@ -3449,6 +3452,7 @@ class RoomReports:
             threading.Thread(target=work, daemon=True, name=f"room-report-work-{room}").start()
             handed_off = True
             if not done.wait(ROOM_REPORT_DEADLINE_SECONDS):
+                expired.set()
                 return 503, {"error": "room_report_slow"}, {"Retry-After": str(int(ROOM_REPORT_DEADLINE_SECONDS))}
             if "error" in result:
                 return 500, {"error": "attest_failed", "detail": type(result["error"]).__name__}, {}

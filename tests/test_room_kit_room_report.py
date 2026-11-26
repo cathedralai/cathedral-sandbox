@@ -257,6 +257,25 @@ def test_a_temporary_state_is_503_and_keeps_the_socket(hotel, cause) -> None:
     assert os.path.exists(sock(root))
 
 
+@pytest.mark.parametrize("cause", ["api_down", "api_500", "frozen"])
+def test_a_temporary_failure_then_recovery_uses_the_same_socket(hotel, cause) -> None:
+    # SpockChaser on AB#1001: an API restart, a 500 or a freeze must not cost a live room its endpoint.
+    ledger, reports, root, api, _tsm = hotel
+    incarnation = started(hotel)[ROOM]
+    listener = reports.listeners[ROOM]
+    if cause == "api_down":
+        api.down = True
+    elif cause == "api_500":
+        reports.api_get = lambda path, timeout, total=None: (500, b'{"error":"boom"}')
+    else:
+        api.states[ROOM] = "frozen"
+    assert post(sock(root), {"report_data_hex": NONCE.hex()})[0] == 503
+    api.down, api.states[ROOM], reports.api_get = False, "running", api
+    status, _h, doc = post(sock(root), {"report_data_hex": NONCE.hex()})
+    assert status == 200 and doc["statement"]["incarnation"] == incarnation
+    assert reports.listeners[ROOM] is listener  # the same listener, never closed and reopened
+
+
 def test_a_create_replayed_during_the_report_is_409(hotel) -> None:
     ledger, _reports, root, _api, tsm = hotel
     started(hotel)
@@ -293,18 +312,23 @@ def test_scheduler_serves_a_waiting_broker_check_before_a_waiting_room() -> None
 def test_a_stalled_read_keeps_the_chip_slot_past_the_rooms_answer(hotel, monkeypatch) -> None:
     _ledger, reports, root, _api, tsm = hotel
     monkeypatch.setattr(rr, "ROOM_REPORT_DEADLINE_SECONDS", 0.3)
-    started(hotel)
+    started(hotel, ROOM, OTHER)
     release = threading.Event()
     tsm.during = lambda: release.wait(10)
     status, _h, doc = post(sock(root), {"report_data_hex": NONCE.hex()})
     assert status == 503 and doc == {"error": "room_report_slow"}
     assert reports.scheduler.busy  # the read still runs: no second in-room read can start
     assert post(sock(root), {"report_data_hex": NONCE.hex()})[0] == 429  # the room already has one
+    reads = len(tsm.inputs)
+    # Another room times out in the queue: no second chip read starts, now or after the stall ends.
+    assert post(sock(root, OTHER), {"report_data_hex": NONCE.hex()})[2] == {"error": "room_report_slow"}
+    assert len(tsm.inputs) == reads
     release.set()
     deadline = time.monotonic() + 5
-    while (reports.scheduler.busy or ROOM in reports.active) and time.monotonic() < deadline:
+    while (reports.scheduler.busy or reports.active) and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert not reports.scheduler.busy and ROOM not in reports.active
+    assert not reports.scheduler.busy and not reports.active
+    assert len(tsm.inputs) == reads  # the expired request was dropped, not run late
 
 
 def test_hotel_attest_route_takes_the_scheduler_with_broker_first(hotel, monkeypatch) -> None:
