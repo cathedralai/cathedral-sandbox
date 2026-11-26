@@ -744,6 +744,13 @@ func (s *vmStore) adoptReceiptsLocked(rec *vmRecord) bool {
 			changed = true
 			continue
 		}
+		// A disputed receipt whose state update was lost: vms.json still holds
+		// the older stored time. Keep it for audit and take the canonical one.
+		if rc, ok := s.receipts[vmRunKey{rec.ID, g}]; ok && g > 0 && rc.Disputed && rec.DesiredState == vmStateStopped && rec.StoppedAt != 0 && rec.StoppedAt != rc.StoppedAt {
+			rec.LegacyStoppedAt, rec.StoppedAt = rec.StoppedAt, rc.StoppedAt
+			changed = true
+			continue
+		}
 		if rc, ok := s.receipts[vmRunKey{rec.ID, g + 1}]; ok && rec.DesiredState == vmStateStopped {
 			rec.Generation, rec.StoppedAt, rec.Ran, rec.LastError = g+1, rc.StoppedAt, false, ""
 			changed = true

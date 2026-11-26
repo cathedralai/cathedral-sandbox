@@ -1596,3 +1596,48 @@ func TestVMHistoryDeleteDisputesLegacyStoredTime(t *testing.T) {
 		t.Fatalf("/runs/1 after delete: %d %v", st, doc)
 	}
 }
+
+// Fix r2-3: a disputed receipt is on disk but the crash came before vms.json
+// took the canonical time. Adoption keeps the stored time for audit, copies the
+// canonical one forward, and repeats change nothing.
+func TestVMHistoryDisputedReceiptRepairsInterruptedStateUpdate(t *testing.T) {
+	c := newHistCase(t)
+	c.run(t)
+	c.must(t, "stop", map[string]any{"generation": 1})
+	legacy := int64(histStopBase + 1 + 4000)
+	setLegacyStoppedAt(t, c.tb, c.id, legacy)
+	tb := c.tb.restart(t, true) // disputed receipt written, vms.json repaired
+	c = &histCase{tb: tb, host: c.host, id: c.id, base: c.base}
+	// Undo the vms.json half, as a crash before its save would leave it.
+	path := filepath.Join(tb.b.cfg.StateDir, vmsFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc vmsFileDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for i := range doc.VMs {
+		if doc.VMs[i].ID == c.id {
+			doc.VMs[i].StoppedAt, doc.VMs[i].LegacyStoppedAt = legacy, 0
+		}
+	}
+	raw, _ = json.Marshal(doc)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // the second pass must change nothing
+		tb = tb.restart(t, true)
+		c = &histCase{tb: tb, host: c.host, id: c.id, base: c.base}
+		if rec := onDiskRecord(t, tb, c.id); rec.LegacyStoppedAt != legacy || rec.StoppedAt != histStopBase+1 {
+			t.Fatalf("pass %d record: %+v", i, rec)
+		}
+	}
+	if st, doc := c.post(t, "stop", map[string]any{"generation": 1}); st != 200 || doc["stopped_at"] != float64(histStopBase+1) {
+		t.Fatalf("repeated stop: %d %v", st, doc)
+	}
+	if st, d := tb.call(t, "operator-key", "GET", c.base+"/runs/1", nil); st != 409 {
+		t.Fatalf("/runs/1: %d %v", st, d)
+	}
+}
