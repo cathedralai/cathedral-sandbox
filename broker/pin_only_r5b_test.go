@@ -17,21 +17,21 @@ func TestOwnershipChangesOfAPinOnlyHotelNeedAKnownRoomCount(t *testing.T) {
 		// release
 		tc := pinChain(t)
 		setHotel(tc, "a", state.set)
-		if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil}); status != 409 || errCode(doc) != "rooms_active" {
+		if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": nil}); status != 409 || errCode(doc) != "rooms_active" {
 			t.Fatalf("%s: release: %d %v", state.name, status, doc)
 		}
 		setHotel(tc, "a", state.undo)
-		if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil}); status != 200 {
+		if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": nil}); status != 200 {
 			t.Fatalf("%s: release once known: %d %v", state.name, status, doc)
 		}
 		// a new owner
 		tc = pinChain(t)
 		setHotel(tc, "a", state.set)
-		if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
+		if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
 			t.Fatalf("%s: new owner: %d %v", state.name, status, doc)
 		}
 		setHotel(tc, "a", state.undo)
-		if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 200 {
+		if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 200 {
 			t.Fatalf("%s: new owner once known: %d %v", state.name, status, doc)
 		}
 		// lend, as patchHotel applies it (the attestation call is not the point here)

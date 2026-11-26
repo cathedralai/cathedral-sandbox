@@ -43,11 +43,11 @@ func TestEmptySyncBetweenCleanupAndSettlementKeepsTheHold(t *testing.T) {
 	// ...and an empty sync runs before settleUncertain takes b.mu.
 	tc.b.syncHotel(context.Background(), ha)
 	change := map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 {
 		t.Fatalf("reference change after the sync erased the hold: %d %v", status, doc)
 	}
 	tc.b.settleUncertain(g, batchID, []createResult{res}, nil)
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 {
 		t.Fatalf("reference change after settlement: %d %v", status, doc)
 	}
 }

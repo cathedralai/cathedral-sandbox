@@ -814,6 +814,20 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		return
 	}
 	b.mu.Lock()
+	// An owner change of a pin_only hotel is an operator procedure: the broker
+	// cannot prove from its own clocks that no dispatched create is still
+	// starting a room, so it takes the hotel only while drained (AB#982). The
+	// one-time switch on (the hotel is not pin_only yet) is not covered.
+	if h.pinOnly() && !h.drain() {
+		changesOwner := (reserve != nil && !lc.reclaim && (*reserve != h.reservedFor() || ref != h.cfg.ReservationRef)) ||
+			req.Lend != nil || (req.PinOnly != nil && !*req.PinOnly)
+		if changesOwner {
+			b.mu.Unlock()
+			writeErr(w, 409, "owner_change_needs_drain", "hotel "+h.cfg.ID+" is pin_only: an owner change (reserved_for, reservation_ref, release, lend or pin_only off) needs the hotel drained first. "+
+				"Operator procedure: drain the hotel, lock out the old owner, wait for the restart guard to show zero rooms with count_known, check the hotel-side workspace and image-pull lists, then send the one PATCH")
+			return
+		}
+	}
 	if reserve != nil && !lc.reclaim {
 		if e := reserveErr(h, *reserve); e != nil {
 			b.mu.Unlock()

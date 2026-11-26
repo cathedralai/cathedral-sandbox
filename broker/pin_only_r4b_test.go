@@ -69,7 +69,7 @@ func TestFailedFirstCleanupListStillHoldsUntilTheDeadline(t *testing.T) {
 		return true
 	})
 	change := map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 {
 		t.Fatalf("reference change after the empty retry, room just appeared: %d %v", status, doc)
 	}
 	// A sync lists and reaps the room; the record stays to the deadline.
@@ -85,7 +85,7 @@ func TestFailedFirstCleanupListStillHoldsUntilTheDeadline(t *testing.T) {
 		}
 		return true
 	})
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 {
 		t.Fatalf("reference change before the deadline: %d %v", status, doc)
 	}
 	tc.b.mu.Lock()
@@ -94,7 +94,7 @@ func TestFailedFirstCleanupListStillHoldsUntilTheDeadline(t *testing.T) {
 	}
 	tc.b.mu.Unlock()
 	tc.b.syncHotel(context.Background(), ha)
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 200 {
 		t.Fatalf("after the deadline and an empty list: %d %v", status, doc)
 	}
 }

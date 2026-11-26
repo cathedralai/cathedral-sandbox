@@ -81,7 +81,7 @@ func TestGatesHoldBetweenALostReplyAndTheRecord(t *testing.T) {
 		t.Fatalf("lost %v", res.lost)
 	}
 	// switch-off with the flag still set
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"pin_only": false}); status != 409 || errCode(doc) != "rooms_active" {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"pin_only": false}); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("switch off: %d %v", status, doc)
 	}
 	// the flag is gone (switch-off elsewhere, or the audit)
@@ -105,7 +105,7 @@ func TestGatesHoldBetweenALostReplyAndTheRecord(t *testing.T) {
 		h.cfg.LentFrom, h.cfg.LentReportID, h.cfg.ReservedFor = "g2", "r0", ""
 		h.cfgMu.Unlock()
 	})
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("reclaim: %d %v", status, doc)
 	}
 }
@@ -113,7 +113,7 @@ func TestGatesHoldBetweenALostReplyAndTheRecord(t *testing.T) {
 func TestLeaveRefusedBetweenALostReplyAndTheRecord(t *testing.T) {
 	tc := knownChain(t)
 	joinOperatorSealed(t, tc, "j1", 4)
-	if status, doc := patchHotelDoc(t, tc, "j1", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "j1", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 200 {
 		t.Fatalf("pin j1: %d %v", status, doc)
 	}
 	if status, doc := patchHotelDoc(t, tc, "j1", map[string]any{"drain": true}); status != 200 {

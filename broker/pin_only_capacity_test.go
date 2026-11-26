@@ -23,7 +23,7 @@ func TestOwnerCapacityEntryCarriesTheReservationGeneration(t *testing.T) {
 	if a == nil || a["pin_only"] != true || a["reservation_generation"] != float64(1) {
 		t.Fatalf("owner entry: %v", a)
 	}
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}); status != 200 {
 		t.Fatalf("ref change: %d %v", status, doc)
 	}
 	if a := entry("key2", "a"); a["reservation_generation"] != float64(2) {

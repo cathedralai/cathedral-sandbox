@@ -27,14 +27,14 @@ func endHold(tc *testChain, id string) {
 func TestSwitchingPinOnlyOffNeedsAKnownRoomCount(t *testing.T) {
 	tc := pinChain(t)
 	holdRecord(tc, "a")
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"pin_only": false}); status != 409 || errCode(doc) != "rooms_active" {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"pin_only": false}); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("switch off with a held record: %d %v", status, doc)
 	}
 	if !tc.b.hotelByID("a").pinOnly() {
 		t.Fatal("a refused PATCH cleared pin_only")
 	}
 	endHold(tc, "a")
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"pin_only": false}); status != 200 || doc["pin_only"] != false {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"pin_only": false}); status != 200 || doc["pin_only"] != false {
 		t.Fatalf("switch off after the deadline: %d %v", status, doc)
 	}
 }
@@ -62,7 +62,7 @@ func TestHeldRecordGuardsOwnershipChangesAfterPinOnlyIsCleared(t *testing.T) {
 		t.Fatalf("leave with a held record: %d %v", status, doc)
 	}
 	endHold(tc, "a")
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 200 {
 		t.Fatalf("new owner after the deadline: %d %v", status, doc)
 	}
 }
@@ -82,10 +82,10 @@ func TestFailClosedClearDoesNotOpenTheHotelWhileARecordIsHeld(t *testing.T) {
 	}
 	setHotel(tc, "a", func(h *hotel) { h.cfg.LentReportID = "r1" }) // a baseline, so a reclaim reaches its checks
 	// A reclaim (a new owner) and a release are refused while the record holds.
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1"}); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("reclaim with a held record: %d %v", status, doc)
 	}
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil}); status == 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": nil}); status == 200 {
 		t.Fatalf("release with a held record: %d %v", status, doc)
 	}
 	endHold(tc, "a")
@@ -96,7 +96,7 @@ func TestFailClosedClearDoesNotOpenTheHotelWhileARecordIsHeld(t *testing.T) {
 		t.Fatal("occupancy should be known after the deadline")
 	}
 	// A reclaim now passes the guard (it then needs a new attestation: 502).
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1"}); errCode(doc) == "rooms_active" {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1"}); errCode(doc) == "rooms_active" {
 		t.Fatalf("reclaim after the deadline still guarded: %d %v", status, doc)
 	}
 }

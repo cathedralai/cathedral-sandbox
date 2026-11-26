@@ -8,7 +8,7 @@ import "testing"
 func TestPinOnlyRuntimeHotelCannotLeaveWithUnresolvedCreates(t *testing.T) {
 	tc := knownChain(t)
 	joinOperatorSealed(t, tc, "j1", 4)
-	if status, doc := patchHotelDoc(t, tc, "j1", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "j1", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 200 {
 		t.Fatalf("pin j1: %d %v", status, doc)
 	}
 	if status, doc := patchHotelDoc(t, tc, "j1", map[string]any{"drain": true}); status != 200 {

@@ -14,7 +14,7 @@ func TestFullyRemovedBusyCleanupChargesNoAllowanceButStillHolds(t *testing.T) {
 	tc, _ := meteredChain(t, nil)
 	tc.putAllowance(t, "g1", allowanceBody(1, 1))
 	markRoomsKnown(tc)
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1", "pin_only": true}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1", "pin_only": true}); status != 200 {
 		t.Fatalf("pin a: %d %v", status, doc)
 	}
 	ha := tc.b.hotelByID("a")
@@ -62,14 +62,14 @@ func TestFullyRemovedBusyCleanupChargesNoAllowanceButStillHolds(t *testing.T) {
 	// The hotel stays held until the create deadline.
 	tc.b.syncHotel(context.Background(), ha)
 	change := map[string]any{"reserved_for": "g1", "reservation_ref": "owner:g1:2", "expect_generation": 1}
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 {
 		t.Fatalf("reference change before the deadline: %d %v", status, doc)
 	}
 	tc.b.mu.Lock()
 	ub.holdUntil = time.Now().Add(-time.Second)
 	tc.b.mu.Unlock()
 	tc.b.syncHotel(context.Background(), ha)
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 200 {
 		t.Fatalf("after the deadline: %d %v", status, doc)
 	}
 }

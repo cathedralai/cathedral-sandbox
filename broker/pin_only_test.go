@@ -40,7 +40,7 @@ func markRoomsKnown(tc *testChain) {
 func pinChain(t *testing.T) *testChain {
 	t.Helper()
 	tc := knownChain(t)
-	status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2", "pin_only": true})
+	status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2", "pin_only": true})
 	if status != 200 || doc["pin_only"] != true {
 		t.Fatalf("pin a: %d %v", status, doc)
 	}
@@ -48,6 +48,18 @@ func pinChain(t *testing.T) *testChain {
 	// A reserved hotel takes no room before its first room list (lend.go).
 	setHotel(tc, "a", func(h *hotel) { h.roomsUnchecked = false })
 	return tc
+}
+
+// ownerPatch is patchHotelDoc for an owner change: a pin_only hotel takes one
+// only while drained (owner_change_needs_drain), so the hotel is drained for
+// the call and put back after.
+func ownerPatch(t *testing.T, tc *testChain, id string, body map[string]any) (int, map[string]any) {
+	t.Helper()
+	h := tc.b.hotelByID(id)
+	setDrain := func(v bool) { h.cfgMu.Lock(); h.cfg.Drain = v; h.cfgMu.Unlock() }
+	setDrain(true)
+	defer setDrain(false)
+	return patchHotelDoc(t, tc, id, body)
 }
 
 // callWith is tc.call plus request headers.
@@ -197,7 +209,7 @@ func TestPinOnlySharedCreatesNeverLandOnTheHotel(t *testing.T) {
 
 func TestPinOnlyQueuedSharedCreateIsPlacedAgainAtTheRecheck(t *testing.T) {
 	tc := knownChain(t)
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
 	a := tc.b.hotelByID("a")
@@ -311,7 +323,7 @@ func TestPinOnlyDedicatedStaleAtTheDispatchRecheck(t *testing.T) {
 
 func TestPinOnlyStaleMarkerIsRefusedAfterTheReferenceChanges(t *testing.T) {
 	tc := pinChain(t)
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}); status != 200 {
 		t.Fatalf("ref change on an empty hotel: %d %v", status, doc)
 	}
 	if status, doc := tc.callWith(t, "key2", dedMark(1), "POST", "/v1/sandboxes", dedBody()); status != 409 || errCode(doc) != "dedicated_generation_stale" {
@@ -336,7 +348,7 @@ func pinWait(t *testing.T, cond func() bool) {
 
 func TestPinOnlySwitchWaitsForCreatesQueuedAndClaims(t *testing.T) {
 	tc := knownChain(t)
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
 	for _, field := range []string{"creating", "queued", "claims"} {
@@ -367,7 +379,7 @@ func TestPinOnlySwitchWaitsForCreatesQueuedAndClaims(t *testing.T) {
 
 func TestPinOnlyClaimHeldByAPrefetchBlocksTheSwitchAndPruningKeepsPullingJobs(t *testing.T) {
 	tc := knownChain(t)
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
 	tc.hotels["a"].pullDelay = 600 * time.Millisecond
@@ -441,7 +453,7 @@ func TestPinOnlyClaimHeldByAWorkspaceCreateBlocksTheSwitch(t *testing.T) {
 	wc.b.cfg.StateDir = t.TempDir()
 	wc.b.cfg.OperatorKeySHA256 = sha("operator-key")
 	markRoomsKnown(wc.testChain)
-	if status, doc := patchHotelDoc(t, wc.testChain, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
+	if status, doc := ownerPatch(t, wc.testChain, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
 	setHotel(wc.testChain, "a", func(h *hotel) { h.roomsUnchecked = false })
@@ -569,7 +581,7 @@ func TestPinOnlyReservedForChangeClearsItAndASameOwnerPatchKeepsIt(t *testing.T)
 	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"drain": false}); status != 200 || doc["pin_only"] != true {
 		t.Fatalf("drain: %d %v", status, doc)
 	}
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2"}); status != 200 || doc["pin_only"] != true {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2"}); status != 200 || doc["pin_only"] != true {
 		t.Fatalf("same owner: %d %v", status, doc)
 	}
 	// A restart keeps it (hotel-reservations.json), with the generation.
@@ -585,15 +597,15 @@ func TestPinOnlyReservedForChangeClearsItAndASameOwnerPatchKeepsIt(t *testing.T)
 		t.Fatalf("%s: %s", reservationsFile, raw)
 	}
 	// A new owner clears it, and so does a release; the same PATCH may set it.
-	status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g1"})
+	status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g1"})
 	if status != 200 || doc["pin_only"] != false || doc["reservation_generation"] != float64(3) {
 		t.Fatalf("new owner: %d %v", status, doc)
 	}
-	status, doc = patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "pin_only": true})
+	status, doc = ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "pin_only": true})
 	if status != 200 || doc["pin_only"] != true || doc["reservation_generation"] != float64(4) {
 		t.Fatalf("new owner and pin_only in one PATCH: %d %v", status, doc)
 	}
-	status, doc = patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil})
+	status, doc = ownerPatch(t, tc, "a", map[string]any{"reserved_for": nil})
 	if status != 200 || doc["pin_only"] != false {
 		t.Fatalf("release: %d %v", status, doc)
 	}
@@ -692,14 +704,14 @@ func TestPinOnlyOfAJoinedHotelIsKeptInHotelsJSON(t *testing.T) {
 	dir := t.TempDir()
 	tc := newChainState(t, dir)
 	joinOperatorSealed(t, tc, "j1", 4)
-	if status, doc := patchHotelDoc(t, tc, "j1", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 200 || doc["pin_only"] != true {
+	if status, doc := ownerPatch(t, tc, "j1", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 200 || doc["pin_only"] != true {
 		t.Fatalf("pin joined: %d %v", status, doc)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, runtimeHotelsFile))
 	if !strings.Contains(string(raw), `"pin_only": true`) {
 		t.Fatalf("hotels.json: %s", raw)
 	}
-	if status, doc := patchHotelDoc(t, tc, "j1", map[string]any{"reserved_for": nil}); status != 200 || doc["pin_only"] != false {
+	if status, doc := ownerPatch(t, tc, "j1", map[string]any{"reserved_for": nil}); status != 200 || doc["pin_only"] != false {
 		t.Fatalf("release: %d %v", status, doc)
 	}
 	raw, _ = os.ReadFile(filepath.Join(dir, runtimeHotelsFile))
@@ -766,7 +778,7 @@ func TestPinOnlyReferenceChangeNeedsAnEmptyHotel(t *testing.T) {
 	tc := pinChain(t) // generation 1, ref owner:g2
 	a := tc.b.hotelByID("a")
 	change := func(ref string, gen uint64) (int, map[string]any) {
-		return patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": ref, "expect_generation": gen})
+		return ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": ref, "expect_generation": gen})
 	}
 	// Refused while a room exists, a create is counted, one is queued or a
 	// claim is held; generation and ref stay.
@@ -824,7 +836,7 @@ func TestPinOnlyReferenceChangeIsRefusedWhileADedicatedCreateIsInFlight(t *testi
 	}()
 	// Past the B4 recheck the create is counted in h.creating until it ends.
 	pinWait(t, func() bool { tc.b.mu.Lock(); defer tc.b.mu.Unlock(); return tc.b.hotelByID("a").creating == 1 })
-	status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1})
+	status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1})
 	if status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("during the create: %d %v", status, doc)
 	}
@@ -836,7 +848,7 @@ func TestPinOnlyReferenceChangeIsRefusedWhileADedicatedCreateIsInFlight(t *testi
 		t.Fatalf("create: %d %v", res.status, res.doc)
 	}
 	// The room it made counts too; once it is deleted the change goes through.
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}); status != 409 {
 		t.Fatalf("with the room: %d %v", status, doc)
 	}
 	if status, doc := tc.call(t, "key2", "DELETE", "/v1/sandboxes/"+res.doc["id"].(string), nil); status != 204 && status != 200 {
@@ -849,7 +861,7 @@ func TestPinOnlyReferenceChangeIsRefusedWhileADedicatedCreateIsInFlight(t *testi
 		tc.b.release(tc.b.hotelByID("a"), rm)
 	}
 	tc.b.mu.Unlock()
-	status, doc = patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1})
+	status, doc = ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1})
 	if status != 200 {
 		t.Fatalf("empty again: %d %v", status, doc)
 	}

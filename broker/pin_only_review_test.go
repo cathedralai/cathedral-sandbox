@@ -20,7 +20,7 @@ import (
 // claim for the whole probe.
 func TestProbeHoldsAClaimSoPinOnlyCannotSwitchMidProbe(t *testing.T) {
 	tc := knownChain(t)
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve: %d %v", status, doc)
 	}
 	setHotel(tc, "a", func(h *hotel) { h.ok, h.roomsUnchecked = true, false })
@@ -126,7 +126,7 @@ func TestPinOnlySwitchAndReferenceChangeRefuseWhileRoomsAreUnknown(t *testing.T)
 		{"unconfirmed create cleanup", func(h *hotel) { h.unreaped = map[string]*unreapedBatch{"b1": {guest: "g2"}} }, func(h *hotel) { h.unreaped = nil }},
 	} {
 		setHotel(tc, "a", c.set)
-		if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
+		if status, doc := ownerPatch(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
 			t.Fatalf("%s: reference change: %d %v", c.name, status, doc)
 		}
 		wantReservation(t, getHotelDoc(t, tc, "a"), "g2", "owner:g2", 1)
@@ -134,18 +134,18 @@ func TestPinOnlySwitchAndReferenceChangeRefuseWhileRoomsAreUnknown(t *testing.T)
 	}
 	// A real restart: the counters are empty and the hotel is unchecked.
 	tc.start(t)
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("after restart: %d %v", status, doc)
 	}
 	// The switch is refused too: a plain reserved hotel, count unknown.
-	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": "g1"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "b", map[string]any{"reserved_for": "g1"}); status != 200 {
 		t.Fatalf("reserve b: %d %v", status, doc)
 	}
 	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"pin_only": true}); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("switch with unknown rooms: %d %v", status, doc)
 	}
 	markRoomsKnown(tc)
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 200 {
 		t.Fatalf("once known and empty: %d %v", status, doc)
 	}
 }
@@ -154,7 +154,7 @@ func TestPinOnlySwitchAndReferenceChangeRefuseWhileRoomsAreUnknown(t *testing.T)
 func TestPinOnlyNeedsADurableStateDir(t *testing.T) {
 	tc := newChain(t) // no state_dir
 	markRoomsKnown(tc)
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 409 || errCode(doc) != "no_state_dir" {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "pin_only": true}); status != 409 || errCode(doc) != "no_state_dir" {
 		t.Fatalf("pin_only without state_dir: %d %v", status, doc)
 	}
 	if tc.b.hotelByID("a").pinOnly() || tc.b.hotelByID("a").reservedFor() != "" {
@@ -162,7 +162,7 @@ func TestPinOnlyNeedsADurableStateDir(t *testing.T) {
 	}
 	// A pin_only hotel that exists anyway takes no reservation change unsaved.
 	setHotel(tc, "a", func(h *hotel) { h.cfg.ReservedFor, h.cfg.PinOnly = "g2", true })
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "x"}); status != 409 || errCode(doc) != "no_state_dir" {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "x"}); status != 409 || errCode(doc) != "no_state_dir" {
 		t.Fatalf("ref change without state_dir: %d %v", status, doc)
 	}
 
@@ -210,7 +210,7 @@ func TestReleaseIsRefusedWhileCreatesOrClaimsAreOutstanding(t *testing.T) {
 				h.claims = 1
 			}
 		})
-		status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil})
+		status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": nil})
 		if status != 409 || errCode(doc) != "rooms_active" {
 			t.Fatalf("%s: release: %d %v", field, status, doc)
 		}
@@ -218,28 +218,28 @@ func TestReleaseIsRefusedWhileCreatesOrClaimsAreOutstanding(t *testing.T) {
 			t.Fatalf("%s: a refused release changed the hotel", field)
 		}
 		// The same owner is no change and stays allowed.
-		if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2"}); status != 200 {
+		if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2"}); status != 200 {
 			t.Fatalf("%s: same owner: %d %v", field, status, doc)
 		}
 		setHotel(tc, "a", func(h *hotel) { h.creating, h.queued, h.claims = 0, 0, 0 })
 	}
 	// An ordinary reserved hotel (not pin_only) is refused the same way, and
 	// released once idle; its own rooms never blocked a release.
-	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": "g1"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "b", map[string]any{"reserved_for": "g1"}); status != 200 {
 		t.Fatalf("reserve b: %d %v", status, doc)
 	}
 	setHotel(tc, "b", func(h *hotel) {
 		h.claims = 1
 		h.rooms["x1"] = &room{h: h, guest: "g1", hid: "x1", id: "b.x1", state: stRunning}
 	})
-	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": nil}); status != 409 {
+	if status, doc := ownerPatch(t, tc, "b", map[string]any{"reserved_for": nil}); status != 409 {
 		t.Fatalf("plain hotel, claim held: %d %v", status, doc)
 	}
 	setHotel(tc, "b", func(h *hotel) { h.claims = 0 })
-	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": nil}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "b", map[string]any{"reserved_for": nil}); status != 200 {
 		t.Fatalf("plain hotel, idle apart from its own room: %d %v", status, doc)
 	}
-	if status, doc := patchHotelDoc(t, tc, "a", map[string]any{"reserved_for": nil}); status != 200 || doc["pin_only"] != false {
+	if status, doc := ownerPatch(t, tc, "a", map[string]any{"reserved_for": nil}); status != 200 || doc["pin_only"] != false {
 		t.Fatalf("idle release: %d %v", status, doc)
 	}
 }
@@ -262,7 +262,7 @@ func TestCompatImportClaimsOnlyWhereTheGuestMayPull(t *testing.T) {
 		t.Fatal("g1 should pull on a pool hotel")
 	}
 	tc.b.releaseClaim(b)
-	if status, doc := patchHotelDoc(t, tc, "b", map[string]any{"reserved_for": "g2"}); status != 200 {
+	if status, doc := ownerPatch(t, tc, "b", map[string]any{"reserved_for": "g2"}); status != 200 {
 		t.Fatalf("reserve b: %d %v", status, doc)
 	}
 	if _, ok := tc.b.claimForImport(g1, b); ok {
@@ -310,7 +310,7 @@ func TestReferenceChangeWaitsForALostCreateToBeReaped(t *testing.T) {
 	}()
 	<-reached // reply lost, cleanup not finished
 	change := map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}
-	status, doc := patchHotelDoc(t, tc, "a", change)
+	status, doc := ownerPatch(t, tc, "a", change)
 	if status != 409 || errCode(doc) != "rooms_active" {
 		close(gate)
 		t.Fatalf("reference change while the lost create is unresolved: %d %v", status, doc)
@@ -321,7 +321,7 @@ func TestReferenceChangeWaitsForALostCreateToBeReaped(t *testing.T) {
 	}
 	// Cleanup found the room gone, but an empty list proves absence only once
 	// the create deadline has passed (Astra r3): the record is retained.
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 {
 		t.Fatalf("before the create deadline: %d %v", status, doc)
 	}
 	tc.b.mu.Lock()
@@ -330,7 +330,7 @@ func TestReferenceChangeWaitsForALostCreateToBeReaped(t *testing.T) {
 	}
 	tc.b.mu.Unlock()
 	tc.b.syncHotel(context.Background(), ha)
-	status, doc = patchHotelDoc(t, tc, "a", change)
+	status, doc = ownerPatch(t, tc, "a", change)
 	if status != 200 {
 		t.Fatalf("after the deadline and an empty list: %d %v", status, doc)
 	}
@@ -381,7 +381,7 @@ func TestReferenceChangeWaitsPastAnEmptyCleanupListForALateRoom(t *testing.T) {
 		t.Fatalf("the hotel started %d rooms; want the late one", n)
 	}
 	change := map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
 		t.Fatalf("reference change after an empty list, room just appeared: %d %v", status, doc)
 	}
 	// A sync lists the room: it is a leftover, reaped, and the record stays.
@@ -397,7 +397,7 @@ func TestReferenceChangeWaitsPastAnEmptyCleanupListForALateRoom(t *testing.T) {
 		}
 		return true
 	})
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 409 {
 		t.Fatalf("reference change before the create deadline: %d %v", status, doc)
 	}
 	// The deadline passes; a list asked after it shows no room.
@@ -407,7 +407,7 @@ func TestReferenceChangeWaitsPastAnEmptyCleanupListForALateRoom(t *testing.T) {
 	}
 	tc.b.mu.Unlock()
 	tc.b.syncHotel(context.Background(), ha)
-	if status, doc := patchHotelDoc(t, tc, "a", change); status != 200 {
+	if status, doc := ownerPatch(t, tc, "a", change); status != 200 {
 		t.Fatalf("after the deadline and an empty list: %d %v", status, doc)
 	}
 }
