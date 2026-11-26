@@ -121,14 +121,23 @@ print(h.get("up"), a.get("state"), a.get("measurement") or "-", h.get("drain"), 
 }
 # Live rooms from the hotel's own API (as install-sealed.sh counts them). Not free_rooms: a drained hotel reports 0.
 rooms() {
-  ssh -n "${SSHO[@]}" "root@$HOST" "$STAGE/post_hotel.sh $D /v1/sandboxes GET < /dev/null" 2>/dev/null | python3 -I -c '
+  # A guest-TLS hotel (AB#817) keeps its hotel key inside the guest only, so the host cannot ask the
+  # hotel API ("no guest ip or key file"). Count through the broker then: rooms_in_use also includes
+  # creates queued or in flight, so it is never lower than the hotel's own list.
+  local r _bd bn
+  r=$(ssh -n "${SSHO[@]}" "root@$HOST" "$STAGE/post_hotel.sh $D /v1/sandboxes GET < /dev/null" 2>/dev/null | python3 -I -c '
 import base64, json, sys
 try:
     d = json.loads(sys.stdin.read().strip().splitlines()[-1])
-    b = json.loads(base64.b64decode(d["body_b64"]))
-    print(len(b.get("sandboxes", [])) if d["status"] == 200 else "?")
+    if d.get("status") == 0 and "no guest ip or key file" in str(d.get("error", "")):
+        print("nokey")
+    else:
+        b = json.loads(base64.b64decode(d["body_b64"]))
+        print(len(b.get("sandboxes", [])) if d["status"] == 200 else "?")
 except Exception:
-    print("?")'
+    print("?")')
+  if [ "$r" = nokey ]; then read -r _bd bn <<< "$(broker_busy)"; r=$bn; fi
+  echo "$r"
 }
 # The broker's own count before a guest restart (AB#875): "<drain> <rooms_in_use>". rooms_in_use
 # includes creates queued or in flight, which the hotel's room list does not show yet.
@@ -261,7 +270,11 @@ PREV0=$(prev_ino)
 unit_run() { echo "$(systemctl is-active "$UNIT" 2>/dev/null) $(systemctl show -p InvocationID --value "$UNIT" 2>/dev/null)"; }
 RUN0=$(unit_run)
 LOGF=${ROLL_REMOTE_LOGDIR:-/root}/sealed-roll-$(basename "$D")-$TS.log
-( cd "$KIT" && SEALED_SKIP_BUILD=1 ./install.sh --sealed "$D/sealed.env" ) > "$LOGF" 2>&1
+# A miner-mode hotel (SEALED_MINER=1) keeps its hotel key in the guest, so install-sealed.sh cannot
+# count rooms and asks for a control-plane drain plus SEALED_RESTART_WITH_ROOMS=1. This roll drained
+# at the broker and proved 0 rooms there (creates in flight included) just before this step.
+RWR=0; grep -q "^SEALED_MINER=1" "$D/sealed.env" && RWR=1
+( cd "$KIT" && SEALED_SKIP_BUILD=1 SEALED_RESTART_WITH_ROOMS=$RWR ./install.sh --sealed "$D/sealed.env" ) > "$LOGF" 2>&1
 rc=$?
 grep -E "expected measurement|measurement matches|MEASUREMENT DIFFERS|no attestation|guest stopped|live room|guest starting" "$LOGF" | cut -c1-200
 if [ "$rc" = 0 ]; then

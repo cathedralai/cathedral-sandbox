@@ -70,6 +70,8 @@ case "$args" in
   *post_hotel.sh*)
     echo "ssh rooms" >> "$F/calls.log"
     n=$(cat "$F/rooms.txt")
+    # A guest-TLS hotel: the host has no hotel key, as post_hotel.sh answers it.
+    [ "$n" = nokey ] && { echo '{"status": 0, "error": "no guest ip or key file in sealed.env"}'; exit 0; }
     body=$(python3 -c "import base64,json,sys; print(base64.b64encode(json.dumps({'sandboxes': [{}]*int(sys.argv[1])}).encode()).decode())" "$n")
     echo "{\"status\": 200, \"body_b64\": \"$body\"}"; exit 0 ;;
 esac
@@ -953,3 +955,69 @@ def test_unknown_hotel_or_missing_route_refuses_when_the_hotel_document_does_not
     assert r.returncode == 1
     assert "hotel_drain=None" in r.stdout or "hotel_drain=?" in r.stdout, r.stdout
     assert "ssh install" not in calls(fake)
+
+
+# ---- Guest-TLS and miner-mode hotels (chi-ur-2 roll, 26 Nov) -----------------------------------------
+# The host cannot ask a guest-TLS hotel's API for its rooms, so the count comes from the broker,
+# whose rooms_in_use includes creates queued or in flight.
+def test_guest_tls_hotel_counts_rooms_at_the_broker(env):
+    e, fake, _ = env
+    (fake / "rooms.txt").write_text("nokey")
+    (fake / "hotel.json").write_text(json.dumps({"id": HOTEL, "drain": False, "rooms_in_use": 2}))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "rooms=2" in r.stdout
+    no_mutation(fake)
+
+
+def test_guest_tls_hotel_with_an_unreadable_broker_count_refuses(env):
+    e, fake, _ = env
+    (fake / "rooms.txt").write_text("nokey")
+    (fake / "hotel.json").write_text("not json")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "rooms=?" in r.stdout
+    no_mutation(fake)
+
+
+def test_guest_tls_hotel_with_zero_broker_rooms_rolls(env):
+    e, fake, home = env
+    (fake / "rooms.txt").write_text("nokey")
+    serve_capacity(fake, [capacity(CUR), capacity(NEW, drain=True)])
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ssh install" in calls(fake)
+    assert "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# install-sealed.sh refuses to restart a miner-mode guest (SEALED_MINER=1) unless told the hotel was
+# drained through the control plane. The roll passes that only for a miner hotel, after its own drain.
+INSTALL_RECORD_FLAG = """#!/bin/bash
+echo "install restart_with_rooms=${SEALED_RESTART_WITH_ROOMS:-unset}" >> "$FAKE_DIR/calls.log"
+if grep -q '^SEALED_MINER=1' "$2" && [ "${SEALED_RESTART_WITH_ROOMS:-0}" != 1 ]; then
+  echo "sealed: miner hotel: the host holds no hotel key, so live rooms cannot be counted" >&2; exit 1
+fi
+systemctl restart "room-sealed-hotel-x.service"
+echo "[sealed] guest starting; serial log"
+echo "[sealed] measurement matches the build"
+"""
+
+
+@pytest.mark.parametrize("miner,flag", [(True, "1"), (False, "0")])
+def test_restart_flag_only_for_a_miner_hotel(host, miner, flag):
+    e, fake, home, d, kit = host
+    if miner:
+        for env_file in (d / "sealed.env", Path(str(d).replace("srv-x", "stage")) / HOTEL / "sealed.env"):
+            env_file.write_text(env_file.read_text() + "SEALED_MINER=1\n")
+    (kit / "install.sh").write_text(INSTALL_RECORD_FLAG)
+    (kit / "install.sh").chmod(0o755)
+    curl = fake.parent / "bin" / "curl"
+    curl.write_text(curl.read_text().replace(
+        '*/v1/broker/capacity) cat "$F/capacity.json" ;;',
+        f'*/v1/broker/capacity) [ "$(readlink {d}/images/current)" = old ] && cat "$F/capacity.json" || cat "$F/capacity.new" ;;'))
+    (fake / "capacity.new").write_text(capacity(NEW, drain=True))
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"install restart_with_rooms={flag}" in calls(fake)
+    assert any(x.startswith("systemctl restart") for x in calls(fake))
+    assert "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
