@@ -25,7 +25,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// lostMargin is added to the create timeout before an empty cleanup list is
+// taken as proof that a create whose reply was lost is not running.
+const lostMargin = 5 * time.Second
 
 // dedicatedHotelHeader marks a create for one pin_only hotel.
 const dedicatedHotelHeader = "X-Cathedral-Dedicated-Hotel"

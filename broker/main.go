@@ -487,6 +487,10 @@ type unreapedBatch struct {
 	// counted its lost attempts, which still count in uncertain until then
 	// (allowance.go unresolvedLocked).
 	unsettled bool
+	// lostHold: kept only because an empty cleanup list proves nothing before
+	// holdUntil (reapOrphans, pin_only.go). A metered request whose attempts
+	// all got a room listed and removed is settled and drops it.
+	lostHold bool
 }
 
 // recordedLeftover reports whether listed room id, with these labels, is a
@@ -1255,6 +1259,10 @@ type createResult struct {
 	// lost: hotels that got the create but never answered. Each may hold a
 	// room this guest does not know about; handleCreate reaps them.
 	lost []*hotel
+	// lostUntil: when the hotel can no longer be working on the lost creates:
+	// the latest send time plus hotelCreateTimeout and lostMargin. An empty
+	// cleanup list before it proves nothing (pin_only.go).
+	lostUntil time.Time
 	// sent: the create bytes the hotel that answered 202 received. createOne
 	// sends one slice on every attempt, so these are the bytes of any retry
 	// too; handleCreate returns them when the caller asks (returnCreateHeader).
@@ -1277,7 +1285,8 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 	tried := map[*hotel]bool{}
 	var last createResult
 	var lost []*hotel
-	finish := func(r createResult) createResult { r.lost = lost; return r }
+	var lostUntil time.Time
+	finish := func(r createResult) createResult { r.lost, r.lostUntil = lost, lostUntil; return r }
 	asked, fellBack := pl, false
 	wantTunables := createHasTunables(body)
 	// size: read from body at the first retry of a metered create (allowance.go).
@@ -1577,7 +1586,10 @@ func (b *broker) createOne(ctx context.Context, g *guestState, body []byte, labe
 			// the guest's own image fault is a refusal: no room was started.
 			if err != nil || ((status < 400 || status >= 500) && !guestImage) {
 				lost = append(lost, h)
-				h.lostPending++          // same hold as creating--: until createMany's cleanup confirms (reapOrphans)
+				h.lostPending++ // same hold as creating--: until createMany's cleanup confirms (reapOrphans)
+				if u := tDispatch.Add(hotelCreateTimeout + lostMargin); u.After(lostUntil) {
+					lostUntil = u
+				}
 				b.noteUncertainLocked(g) // counts for a metered guest until reaped (allowance.go)
 			}
 			if err != nil {
@@ -1638,7 +1650,11 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 	}
 	lost := map[*hotel]int{} // the lost attempts per hotel, each counted in h.lostPending
 	keep := map[*hotel]map[string]bool{}
+	var lostUntil time.Time
 	for _, res := range results {
+		if res.lostUntil.After(lostUntil) {
+			lostUntil = res.lostUntil
+		}
 		for _, h := range res.lost {
 			lost[h]++
 		}
@@ -1656,7 +1672,7 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 		}
 	}
 	for h, n := range lost {
-		if b.reapOrphans(h, g, batchID, keep[h], n) {
+		if b.reapOrphans(h, g, batchID, keep[h], n, lostUntil) {
 			continue
 		}
 		// The failed hotel may still run a room of this request: the guest
@@ -1690,10 +1706,23 @@ func (b *broker) createMany(ctx context.Context, g *guestState, payload map[stri
 // pending is the number of lost attempts this request counted in
 // h.lostPending: they end here, with the request either confirmed gone or
 // recorded in h.unreaped in the same b.mu hold, so the hotel never looks empty.
-func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool, pending int) bool {
+//
+// An empty list proves absence only once the hotel can no longer be working
+// on the create (until, from the send time and the create timeout): before
+// that the request is retained in h.unreaped with a hold to until, in the
+// same b.mu hold that drops the pending count, and the sync loop ends it with
+// a list asked after until (pin_only.go, Astra r3).
+func (b *broker) reapOrphans(h *hotel, g *guestState, batchID string, keep map[string]bool, pending int, until time.Time) bool {
+	asked := time.Now()
 	if b.reapPass(h, g.cfg.ID, batchID, keep, 3*time.Second) {
 		b.mu.Lock()
 		h.lostPending -= pending
+		if asked.Before(until) && h.unreaped[batchID] == nil {
+			if h.unreaped == nil {
+				h.unreaped = map[string]*unreapedBatch{}
+			}
+			h.unreaped[batchID] = &unreapedBatch{guest: g.cfg.ID, keep: keep, holdUntil: until, unsettled: true, lostHold: true}
+		}
 		b.mu.Unlock()
 		return true
 	}

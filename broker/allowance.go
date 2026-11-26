@@ -608,6 +608,10 @@ func (b *broker) settleUncertain(g *guestState, batchID string, results []create
 		if ub != nil {
 			ub.unsettled = false // uncertain gives these attempts up below, in this b.mu step
 		}
+		if metered && ub != nil && ub.lostHold && !ub.busy && len(b.allow.removed[key]) >= n {
+			delete(h.unreaped, batchID) // every attempt's room was listed and removed: nothing may still start
+			ub = nil
+		}
 		if !metered || len(b.allow.removed[key]) >= n {
 			// Not metered: as before. Metered and every attempt's room listed
 			// and removed: nothing is left to count.

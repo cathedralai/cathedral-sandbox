@@ -319,9 +319,95 @@ func TestReferenceChangeWaitsForALostCreateToBeReaped(t *testing.T) {
 	if s := <-done; s != 502 {
 		t.Fatalf("create: %d", s)
 	}
+	// Cleanup found the room gone, but an empty list proves absence only once
+	// the create deadline has passed (Astra r3): the record is retained.
+	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+		t.Fatalf("before the create deadline: %d %v", status, doc)
+	}
+	tc.b.mu.Lock()
+	for _, ub := range ha.unreaped {
+		ub.holdUntil = time.Now().Add(-time.Second)
+	}
+	tc.b.mu.Unlock()
+	tc.b.syncHotel(context.Background(), ha)
 	status, doc = patchHotelDoc(t, tc, "a", change)
 	if status != 200 {
-		t.Fatalf("after cleanup confirmed the room gone: %d %v", status, doc)
+		t.Fatalf("after the deadline and an empty list: %d %v", status, doc)
 	}
 	wantReservation(t, doc, "g2", "owner:g2:2", 2)
+}
+
+// Astra r3: an empty cleanup list proves nothing while the hotel may still be
+// starting the create. The list answers empty, and only then does the hotel
+// start the room; the reference change must wait until the create deadline has
+// passed and a list asked after it shows no room.
+func TestReferenceChangeWaitsPastAnEmptyCleanupListForALateRoom(t *testing.T) {
+	tc := pinChain(t) // generation 1
+	ha := tc.b.hotelByID("a")
+	upstream := ha.cfg.API
+	var mu sync.Mutex
+	var heldCreate []byte
+	var heldReq *http.Request
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/v1/sandboxes":
+			mu.Lock()
+			heldCreate, heldReq = body, r.Clone(context.Background())
+			mu.Unlock()
+			hijackClose(w) // reply lost; the hotel has not started the room yet
+		case r.Method == "GET" && r.URL.Path == "/v1/sandboxes":
+			status, hdr, out := forwardTo(upstream, r, body) // the snapshot: empty
+			mu.Lock()
+			cb, cr := heldCreate, heldReq
+			heldCreate = nil
+			mu.Unlock()
+			if cb != nil { // now the hotel starts the room
+				forwardTo(upstream, cr, cb)
+			}
+			passThrough(w, status, hdr, out)
+		default:
+			status, hdr, out := forwardTo(upstream, r, body)
+			passThrough(w, status, hdr, out)
+		}
+	}))
+	t.Cleanup(proxy.Close)
+	setHotel(tc, "a", func(h *hotel) { h.cfg.API = proxy.URL })
+
+	if status, _ := tc.callWith(t, "key2", dedMark(1), "POST", "/v1/sandboxes", dedBody()); status != 502 {
+		t.Fatalf("create with a lost reply: %d", status)
+	}
+	if n := len(tc.hotels["a"].creates); n != 1 {
+		t.Fatalf("the hotel started %d rooms; want the late one", n)
+	}
+	change := map[string]any{"reserved_for": "g2", "reservation_ref": "owner:g2:2", "expect_generation": 1}
+	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 || errCode(doc) != "rooms_active" {
+		t.Fatalf("reference change after an empty list, room just appeared: %d %v", status, doc)
+	}
+	// A sync lists the room: it is a leftover, reaped, and the record stays.
+	tc.b.syncHotel(context.Background(), ha)
+	pinWait(t, func() bool { return callsTo(tc.hotels["a"], "DELETE /v1/sandboxes/") >= 1 })
+	pinWait(t, func() bool {
+		tc.b.mu.Lock()
+		defer tc.b.mu.Unlock()
+		for _, ub := range ha.unreaped {
+			if ub.busy {
+				return false
+			}
+		}
+		return true
+	})
+	if status, doc := patchHotelDoc(t, tc, "a", change); status != 409 {
+		t.Fatalf("reference change before the create deadline: %d %v", status, doc)
+	}
+	// The deadline passes; a list asked after it shows no room.
+	tc.b.mu.Lock()
+	for _, ub := range ha.unreaped {
+		ub.holdUntil = time.Now().Add(-time.Second)
+	}
+	tc.b.mu.Unlock()
+	tc.b.syncHotel(context.Background(), ha)
+	if status, doc := patchHotelDoc(t, tc, "a", change); status != 200 {
+		t.Fatalf("after the deadline and an empty list: %d %v", status, doc)
+	}
 }
