@@ -52,6 +52,12 @@ func (b *broker) forgetRefusal(h *hotel, now time.Time) error {
 		return fmt.Errorf("the hotel has been down %s; wait until %s", now.Sub(h.downSince).Round(time.Second), minerForgetDownFor)
 	case h.creating+h.queued > 0:
 		return errors.New("a create is still in flight on the hotel")
+	case h.lostHoldEnds(now).After(now):
+		// A forget drops the hotel with its record: a rejoin would start with no
+		// hold while the old create may still start its room (pin_only.go). The
+		// operator forget is the only forget (there is no automatic one) and has
+		// no force flag, so it waits for the deadline.
+		return fmt.Errorf("a create with an unknown outcome may still start a room on the hotel; wait until %s", h.lostHoldEnds(now).UTC().Format(time.RFC3339))
 	}
 	return nil
 }

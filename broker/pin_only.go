@@ -180,6 +180,21 @@ func (h *hotel) noteQuarantine(t time.Time) {
 // quarantined reports whether a lost create on h may still be starting a room.
 func (h *hotel) quarantined() bool { return time.Now().UnixNano() < h.quarantineUntil.Load() }
 
+// lostHoldEnds is when the last lost-create hold of h ends (before now: none).
+// Caller holds b.mu.
+func (h *hotel) lostHoldEnds(now time.Time) time.Time {
+	end := time.Unix(0, h.quarantineUntil.Load())
+	for _, ub := range h.unreaped {
+		if ub.lostHold && ub.holdUntil.After(end) {
+			end = ub.holdUntil
+		}
+	}
+	if end.Before(now) {
+		return now.Add(-time.Nanosecond)
+	}
+	return end
+}
+
 // closedToShared: no unmarked create, pull or count may use h: it is pin_only,
 // or quarantined after the flag was cleared (for example by the fail-closed
 // audit) while a lost create may still start its room (Astra r7).
