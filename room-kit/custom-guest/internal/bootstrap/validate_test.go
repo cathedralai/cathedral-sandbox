@@ -229,3 +229,31 @@ func TestCmdlineAllowlistAndMeasuredAnchor(t *testing.T) {
 		t.Fatal("invalid owner signature accepted")
 	}
 }
+
+// encoding/json matches struct fields case-insensitively. Python's fields() does not, so a key
+// in another case must fail here too, at every level, or guest and owner read one signed
+// document differently.
+func TestKeysMustMatchCaseExactly(t *testing.T) {
+	rename := func(doc map[string]any, from, to string) {
+		doc[to] = doc[from]
+		delete(doc, from)
+	}
+	cases := map[string]func(m, b map[string]any){
+		"bootstrap top level": func(m, b map[string]any) { rename(b, "hotel", "Hotel") },
+		"bootstrap network":   func(m, b map[string]any) { rename(b["network"].(map[string]any), "guest_ip", "Guest_ip") },
+		"bootstrap port":      func(m, b map[string]any) { rename(b["ports"].([]any)[0].(map[string]any), "proto", "PROTO") },
+		"manifest top level":  func(m, b map[string]any) { rename(m, "kind", "Kind") },
+		"both cases present": func(m, b map[string]any) {
+			b["Hotel"] = b["hotel"]
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, b := documents(t)
+			mutate(m, b)
+			if _, err := Validate(signed(t, m, b)); err == nil {
+				t.Fatal("a key in another case was accepted")
+			}
+		})
+	}
+}
