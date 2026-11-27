@@ -1255,3 +1255,31 @@ func TestVMsGateRefusedStartIsHostRefusedAndStaysStopped(t *testing.T) {
 		}
 	}
 }
+
+// The list names each VM's create request id, so the API can match a stuck
+// create to its broker record exactly (polariscomputer #2345); a VM made
+// without one carries no request_id member.
+func TestVMsViewAndListNameTheCreateRequestID(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	st, made := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil),
+		map[string]string{"Idempotency-Key": "req-list-1"})
+	if st != 201 || made["request_id"] != "req-list-1" {
+		t.Fatalf("create: %d %v", st, made)
+	}
+	plain := tb.create(t, nil)
+	if _, has := plain["request_id"]; has {
+		t.Fatalf("a create without a key reports request_id: %v", plain)
+	}
+	st, list := tb.call(t, "operator-key", "GET", "/v1/broker/vms", nil)
+	if st != 200 {
+		t.Fatalf("list: %d %v", st, list)
+	}
+	seen := map[any]any{}
+	for _, item := range list["vms"].([]any) {
+		vm := item.(map[string]any)
+		seen[vm["id"]] = vm["request_id"]
+	}
+	if seen[made["id"]] != "req-list-1" || seen[plain["id"]] != nil || len(seen) != 2 {
+		t.Fatalf("list request ids: %v", seen)
+	}
+}
