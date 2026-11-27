@@ -70,6 +70,11 @@ elif phase == "intake":
         h["inbox"], h["staging"], h["launch_dir"] = False, False, True
         log("intake_done")
         r = {"ok": True, "report": {"ok": True}, "files": {}}
+elif phase == "hold-stop" and opts["--part"] == "a" and h.get("die_after_marker"):
+    # interrupted after the marker is written, before the kit stop
+    h["marker"] = {"launch_id": os.environ["FAKE_LAUNCH"], "state": "held"}
+    h["die_after_marker"] = False
+    r = {"ok": False, "error_code": "custom_guest_kit_failed", "detail": "injected after the marker"}
 elif phase == "hold-stop" and opts["--part"] == "a":
     if h["marker"] is None:
         h["marker"] = {"launch_id": os.environ["FAKE_LAUNCH"], "state": "held"}
@@ -1394,3 +1399,29 @@ def test_a_stale_fence_answer_lets_the_observer_decide(rig):
     assert rc == 0, out
     assert '"stale_answer": "fenced"' in rig.stderr
     assert_held(rig)
+
+
+def test_a_reopened_abort_runs_its_cleanup_again(rig):
+    """Astra r2 on #785: abort#1 journals unhold done and dies before its restore; hold closes it and goes on;
+    H6a writes the marker and dies before the kit stop; a second abort must remove that marker."""
+    rc, _ = rig.hold(CG_FAULT="op:hold#1:H3")
+    assert rc == 137
+    path = rig.home / HOTEL / "journal.jsonl"
+    seq = max(e["seq"] for e in rig.journal())
+    for i, (sub, phase, detail) in enumerate([("begin", "intent", {"argv": ["abort"]}),
+                                              ("reason", "done", {"error_code": "custom_guest_hold_failed"}),
+                                              ("kit_active", "intent", None), ("kit_active", "done", None),
+                                              ("unhold", "intent", None), ("unhold", "done", None)]):
+        path.open("a").write(json.dumps({"seq": seq + 1 + i, "launch_id": LAUNCH, "generation": None,
+                                         "step": "abort#1", "sub": sub, "phase": phase, "at": iso(time.time()),
+                                         "detail": detail}, sort_keys=True) + "\n")
+    rig.set_host(die_after_marker=True)
+    rc, out = rig.hold()
+    assert rc == 1 and out["error_code"] == "custom_guest_kit_failed", out
+    h = rig.host()
+    assert h["marker"] == {"launch_id": LAUNCH, "state": "held"} and h["kit"]["state"] == "active"
+    rc, out = rig.run("abort", "--reason", "custom_guest_kit_failed")
+    assert rc == 0, out
+    assert rig.host()["marker"] is None, "the marker of the second run is removed"
+    assert_approved_after_abort(rig, "custom_guest_kit_failed", fenced=True)  # this run's reason, not the old one
+    assert rig.run("resume") == (0, {"ok": True, "open": None})

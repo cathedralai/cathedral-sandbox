@@ -473,7 +473,7 @@ class Op:
 
         recheck: observe again even when the journal shows the sub done (evidence a host reboot can make stale).
         """
-        if self.j.done(self.launch, step, name) and not recheck:
+        if self.done_now(step, name) and not recheck:
             return
         seq = self.j.write(self.launch, generation, step, name, "intent")
         try:
@@ -491,6 +491,16 @@ class Op:
             self.j.write(self.launch, generation, step, name, "failed", {"error_code": e.code, "detail": e.detail[:300]})
             raise
         self.j.write(self.launch, generation, step, name, "done", self.stash.pop(name, None))
+
+    def run_entries(self, step: str, sub: str, phase: str | None = None) -> list[dict]:
+        """Entries of ``sub`` in the current run of ``step``: after its latest begin. A step that was closed and
+        begun again (a refused abort reopened, a boot rerun) never trusts what its earlier run journaled."""
+        begins = self.j.find(self.launch, step, "begin")
+        start = begins[-1]["seq"] if begins else 0
+        return [e for e in self.j.find(self.launch, step, sub, phase) if e["seq"] > start]
+
+    def done_now(self, step: str, sub: str) -> bool:
+        return bool(self.run_entries(step, sub, "done"))
 
     def begin(self, step: str, generation: int | None = None) -> None:
         if not self.open_step(step):
@@ -886,7 +896,7 @@ class Op:
     def abort_untouched(self, n: int) -> bool:
         """abort#n never began the restore: no restore sub journaled, and the record has no restore intent, no
         restore expect and no unresolved send."""
-        if self.j.find(self.launch, f"abort#{n}", "restore"):
+        if self.run_entries(f"abort#{n}", "restore"):
             return False
         rec = self.record()
         res = self.res(rec)
@@ -910,7 +920,7 @@ class Op:
                                        "as refused; run resume to go on")
         self.begin(step)
         # The first run's error code is the one the record gets, whatever a resumed run was told.
-        first = self.j.find(self.launch, step, "reason", "done")
+        first = self.run_entries(step, "reason", "done")
         if first:
             code = first[-1]["detail"]["error_code"]
         else:
@@ -998,7 +1008,7 @@ class Op:
         if bound is not None:
             booting_now = st == "booting" and cur == bound
             not_started = st in ("held", "stopped") and cur == bound - 1 \
-                and not self.j.done(self.launch, f"boot#{bound}", "booting")
+                and not self.done_now(f"boot#{bound}", "booting")
             if not (booting_now or not_started):
                 self.close_boots(bound)
                 print(json.dumps({"ok": True, "state": st, "generation": cur, "closed": f"boot#{bound}"}))
@@ -1124,7 +1134,7 @@ class Op:
 
         # Until R12 gives the hotel back, the evidence must be about the kit boot that runs now: a host reboot
         # after R11 makes the journaled R1 to R11 stale, so both are observed again on every run (5.4, 11.6).
-        before_r12 = not self.j.done(self.launch, step, "R12")
+        before_r12 = not self.done_now(step, "R12")
         self.sub(step, "R1_R10", kit_current, kit, recheck=before_r12)
 
         def r11() -> bool:
