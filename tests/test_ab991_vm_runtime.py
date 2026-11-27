@@ -657,6 +657,15 @@ def test_a_gates_script_that_cannot_run_refuses_as_gates_failed(host, mode):
     _start_refused_gates_failed(host, {"VM_GATES": str(path)})
 
 
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "nan", "inf"])
+def test_a_bad_gate_wait_falls_back_and_breaks_nothing(host, bad):
+    host.create()
+    host.ctl("authorize", "vm1", str(int(time.time()) + 600), "1")
+    assert host.ctl("enforce", extra={"VM_GATE_WAIT": bad})[0] == 0
+    rc, out = host.ctl("start", "vm1", "--generation", "1", extra={"VM_GATE_WAIT": bad})
+    assert rc == 0 and out["state"] == "running", out
+
+
 def test_start_runs_when_the_gates_pass_after_the_paid_check(host):
     host.create()
     rc, out = host.ctl("start", "vm1", "--generation", "1")

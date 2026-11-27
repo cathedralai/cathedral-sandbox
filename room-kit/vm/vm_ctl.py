@@ -375,7 +375,17 @@ def paid_refusal(a: dict, now: int) -> Refusal | None:
 
 # ---- pre-launch gates (spec r2 8.3, #788) ---------------------------------------------
 
-GATE_WAIT = float(os.environ.get("VM_GATE_WAIT") or 90)  # tests shorten it; gate 13 reads every bundle file; the broker gives start 2 min in all
+GATE_WAIT = 90  # gate 13 reads every bundle file; the broker gives start 2 min in all
+
+
+def gate_wait() -> float:
+    """GATE_WAIT, or VM_GATE_WAIT when it is a finite number above 0 (tests shorten it). Read at the
+    call so a bad value never breaks the other commands, `enforce` included."""
+    try:
+        wait = float(os.environ.get("VM_GATE_WAIT") or GATE_WAIT)
+    except ValueError:
+        return GATE_WAIT
+    return wait if 0 < wait < float("inf") else GATE_WAIT
 
 
 def gates_command() -> str:
@@ -394,9 +404,9 @@ def gate_refusal(name: str) -> Refusal | None:
     import vm_gates
     try:
         p = subprocess.run([gates_command(), "check", name], capture_output=True, text=True,
-                           timeout=GATE_WAIT)
+                           timeout=gate_wait())
     except subprocess.TimeoutExpired:
-        return Refusal("gates_failed", f"the pre-launch gates did not answer in {GATE_WAIT} s", 1)
+        return Refusal("gates_failed", f"the pre-launch gates did not answer in {gate_wait():g} s", 1)
     except OSError as e:
         return Refusal("gates_failed", f"the pre-launch gates did not run: {type(e).__name__}", 1)
     if p.returncode == 0:
