@@ -1,7 +1,7 @@
 // Customer VMs on VM hosts (AB#991). Operator key only; off by default.
 //
 //	POST   /v1/broker/vms                  {"account", "vcpus", "mem_gib", "disk_gib", "ssh_public_key", optional "host", optional "request_id"}
-//	GET    /v1/broker/vms                  every VM, merged with its host's list
+//	GET    /v1/broker/vms                  every VM, merged with its host's list (each names its create request_id, if any)
 //	GET    /v1/broker/vms/{id}             one VM, merged with its host's status
 //	POST   /v1/broker/vms/{id}/authorize   {"paid_through": <unix seconds>, "generation": n}
 //	POST   /v1/broker/vms/{id}/start       optional {"generation": n}
@@ -627,8 +627,8 @@ func (s *vmStore) view(r *vmRecord) map[string]any {
 		v["last_error"] = r.LastError
 	}
 	// The create's Idempotency-Key, so the API can tell exactly which of its
-	// creates a listed VM answers (polariscomputer #2345). It is the API's own
-	// derived id, never a customer value.
+	// creates a listed VM answers (polariscomputer #2345). The broker does not
+	// check where it came from; the API sends only its derived vmc- id.
 	if r.RequestID != "" {
 		v["request_id"] = r.RequestID
 	}
