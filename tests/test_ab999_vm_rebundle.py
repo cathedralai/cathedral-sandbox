@@ -665,7 +665,7 @@ ROOT_SWAP = textwrap.dedent('''
 def test_a_swapped_mailbox_cannot_redirect_the_answer_write_as_root(tmp_path):
     """The answer write as root: a link swapped in for mailbox.raw is refused, and a hard link to a
     root-owned file stays unchanged even with root's checks fooled, because the child that writes
-    is the VM user (team-lead VM6 P1, the #789 QMP pattern)."""
+    is the VM user (the #789 QMP pattern)."""
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
         if os.environ.get("CI"):
             pytest.fail("CI must run this as root (sudo -n)")
