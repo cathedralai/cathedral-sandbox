@@ -229,10 +229,21 @@ def target_live(rec: dict, to: str, view: dict) -> bool:
     return live == restored and hold is None
 
 
+OUT = ("sending", "unanswered")  # PR 3 send entries whose PATCH may have left ("claimed" never did)
+
+
+def sends_out(pending: dict) -> int:
+    """How many calls' copies of the unresolved PATCH may be out (PR 3 sends: intent_id -> claimed, sending,
+    unanswered or answered)."""
+    return sum(1 for v in (pending.get("sends") or {}).values() if v in OUT)
+
+
 def settled_by_read(rec: dict, pending: dict, view: dict) -> bool:
-    """4.6: a read resolves a send when the generation is past its fence, or it is the only send and shows its target."""
-    past = int(view.get("reservation_generation") or 0) > int(pending.get("expect_generation") or 0)
-    return past or (pending.get("sends") == 1 and target_live(rec, pending.get("to"), view))
+    """The API's settle rule, read side (4.6): resolved when no copy can be out, or a read shows the whole target
+    and the PATCH moves the generation or only one copy can be out. A generation past the fence alone is not
+    enough: the hold must agree with the tuple."""
+    out = sends_out(pending)
+    return out == 0 or (target_live(rec, pending.get("to"), view) and (bool(pending.get("bumps")) or out == 1))
 
 
 class Op:
@@ -382,7 +393,7 @@ class Op:
             pending = unresolved_of(self.record()) or {}
             view = self.view()
             print(json.dumps({"waiting": "unresolved_broker_send", "launch_id": self.launch, "for": why,
-                              "send": pending.get("to"), "sent_at": pending.get("at"), "sends": pending.get("sends"),
+                              "send": pending.get("to"), "sent_at": pending.get("at"), "out": sends_out(pending),
                               "live": tuple_of(view)}), file=sys.stderr, flush=True)
             if time.time() >= end:
                 raise Blocked("custom_guest_send_unresolved",
@@ -427,9 +438,9 @@ class Op:
             if code in ("no_answer", "custom_guest_reservation_moved") and pending is not None \
                     and pending.get("to") == to and pending.get("bumps"):
                 if time.time() >= send_end:
-                    raise Blocked("custom_guest_send_unresolved", f"fence {to}: {pending.get('sends')} sends, "
-                                  f"none answered or seen; Toby decides")
-                print(json.dumps({"resending": to, "launch_id": self.launch, "sends": pending.get("sends"),
+                    raise Blocked("custom_guest_send_unresolved", f"fence {to}: {sends_out(pending)} copies may be "
+                                  f"out, none answered or seen; Toby decides")
+                print(json.dumps({"resending": to, "launch_id": self.launch, "out": sends_out(pending),
                                   "why": "it moves the generation: the first copy to land fails every other"}),
                       file=sys.stderr, flush=True)
                 time.sleep(min(POLL, 5))

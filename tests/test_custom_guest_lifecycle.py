@@ -154,9 +154,10 @@ print("RESULT " + json.dumps(r))
 
 # ---------------------------------------------------------------- fake API and broker
 
-# PR 3 contract (bigailabs/polariscomputer#2336 at 44364fe, polaris/services/cathedral_custom_guest.py):
+# PR 3 contract (bigailabs/polariscomputer#2336 at 1604dad, polaris/services/cathedral_custom_guest.py):
 # apply_patch, _check_host_fields, _start_hold, _finish_hold, _fence_ready, _finalize, live_rows, and the
-# unresolved-send guard (settle_unresolved, unresolved_error, the two fence transactions with intent_id).
+# unresolved-send guard (settle_unresolved, _retire, unresolved_error; the three fence transactions with
+# intent_id and one send entry per call: claimed, sending, then answered or unanswered).
 FIELD_KEYS = {"hold_phase", "manifest", "bootstrap", "host_data_hex", "expected_measurement", "host", "stop_reason",
               "error_code", "error_detail"}
 INPUT_KEYS = {"ovmf_url", "ovmf_sha256", "reference_initrd_version", "reference_initrd_url", "reference_initrd_sha256",
@@ -178,6 +179,9 @@ ABORTABLE = {"intent", "drained", "fenced", "inventoried", "kit_stopping"}
 
 def conflict(msg):
     return 409, {"error": "custom_guest_state_conflict", "message": msg}
+
+
+OUT = ("sending", "unanswered")  # PR 3 send entries whose PATCH may have left
 
 
 def moved(msg):
@@ -219,6 +223,7 @@ class World:
         self.land_after_reads = None                 # land the oldest delayed PATCH after this many operator reads
         self.race: set[str] = set()                  # target -> another call rewrites the intent between the 2 commits
         self.crash_after_send: dict[str, int] = {}   # target -> the API dies after the broker applied, before commit
+        self.die_after_claim: dict[str, int] = {}    # target -> the API restarts between its first two transactions
         self.broker_patches: list[str] = []          # every fence PATCH the API sent (applied or delayed), by target
         self.nonce = 0
         self.calls: list[str] = []
@@ -381,11 +386,30 @@ class World:
             return self.live() == res.get("fenced") and self.hold_is(True)
         return bool(res.get("fenced")) and self.live() == self.restored_tuple(res) and self.broker["custom_guest_hold"] is None
 
-    def settle(self, host: dict) -> None:
+    def settle(self, host: dict, read: bool = True, keep: str | None = None) -> None:
+        """settle_unresolved: drop entries that cannot be out (claimed but for ``keep``), then clear the send
+        when none can be out, or a read shows its whole target and it bumps or only one copy can be out."""
         res = host["reservation"]
         p = res.get("unresolved")
-        if p and (self.live()["generation"] > p["expect_generation"] or (p["sends"] == 1 and self.at_target(host, p["to"]))):
+        if not p:
+            return
+        sends = {k: v for k, v in p["sends"].items() if v in OUT or (k == keep and v == "claimed")}
+        out = [k for k, v in sends.items() if v in OUT]
+        if not sends:
             res["unresolved"] = None
+            return
+        p["sends"] = sends
+        if out and read and self.at_target(host, p["to"]) and (p["bumps"] or len(out) == 1):
+            res["unresolved"] = None
+
+    def retire(self, host: dict, intent_id: str) -> None:
+        """_retire: a call that never sent drops its own claimed entry."""
+        res = host["reservation"]
+        p = res.get("unresolved")
+        if p is None or p["sends"].get(intent_id) != "claimed":
+            return
+        sends = {k: v for k, v in p["sends"].items() if k != intent_id and v in OUT}
+        res["unresolved"] = {**p, "sends": sends} if sends else None
 
     def finalize(self, host: dict, to: str) -> None:
         rec, res, bh = self.record, host["reservation"], host.setdefault("broker_hold", {})
@@ -491,25 +515,37 @@ class World:
         intent_id = f"{res['attempt']}:{self.nonce}"
         res.update(intent=to, intent_id=intent_id)
         res["unresolved"] = {"to": to, "intent_id": intent_id, "expect_generation": expect_generation, "bumps": bumps,
-                             "sends": (pending or {}).get("sends", 0) + 1, "at": iso(time.time())}
+                             "sends": {**((pending or {}).get("sends") or {}), intent_id: "claimed"},
+                             "at": iso(time.time())}
+        if self.die_after_claim.get(to):
+            self.die_after_claim[to] -= 1
+            return 500, {"error": "internal"}  # an API restart between the steps: the entry stays claimed
         if to in self.race:
             self.race.discard(to)
-            self.fence(to)  # another call, between this call's two transactions: it sends and finishes
-        # 2. Under the lock again: still this call's intent, then the one PATCH and the read-back.
+            self.fence(to)  # another call, between this call's first two transactions: it sends and finishes
+
+        def unsent(refusal):
+            self.retire(host, intent_id)  # this call sends nothing: its claimed entry goes
+            return refusal
+
+        # 2. Under the lock again: still this call's claimed intent, then "sending" committed before the PATCH.
         if res.get("intent_id") != intent_id or res.get("intent") != to or \
-                (res.get("unresolved") or {}).get("intent_id") != intent_id:
-            return conflict("another step changed this launch's fence since this call wrote its intent; nothing sent")
-        self.settle(host)
+                ((res.get("unresolved") or {}).get("sends") or {}).get(intent_id) != "claimed":
+            return unsent(conflict("another step changed this launch's fence since this call wrote its intent; "
+                                   "nothing sent"))
+        self.settle(host, keep=intent_id)
         if self.at_target(host, to):
+            self.retire(host, intent_id)
             self.finalize(host, to)
             return 200, {"launch_id": LAUNCH, "to": to, "sent": False, "tuple": self.live()}
         if res.get("unresolved") is None:
-            return moved("the reservation moved since this call wrote its intent; nothing sent")
+            return unsent(moved("the reservation moved since this call wrote its intent; nothing sent"))
         refused = self.fence_ready(host, to)
         if refused:
-            return refused
+            return unsent(refused)
         if not self.from_ok(host, to):
-            return moved("the live reservation or hold is in none of the states this step expects")
+            return unsent(moved("the live reservation or hold is in none of the states this step expects"))
+        res["unresolved"]["sends"][intent_id] = "sending"
         spec, code, answered = self.patch_args(host, to), None, True
         self.broker_patches.append(to)
         if to == "fenced" and self.rooms_active:
@@ -528,9 +564,12 @@ class World:
             code = self.broker_patch(spec)
         if answered and code is None and self.crash_after_send.get(to):
             self.crash_after_send[to] -= 1
-            return 500, {"error": "internal"}  # step 2 never committed: the intent and the unresolved send stay
-        if answered and res["unresolved"]["sends"] == 1:
-            res["unresolved"] = None  # the broker answered the only send of this PATCH
+            return 500, {"error": "internal"}  # step 3 never committed: the intent and the "sending" entry stay
+        # 3. Under the lock again: record the answer, then the read-back decides.
+        p = res.get("unresolved")
+        if p is not None and p["sends"].get(intent_id) == "sending":
+            p["sends"][intent_id] = "answered" if answered else "unanswered"
+            self.settle(host, read=False)
         if code:
             return 409, {"error": code, "message": f"the broker refused the {to} PATCH"}
         self.settle(host)
@@ -1288,3 +1327,14 @@ def test_resume_never_relaunches_a_stopped_guest(rig, resume_while_running):
     assert rig.run("resume") == (0, {"ok": True, "open": None})
     rc, out = rig.run("boot")
     assert rc == 0 and rig.world.record["generation"] == 2 and rig.host()["boots"] == 2, out
+
+
+@pytest.mark.parametrize("to", ["fenced", "kit_down"])
+def test_a_claimed_send_never_blocks_after_an_api_restart(rig, to):
+    """1604dad: an API restart between the intent and "sending" leaves a claimed entry that was never out. The
+    operator's read sees nothing can be out, and the next POST settles it and sends once."""
+    rig.world.die_after_claim[to] = 1
+    rc, out = rig.hold(CG_SEND_WAIT="5")
+    assert rc == 0, out
+    assert rig.world.broker_patches.count(to) == 1
+    assert_held(rig)
