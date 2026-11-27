@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import vm_host_support
 from test_ab991_vm_runtime import (FAKE_IPTABLES, FAKE_LOCALDS, FAKE_LOG, FAKE_QEMU_IMG, FAKE_SYSTEMCTL, KEY,
                                    KIT)
 
@@ -45,12 +46,11 @@ def vm(tmp_path, monkeypatch):
                     "flock": FAKE_LOG, "ss": FAKE_LOG}.items():
         (fake / n).write_text(text)
         (fake / n).chmod(0o755)
-    image = tmp_path / "base.img"
-    image.write_bytes(b"not really an image")
+    sealed = vm_host_support.sealed_host(tmp_path, fake)
     (tmp_path / "id.pub").write_text(KEY + "\n")
     for k, v in {"PATH": f"{fake}:{os.environ['PATH']}", "VM_ROOT": str(tmp_path / "vms"),
                  "SYSTEMD_UNIT_DIR": str(tmp_path / "units"), "FAKE_STATE": str(tmp_path / "systemd.json"),
-                 "VM_STOP_WAIT": "1", "VM_LOCK_DIR": str(tmp_path / "lock")}.items():
+                 "VM_STOP_WAIT": "1", "VM_LOCK_DIR": str(tmp_path / "lock"), **sealed}.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)  # no __pycache__ in the kit directory
     spec = importlib.util.spec_from_file_location("vm_ctl_under_test", KIT / "vm_ctl.py")
@@ -76,8 +76,7 @@ def vm(tmp_path, monkeypatch):
 
         def create(self, name="vm1", port="22001"):
             return self.run(lambda a: mod.cmd_create(a, None), name, "--vcpus", "1", "--mem-gib", "1",
-                            "--disk-gib", "8", "--ssh-key-file", str(tmp_path / "id.pub"), "--ssh-port", port,
-                            "--image", str(image))
+                            "--disk-gib", "8", "--ssh-key-file", str(tmp_path / "id.pub"), "--ssh-port", port)
 
         def auth(self, g, name="vm1", paid=None):
             return self.run(mod.cmd_authorize, name, str(paid or self.paid), str(g))
