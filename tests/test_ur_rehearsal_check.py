@@ -49,12 +49,56 @@ def status(result):
     return {c["name"]: c["status"] for c in result["checks"]}
 
 
-def test_pass_needs_both_automated_checks(tmp_path):
-    calls = []
-    result = rc.run(args(tmp_path), runner(calls=calls))
-    assert result["verdict"] == "PASS"
+DISKS = "%s  data.raw\n%s  root.raw\n" % ("aa" * 32, "bb" * 32)
+RESTART = json.dumps({"verdict": "PASS", "launch_id": LAUNCH_ID}) + "\n"
+
+
+def evidence(a, tmp_path, before=DISKS, after=DISKS, restart=RESTART):
+    for name, text in (("before", before), ("after", after), ("restart", restart)):
+        (tmp_path / name).write_text(text)
+    a.preserved_before, a.preserved_after, a.restart_result = (str(tmp_path / n) for n in ("before", "after", "restart"))
+    return a
+
+
+def test_without_evidence_the_verdict_is_incomplete_not_pass(tmp_path):
+    """Spock's HOLD on #778: missing restart or disk evidence must never read as PASS."""
+    result = rc.run(args(tmp_path), runner())
+    assert result["verdict"] == "INCOMPLETE"
     assert status(result) == {"launch_documents": "pass", "guest_report": "pass",
                               "restart_same_launch": "not_checked", "preserved_work": "not_checked"}
+
+
+def test_main_exits_2_when_incomplete(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(rc, "run", lambda a: {"verdict": "INCOMPLETE", "checks": []})
+    assert rc.main(["--host", "h", "--identity", "i", "--manifest", "m", "--bootstrap", "b", "--bootstrap-signature", "s",
+                    "--owner-public-key", "o", "--expected-measurement", "e", "--expected-chip-id", "c",
+                    "--expected-cpuid", "u", "--ark-sha256", "a", "--known-hosts-out", "k", "--min-tcb", "t"]) == 2
+
+
+@pytest.mark.parametrize("after,why", [
+    ("%s  data.raw\n%s  root.raw\n" % ("cc" * 32, "bb" * 32), "changed during the hold: data.raw"),
+    ("%s  root.raw\n" % ("bb" * 32), "differ"),
+    ("", "no disks"),
+    ("not a listing\n", "sha256sum"),
+])
+def test_a_changed_or_missing_disk_fails(tmp_path, after, why):
+    result = rc.run(evidence(args(tmp_path), tmp_path, after=after), runner())
+    assert result["verdict"] == "FAIL" and status(result)["preserved_work"] == "fail"
+    assert why in result["checks"][-1]["detail"]
+
+
+@pytest.mark.parametrize("restart", [
+    json.dumps({"verdict": "FAIL", "reason": "x"}), json.dumps({"verdict": "PASS", "launch_id": "cg-ffffffffffff"}), "", "[]"])
+def test_a_bad_restart_result_fails(tmp_path, restart):
+    result = rc.run(evidence(args(tmp_path), tmp_path, restart=restart), runner())
+    assert result["verdict"] == "FAIL" and status(result)["restart_same_launch"] == "fail"
+
+
+def test_pass_needs_every_check_including_evidence(tmp_path):
+    calls = []
+    result = rc.run(evidence(args(tmp_path), tmp_path), runner(calls=calls))
+    assert result["verdict"] == "PASS"
+    assert set(status(result).values()) == {"pass"}
     assert result["checks"][0]["detail"]["host_data"] == VECTOR["host_data_hex"]
     argv = calls[0]
     assert argv[1].endswith("verify_custom_guest.py")

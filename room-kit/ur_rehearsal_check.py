@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
 """Rehearsal A checker for a dedicated custom SNP guest (draft for spec r9 section 14.2).
 
-Runs the owner-side checks in order and prints one JSON checklist. The verdict is PASS
-only when every automated check passes. A failed or skipped check makes it FAIL.
+Runs the owner-side checks in order and prints one JSON checklist.
+  PASS        every check passed, including the restart and disk evidence.
+  INCOMPLETE  nothing failed, but restart or disk evidence was not given (exit 2).
+  FAIL        any check failed (exit 1).
+Only PASS exits 0, so a rehearsal without its evidence never reads as a pass.
 
-Automated checks:
+Checks:
   1. launch_documents: the owner's retained manifest, bootstrap and signature agree and
      give HOST_DATA (custom_guest_protocol.validate_launch). The SSH endpoint given here
      must be the owner-signed public host and first port.
   2. guest_report: one fresh SSH connection returns an SNP report bound to the accepted
      host key and a fresh challenge, with the expected measurement, HOST_DATA, chip, CPU
      and TCB floor (verify_custom_guest.py, run as a subprocess).
+  3. restart_same_launch (--restart-result): the verify_custom_guest.py JSON taken after
+     the hold and return must be PASS for the same launch_id.
+  4. preserved_work (--preserved-before, --preserved-after): sha256sum listings of the kept
+     disks taken before the hold and after the return. Both must list the same disks with
+     the same digests (spec r9 section 14.2 A5).
 
-Recorded, not automated (status "not_checked"; the operator attaches evidence):
-  - restart_same_launch: the guest restarts and the same launch_id answers check 2 again.
-  - preserved_work: the kept disks are byte-identical after the restart.
-
-This draft was written before the spec text reached this lane. Checks will be renamed,
-added or removed to match sections 14.2 and 16. It never creates, stops or changes a guest.
+It never creates, stops or changes a guest.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -34,10 +38,8 @@ import custom_guest_protocol as protocol  # noqa: E402
 SCHEMA = "cathedral.ur_rehearsal_check/v1-draft"
 # Same caps as verify_custom_guest.py, so both tools accept the same files.
 DOC_LIMIT = 16384
-RECORDED = (
-    ("restart_same_launch", "restart the guest and rerun guest_report for the same launch_id"),
-    ("preserved_work", "compare the kept disks before and after the restart, byte for byte"),
-)
+EVIDENCE_LIMIT = 1 << 20
+SHA256SUM_LINE = re.compile(r"([0-9a-f]{64})  (\S(?:.*\S)?)")
 
 
 def read_limit(path, limit):
@@ -72,6 +74,44 @@ def guest_report(argv, runner=subprocess.run):
     return {key: result.get(key) for key in ("verdict", "launch_id", "ssh_channel_binding", "ssh_host_key")}
 
 
+def evidence(name, given, flags, fn):
+    if not given:
+        return {"name": name, "status": "not_checked", "detail": f"no evidence: pass {flags}"}
+    return check(name, fn)
+
+
+def restart_same_launch(raw, launch_id):
+    protocol.need(launch_id, "launch documents failed, so the restart cannot be matched")
+    lines = [line for line in raw.decode("utf-8", "replace").splitlines() if line.strip()]
+    protocol.need(lines, "restart result is empty")
+    result = json.loads(lines[-1])
+    protocol.need(isinstance(result, dict) and result.get("verdict") == "PASS", "restart result is not PASS")
+    protocol.need(result.get("launch_id") == launch_id, "restart result names another launch")
+    return {"launch_id": launch_id}
+
+
+def sha256sum_listing(raw, label):
+    entries = {}
+    for line in raw.decode("ascii").splitlines():
+        if not line.strip():
+            continue
+        match = SHA256SUM_LINE.fullmatch(line)
+        protocol.need(match, f"{label}: not a sha256sum line")
+        protocol.need(match.group(2) not in entries, f"{label}: disk listed twice")
+        entries[match.group(2)] = match.group(1)
+    protocol.need(entries, f"{label}: no disks listed")
+    return entries
+
+
+def preserved_work(before_raw, after_raw):
+    before = sha256sum_listing(before_raw, "before")
+    after = sha256sum_listing(after_raw, "after")
+    protocol.need(set(before) == set(after), "the kept disks before and after differ")
+    changed = sorted(name for name in before if before[name] != after[name])
+    protocol.need(not changed, "changed during the hold: " + ", ".join(changed))
+    return {"disks": len(before)}
+
+
 def verifier_argv(args):
     argv = [sys.executable, os.path.join(KIT, "verify_custom_guest.py"),
             "--host", args.host, "--port", str(args.port), "--identity", args.identity,
@@ -100,9 +140,14 @@ def run(args, runner=subprocess.run):
         if report["status"] == "pass" and report["detail"].get("launch_id") != launch["detail"]["launch_id"]:
             report = {"name": "guest_report", "status": "fail", "detail": "report names another launch"}
         checks.append(report)
-    checks += [{"name": name, "status": "not_checked", "detail": how} for name, how in RECORDED]
-    automated = [c for c in checks if c["status"] != "not_checked"]
-    verdict = "PASS" if all(c["status"] == "pass" for c in automated) else "FAIL"
+    checks.append(evidence("restart_same_launch", args.restart_result, "--restart-result",
+                           lambda: restart_same_launch(read_limit(args.restart_result, EVIDENCE_LIMIT),
+                                                       launch["detail"].get("launch_id") if launch["status"] == "pass" else None)))
+    checks.append(evidence("preserved_work", args.preserved_before and args.preserved_after, "--preserved-before and --preserved-after",
+                           lambda: preserved_work(read_limit(args.preserved_before, EVIDENCE_LIMIT),
+                                                  read_limit(args.preserved_after, EVIDENCE_LIMIT))))
+    statuses = {c["status"] for c in checks}
+    verdict = "FAIL" if "fail" in statuses else "INCOMPLETE" if "not_checked" in statuses else "PASS"
     return {"schema": SCHEMA, "verdict": verdict, "checks": checks}
 
 
@@ -114,13 +159,16 @@ def parser():
     p.add_argument("--port", type=int, default=20022)
     p.add_argument("--min-tcb", action="append", required=True)
     p.add_argument("--ark-crl")
+    p.add_argument("--restart-result", help="verify_custom_guest.py JSON output taken after the hold and return")
+    p.add_argument("--preserved-before", help="sha256sum listing of the kept disks before the hold")
+    p.add_argument("--preserved-after", help="sha256sum listing of the kept disks after the return")
     return p
 
 
 def main(argv=None):
     result = run(parser().parse_args(argv))
     print(json.dumps(result, indent=1))
-    return 0 if result["verdict"] == "PASS" else 1
+    return {"PASS": 0, "FAIL": 1}.get(result["verdict"], 2)
 
 
 if __name__ == "__main__":
