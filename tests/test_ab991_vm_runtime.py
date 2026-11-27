@@ -572,3 +572,87 @@ def test_enforce_purges_a_stopped_vms_leftover_forward_only_when_disabled(host):
     host.tools.write_text("")
     assert host.ctl("enforce")[0] == 0
     assert "iptables" not in host.tools.read_text()
+
+
+# ---- pre-launch gates wiring (spec r2 8.3, #788) ----------------------------------------
+
+GATE_ERRORS = {10: "vm_invalid", 11: "vm_host_not_enabled", 12: "vm_bundle_not_enabled",
+               13: "vm_bundle_mismatch", 14: "vm_host_changed", 15: "sev_baseline_missing",
+               16: "sev_status_unreadable", 17: "sev_platform_changed", 18: "sev_state_unavailable"}
+
+
+def _gates(host, code, doc):
+    (host.root.parent / "systemd.json.gates").write_text(f"{code}\n{json.dumps(doc)}\n")
+
+
+def _gate_calls(host):
+    tools = host.root.parent / "systemd.json.tools"
+    return [ln for ln in (tools.read_text().splitlines() if tools.exists() else []) if ln.startswith("vm-gates ")]
+
+
+def test_the_gate_codes_are_the_gates_own():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("vm_gates_codes", KIT / "vm_gates.py")
+    gates = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gates)
+    assert {v: k for k, v in gates.EXIT.items()} == GATE_ERRORS
+
+
+@pytest.mark.parametrize("code", sorted(GATE_ERRORS))
+def test_start_refused_by_each_gate_leaves_no_start_line(host, code):
+    """A gate refusal passes through with its own error and exit code (17 sev_platform_changed,
+    18 sev_state_unavailable): no start line, nothing billed, the unit never started."""
+    host.create()
+    host.ctl("authorize", "vm1", str(int(time.time()) + 600), "1")
+    _gates(host, code, {"ok": False, "error": GATE_ERRORS[code], "detail": "the  reason\nhere"})
+    rc, out = host.ctl("start", "vm1", "--generation", "1")
+    assert (rc, out["error"], out["detail"]) == (code, GATE_ERRORS[code], "the reason here"), out
+    assert _gate_calls(host) == ["vm-gates check vm1"]
+    assert host.ctl("status", "vm1")[1]["state"] == "created"
+    hist = host.root / ".history" / "vm1.jsonl"
+    assert not hist.exists() or '"start"' not in hist.read_text()
+    assert not (host.root / "vm1" / "started").exists()
+
+
+@pytest.mark.parametrize("code,doc", [
+    (1, {"ok": False, "error": "internal", "detail": "x"}), (2, {"ok": False, "error": "usage", "detail": "x"}),
+    (17, {"ok": False, "error": "vm_invalid", "detail": "x"}),   # an error that is not its code's
+    (17, "not json"), (3, {"ok": False, "error": "stale_generation"}), (4, {"error": "unpaid"}),
+])
+def test_any_other_gate_answer_refuses_as_gates_failed(host, code, doc):
+    """Never a pass, and never an exit the broker reads as stale (3) or unpaid (4)."""
+    host.create()
+    host.ctl("authorize", "vm1", str(int(time.time()) + 600), "1")
+    _gates(host, code, doc)
+    rc, out = host.ctl("start", "vm1", "--generation", "1")
+    assert (rc, out["error"]) == (1, "gates_failed"), out
+    assert host.ctl("status", "vm1")[1]["state"] == "created"
+
+
+def test_start_runs_when_the_gates_pass_after_the_paid_check(host):
+    host.create()
+    rc, out = host.ctl("start", "vm1", "--generation", "1")
+    assert out["error"] in ("stale_generation", "generation_closed", "unpaid") and _gate_calls(host) == []
+    host.ctl("authorize", "vm1", str(int(time.time()) + 600), "1")
+    rc, out = host.ctl("start", "vm1", "--generation", "1")
+    assert rc == 0 and out["state"] == "running", out
+    assert _gate_calls(host) == ["vm-gates check vm1"]
+    assert '"start"' in (host.root / ".history" / "vm1.jsonl").read_text()
+
+
+def test_a_reboot_the_gates_refuse_leaves_the_vm_running(host):
+    host.create()
+    host.ctl("authorize", "vm1", str(int(time.time()) + 600), "1")
+    assert host.ctl("start", "vm1", "--generation", "1")[0] == 0
+    _gates(host, 17, {"ok": False, "error": "sev_platform_changed", "detail": "x"})
+    rc, out = host.ctl("reboot", "vm1", "--generation", "1")
+    assert (rc, out["error"]) == (17, "sev_platform_changed"), out
+    assert host.ctl("status", "vm1")[1]["state"] == "running"
+    assert not (host.root / "vm1" / "reboot-pending.json").exists()
+
+
+def test_the_enforce_service_compares_the_sev_status_after_the_credit_cutoff(host):
+    host.create()
+    lines = [ln for ln in (host.units / "cathedral-vm-enforce.service").read_text().splitlines()
+             if ln.startswith("ExecStart=")]
+    assert lines == [f"ExecStart={KIT.resolve()}/vm-ctl.sh enforce", f"ExecStart=-{KIT.resolve()}/vm-gates.sh enforce"]

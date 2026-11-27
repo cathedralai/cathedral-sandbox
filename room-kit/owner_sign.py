@@ -165,9 +165,28 @@ def main() -> int:
     ap.add_argument("--raw-out", help="with --public: also write the 32 raw public key bytes here")
     ap.add_argument("--bootstrap-digest", action="store_true",
                     help="print SEALED_BOOTSTRAP_SHA256 for --body (no key needed)")
+    ap.add_argument("--custom-guest-bootstrap", action="store_true",
+                    help="sign canonical custom guest bootstrap bytes from --body; print base64 signature")
     ap.add_argument("--hotel-form", action="store_true",
                     help="--body is already the hotel form (the API owner request preview document)")
     a = ap.parse_args()
+    if a.custom_guest_bootstrap:
+        if not a.key or not a.body or a.public or a.bootstrap_digest or a.hotel_form or a.guest:
+            ap.error("--custom-guest-bootstrap requires only --key and --body")
+        import custom_guest_protocol as custom
+        try:
+            with open(a.body, "rb") as source:
+                raw = source.read(16385)
+            doc = custom.bootstrap(raw)
+            key = load_key(a.key)
+            public = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            custom.need(custom.decode64(doc["owner_ed25519_b64"], 32, "owner") == public,
+                        "bootstrap owner differs from signing key")
+            print(base64.b64encode(key.sign(custom.BOOTSTRAP_DOMAIN + hashlib.sha256(raw).digest())).decode())
+            return 0
+        except (ValueError, OSError) as exc:
+            print(f"owner_sign: {exc}", file=sys.stderr)
+            return 1
     if a.bootstrap_digest:
         if not a.body or not (a.guest or a.hotel_form):
             ap.error("--bootstrap-digest needs --body and --guest (or --hotel-form)")

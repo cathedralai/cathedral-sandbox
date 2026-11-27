@@ -1,0 +1,17 @@
+{
+  "LVM2.2.03.31.tgz": "5db2956a00fbf87d92274cccc92436387ec0c3faadece7413ece1ba1c10c98ff",
+  "cryptsetup-2.8.4.tar.xz": "443e46f8964c9acc780f455afbb8e23aa0e8ed7ec504cfc59e04f406fa1e8a83",
+  "libargon2-dev_0~20190702+dfsg-5_amd64.deb": "a26f546b04cfe5a6e2fc5a61d1e879b7583d2bb3cecf482bedfc669bedd694a7",
+  "libblkid-dev_2.41.3-3ubuntu2.2_amd64.deb": "93fa0902918628b9482caca650e63a0e6b9fc971f8ac64fc902f79b87dfa039d",
+  "libc6-dev_2.43-2ubuntu2.7_amd64.deb": "338a4f0c8fc38f1002447096c62cb412cfa3a5eab034857aec33e343d429551d",
+  "libdevmapper-dev_2%3a1.02.205-2ubuntu3_amd64.deb": "43b303d9b7569ea7b245052b9299603125c8e37abc866180ad4926dd96720653",
+  "libjitterentropy3-dev_3.6.3-1_amd64.deb": "fa70d1a557fbe9f2a2977b332e1c654c29f3b79bc947f24b385873f63c320d18",
+  "libjson-c-dev_0.18+ds-3_amd64.deb": "af4e187e01fcee2b2523b9bc052d7988b0070d2934762453701dad10c1005689",
+  "libpopt-dev_1.19+dfsg-2build1_amd64.deb": "1fd17b4f7293bd4b199312e7220774b88b27bf5195f9d64becad49fad66f3137",
+  "libssl-dev_3.5.5-1ubuntu3.7_amd64.deb": "d1cf6cafb141490b7020e392964b1f901835d60cb88c3a68ef0f95ef5e930de4",
+  "libudev-dev_259.9-0ubuntu0.1_amd64.deb": "e9e142b9b0f287a58dc0cef550bc8200cddad495fdf9ba6245c76be615d24048",
+  "libzstd-dev_1.5.7+dfsg-3_amd64.deb": "6d81369284ba3fd094f635fe6b9f8dfc71baaca36c1f758fe62244839e25ecf0",
+  "linux-libc-dev_7.0.0-44.44_amd64.deb": "b1bd69037483894be260e934503e8c99debebb6d622e3d5010e79fea4108ee43",
+  "uuid-dev_2.41.3-3ubuntu2.2_amd64.deb": "0ba791f89888491857c69ad3d59d8517d4926eae0c242f213579fc59ea0b5e94",
+  "zlib1g-dev_1%3a1.3.dfsg+really1.3.1-1ubuntu3.2_amd64.deb": "2e4663ab8d018aff8351ee949e53971911b2aca3491eefde61e82111ee83cbc3"
+}

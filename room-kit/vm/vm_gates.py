@@ -515,13 +515,16 @@ def sev_gate() -> None:
                               " `vm-gates.sh baseline --replace --expect`")
 
 
-def accept_change() -> None:
+def accept_change() -> bool:
     """The operator accepts the verified status: clears this boot's change and arms the boot again.
-    Caller holds the SEV lock and has written the new baseline."""
+    Caller holds the SEV lock and has written the new baseline. True when it cleared a change record
+    or a disarmed boot (a boot record without its token)."""
     state_dir()
+    cleared = present(hp(BOOTED)) and not armed()
     for path in (hp(CHANGED), hp(DURABLE_CHANGED)):
         try:
             os.unlink(path)
+            cleared = True
         except FileNotFoundError:
             pass
         except OSError as e:
@@ -531,6 +534,7 @@ def accept_change() -> None:
         create_once(hp(BOOTED))
     except OSError as e:
         raise GateRefusal("sev_state_unavailable", f"cannot arm this boot: {e.strerror}") from None
+    return cleared
 
 
 def status_digest(status: dict) -> str:
@@ -640,8 +644,10 @@ def take_baseline(replace: bool, expect: str) -> dict:
                               f"the status now (digest {now[:16]}) is not the one verified ({expect[:16]}):"
                               " read it again with `vm-gates.sh status` and verify it")
         write_atomic(path, json.dumps(status, sort_keys=True).encode() + b"\n")  # mode 0600 (mkstemp)
-        accept_change()
-    return {"ok": True, "baseline": str(path), "digest": now, "status": status}
+        cleared = accept_change()
+    if cleared:
+        print("vm-gates: baseline: cleared this boot's SEV change record and armed the boot again", file=sys.stderr)
+    return {"ok": True, "baseline": str(path), "digest": now, "status": status, "cleared_change": cleared}
 
 
 def baseline_args(rest: list[str]) -> tuple[bool, str]:
