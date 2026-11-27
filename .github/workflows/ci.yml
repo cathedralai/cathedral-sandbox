@@ -17,7 +17,9 @@ concurrency:
 jobs:
   test:
     name: Python ${{ matrix.python-version }} (${{ matrix.shard }}/4)
-    runs-on: ubuntu-latest
+    # Our own sealed runners for same-repo PRs and pushes. Fork PRs always use hosted runners.
+    # To move everything back to hosted runners, set the repo variable SANDBOX_CI_RUNS_ON to '"ubuntu-latest"'.
+    runs-on: ${{ fromJSON((github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (vars.SANDBOX_CI_RUNS_ON || '["self-hosted","cathedral"]') || '"ubuntu-latest"') }}
     strategy:
       fail-fast: false
       matrix:
