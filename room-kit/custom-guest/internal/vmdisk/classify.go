@@ -77,8 +77,9 @@ type Result struct {
 	Why    string  // one line for the serial log; never key material
 }
 
-// Classify is spec r3 7.2 step 3. Committed means: the LUKS device passes
-// the VM header rules, a slot opens with this key, and a meta copy is valid.
+// Classify is spec r3 7.2 step 3 for a root.raw of diskBytes. Committed
+// means: the LUKS device passes the VM header rules, a slot opens with this
+// key, and a meta copy is valid.
 // An error from a probe is returned as is: the caller powers off and writes
 // nothing, and the disk is not classified.
 //
@@ -86,7 +87,12 @@ type Result struct {
 // fails the rules but that this key opens and that holds a valid meta copy
 // is broken, not resume. That is a committed volume behind an edited header,
 // so a forged intent never formats a volume this boot can read a meta from.
-func Classify(f Facts, id vmidentity.Identity) (Result, error) {
+//
+// A committed volume whose meta records another disk size than this boot's
+// is broken (#805), smaller or larger: the intent area and the LUKS device
+// end move with the size, so the open would treat live ciphertext as the
+// intent area (smaller) or a stale tail as part of the volume (larger).
+func Classify(f Facts, id vmidentity.Identity, diskBytes int64) (Result, error) {
 	r := Result{Slot: -1}
 	var err error
 	if r.Intent, err = f.Intent(); err != nil {
@@ -152,6 +158,8 @@ func Classify(f Facts, id vmidentity.Identity) (Result, error) {
 		return done(StateBroken, "a committed volume behind a header that fails the VM header rules")
 	case meta.Valid && !meta.Meta.Names(id):
 		return done(StateBroken, "the volume's meta names another identity")
+	case meta.Valid && meta.Meta.DiskBytes != diskBytes:
+		return done(StateBroken, "the disk is not the size the volume was committed at")
 	case meta.Valid:
 		r.Meta = meta
 		return done(StateOpen, "committed; meta "+meta.Meta.State)

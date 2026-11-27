@@ -125,11 +125,15 @@ func ParseIntent(rec []byte, id vmidentity.Identity, diskBytes int64) IntentStat
 }
 
 // Meta is one meta copy (spec r3 7.2 "Meta"). Slots maps a LUKS keyslot
-// number to its role: "m:<measurement hex>" or "recovery".
+// number to its role: "m:<measurement hex>" or "recovery". DiskBytes is
+// root.raw's size when F4 committed the volume; every later meta write
+// copies it, and a boot at any other size is broken (#805), because the
+// layout (LUKS device, intent area) is derived from the size.
 type Meta struct {
 	Seq            int64
 	VMID           string
 	IdentitySHA256 string
+	DiskBytes      int64
 	State          string
 	Slots          map[int]string
 }
@@ -145,6 +149,9 @@ func (m Meta) Names(id vmidentity.Identity) bool {
 func (m Meta) check() error {
 	bad := errors.New("meta invalid")
 	if m.Seq < 1 || !vmIDRE.MatchString(m.VMID) || !hex64RE.MatchString(m.IdentitySHA256) || len(m.Slots) == 0 || len(m.Slots) > 32 {
+		return bad
+	}
+	if _, err := NewLayout(m.DiskBytes); err != nil {
 		return bad
 	}
 	measured, recovery := 0, 0
@@ -188,7 +195,7 @@ func EncodeMeta(m Meta) ([RecordBytes]byte, error) {
 	}
 	body, err := vmidentity.Canonical(vmidentity.Object{
 		"schema": MetaSchema, "seq": m.Seq, "vm_id": m.VMID, "identity_sha256": m.IdentitySHA256,
-		"state": m.State, "slots": slots,
+		"disk_bytes": m.DiskBytes, "state": m.State, "slots": slots,
 	})
 	if err != nil {
 		return [RecordBytes]byte{}, err
@@ -196,25 +203,28 @@ func EncodeMeta(m Meta) ([RecordBytes]byte, error) {
 	return frame(metaMagic, body)
 }
 
-// ParseMeta returns a copy's meta, or false if the copy is not valid.
+// ParseMeta returns a copy's meta, or false if the copy is not valid. A
+// copy without disk_bytes (the field set #798 wrote) is not valid; no disk
+// was committed with it, since VM1b is not wired into any image.
 func ParseMeta(rec []byte) (Meta, bool) {
 	body := unframe(metaMagic, rec)
 	if body == nil {
 		return Meta{}, false
 	}
 	doc, err := vmidentity.ParseCanonical(body, 2)
-	if err != nil || !vmidentity.Fields(doc, "schema", "seq", "vm_id", "identity_sha256", "state", "slots") {
+	if err != nil || !vmidentity.Fields(doc, "schema", "seq", "vm_id", "identity_sha256", "disk_bytes", "state", "slots") {
 		return Meta{}, false
 	}
 	schema, _ := vmidentity.String(doc, "schema")
 	var m Meta
-	var ok [4]bool
+	var ok [5]bool
 	m.Seq, ok[0] = vmidentity.Int(doc, "seq")
 	m.VMID, ok[1] = vmidentity.String(doc, "vm_id")
 	m.IdentitySHA256, ok[2] = vmidentity.String(doc, "identity_sha256")
-	m.State, ok[3] = vmidentity.String(doc, "state")
+	m.DiskBytes, ok[3] = vmidentity.Int(doc, "disk_bytes")
+	m.State, ok[4] = vmidentity.String(doc, "state")
 	table, isObject := doc["slots"].(vmidentity.Object)
-	if schema != MetaSchema || ok != [4]bool{true, true, true, true} || !isObject {
+	if schema != MetaSchema || ok != [5]bool{true, true, true, true, true} || !isObject {
 		return Meta{}, false
 	}
 	m.Slots = map[int]string{}

@@ -3,6 +3,7 @@ package vmdisk
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
@@ -43,7 +44,7 @@ func (h *harness) writeMetaWith(d *disk, pass []byte, copyIndex int, m Meta) {
 	}
 	defer ctl.close()
 	st, _ := os.Stat(d.loop)
-	luksDev, err := ctl.createLinear(h.names.LUKS, false, st.Sys().(*syscall.Stat_t).Rdev, 0, uint64((testDisk-IntentAreaBytes)/sectorBytes))
+	luksDev, err := ctl.createLinear(h.names.LUKS, false, st.Sys().(*syscall.Stat_t).Rdev, 0, uint64((d.size-IntentAreaBytes)/sectorBytes))
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -221,6 +222,29 @@ func TestRootUnreadableHeaderIsBroken(t *testing.T) {
 	}
 	d.writeAt(testDisk-IntentAreaBytes, rec[:])
 	h.mustRefuse(d, id, k, StateBroken)
+}
+
+// A committed disk that comes back at another size than it was committed at
+// (#805) is broken, every byte unchanged. Shrunk by 1 MiB, the last MiB
+// the init reads as the intent area is live LUKS ciphertext (random bytes
+// stand in for it); grown by 1 MiB, the layout moves under a committed
+// volume. Both are refused.
+func TestRootResizedCommittedDiskIsBroken(t *testing.T) {
+	for name, delta := range map[string]int64{"shrunk by 1 MiB": -MiB, "grown by 1 MiB": MiB} {
+		t.Run(name, func(t *testing.T) {
+			h := rootHarness(t)
+			id, k := testID(t, "vm-0123456789ab"), newKey(1)
+			d := h.newDisk(testDisk + MiB)
+			h.mustReady(d, id, k, StateNew)
+			tail := make([]byte, IntentAreaBytes)
+			if _, err := rand.Read(tail); err != nil {
+				t.Fatal(err)
+			}
+			d.writeAt(d.size-2*IntentAreaBytes, tail)
+			d.resize(d.size + delta)
+			h.mustRefuse(d, id, k, StateBroken)
+		})
+	}
 }
 
 func TestRootIntentCases(t *testing.T) {

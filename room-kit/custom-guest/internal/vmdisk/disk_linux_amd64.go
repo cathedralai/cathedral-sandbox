@@ -75,7 +75,7 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 		return Outcome{}, err
 	}
 
-	res, err := Classify(&linuxFacts{r: r}, cfg.Identity)
+	res, err := Classify(&linuxFacts{r: r}, cfg.Identity, cfg.DiskBytes)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("classify: %w", err)
 	}
@@ -414,7 +414,7 @@ func (r *run) format() (Meta, error) {
 	r.log("vm-disk: F3 volume open, header rules hold")
 	cutAfter("f3-open")
 	cur := Current{Copy: 0, Valid: true, Meta: Meta{Seq: 1, VMID: r.cfg.Identity.VMID,
-		IdentitySHA256: r.cfg.Identity.SHA256Hex(), State: StateInitializing,
+		IdentitySHA256: r.cfg.Identity.SHA256Hex(), DiskBytes: r.cfg.DiskBytes, State: StateInitializing,
 		Slots: map[int]string{slot: MeasurementRole(r.cfg.Measurement)}}}
 	if err := r.writeMeta("f4", 0, cur.Meta); err != nil {
 		return Meta{}, err
