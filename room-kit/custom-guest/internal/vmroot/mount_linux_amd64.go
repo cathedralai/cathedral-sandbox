@@ -193,13 +193,26 @@ func plainDirectory(root *os.Root, name string) (*os.File, error) {
 	return f, nil
 }
 
-func bindReadOnly(src string, dst *os.File, extra uintptr) error {
-	target := descriptorPath(dst)
-	if err := syscall.Mount(src, target, "", syscall.MS_BIND, ""); err != nil {
+// bindReadOnly binds src over name in root, then remounts the new mount read-only. The remount
+// must name the bind mount, not the directory under it: a descriptor opened before the bind still
+// points at the old mount, so name is opened again after the bind.
+func bindReadOnly(src string, root *os.Root, name string, extra uintptr) error {
+	before, err := root.Open(name)
+	if err != nil {
+		return err
+	}
+	err = syscall.Mount(src, descriptorPath(before), "", syscall.MS_BIND, "")
+	before.Close()
+	if err != nil {
 		return fmt.Errorf("bind %s: %w", src, err)
 	}
+	after, err := root.Open(name)
+	if err != nil {
+		return err
+	}
+	defer after.Close()
 	// A bind mount takes its flags from the source; read-only and the rest need a second call.
-	if err := syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|extra, ""); err != nil {
+	if err := syscall.Mount("", descriptorPath(after), "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|extra, ""); err != nil {
 		return fmt.Errorf("remount %s read-only: %w", src, err)
 	}
 	return nil
@@ -235,9 +248,8 @@ func (m *Mounted) Finish(cfg FinishConfig) error {
 	if err != nil {
 		return err
 	}
-	err = bindReadOnly("/usr/lib/modules/"+cfg.KernelRelease, modules, syscall.MS_NOEXEC)
 	modules.Close()
-	if err != nil {
+	if err := bindReadOnly("/usr/lib/modules/"+cfg.KernelRelease, root, dir, syscall.MS_NOEXEC); err != nil {
 		return fmt.Errorf("bind modules: %w", err)
 	}
 	// /run: a tmpfs the same size as systemd's own, which keeps an inherited /run mount.
@@ -266,13 +278,7 @@ func (m *Mounted) Finish(cfg FinishConfig) error {
 		if err := writeNew(runRoot, dest, nil, 0o755); err != nil {
 			return err
 		}
-		f, err := runRoot.Open(dest)
-		if err != nil {
-			return err
-		}
-		err = bindReadOnly(tool.Source, f, 0)
-		f.Close()
-		if err != nil {
+		if err := bindReadOnly(tool.Source, runRoot, dest, 0); err != nil {
 			return fmt.Errorf("bind %s: %w", tool.Name, err)
 		}
 	}

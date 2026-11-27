@@ -157,7 +157,7 @@ def build(inputs: Path, work: Path, log) -> dict[str, Path]:
     run(["./configure", "--disable-nls", "--disable-elf-shlibs", "--disable-bsd-shlibs", "--disable-uuidd",
          "--disable-fuse2fs", "--disable-defrag", "--disable-e2initrd-helper", "--disable-fsck"],
         e2, e2env, log)
-    run(["make", "-j2", "-C", "lib"], e2, e2env, log)
+    run(["make", "-j2", "libs"], e2, e2env, log)
     run(["make", "-j2", "-C", "misc", "mke2fs"], e2, e2env, log)
     run(["make", "-j2", "-C", "resize", "resize2fs"], e2, e2env, log)
 
