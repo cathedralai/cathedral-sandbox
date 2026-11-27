@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"reflect"
 	"syscall"
@@ -479,18 +478,16 @@ func (r *run) firstBoot(cur Current) (Meta, error) {
 	if err := r.mapFS(); err != nil {
 		return Meta{}, err
 	}
-	recovery := make([]byte, 32)
-	defer clear(recovery)
-	if _, err := io.ReadFull(r.cfg.Random, recovery); err != nil {
-		return Meta{}, fmt.Errorf("recovery key: %w", err)
-	}
-	if bytes.Equal(recovery, make([]byte, 32)) {
-		return Meta{}, errors.New("recovery key is zero")
-	}
 	cut := func(point string) error { r.log("vm-disk: %s", point); cutAfter(point); return nil }
-	if err := r.cfg.Setup.FirstBoot(r.ctx, r.fs, recovery, cut); err != nil {
+	key, err := r.cfg.Setup.FirstBoot(r.ctx, r.fs, cut)
+	defer clear(key[:])
+	if err != nil {
 		return Meta{}, fmt.Errorf("first boot setup: %w", err)
 	}
+	if key == [32]byte{} {
+		return Meta{}, errors.New("recovery key is zero")
+	}
+	recovery := key[:]
 	r.fs.Close()
 	r.fs = nil
 	if err := r.dm.remove(r.cfg.Names.FS); err != nil {

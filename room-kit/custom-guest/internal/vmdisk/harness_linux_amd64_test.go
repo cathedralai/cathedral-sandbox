@@ -188,34 +188,38 @@ func (h *harness) powerOff() {
 }
 
 // fakeSetup stands in for vmroot (PR C): it writes markers over the file
-// system area and R where the recovery key file would hold it, with the
-// step 4.2 and 4.3 cut points between.
+// system area, makes R and writes it where the recovery key file would
+// hold it, with the step 4.2 and 4.3 cut points between.
 type fakeSetup struct{}
 
 const fsMarker = "CVM-TEST-FS-MARKER"
 
-func (fakeSetup) FirstBoot(_ context.Context, fs *os.File, recovery []byte, cut func(string) error) error {
+func (fakeSetup) FirstBoot(_ context.Context, fs *os.File, cut func(string) error) ([32]byte, error) {
+	var recovery [32]byte
 	block := make([]byte, 4096)
 	copy(block, fsMarker+" copy")
 	if _, err := fs.WriteAt(block, 0); err != nil {
-		return err
+		return recovery, err
 	}
 	fs.Sync()
 	cut("copy")
 	copy(block, fsMarker+" grown")
 	if _, err := fs.WriteAt(block, MiB); err != nil {
-		return err
+		return recovery, err
 	}
 	fs.Sync()
 	cut("resize2fs")
+	if _, err := rand.Read(recovery[:]); err != nil {
+		return recovery, err
+	}
 	clear(block)
-	copy(block, recovery)
+	copy(block, recovery[:])
 	if _, err := fs.WriteAt(block, 2*MiB); err != nil {
-		return err
+		return recovery, err
 	}
 	fs.Sync()
 	cut("recovery-file")
-	return nil
+	return recovery, nil
 }
 
 // boot runs one boot of d in this process and powers off after it.
@@ -225,7 +229,7 @@ func (h *harness) boot(d *disk, id vmidentity.Identity, k key) (Outcome, error, 
 	defer func() { f.Close(); h.powerOff(); d.detach() }()
 	var lines []string
 	out, err := Run(context.Background(), Config{Disk: f, DiskBytes: testDisk, Identity: id, Passphrase: k.pass,
-		Measurement: k.meas, Cryptsetup: h.tool, Names: h.names, Setup: fakeSetup{}, Random: rand.Reader,
+		Measurement: k.meas, Cryptsetup: h.tool, Names: h.names, Setup: fakeSetup{},
 		Log: func(s string) { lines = append(lines, s) }})
 	if out.FSArea != nil {
 		out.FSArea.Close()

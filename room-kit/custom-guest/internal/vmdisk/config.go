@@ -3,7 +3,6 @@ package vmdisk
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 
 	"github.com/cathedralai/cathedral-sandbox/custom-guest/internal/vmidentity"
@@ -32,10 +31,11 @@ func (n Names) all() []string { return []string{n.FS, n.Crypt, n.Probe, n.LUKS} 
 
 // Setup is spec r3 7.2 steps 4.2 and 4.3 on the file system area (vmroot,
 // PR C): copy the verified base image, resize2fs, user cathedral, host
-// keys, cloud-init off, sync; then write the recovery key file; sync. It
-// calls cut after each of its own steps.
+// keys, cloud-init off, sync; then make the recovery key R, write its file
+// and sync. It returns R, which step 4.4 adds as a keyslot, with nothing
+// left mounted on fsArea. It calls cut after each of its own steps.
 type Setup interface {
-	FirstBoot(ctx context.Context, fsArea *os.File, recovery []byte, cut func(string) error) error
+	FirstBoot(ctx context.Context, fsArea *os.File, cut func(string) error) (recovery [32]byte, err error)
 }
 
 // Config is one boot's disk inputs.
@@ -48,7 +48,6 @@ type Config struct {
 	Cryptsetup  Tool
 	Names       Names
 	Setup       Setup
-	Random      io.Reader // the recovery key R
 	Log         func(string)
 }
 
@@ -66,8 +65,8 @@ type Outcome struct {
 
 func (c Config) check() error {
 	switch {
-	case c.Disk == nil, len(c.Passphrase) != 32, c.Measurement == [48]byte{}, c.Setup == nil, c.Random == nil,
-		c.Log == nil, c.Identity.VMID == "":
+	case c.Disk == nil, len(c.Passphrase) != 32, c.Measurement == [48]byte{}, c.Setup == nil, c.Log == nil,
+		c.Identity.VMID == "":
 		return errors.New("disk config incomplete")
 	}
 	for _, name := range c.Names.all() {

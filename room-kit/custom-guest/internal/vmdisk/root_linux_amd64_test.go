@@ -267,7 +267,7 @@ func TestRootExistingMappingRefusesTheBoot(t *testing.T) {
 	}
 	ctl.close()
 	_, err = Run(context.Background(), Config{Disk: f, DiskBytes: testDisk, Identity: id, Passphrase: k.pass,
-		Measurement: k.meas, Cryptsetup: h.tool, Names: h.names, Setup: fakeSetup{}, Random: bytes.NewReader(make([]byte, 64)),
+		Measurement: k.meas, Cryptsetup: h.tool, Names: h.names, Setup: fakeSetup{},
 		Log: func(string) {}})
 	f.Close()
 	h.powerOff()
@@ -281,7 +281,7 @@ func TestRootExistingMappingRefusesTheBoot(t *testing.T) {
 	// The wrong size is refused before any mapping.
 	f = d.attach()
 	_, err = Run(context.Background(), Config{Disk: f, DiskBytes: testDisk + MiB, Identity: id, Passphrase: k.pass,
-		Measurement: k.meas, Cryptsetup: h.tool, Names: h.names, Setup: fakeSetup{}, Random: bytes.NewReader(make([]byte, 64)),
+		Measurement: k.meas, Cryptsetup: h.tool, Names: h.names, Setup: fakeSetup{},
 		Log: func(string) {}})
 	f.Close()
 	h.powerOff()

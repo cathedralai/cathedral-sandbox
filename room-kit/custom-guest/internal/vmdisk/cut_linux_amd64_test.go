@@ -4,7 +4,6 @@ package vmdisk
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -61,7 +60,7 @@ func TestHelperBoot(t *testing.T) {
 	}
 	out, err := Run(context.Background(), Config{Disk: disk, DiskBytes: testDisk, Identity: id, Passphrase: pass,
 		Measurement: meas, Cryptsetup: Tool{Path: cfg.Tool, SHA256: sha256.Sum256(tool), Name: "cryptsetup"},
-		Names: cfg.Names, Setup: fakeSetup{}, Random: rand.Reader,
+		Names: cfg.Names, Setup: fakeSetup{},
 		Log: func(s string) { fmt.Fprintln(journal, s); journal.Sync() }})
 	if err != nil {
 		t.Fatal(err)
