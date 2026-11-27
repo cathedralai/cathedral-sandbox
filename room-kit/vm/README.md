@@ -320,8 +320,9 @@ the guest; the answer at 128 KiB, written by the host. A record is `CVMMBX1\0`, 
 4-byte big-endian body length, the body's sha256 and a canonical JSON body (at most 64 KiB minus
 the 45-byte header; 4096 bytes for the answer).
 
-- **Read:** magic, kind, length bound and sha256; a mismatch is a torn read, read again 5 times
-  200 ms apart. Then a bounded pre-scan refuses any nesting before the parser runs, and the keys
+- **Read:** magic, kind, length bound and sha256; a mismatch is a torn read. `status` and `list`
+  read each slot once (a torn slot is empty there); only `rewrap`, under that VM's lock, reads
+  the offer again, 5 times 200 ms apart. Then a bounded pre-scan refuses any nesting before the parser runs, and the keys
   must be exactly the schema's, each with its type and length. Any failure, of any exception
   type, is an empty slot: it never fails `status`, `list` or another VM.
 - **Host access:** the VM directory (root's, 0700) opened with `O_DIRECTORY|O_NOFOLLOW`, then

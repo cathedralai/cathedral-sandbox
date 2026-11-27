@@ -172,30 +172,35 @@ def test_a_slot_that_never_checks_counts_as_empty(waiting, why):
     assert (code, res["error"]) == (3, "no_rewrap_offer") and waiting.box.read_bytes() == before
 
 
-def test_a_torn_record_is_read_again_until_it_checks(waiting, monkeypatch):
-    """A prefix of the record, then the rest lands while the host waits: read whole. One that never
-    lands is read MAILBOX_RETRIES more times, then counts as empty."""
+def test_status_reads_each_slot_once_and_rewrap_waits_for_a_torn_offer(waiting, monkeypatch):
+    """A prefix of the record, then the rest lands while the host waits. status and list read once
+    (a torn slot is empty there, with no wait); rewrap reads the offer again until it checks, and
+    one that never lands is read MAILBOX_RETRIES more times, then counts as empty."""
     whole = M.encode_slot(M.KIND_OFFER, OFFER_BODY)
-    put(waiting.box, M.OFFER_OFFSET, whole[:45 + 700] + bytes(M.SLOT_BYTES - 745))
+    torn = whole[:45 + 700] + bytes(M.SLOT_BYTES - 745)
+    put(waiting.box, M.OFFER_OFFSET, torn)
     for k, v in waiting.environ.items():
         monkeypatch.setenv(k, v)
     mod = _load("vm_ctl_torn_test", KIT / "vm_ctl.py")
     sleeps = []
+    monkeypatch.setattr(mod.time, "sleep", sleeps.append)
+    assert mod.status_of("vm1")["rewrap_offer"] is None and sleeps == []
+    assert mod.cmd_list([])["vms"][0]["rewrap_offer"] is None and sleeps == []
 
     def lands(seconds):
         sleeps.append(seconds)
         if len(sleeps) == 2:
             put(waiting.box, M.OFFER_OFFSET, whole)
     monkeypatch.setattr(mod.time, "sleep", lands)
-    fd = mod.mailbox_open(waiting.root / "vm1", ME.pw_name)
-    try:
-        assert mod.mailbox_slot(fd, M.OFFER_OFFSET) == OFFER_BODY and len(sleeps) == 2
-        put(waiting.box, M.OFFER_OFFSET, whole[:45 + 700] + bytes(M.SLOT_BYTES - 745))
-        sleeps.clear()
-        monkeypatch.setattr(mod.time, "sleep", sleeps.append)
-        assert mod.mailbox_slot(fd, M.OFFER_OFFSET) is None and len(sleeps) == mod.MAILBOX_RETRIES
-    finally:
-        os.close(fd)
+    res = mod.cmd_rewrap(["vm1", "--generation", "1"], ANSWER)
+    assert res["written"] is True and len(sleeps) == 2
+    assert slot_of(waiting.box, M.ANSWER_OFFSET) == M.encode_slot(M.KIND_ANSWER, ANSWER)
+    put(waiting.box, M.OFFER_OFFSET, torn)
+    sleeps.clear()
+    monkeypatch.setattr(mod.time, "sleep", sleeps.append)
+    with pytest.raises(mod.Refusal) as refused:
+        mod.cmd_rewrap(["vm1", "--generation", "1"], ANSWER)
+    assert refused.value.error == "no_rewrap_offer" and len(sleeps) == mod.MAILBOX_RETRIES
 
 
 # ---- rewrap ------------------------------------------------------------------------------------

@@ -93,7 +93,9 @@ COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status"
             "cancel", "history", "rebundle", "rewrap")
 STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
 MAILBOX_BYTES = vm_mailbox.MAILBOX_BYTES
-# A torn guest record (spec r3 7.5 Read) is read again this many times, this far apart.
+# rewrap reads a torn offer (spec r3 7.5 Read) again this many times, this far apart, under that
+# VM's lock only. status and list read each slot once: a guest that keeps its slot torn must not
+# slow every list on the host.
 MAILBOX_RETRIES = 5
 MAILBOX_RETRY_WAIT = float(os.environ.get("VM_MAILBOX_RETRY_WAIT", "0.2"))
 # Rebundle (spec r3 7.5 step 1): the applied op_ids a VM remembers, with their results.
@@ -438,24 +440,24 @@ def mailbox_open(d: Path, user: str, write: bool = False) -> int:
     return fd
 
 
-def mailbox_slot(fd: int, offset: int) -> bytes | None:
+def mailbox_slot(fd: int, offset: int, retries: int = 0) -> bytes | None:
     """The record body in the slot at offset, or None when the slot is empty. A torn record is read
-    again MAILBOX_RETRIES times, MAILBOX_RETRY_WAIT apart; one that never checks is empty."""
+    again up to retries times, MAILBOX_RETRY_WAIT apart; one that never checks is empty."""
     kind = vm_mailbox.SLOT_KIND[offset]
-    for attempt in range(MAILBOX_RETRIES + 1):
+    for attempt in range(retries + 1):
         try:
             return vm_mailbox.decode_slot(os.pread(fd, vm_mailbox.SLOT_BYTES, offset), kind)
         except vm_mailbox.Torn:
-            if attempt < MAILBOX_RETRIES:
+            if attempt < retries:
                 time.sleep(MAILBOX_RETRY_WAIT)
     return None
 
 
-def guest_record(fd: int, offset: int) -> tuple[dict, bytes] | None:
+def guest_record(fd: int, offset: int, retries: int = 0) -> tuple[dict, bytes] | None:
     """A guest slot's (document, body bytes), or None. The bytes are the guest's: any failure, of any
     exception type (a recursion or memory error too), is an empty slot."""
     try:
-        body = mailbox_slot(fd, offset)
+        body = mailbox_slot(fd, offset, retries)
         return None if body is None else (vm_mailbox.parse_body(body, vm_mailbox.SLOT_KIND[offset]), body)
     except Exception:
         return None
@@ -464,7 +466,8 @@ def guest_record(fd: int, offset: int) -> tuple[dict, bytes] | None:
 def mailbox_view(d: Path, env: dict, running: bool) -> dict:
     """What status shows of the mailbox (spec r3 7.2, 7.5 step 3): the guest's status record and,
     while the VM runs, the offer its guest waits with. Guest data, passed on and trusted by nothing
-    here; any problem is an empty slot, so it never fails status, list or another VM."""
+    here; any problem is an empty slot, so it never fails status, list or another VM. Each slot is
+    read once (no torn-read retry here)."""
     view: dict = {"vm_state": None, "guest_status": None, "rewrap_offer": None}
     try:
         fd = mailbox_open(d, env["VM_USER"])
@@ -1572,6 +1575,7 @@ def cmd_rebundle(args: list[str]) -> dict:
     (4) selection_values: else bundle_incompatible, exit 20. Then launch.json is written once (the
     commit point) with B2, its measurement, the revision + 1 and the op; vm.env and the unit
     follow (sync_selection), as start does again before its gates."""
+    # No admission check (vm_capacity.py): a rebundle keeps the VM's vCPUs, memory and disks.
     want = ("--generation", "--expect-revision", "--op-id", "--to")
     opts = parse_opts(args, set(want), 1)
     name = check_name(opts["_"][0])
@@ -1656,7 +1660,7 @@ def cmd_rewrap(args: list[str], answer: bytes | None) -> dict:
             raise Refusal("no_rewrap_offer", f"VM {name} is not running: no guest waits for an answer", 3)
         fd = mailbox_open(d, user, write=True)
         try:
-            offer = guest_record(fd, vm_mailbox.OFFER_OFFSET)
+            offer = guest_record(fd, vm_mailbox.OFFER_OFFSET, MAILBOX_RETRIES)
             if offer is None:
                 raise Refusal("no_rewrap_offer", "the offer slot holds no valid offer", 3)
             if vm_mailbox.body_sha256(offer[1]) != doc["offer_sha256"]:

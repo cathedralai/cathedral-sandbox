@@ -13,9 +13,9 @@ The body is canonical JSON (vm_measure.canonical, D 8.1), at most 64 KiB minus t
 header for status and offer, 4096 bytes for the answer.
 
 Everything the guest writes is untrusted. A reader checks the magic, the kind, the length bound
-and the sha256 (a mismatch is a torn read: the writer is mid-write, so the host retries); then
+and the sha256 (a mismatch is a torn read: the writer may be mid-write; rewrap reads again); then
 a bounded pre-scan refuses any nesting before the parser runs; then the keys must be exactly the
-schema's, each with its type and length. Any failure of any kind, after the retries, is an empty
+schema's, each with its type and length. Any failure of any kind, after any retries, is an empty
 slot (read_slot catches every exception): it never fails status, list or another VM.
 
 Guest rules: the init zeroes the offer slot on every boot that is not waiting for an answer, and
