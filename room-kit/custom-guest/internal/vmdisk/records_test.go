@@ -102,7 +102,7 @@ func TestIntentRefusesAnotherBody(t *testing.T) {
 func readyMeta(id vmidentity.Identity, seq int64) Meta {
 	var m [48]byte
 	m[0] = 0xaa
-	return Meta{Seq: seq, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateReady,
+	return Meta{Seq: seq, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateReady,
 		Slots: map[int]string{0: MeasurementRole(m), 1: RoleRecovery}}
 }
 
@@ -114,32 +114,57 @@ func TestMetaRoundTripAndTableRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok := ParseMeta(rec[:])
-	if !ok || got.Seq != 2 || got.State != StateReady || len(got.Slots) != 2 || got.Slots[1] != RoleRecovery || !got.Names(id) {
+	if !ok || got.Seq != 2 || got.DiskBytes != diskSize || got.State != StateReady || len(got.Slots) != 2 || got.Slots[1] != RoleRecovery || !got.Names(id) {
 		t.Fatalf("round trip %+v", got)
 	}
-	init := Meta{Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateInitializing, Slots: map[int]string{4: m.Slots[0]}}
+	init := Meta{Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateInitializing, Slots: map[int]string{4: m.Slots[0]}}
 	if _, err := EncodeMeta(init); err != nil {
 		t.Fatal(err)
 	}
 	for name, bad := range map[string]Meta{
-		"initializing with recovery": {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateInitializing, Slots: m.Slots},
-		"ready without recovery":     {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateReady, Slots: init.Slots},
-		"two recovery slots":         {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateReady, Slots: map[int]string{0: m.Slots[0], 1: RoleRecovery, 2: RoleRecovery}},
-		"seq 0":                      {Seq: 0, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateReady, Slots: m.Slots},
-		"slot 32":                    {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateReady, Slots: map[int]string{32: m.Slots[0], 1: RoleRecovery}},
-		"short measurement":          {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateReady, Slots: map[int]string{0: "m:aa", 1: RoleRecovery}},
-		"other state":                {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: "open", Slots: m.Slots},
+		"initializing with recovery": {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateInitializing, Slots: m.Slots},
+		"ready without recovery":     {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateReady, Slots: init.Slots},
+		"two recovery slots":         {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateReady, Slots: map[int]string{0: m.Slots[0], 1: RoleRecovery, 2: RoleRecovery}},
+		"seq 0":                      {Seq: 0, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateReady, Slots: m.Slots},
+		"slot 32":                    {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateReady, Slots: map[int]string{32: m.Slots[0], 1: RoleRecovery}},
+		"short measurement":          {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: StateReady, Slots: map[int]string{0: "m:aa", 1: RoleRecovery}},
+		"other state":                {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize, State: "open", Slots: m.Slots},
+		"no disk size":               {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), State: StateReady, Slots: m.Slots},
+		"disk under the minimum":     {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: MinDiskBytes - MiB, State: StateReady, Slots: m.Slots},
+		"disk not whole MiB":         {Seq: 1, VMID: id.VMID, IdentitySHA256: id.SHA256Hex(), DiskBytes: diskSize + 512, State: StateReady, Slots: m.Slots},
 	} {
 		if _, err := EncodeMeta(bad); err == nil {
 			t.Errorf("%s: encoded", name)
 		}
 	}
 	// A slot key that is not canonical decimal never parses.
-	raw, _ := vmidentity.Canonical(vmidentity.Object{"schema": MetaSchema, "seq": int64(1), "vm_id": id.VMID,
-		"identity_sha256": id.SHA256Hex(), "state": StateReady, "slots": vmidentity.Object{"00": m.Slots[0], "1": RoleRecovery}})
-	frameRec, _ := frame(metaMagic, raw)
-	if _, ok := ParseMeta(frameRec[:]); ok {
+	metaRecord := func(o vmidentity.Object) []byte {
+		raw, err := vmidentity.Canonical(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := frame(metaMagic, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec[:]
+	}
+	fields := func(slots vmidentity.Object) vmidentity.Object {
+		return vmidentity.Object{"schema": MetaSchema, "seq": int64(1), "vm_id": id.VMID, "identity_sha256": id.SHA256Hex(),
+			"disk_bytes": int64(diskSize), "state": StateReady, "slots": slots}
+	}
+	good := vmidentity.Object{"0": m.Slots[0], "1": RoleRecovery}
+	if _, ok := ParseMeta(metaRecord(fields(good))); !ok {
+		t.Fatal("the hand-built control record does not parse")
+	}
+	if _, ok := ParseMeta(metaRecord(fields(vmidentity.Object{"00": m.Slots[0], "1": RoleRecovery}))); ok {
 		t.Fatal("slot key 00 parsed")
+	}
+	// The #798 field set, without disk_bytes, is not a valid copy (#805).
+	old := fields(good)
+	delete(old, "disk_bytes")
+	if _, ok := ParseMeta(metaRecord(old)); ok {
+		t.Fatal("a meta without disk_bytes parsed")
 	}
 	for i := 0; i < RecordBytes; i += 7 {
 		flipped := rec

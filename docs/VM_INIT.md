@@ -61,14 +61,22 @@ Order of the probes: intent, header, (blank), opens, meta.
 
 | State | When | Then |
 |-------|------|------|
-| `open` | header rules hold, a slot opens with this key, a meta copy is valid and names this `vm_id` and `identity_sha256` | a nonzero intent area is zeroed first; `initializing` repeats step 4; a slot missing from the table is added (7.5 step 5) |
+| `open` | header rules hold, a slot opens with this key, a meta copy is valid, names this `vm_id` and `identity_sha256`, and records this boot's `disk_bytes` | a nonzero intent area is zeroed first; `initializing` repeats step 4; a slot missing from the table is added (7.5 step 5) |
 | `resume` | not committed, this VM's valid intent, and no LUKS2 header, a LUKS2 header with no keyslot, or a slot this key opens with no valid meta | format from F3 |
 | `new` | no valid intent, not LUKS, every byte of the LUKS device zero | format from F1 |
 | `locked` | no valid intent, header rules hold, no slot opens | status, power off; never written |
 | `tampered` | no valid intent, a LUKS2 header that fails the rules | status, power off; never written |
-| `broken` | anything else: LUKS1; a LUKS magic (primary, or a LUKS2 secondary at any offset LUKS2 allows) that cryptsetup cannot read, with or without an intent; not blank and not LUKS with no intent; a valid intent with a keyslot this key cannot open; meta of another identity; a slot opens with no meta and no intent; a valid meta behind a header that fails the rules | status, power off; never written |
+| `broken` | anything else: LUKS1; a LUKS magic (primary, or a LUKS2 secondary at any offset LUKS2 allows) that cryptsetup cannot read, with or without an intent; not blank and not LUKS with no intent; a valid intent with a keyslot this key cannot open; meta of another identity; meta of another disk size, smaller or larger (#805); a slot opens with no meta and no intent; a valid meta behind a header that fails the rules | status, power off; never written |
 
 The host's `vm_state` shows `resume` as `new`.
+
+Disk size (#805): the layout is derived from root.raw's size (the LUKS device
+ends and the intent area starts 1 MiB before the end), so a committed volume
+opens only at the size its meta records. Smaller, the last MiB the open would
+zero as the intent area is live ciphertext; larger, the old intent area and any
+tail join the volume under a file system that never had them. Both are `broken`
+and nothing is written. Growing a root disk needs its own step that rewrites
+`disk_bytes`; none exists yet.
 
 The last `broken` row is stricter than r3's text (D4 on PR #798): a header that
 fails the rules, a slot this key opens and a valid meta would read as `resume`,
@@ -91,7 +99,7 @@ kernel's crypt table must be the same cipher, sector size and device.
 - F1 (`new` only): the zero read of the LUKS device.
 - F2: write the intent and read it back.
 - F3: `luksFormat` (aes-xts-plain64, 512-bit key, 4 KiB sectors, data offset 16 MiB) with the M key; open; check the header rules.
-- F4: meta copy 0, `seq` 1, `initializing`, the M slot only. The commit point.
+- F4: meta copy 0, `seq` 1, `initializing`, the M slot only, and `disk_bytes` (root.raw's size now). The commit point. Every later meta write copies `disk_bytes`.
 - F5: zero the intent area and read it back as zero.
 - 4.1: remove every keyslot the table does not list.
 - 4.2, 4.3: root setup on the file system area; it returns the recovery key R.
