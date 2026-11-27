@@ -227,6 +227,9 @@ boot configuration, embedded initramfs and unused hardware drivers are disabled.
 `CONFIG_IPV6_SIT` is disabled too: `x86_64_defconfig` turns it on, the kernel
 then creates a device-less `sit0` at boot, and `bootstate` refuses every
 interface except the one virtio NIC. The build fails if any of these come back.
+`make` runs with `HAVE_XXHASH=n`: objtool otherwise builds its livepatch part on
+any host with libxxhash, and that part of this Ubuntu tree does not compile.
+Livepatch needs modules, so the kernel has none either way.
 
 The recipe contains one explicit source adjustment: x86 `COMMAND_LINE_SIZE`
 is increased from 2048 to 4096. Linux advertises one less in the boot header;
