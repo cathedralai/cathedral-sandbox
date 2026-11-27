@@ -1,0 +1,56 @@
+name: VM guest
+
+# The root-needing tests of the sealed VM guest (AB#999, VM1b): loop devices, dm-verity and
+# e2fsprogs. The ordinary Go tests of these packages already run in ci.yml (go test -race ./...).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "room-kit/custom-guest/**"
+      - "room-kit/vm/**"
+      - "scripts/build_vm_initrd_tools.py"
+      - "scripts/vm_initrd_tools_inputs.json"
+      - "tests/test_vm_initrd.py"
+      - ".github/workflows/vm-guest.yml"
+  pull_request:
+    paths:
+      - "room-kit/custom-guest/**"
+      - "room-kit/vm/**"
+      - "scripts/build_vm_initrd_tools.py"
+      - "scripts/vm_initrd_tools_inputs.json"
+      - "tests/test_vm_initrd.py"
+      - ".github/workflows/vm-guest.yml"
+
+concurrency:
+  group: vm-guest-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  vmroot:
+    name: vmroot on loop devices (root)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.11"
+          cache: false
+      - name: Packages and kernel modules
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cryptsetup-bin e2fsprogs
+          sudo modprobe loop dm-mod dm-verity || true
+          lsmod | grep -E 'dm_verity|loop' || true
+          veritysetup --version
+      - name: Build the test binary as the runner user
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: go test -c -o "$RUNNER_TEMP/vmroot.test" ./internal/vmroot
+      - name: Run it as root
+        working-directory: room-kit/custom-guest/internal/vmroot
+        run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmroot.test" -test.v -test.count=1
