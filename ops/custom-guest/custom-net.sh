@@ -159,8 +159,13 @@ link_clash() {
     case "$cidr" in
       10.217.$N.*) fail custom_guest_port_unavailable "$dev already holds $cidr, inside this launch's /30" ;;
     esac
-    [ "$dev" = "$TAP" ] && fail custom_guest_port_unavailable "$TAP holds $cidr, not $HOST/30"
+    if [ "$dev" = "$TAP" ]; then
+      fail custom_guest_port_unavailable "$TAP holds $cidr, not $HOST/30"
+    fi
   done < <(ip -4 -o addr show 2>/dev/null || true)
+  # Without this, a loop whose last address is not the tap returns the false test's 1, and set -e
+  # ends "up" with no message (rehearsal B, 27 Nov: every real host lists lo and its uplink).
+  return 0
 }
 
 load() {
