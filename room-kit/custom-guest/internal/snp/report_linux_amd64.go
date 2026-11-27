@@ -183,7 +183,9 @@ func CheckLocal(report []byte, data [64]byte, hostData *[32]byte) error {
 		return errors.New("report length invalid")
 	}
 	version := binary.LittleEndian.Uint32(report[:4])
-	if version != 2 && version != 3 {
+	// AMD ABI 1.58 table 23 keeps these local binding fields at the same
+	// offsets in reports 2 through 5. Unknown future layouts must fail closed.
+	if version < 2 || version > 5 {
 		return errors.New("report version invalid")
 	}
 	if binary.LittleEndian.Uint64(report[8:16]) != 0x30000 {

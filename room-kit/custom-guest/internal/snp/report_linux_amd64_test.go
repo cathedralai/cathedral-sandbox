@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,7 +125,7 @@ func TestLocalBindingRefusesMismatches(t *testing.T) {
 			case "length":
 				report = report[:100]
 			case "version":
-				report[0] = 4
+				report[0] = 6
 			case "policy":
 				report[8] ^= 1
 			case "vmpl":
@@ -145,7 +146,7 @@ func TestLocalBindingRefusesMismatches(t *testing.T) {
 			}
 		})
 	}
-	for _, version := range []byte{2, 3} {
+	for _, version := range []byte{2, 3, 4, 5} {
 		report := validReport(data)
 		report[0] = version
 		if err := CheckLocal(report, data, &[32]byte{}); err != nil {
@@ -193,5 +194,47 @@ func TestPublicKeyFileChecks(t *testing.T) {
 	}
 	if _, err = PublicKey(dir); err == nil {
 		t.Fatal("directory accepted")
+	}
+}
+
+// Exercise the ioctl extraction and boot HOST_DATA check for every supported
+// layout. These are synthetic firmware responses, not hardware evidence.
+func TestReportVersionsThroughCollection(t *testing.T) {
+	for _, version := range []uint32{0, 1, 2, 3, 4, 5, 6, 0x10000005} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			data := BootData([32]byte{7})
+			host := [32]byte{9}
+			report, err := collectWith(data, func(_ *reportRequest, resp *[4000]byte) (uint64, error) {
+				binary.LittleEndian.PutUint32(resp[4:8], ReportBytes)
+				raw := validReport(data)
+				binary.LittleEndian.PutUint32(raw[:4], version)
+				copy(raw[0xc0:0xe0], host[:])
+				copy(resp[32:], raw)
+				return 0, nil
+			})
+			if version < 2 || version > 5 {
+				if err == nil || report != nil {
+					t.Fatal("unknown report version accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := CheckLocal(report, data, &host); err != nil {
+				t.Fatal(err)
+			}
+			for _, offset := range []int{8, 0x30, 0x48, 0x50, 0xc0} {
+				mutated := append([]byte(nil), report...)
+				if offset == 0x48 {
+					mutated[offset] = 4
+				} else {
+					mutated[offset] ^= 1
+				}
+				if err := CheckLocal(mutated, data, &host); err == nil {
+					t.Fatalf("version %d accepted changed binding at %#x", version, offset)
+				}
+			}
+		})
 	}
 }
