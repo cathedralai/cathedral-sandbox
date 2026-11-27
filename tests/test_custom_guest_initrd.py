@@ -57,6 +57,17 @@ def test_deterministic_roundtrip_and_standard_cpio_reader():
         assert result.stdout.decode().splitlines() == [r[0] for r in records()]
 
 
+def test_large_static_closure_roundtrip():
+    # Model the size/window of a real static init and helper, rather than only
+    # tiny ELF fixtures. This is an archive test, not an executable boot image.
+    files = {name: data + bytes(2 * 1024 * 1024) for name, data in inputs()[0].items()}
+    closure = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+    raw = archive.build_raw(files, closure)
+    packed = archive.pack(raw, closure)
+    assert zstandard.get_frame_parameters(packed).window_size > 256 * 1024
+    assert archive.unpack(packed, closure) == raw
+
+
 @pytest.mark.parametrize("change", ["duplicate", "absolute", "dotdot", "dot", "symlink", "device",
                                     "fifo", "unlisted", "missing", "setuid", "nonexec_init", "parent_file"])
 def test_archive_rejects_unsafe_layout(change):

@@ -369,3 +369,24 @@ and proves the root/mount/descriptor/environment handoff. It deliberately
 bypasses preparation; it does not prove signed inputs, verity or SNP boot.
 The complete PID1 caller, memory rule, data unlock and hardware proof remain
 pending. Do not treat these component tests as a complete boot image.
+
+### Early kernel views and report permissions
+
+`PrepareKernelViews` is a root-PID1-only component intended to run before any
+launch input is read. It makes mount propagation private, mounts fresh proc,
+sysfs and devtmpfs views, and restricts the kernel-identified SNP character
+device to root:root 0600. It mounts configfs and restricts its root to 0700
+before owner code can access the TSM report interface. Invalid targets or any
+failed mount/permission check stop preparation; the caller must power off.
+
+Tests cover ordering, failure at every stage, alias refusal and permission
+readback. The positive character-device test uses a newly created null-driver
+inode in a private scratch filesystem. Tests never mount production devtmpfs
+or configfs and never change the host SNP device. A mount namespace alone is
+not isolation for these kernel-global objects: do not run this setup component
+in a host/container rehearsal.
+
+This component is not yet wired into a complete PID1. The inherited `/run`
+capacity also needs validation with the reference systemd boot; the current
+16 MiB/256-inode cap has a review concern and is not a qualified runtime limit.
+These additions do not establish a bootable image or hardware acceptance.
