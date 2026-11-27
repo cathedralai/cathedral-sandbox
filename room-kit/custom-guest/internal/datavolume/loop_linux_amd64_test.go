@@ -142,6 +142,7 @@ func (l *loopFixture) mapperPresent() bool {
 
 type spy struct {
 	*HeldDevice
+	t       *testing.T
 	formats int
 	opens   int
 	mkfs    error // injected MakeFilesystem failure: a power cut at that step
@@ -159,18 +160,38 @@ type cutMapping struct {
 
 func (c cutMapping) MakeFilesystem(context.Context) error { return c.err }
 
+// loggedMapping reports which Verify check failed. Unlock deliberately hides
+// adapter errors behind a fixed message, so without this a root CI failure only
+// says "policy mismatch".
+type loggedMapping struct {
+	OwnedMapping
+	t *testing.T
+}
+
+func (l loggedMapping) Verify(ctx context.Context) error {
+	err := l.OwnedMapping.Verify(ctx)
+	if err != nil {
+		l.t.Logf("verify: %v", err)
+	}
+	return err
+}
+
 func (s *spy) Open(ctx context.Context, p []byte) (OwnedMapping, error) {
 	s.opens++
 	m, err := s.HeldDevice.Open(ctx, p)
-	if m != nil && s.mkfs != nil {
-		return cutMapping{m, s.mkfs}, err
+	if m == nil {
+		return nil, err
 	}
-	return m, err
+	var owned OwnedMapping = loggedMapping{m, s.t}
+	if s.mkfs != nil {
+		owned = cutMapping{owned, s.mkfs}
+	}
+	return owned, err
 }
 
 func TestLoopBlankDiskFormatsAndMountsRestricted(t *testing.T) {
 	l := newLoop(t)
-	s := &spy{HeldDevice: l.held()}
+	s := &spy{t: t, HeldDevice: l.held()}
 	if err := l.unlock(s, testSecret); err != nil {
 		t.Fatal(err)
 	}
@@ -206,14 +227,14 @@ func TestLoopBlankDiskFormatsAndMountsRestricted(t *testing.T) {
 
 func TestLoopRerunOpensWithoutFormat(t *testing.T) {
 	l := newLoop(t)
-	if err := l.unlock(&spy{HeldDevice: l.held()}, testSecret); err != nil {
+	if err := l.unlock(&spy{t: t, HeldDevice: l.held()}, testSecret); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(l.tools.mountTarget, "keep"), []byte("kept"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	l.teardown()
-	s := &spy{HeldDevice: l.held()}
+	s := &spy{t: t, HeldDevice: l.held()}
 	if err := l.unlock(s, testSecret); err != nil {
 		t.Fatal(err)
 	}
@@ -228,12 +249,12 @@ func TestLoopRerunOpensWithoutFormat(t *testing.T) {
 
 func TestLoopWrongPassphraseNeverFormats(t *testing.T) {
 	l := newLoop(t)
-	if err := l.unlock(&spy{HeldDevice: l.held()}, testSecret); err != nil {
+	if err := l.unlock(&spy{t: t, HeldDevice: l.held()}, testSecret); err != nil {
 		t.Fatal(err)
 	}
 	l.teardown()
 	before := l.sha()
-	s := &spy{HeldDevice: l.held()}
+	s := &spy{t: t, HeldDevice: l.held()}
 	if err := l.unlock(s, "not the passphrase"); err == nil {
 		t.Fatal("wrong passphrase unlocked")
 	}
@@ -253,7 +274,7 @@ func TestLoopNonzeroByteWithoutLUKSRefused(t *testing.T) {
 	}
 	f.Close()
 	before := l.sha()
-	s := &spy{HeldDevice: l.held()}
+	s := &spy{t: t, HeldDevice: l.held()}
 	if err := l.unlock(s, testSecret); err == nil {
 		t.Fatal("nonblank unmarked disk accepted")
 	}
@@ -266,7 +287,7 @@ func TestLoopNonzeroByteWithoutLUKSRefused(t *testing.T) {
 // filesystem, refuses, and does not format again.
 func TestLoopCutBeforeMkfsRefusesNextRun(t *testing.T) {
 	l := newLoop(t)
-	cut := &spy{HeldDevice: l.held(), mkfs: errors.New("power cut")}
+	cut := &spy{t: t, HeldDevice: l.held(), mkfs: errors.New("power cut")}
 	if err := l.unlock(cut, testSecret); err == nil {
 		t.Fatal("cut run reported success")
 	}
@@ -277,7 +298,7 @@ func TestLoopCutBeforeMkfsRefusesNextRun(t *testing.T) {
 		t.Fatal("cut run left a mapping open")
 	}
 	before := l.sha()
-	next := &spy{HeldDevice: l.held()}
+	next := &spy{t: t, HeldDevice: l.held()}
 	err := l.unlock(next, testSecret)
 	if err == nil || !strings.Contains(err.Error(), "not formatting") {
 		t.Fatalf("next run: %v", err)
@@ -304,7 +325,7 @@ func TestLoopNullCipherHeaderRefusedBeforeOpen(t *testing.T) {
 		t.Fatalf("could not create the null-cipher fixture: %v\n%s", err, out)
 	}
 	before := l.sha()
-	s := &spy{HeldDevice: l.held()}
+	s := &spy{t: t, HeldDevice: l.held()}
 	err := l.unlock(s, testSecret)
 	if err == nil || !strings.Contains(err.Error(), "policy mismatch") {
 		t.Fatalf("err=%v", err)
@@ -317,7 +338,7 @@ func TestLoopNullCipherHeaderRefusedBeforeOpen(t *testing.T) {
 // Verify must compare the backing device, not just the name.
 func TestLoopVerifyRefusesWrongBackingDisk(t *testing.T) {
 	l := newLoop(t)
-	if err := l.unlock(&spy{HeldDevice: l.held()}, testSecret); err != nil {
+	if err := l.unlock(&spy{t: t, HeldDevice: l.held()}, testSecret); err != nil {
 		t.Fatal(err)
 	}
 	m := &mapping{dev: "7:255", size: loopSize, tools: l.tools}
@@ -355,7 +376,7 @@ func TestLoopMountTargetInUseRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	sh(t, "mount", "-t", "tmpfs", "tmpfs", l.tools.mountTarget)
-	s := &spy{HeldDevice: l.held()}
+	s := &spy{t: t, HeldDevice: l.held()}
 	if err := l.unlock(s, testSecret); err == nil {
 		t.Fatal("mounted over an occupied target")
 	}

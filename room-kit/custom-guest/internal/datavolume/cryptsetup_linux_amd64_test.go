@@ -284,3 +284,48 @@ func TestFilesystemAndMountParsing(t *testing.T) {
 		t.Fatal("duplicate status key not poisoned")
 	}
 }
+
+// status2_8_4 is `cryptsetup status` from the pinned helper (2.8.4) over this
+// adapter's own mapping on a loop device.
+const status2_8_4 = `/dev/mapper/cathedral-data is active.
+  type:    LUKS2
+  cipher:  aes-xts-plain64
+  keysize: 768 [bits]
+  key location: keyring
+  integrity: hmac(sha256)
+  integrity keysize: 256 [bits]
+  integrity tag size: 32 [bytes]
+  device:  /dev/loop0
+  loop:    /tmp/disk.img
+  sector size:  4096 [bytes]
+  offset:  0 [512-byte units] (0 [bytes])
+  size:    225728 [512-byte units] (115572736 [bytes])
+  mode:    read/write
+`
+
+func TestStatusPolicy(t *testing.T) {
+	if err := statusPolicy([]byte(status2_8_4)); err != nil {
+		t.Fatalf("pinned helper's own status refused: %v", err)
+	}
+	refuse := map[string][2]string{
+		"2.7 keysize format": {"keysize: 768 [bits]", "keysize: 768 bits"},
+		"2.7 sector format":  {"sector size:  4096 [bytes]", "sector size:  4096"},
+		"xts-256":            {"keysize: 768 [bits]", "keysize: 512 [bits]"},
+		"no integrity key":   {"  integrity keysize: 256 [bits]\n", ""},
+		"512-byte sectors":   {"4096 [bytes]\n  offset", "512 [bytes]\n  offset"},
+		"cbc":                {"aes-xts-plain64", "aes-cbc-essiv:sha256"},
+		"hmac-sha1":          {"integrity: hmac(sha256)", "integrity: hmac(sha1)"},
+		"readonly":           {"read/write", "readonly"},
+		"suspended":          {"read/write", "read/write (suspended)"},
+		"discards":           {"mode:    read/write\n", "mode:    read/write\n  flags:   discards \n"},
+		"duplicate cipher":   {"  key location", "  cipher:  aes-xts-plain64\n  key location"},
+	}
+	for name, edit := range refuse {
+		if !strings.Contains(status2_8_4, edit[0]) {
+			t.Fatalf("%s: fixture lacks %q", name, edit[0])
+		}
+		if err := statusPolicy([]byte(strings.Replace(status2_8_4, edit[0], edit[1], 1))); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}

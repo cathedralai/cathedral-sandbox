@@ -79,6 +79,32 @@ func parseStatus(raw []byte) map[string]string {
 	return fields
 }
 
+// statusPolicy checks `cryptsetup status` output in the format of cryptsetup
+// 2.8.4, the pinned helper (2.7.x prints "768 bits" and a bare sector size, and
+// is refused rather than guessed at). `status` cannot name the LUKS type here (it
+// may print "n/a" without the header device); the dm uuid prefix in Verify
+// carries that. 768 bits is the 64-byte XTS key plus the 32-byte HMAC key.
+func statusPolicy(raw []byte) error {
+	f := parseStatus(raw)
+	want := []struct{ key, value string }{
+		{"cipher", "aes-xts-plain64"},
+		{"keysize", "768 [bits]"},
+		{"integrity", "hmac(sha256)"},
+		{"integrity keysize", "256 [bits]"},
+		{"sector size", "4096 [bytes]"},
+		{"mode", "read/write"},
+	}
+	for _, w := range want {
+		if f[w.key] != w.value {
+			return errors.New("data mapping policy mismatch: status " + w.key)
+		}
+	}
+	if strings.Contains(f["flags"], "discards") {
+		return errors.New("data mapping policy mismatch: status flags")
+	}
+	return nil
+}
+
 // Verify reads back the live stack instead of trusting that a passphrase worked.
 // It requires, from the kernel and from the helper:
 //   - /dev/mapper/cathedral-data is a block device whose dm name and LUKS2 uuid match;
@@ -87,57 +113,49 @@ func parseStatus(raw []byte) map[string]string {
 //   - aes-xts-plain64, 4096-byte sectors, hmac(sha256) integrity with its
 //     32-byte key, read/write, no discards;
 //   - the usable size is positive and not larger than the held disk.
+//
+// Each refusal names the check that failed; none carries secret material.
 func (m *mapping) Verify(ctx context.Context) error {
-	fail := errors.New("data mapping policy mismatch")
+	fail := func(what string) error { return errors.New("data mapping policy mismatch: " + what) }
 	crypt, err := devNumber(m.node())
 	if err != nil {
-		return fail
+		return fail("mapper node")
 	}
 	if name, err := sysAttr(m.tools.sys, crypt, "dm/name"); err != nil || name != mapperName {
-		return fail
+		return fail("dm name")
 	}
 	if uuid, err := sysAttr(m.tools.sys, crypt, "dm/uuid"); err != nil || !strings.HasPrefix(uuid, "CRYPT-LUKS2-") {
-		return fail
+		return fail("dm uuid")
 	}
 	if s, err := sysAttr(m.tools.sys, crypt, "dm/suspended"); err != nil || s != "0" {
-		return fail
+		return fail("suspended")
 	}
 	sectors, err := sysAttr(m.tools.sys, crypt, "size")
 	if err != nil {
-		return fail
+		return fail("size")
 	}
 	n, err := unsigned(sectors)
 	if err != nil || n == 0 || n > uint64(m.size/512) {
-		return fail
+		return fail("size")
 	}
 	below, err := slaves(m.tools.sys, crypt)
 	if err != nil || len(below) != 1 {
-		return fail
+		return fail("crypt layer")
 	}
 	if uuid, err := sysAttr(m.tools.sys, below[0], "dm/uuid"); err != nil || !strings.HasPrefix(uuid, "CRYPT-INTEGRITY-") {
-		return fail
+		return fail("integrity layer")
 	}
 	disks, err := slaves(m.tools.sys, below[0])
 	if err != nil || len(disks) != 1 || disks[0] != m.dev {
-		return fail
+		return fail("backing disk")
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	res, err := m.tools.exec(cctx, command{args: []string{"status", mapperName}})
 	if err != nil {
-		return fail
+		return fail("status unavailable")
 	}
-	f := parseStatus(res.stdout)
-	// `status` cannot name the LUKS type here (it prints "n/a" without the header
-	// device); the dm uuid prefix above carries that. 768 bits is the 64-byte XTS
-	// key plus the 32-byte HMAC key.
-	sector := strings.TrimSuffix(f["sector size"], " [bytes]")
-	if f["cipher"] != "aes-xts-plain64" || sector != "4096" || f["keysize"] != "768 bits" ||
-		f["integrity"] != "hmac(sha256)" || f["integrity keysize"] != "256 bits" ||
-		f["mode"] != "read/write" || strings.Contains(f["flags"], "discards") {
-		return fail
-	}
-	return nil
+	return statusPolicy(res.stdout)
 }
 
 // Filesystem probes the plaintext side read-only. "ext4" requires the ext
