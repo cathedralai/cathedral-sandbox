@@ -60,6 +60,25 @@ func (h *hotel) customGuestHold() *customGuestHold {
 
 func (h *hotel) held() bool { return h.customGuestHold() != nil }
 
+// reservationView is h's owner, reservation tuple, drain and hold, read in
+// one h.cfgMu hold so they belong together. The operator view reads it under
+// b.mu, which every writer of these fields holds through its save and any
+// rollback.
+type reservationView struct {
+	reservedFor, ref, lentFrom, lentReportID string
+	gen                                      uint64
+	pinOnly, drain                           bool
+	hold                                     *customGuestHold
+}
+
+func (h *hotel) reservationView() reservationView {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	c := h.cfg
+	return reservationView{reservedFor: c.ReservedFor, ref: c.ReservationRef, lentFrom: c.LentFrom, lentReportID: c.LentReportID,
+		gen: c.ReservationGeneration, pinOnly: c.PinOnly, drain: c.Drain || c.CustomGuestHold != nil, hold: c.CustomGuestHold}
+}
+
 // cfgDrain is the drain the config file or a PATCH set, without the hold.
 func (h *hotel) cfgDrain() bool {
 	h.cfgMu.RLock()

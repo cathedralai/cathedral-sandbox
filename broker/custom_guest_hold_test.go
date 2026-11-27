@@ -921,3 +921,54 @@ func TestTheOperatorViewAlwaysCarriesTheHoldKey(t *testing.T) {
 		t.Fatalf("guest view carries the hold: %s", raw)
 	}
 }
+
+// Astra on 71f6702 (P1): the operator read-back must never show a tuple a
+// failed save later undoes. Two H3 copies carry expect_generation G; one
+// moves the hotel to G+1 in memory, then its save fails and rolls back. A GET
+// in that window must answer G with no hold, never G+1 with no hold, or the
+// API's retry fence (settle_unresolved) clears its guard while the delayed
+// copy can still match G.
+func TestTheOperatorReadBackNeverShowsATupleAFailedSaveUndoes(t *testing.T) {
+	for _, saveFails := range []bool{true, false} {
+		hc := newHoldChain(t, true, false)
+		paused, resume := make(chan struct{}), make(chan struct{})
+		oldHook, oldSync := beforeHotelPatchSave, durableSync
+		beforeHotelPatchSave = func(id string) {
+			if id == "a" {
+				close(paused)
+				<-resume
+			}
+		}
+		if saveFails {
+			durableSync = func(f *os.File) error { return os.ErrPermission }
+		}
+		patched := make(chan int, 1)
+		go func() { s, _ := hc.patch(t, h3Body(1)); patched <- s }()
+		<-paused // G+1 and the hold are in memory, not saved
+		read := make(chan map[string]any, 1)
+		go func() {
+			_, doc := hc.call(t, "operator-key", "GET", "/v1/broker/hotels/a", nil)
+			read <- doc
+		}()
+		time.Sleep(200 * time.Millisecond) // the GET runs while the PATCH holds the save
+		close(resume)
+		s := <-patched
+		durableSync, beforeHotelPatchSave = oldSync, oldHook
+		doc := <-read
+		if saveFails {
+			if s != 500 {
+				t.Fatalf("failed save: PATCH %d", s)
+			}
+			wantReservation(t, doc, "g1", "order-1", 1)
+			wantHold(t, doc, "", false)
+			// The delayed copy with G then wins, as it must: nothing was saved.
+			hc.fence(t)
+			continue
+		}
+		if s != 200 {
+			t.Fatalf("saved H3: PATCH %d", s)
+		}
+		wantReservation(t, doc, "g1", holdRef, 2)
+		wantHold(t, doc, holdLaunch, false)
+	}
+}

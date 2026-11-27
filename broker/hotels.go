@@ -1163,27 +1163,31 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 }
 
 func (b *broker) hotelDoc(h *hotel) map[string]any {
+	// Everything under b.mu, the owner, tuple and hold in one h.cfgMu hold:
+	// a PATCH holds b.mu from its checks through its save and any rollback,
+	// so the view never shows a value a failed save undoes (the API fences
+	// its retries on this read-back).
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	labels := h.labels()
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	v := h.reservationView()
 	var reserved, lent, lentReport any
-	if r := h.reservedFor(); r != "" {
-		reserved = r
+	if v.reservedFor != "" {
+		reserved = v.reservedFor
 	}
-	if l := h.lentFrom(); l != "" {
-		lent, lentReport = l, h.lentReportID()
+	if v.lentFrom != "" {
+		lent, lentReport = v.lentFrom, v.lentReportID
 	}
-	gen, ref := h.reservation()
 	var resRef any // null when none, like reserved_for
-	if ref != "" {
-		resRef = ref
+	if v.ref != "" {
+		resRef = v.ref
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	now := time.Now()
-	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
-		"reserved_for": reserved, "reservation_generation": gen, "reservation_ref": resRef, "pin_only": h.pinOnly(), // AB#982
+	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": v.drain, "runtime": h.runtime,
+		"reserved_for": reserved, "reservation_generation": v.gen, "reservation_ref": resRef, "pin_only": v.pinOnly, // AB#982
 		"lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
 		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice(),
@@ -1191,7 +1195,7 @@ func (b *broker) hotelDoc(h *hotel) map[string]any {
 		// guest TLS hotel's host has no key to count them, so a re-seal waits for 0 here (AB#817).
 		"rooms_in_use": h.used(),
 		"mem_pct":      h.memPct, "mem_full_pct": b.memFullLimit(h), "mem_full": b.memFull(h),
-		"custom_guest_hold": holdDoc(h.customGuestHold())} // null when unset (custom_guest_hold.go)
+		"custom_guest_hold": holdDoc(v.hold)} // null when unset (custom_guest_hold.go)
 	diskDoc(h, d)
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
