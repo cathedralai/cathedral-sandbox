@@ -53,11 +53,11 @@ for a in "$@"; do
   case "$a" in -n) nflag=1 ;; root@*) seen=1 ;; esac
 done
 stdin=""; if [ $nflag = 0 ] && [ ! -t 0 ]; then stdin=$(cat); fi
-# FAKE_HOST_EXEC=1: run the install and rollback scripts for real against a fake host tree.
+# FAKE_HOST_EXEC=1: run the install and rollback scripts for real against a fake host tree, with
+# the remote command as given (timeout ... bash -s -- args), as sshd would run it.
 host_exec() {
   echo "ssh $1" >> "$F/calls.log"
-  local i=0; while [ "${rest[$i]}" != -- ]; do i=$((i+1)); done
-  printf '%s' "$stdin" | bash -s -- "${rest[@]:$((i+1))}"
+  printf '%s' "$stdin" | "${rest[@]}"
   exit $?
 }
 case "$args" in
@@ -91,6 +91,7 @@ esac
 FAKE_GUARD = "#!/bin/bash\necho 'CONST PATH: GREEN 200'\n"
 
 CHECK_OK = (
+    "custom_guest_hold=none\n"
     "current=old booted=old unit=active\n"
     "staged files vs manifest: OK\n"
     f"remeasured={NEW}\n"
@@ -148,8 +149,10 @@ def env(tmp_path):
         "ROLL_HOTELS_CONF": str(tmp_path / "hotels.conf"), "ROLL_OPERATOR_KEY_FILE": str(tmp_path / "opkey"),
         "ROLL_GUARD": str(bin_dir / "guard"), "ROLL_FOREGROUND": "1", "ROLL_POLL_SLEEP": "0",
         "ROLL_DRAIN_SETTLE": "0", "ROLL_UNDRAIN_SETTLE": "0", "ROLL_ADMIT_TIMEOUT": "1",
-        "HOME": str(tmp_path),
+        "HOME": str(tmp_path), "CATHEDRAL_SNP_LOCK_DIR": str(tmp_path / "run-lock"),
     })
+    for k in ("CATHEDRAL_SNP_LOCK_FD", "CATHEDRAL_SNP_LOCK_OWNER", "CATHEDRAL_SNP_LOCK_WAIT", "ROOM_DESTDIR"):
+        e.pop(k, None)
     return e, fake, home
 
 

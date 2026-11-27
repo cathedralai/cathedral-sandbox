@@ -42,6 +42,12 @@ DRAIN_SETTLE=${ROLL_DRAIN_SETTLE:-5}
 UNDRAIN_SETTLE=${ROLL_UNDRAIN_SETTLE:-20}
 STAGE_TIMEOUT=${ROLL_STAGE_TIMEOUT:-2400}
 STAGE_ROOT=${ROLL_STAGE_ROOT:-/root}   # on the hotel host: stage dirs and kit bundles
+# The host lock protocol and the custom guest hold marker (AB#999; spec r9 5.3, 5.10). This copy of
+# the kit's host-lock.sh is sent ahead of every host step, so the roll.sh an operator runs carries
+# the guard whatever kit commit is staged. A host step runs under timeout: a killed step frees the
+# lock with its whole process group.
+HOST_LOCK_LIB=$HERE/../../room-kit/sealed/host-lock.sh
+HOST_STEP_MAX=3600   # spec 5.3: roll install 60 min
 PLANS=$ROLL_HOME/plans
 STATE=$ROLL_HOME/state
 LOG=$ROLL_HOME/roll.log
@@ -244,8 +250,13 @@ except Exception:
 
 # ---- host steps -------------------------------------------------------------------------------
 host_check() {
-  ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" <<'REMOTE' 2>&1
+  { cat "$HOST_LOCK_LIB"; cat <<'REMOTE'
 D=$1 S=$2 NEWIMG=$3 KIT=$4 UNIT=$5
+# Read only, before the drain: a hotel a custom guest holds is never drained or rolled. host_install
+# checks again under the host lock.
+if ! declare -F snp_hold_marker >/dev/null; then echo "custom_guest_hold=unknown (host-lock.sh did not load)"
+elif HOLD=$(snp_hold_marker "$D"); then echo "custom_guest_hold=${HOLD%% *} launch=${HOLD#* }"
+else echo "custom_guest_hold=none"; fi
 # Both as the image directory name: images/current can be relative or absolute (install-sealed.sh
 # writes an absolute path when it puts the previous image back). readlink -e: a missing link or
 # image reads empty, never the link's own name.
@@ -269,13 +280,20 @@ echo "remeasured=$("$D/venv/bin/sev-snp-measure" --mode snp --vcpus "$V" --vcpu-
 diff <(grep -vE '^SEALED_DIR=|^SEALED_ROOM_SEALED_(SECRETS|EXEC)=' "$D/sealed.env") <(grep -vE '^SEALED_DIR=|^SEALED_ROOM_SEALED_(SECRETS|EXEC)=' "$S/sealed.env") >/dev/null && echo "env: hotel and staged differ only in SEALED_DIR and the flags" || echo "env: HOTEL SETTINGS CHANGED SINCE STAGING"
 echo "kit=$(git -C "$KIT/.." rev-parse --short=7 HEAD) clean=$([ -z "$(git -C "$KIT/.." status --porcelain)" ] && echo yes || echo no)"
 REMOTE
+  } | ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" 2>&1
 }
 
 # Copies the staged image in, sets the two sealed flags, runs install.sh. Rolls itself back on a failed install.
 host_install() {
-  ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" "$OLDIMG" "$1" "${2:-no}" <<'REMOTE' 2>&1
-D=$1 S=$2 NEWIMG=$3 KIT=$4 UNIT=$5 OLDIMG=$6 TS=$7 GUARD=$8
+  { cat "$HOST_LOCK_LIB"; cat <<'REMOTE'
+D=$1 S=$2 NEWIMG=$3 KIT=$4 UNIT=$5 OLDIMG=$6 TS=$7 GUARD=$8 MAX=$9
 set -u
+# The host lock for the whole step, then the custom guest marker in either state, before anything
+# on the host changes. install.sh, install-sealed.sh and write-units.sh inherit this lock.
+H=${UNIT#room-sealed-}; H=${H%.service}
+snp_lock_take roll host_install "$H" - "$MAX" 2>&1 || { echo "RESULT=busy nothing changed"; exit 0; }
+trap snp_lock_release EXIT
+if HOLD=$(snp_hold_marker "$D"); then echo "RESULT=held launch=${HOLD#* } state=${HOLD%% *} nothing changed; resume this roll after that launch's return finishes"; exit 0; fi
 [ -e "$D/sealed.env.bak-$TS" ] || cp -a "$D/sealed.env" "$D/sealed.env.bak-$TS" || { echo "RESULT=nochange backup failed"; exit 0; }
 for k in SEALED_ROOM_SEALED_SECRETS SEALED_ROOM_SEALED_EXEC; do
   if grep -q "^$k=" "$D/sealed.env"; then sed -i "s/^$k=.*/$k=1/" "$D/sealed.env"; else echo "$k=1" >> "$D/sealed.env"; fi
@@ -322,13 +340,19 @@ fi
 systemctl restart "$UNIT"; sleep 5
 echo "RESULT=rolledback unit=$(systemctl is-active "$UNIT") current=$(readlink "$D/images/current")"
 REMOTE
+  } | ssh "${SSHO[@]}" "root@$HOST" timeout --kill-after=30s "$HOST_STEP_MAX" \
+      bash -s -- "$D" "$S" "$NEWIMG" "$KIT" "$UNIT" "$OLDIMG" "$1" "${2:-no}" "$HOST_STEP_MAX" 2>&1
 }
 
 # Idempotent: image back to OLDIMG, env back from the backup if one exists, the owner's data volume
 # back if this run reset it, restart the guest. RESULT=held: not restarted, the hotel must stay drained.
 host_rollback() {
-  ssh "${SSHO[@]}" "root@$HOST" bash -s -- "$D" "$UNIT" "$OLDIMG" "$1" <<'REMOTE' 2>&1
-D=$1 UNIT=$2 OLDIMG=$3 TS=$4
+  { cat "$HOST_LOCK_LIB"; cat <<'REMOTE'
+D=$1 UNIT=$2 OLDIMG=$3 TS=$4 MAX=$5
+H=${UNIT#room-sealed-}; H=${H%.service}
+snp_lock_take roll host_rollback "$H" - "$MAX" 2>&1 || { echo "RESULT=busy nothing changed"; exit 0; }
+trap snp_lock_release EXIT
+if HOLD=$(snp_hold_marker "$D"); then echo "RESULT=held launch=${HOLD#* } state=${HOLD%% *} nothing changed; resume this roll after that launch's return finishes"; exit 0; fi
 if [ -e "$D/roll-reset-$TS" ]; then
   [ -f "$D/data.raw.prev" ] || { echo "RESULT=held this run reset the data volume but data.raw.prev is gone; not booting $OLDIMG on the wrong volume"; exit 0; }
   systemctl stop "$UNIT"
@@ -342,6 +366,8 @@ ln -sfn "$OLDIMG" "$D/images/current"
 systemctl restart "$UNIT"; sleep 5
 echo "RESULT=rolledback unit=$(systemctl is-active "$UNIT") current=$(readlink "$D/images/current")"
 REMOTE
+  } | ssh "${SSHO[@]}" "root@$HOST" timeout --kill-after=30s "$HOST_STEP_MAX" \
+      bash -s -- "$D" "$UNIT" "$OLDIMG" "$1" "$HOST_STEP_MAX" 2>&1
 }
 
 # "current=<image> booted=<image>": images/current and the image launch-guest.sh last booted, both as
@@ -407,6 +433,7 @@ recover() {
     while read -r l; do log "host: $l"; done <<< "$rb"
     case "$rb" in
       *RESULT=rolledback*) st_set HOST_ROLLED_BACK 1 ;;
+      *"RESULT=held launch="*|*RESULT=busy*) stuck "$phase" "host rollback refused, nothing changed: $(grep -o 'RESULT=.*' <<< "$rb" | head -1)"; return ;;
       *RESULT=held*) stuck "$phase" "host rollback held (data volume). Inspect ${D}/data.raw* on $HOST"; return ;;
     esac
   fi
@@ -469,6 +496,7 @@ preflight() {  # fresh run only; read only
   fi
   local chk; chk=$(host_check)
   while read -r l; do log "host: $l"; done <<< "$chk"
+  case "$chk" in *"custom_guest_hold=none"*) ;; *) refuse "a custom guest holds $HOTEL ($(grep -o 'custom_guest_hold=.*' <<< "$chk" || echo 'no marker answer')); nothing changed. Roll it after that launch's return finishes" ;; esac
   case "$chk" in *STAGED_MISSING*) refuse "staged image $NEWIMG is missing" ;; esac
   case "$chk" in *"staged files vs manifest: OK"*) ;; *) refuse "staged image files do not match their manifest" ;; esac
   case "$chk" in *"remeasured=$NEW"*) ;; *) refuse "the staged image no longer measures ${NEW:0:16}" ;; esac
@@ -523,6 +551,13 @@ run_apply() {
     local out; out=$(host_install "$TS" "${guard%% *}")
     while read -r l; do log "host: $l"; done <<< "$out"
     case "$out" in
+      *RESULT=held*|*RESULT=busy*)
+        # The host changed nothing. No recovery: a custom guest hold, or the phase that holds the host
+        # lock, owns this hotel's drain, and an undrain here would open it under the hold. The run
+        # stays drained; a resume repeats the install.
+        st_set PHASE drained
+        log "HOLD: $(grep -o 'RESULT=.*' <<< "$out" | head -1). $HOTEL stays drained, nothing installed. Resume with: roll.sh apply $HOTEL"
+        exit 1 ;;
       *RESULT=installed*) st_set PHASE installed; phase=installed ;;
       *RESULT=nochange*) st_set PHASE drained; die "host step changed nothing: $(grep -o 'RESULT=nochange.*' <<< "$out")" ;;
       *RESULT=refused*) st_set HOST_ROLLED_BACK 1; die "the installer refused before restarting the guest (live room or a check); files back to $OLDIMG, guest not restarted" ;;
