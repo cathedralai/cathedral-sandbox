@@ -1,0 +1,44 @@
+{
+ "about": "Shared vectors for the sealed VM root disk key (spec r3 7.2 step 2): sealed_data_key.py's HKDF with the salt cathedral-vm-root-v1, over the HOST_DATA of vm_measure_v1.json's identities and fake chip keys. Made by scripts/make_vm_root_key_vectors.py.",
+ "cases": [
+  {
+   "chip_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "chip_key_name": "fake-1",
+   "field_select": 9,
+   "host_data_hex": "3579eb9669956b96ed935f586ef0f94cd432b8e1ba949542f3c816694dd46edc",
+   "identity": "a",
+   "key_id": "af6bb9e7415d15a9",
+   "passphrase_hex": "d28c2324ad8e909182d465c4c7833a30160e8155b4adff0efb4294396cc66783"
+  },
+  {
+   "chip_key_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+   "chip_key_name": "fake-2",
+   "field_select": 9,
+   "host_data_hex": "3579eb9669956b96ed935f586ef0f94cd432b8e1ba949542f3c816694dd46edc",
+   "identity": "a",
+   "key_id": "d2b09ad5a578cd4c",
+   "passphrase_hex": "8e647d93892a9640ca4eb9e65ac3dde45c677409c0f89fee8fa9c261df59701d"
+  },
+  {
+   "chip_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+   "chip_key_name": "fake-1",
+   "field_select": 9,
+   "host_data_hex": "0d207d335d64525677acadd0b88b60d45f614e59767fcc4f82a2c519635ab72c",
+   "identity": "b",
+   "key_id": "670d956ec2322948",
+   "passphrase_hex": "4f49f527aa7ca2c957971bdd86714363600310bca802cde013cfa4981f1ec4e7"
+  },
+  {
+   "chip_key_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+   "chip_key_name": "fake-2",
+   "field_select": 9,
+   "host_data_hex": "0d207d335d64525677acadd0b88b60d45f614e59767fcc4f82a2c519635ab72c",
+   "identity": "b",
+   "key_id": "e10ca11acfe5e440",
+   "passphrase_hex": "ad81a994c5d25866f5cdc2f6ef659b1fb5347901ed9e610b4ed482e034a4441e"
+  }
+ ],
+ "field_select": 9,
+ "salt_utf8": "cathedral-vm-root-v1",
+ "schema": "cathedral.vm.root-key-vectors/v1"
+}
