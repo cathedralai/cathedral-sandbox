@@ -65,7 +65,7 @@ jobs:
       - name: Toolchain
         run: |
           apt-get update -q
-          apt-get install -y -q --no-install-recommends gcc make pkg-config python3 xz-utils binutils bzip2 patch ca-certificates
+          apt-get install -y -q --no-install-recommends gcc libc6-dev make pkg-config python3 xz-utils binutils bzip2 patch ca-certificates
           gcc --version | head -1
           make --version | head -1
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

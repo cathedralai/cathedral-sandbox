@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -75,6 +76,11 @@ func (m *Mounted) Unmount() error {
 // Resize grows the file system to its device, online (resize2fs refuses an unmounted file system
 // that was not checked, and the tools carry no e2fsck).
 func (m *Mounted) Resize(t Tool) error {
+	// resize2fs opens the device itself and finds the mount from it. A device the disk package opened
+	// by its /dev path is named so; anything else falls back to the descriptor.
+	if name := m.fs.Name(); strings.HasPrefix(name, "/dev/") && !strings.Contains(name, "..") {
+		return t.run(5*time.Minute, nil, name)
+	}
 	return t.run(5*time.Minute, []*os.File{m.fs}, "/proc/self/fd/4")
 }
 
