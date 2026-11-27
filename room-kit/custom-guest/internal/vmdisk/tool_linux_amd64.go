@@ -14,14 +14,6 @@ import (
 	"time"
 )
 
-// Tool is a helper binary pinned by sha256 in measured code (the VM
-// initrd's closure), never chosen by the host or a disk.
-type Tool struct {
-	Path   string
-	SHA256 [32]byte
-	Name   string // argv[0]
-}
-
 // openPinned is internal/bootstate/verity_linux_amd64.go openPinnedHelper
 // (copied, not imported, until the consolidation PR): a root-owned regular
 // executable, not group or world writable, whose bytes hash to the pin.

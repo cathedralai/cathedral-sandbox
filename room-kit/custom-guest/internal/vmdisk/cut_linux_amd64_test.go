@@ -157,28 +157,33 @@ func TestCutInsideHelpers(t *testing.T) {
 	}
 }
 
-func TestCutTwiceAtOnePointEndsReady(t *testing.T) {
+// A cut on the boot after a cut. The second point is one the resumed boot
+// passes again: F2 and F4 are not rerun (resume starts at F3, an F4 meta
+// makes the disk open), so they pair with the next step that is.
+func TestCutTwiceEndsReady(t *testing.T) {
 	id, k := testID(t, "vm-0123456789ab"), newKey(1)
-	for _, point := range []string{"f2", "f3-format", "f4-torn", "f4", "4.4", "4.5-torn"} {
-		t.Run(point, func(t *testing.T) {
+	for _, c := range []struct {
+		first, second string
+		next          State
+	}{
+		{"f2", "f3-format", StateResume},
+		{"f3-format", "f3-format", StateResume},
+		{"f3-open", "f4-torn", StateResume},
+		{"f4-torn", "f4-torn", StateResume},
+		{"f4", "4.1", StateOpen},
+		{"f5", "copy", StateOpen},
+		{"4.4", "4.4", StateOpen},
+		{"4.4", "4.1", StateOpen}, // the stray recovery slot removed, then cut
+		{"4.5-torn", "4.5-torn", StateOpen},
+	} {
+		t.Run(c.first+" then "+c.second, func(t *testing.T) {
 			h := rootHarness(t)
 			d := h.newDisk(testDisk)
-			h.cutBoot(d, id, k, point)
-			h.cutBoot(d, id, k, point)
-			out, err, lines := h.boot(d, id, k)
-			if err != nil || !out.Ready {
-				t.Fatalf("state %s err %v\n%s", out.State, err, strings.Join(lines, "\n"))
-			}
-			h.checkReady(d, id, k)
+			h.cutBoot(d, id, k, c.first)
+			h.cutBoot(d, id, k, c.second)
+			h.finishBoot(d, id, k, c.next)
 		})
 	}
-	t.Run("4.4 then 4.1", func(t *testing.T) {
-		h := rootHarness(t)
-		d := h.newDisk(testDisk)
-		h.cutBoot(d, id, k, "4.4")
-		h.cutBoot(d, id, k, "4.1") // the stray recovery slot removed, then cut
-		h.finishBoot(d, id, k, StateOpen)
-	})
 }
 
 func TestCutThenBundleChange(t *testing.T) {
@@ -196,10 +201,17 @@ func TestCutThenBundleChange(t *testing.T) {
 		h.mustRefuse(d, id, k2, StateBroken)
 		h.finishBoot(d, id, k1, StateResume)
 	})
-	t.Run("after F4, locked for the new bundle, ready for the old", func(t *testing.T) {
+	t.Run("after F4, broken for the new bundle while the intent stands", func(t *testing.T) {
 		h := rootHarness(t)
 		d := h.newDisk(testDisk)
 		h.cutBoot(d, id, k1, "f4")
+		h.mustRefuse(d, id, k2, StateBroken)
+		h.finishBoot(d, id, k1, StateOpen)
+	})
+	t.Run("after F5, locked for the new bundle, ready for the old", func(t *testing.T) {
+		h := rootHarness(t)
+		d := h.newDisk(testDisk)
+		h.cutBoot(d, id, k1, "f5")
 		h.mustRefuse(d, id, k2, StateLocked)
 		h.finishBoot(d, id, k1, StateOpen)
 	})
