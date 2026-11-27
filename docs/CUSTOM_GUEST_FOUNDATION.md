@@ -450,3 +450,24 @@ These are tests with an injected disk/mapping adapter, including partial failure
 and relaunch retries. No Linux adapter, unlock CLI, real LUKS format/mount or
 hardware proof is supplied by this component. Adapter identity, serialization,
 cryptsetup behavior and mount restrictions still require independent validation.
+
+
+The first Linux adapter component now holds the data device by descriptor.
+`OpenData` is an owner-command operation, never a boot operation. It selects
+`custom-data` by serial, checks the signed size and writable virtio identity,
+refuses partitions, existing holders and mounts, and repeats inventory checks
+after opening. Kernel device type, major/minor, size and read-only state are
+checked on the held descriptor. Later cryptsetup calls must inherit that
+same descriptor; they must not reopen a user-supplied pathname.
+
+A root-owned private runtime lock serializes this helper. Failed opens release
+both descriptors; closing the holder never closes a device-mapper mapping.
+This cooperative lock does not prevent the owner from deliberately accessing
+the disk through another root program. The complete adapter must recheck
+identity/use before writes and verify its own active mapping before filesystem
+work. It must retain ownership records for cleanup of partial opens.
+
+The new tests use private sysfs/dev/mount fixtures, with descriptor ioctl checks
+substituted by a test callback. The real inspector is tested to reject ordinary
+files. Root-owned lock tests require uid 0 and skip otherwise. No real block
+device, LUKS formatting, mounting, runtime CLI or hardware acceptance is claimed.
