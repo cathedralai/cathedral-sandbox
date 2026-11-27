@@ -518,7 +518,8 @@ def test_removed_token_refuses_until_reboot_or_accept(host, capsys):
     assert host.run("check", "vm1", capsys=capsys)[0] == 0
     host.armed.unlink()
     assert "not armed" in refused(host, capsys, "sev_state_unavailable")
-    assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 0
+    code, doc, err = host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)
+    assert code == 0 and doc["cleared_change"] is True and "cleared this boot's SEV change record" in err
     assert host.run("check", "vm1", capsys=capsys)[0] == 0
     host.armed.unlink()
     host.reboot("boot-2")
@@ -668,8 +669,9 @@ def test_gate_order_first_refusal_wins(host, capsys):
 def test_baseline_records_sev_status_read_output(host, capsys):
     host.baseline.unlink()
     host.sev["snp"]["guest_count"] = 3
-    code, doc, _ = host.run("baseline", "--expect", host.digest(), capsys=capsys)
+    code, doc, err = host.run("baseline", "--expect", host.digest(), capsys=capsys)
     assert code == 0 and doc["baseline"] == str(host.baseline)
+    assert doc["cleared_change"] is False and err == ""  # a first baseline: nothing to clear
     stored = json.loads(host.baseline.read_text())
     assert stored == host.sev and sev.differences(stored, STATUS) == []
     assert (host.baseline.stat().st_mode & 0o777) == 0o600
@@ -706,7 +708,9 @@ def test_replace_is_the_explicit_accept_in_the_same_boot(host, capsys):
     refused(host, capsys, "sev_platform_changed", "enforce")
     host.sev = copy.deepcopy(STATUS)
     refused(host, capsys, "sev_platform_changed")
-    assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 0
+    code, doc, err = host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)
+    assert code == 0 and doc["cleared_change"] is True
+    assert "cleared this boot's SEV change record" in err
     assert host.run("check", "vm1", capsys=capsys)[0] == 0
 
 
