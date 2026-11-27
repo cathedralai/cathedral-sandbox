@@ -420,3 +420,27 @@ func TestMapperNodeFollowsOnlyUdevLink(t *testing.T) {
 		}
 	}
 }
+
+func TestLayerIDs(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	crypt := "CRYPT-LUKS2-" + id + "-cathedral-data"
+	integrity := "CRYPT-SUBDEV-" + id + "-cathedral-data_dif"
+	if err := layerIDs(crypt, integrity); err != nil {
+		t.Fatalf("cryptsetup 2.8.4 layers refused: %v", err)
+	}
+	other := "fedcba9876543210fedcba9876543210"
+	for name, pair := range map[string][2]string{
+		"2.7 integrity prefix":  {crypt, "CRYPT-INTEGRITY-" + id + "-cathedral-data_dif"},
+		"plain crypt":           {"CRYPT-PLAIN-" + id + "-cathedral-data", integrity},
+		"luks1":                 {"CRYPT-LUKS1-" + id + "-cathedral-data", integrity},
+		"other volume's subdev": {crypt, "CRYPT-SUBDEV-" + other + "-cathedral-data_dif"},
+		"other name":            {"CRYPT-LUKS2-" + id + "-other", "CRYPT-SUBDEV-" + id + "-other_dif"},
+		"short uuid":            {"CRYPT-LUKS2-0123-cathedral-data", "CRYPT-SUBDEV-0123-cathedral-data_dif"},
+		"upper hex":             {"CRYPT-LUKS2-" + strings.ToUpper(id) + "-cathedral-data", "CRYPT-SUBDEV-" + strings.ToUpper(id) + "-cathedral-data_dif"},
+		"empty":                 {"", ""},
+	} {
+		if err := layerIDs(pair[0], pair[1]); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}

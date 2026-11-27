@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -130,11 +131,30 @@ func statusPolicy(raw []byte) error {
 	return nil
 }
 
+var cryptLayerID = regexp.MustCompile(`^CRYPT-LUKS2-([0-9a-f]{32})-` + mapperName + `$`)
+
+// layerIDs checks the dm uuids of the two layers as cryptsetup 2.8.4 names
+// them: the crypt layer is our LUKS2 volume under our name, and the layer below
+// is its own integrity sub-device, CRYPT-SUBDEV-<same uuid>-<name>_dif (2.7
+// called it CRYPT-INTEGRITY-; that form is refused). dm uuids are public
+// header metadata, so the observed value is safe to report.
+func layerIDs(crypt, integrity string) error {
+	match := cryptLayerID.FindStringSubmatch(crypt)
+	if match == nil {
+		return fmt.Errorf("data mapping policy mismatch: dm uuid %q", crypt)
+	}
+	if integrity != "CRYPT-SUBDEV-"+match[1]+"-"+mapperName+"_dif" {
+		return fmt.Errorf("data mapping policy mismatch: integrity layer uuid %q", integrity)
+	}
+	return nil
+}
+
 // Verify reads back the live stack instead of trusting that a passphrase worked.
 // It requires, from the kernel and from the helper:
 //   - /dev/mapper/cathedral-data is a block device whose dm name and LUKS2 uuid match;
-//   - exactly one layer beneath it, a dm-integrity device, which itself sits on
-//     exactly one device: the held disk, by device number;
+//   - exactly one layer beneath it, that volume's own integrity sub-device by
+//     dm name and uuid, which itself sits on exactly one device: the held
+//     disk, by device number;
 //   - aes-xts-plain64, 4096-byte sectors, hmac(sha256) integrity with its
 //     32-byte key, read/write, no discards;
 //   - the usable size is positive and not larger than the held disk.
@@ -153,7 +173,8 @@ func (m *mapping) Verify(ctx context.Context) error {
 	if name, err := sysAttr(m.tools.sys, crypt, "dm/name"); err != nil || name != mapperName {
 		return fail("dm name")
 	}
-	if uuid, err := sysAttr(m.tools.sys, crypt, "dm/uuid"); err != nil || !strings.HasPrefix(uuid, "CRYPT-LUKS2-") {
+	cryptID, err := sysAttr(m.tools.sys, crypt, "dm/uuid")
+	if err != nil {
 		return fail("dm uuid")
 	}
 	if s, err := sysAttr(m.tools.sys, crypt, "dm/suspended"); err != nil || s != "0" {
@@ -171,8 +192,15 @@ func (m *mapping) Verify(ctx context.Context) error {
 	if err != nil || len(below) != 1 {
 		return fail("crypt layer")
 	}
-	if uuid, err := sysAttr(m.tools.sys, below[0], "dm/uuid"); err != nil || !strings.HasPrefix(uuid, "CRYPT-INTEGRITY-") {
+	integrityID, err := sysAttr(m.tools.sys, below[0], "dm/uuid")
+	if err != nil {
 		return fail("integrity layer")
+	}
+	if name, err := sysAttr(m.tools.sys, below[0], "dm/name"); err != nil || name != mapperName+"_dif" {
+		return fail("integrity layer name")
+	}
+	if err := layerIDs(cryptID, integrityID); err != nil {
+		return err
 	}
 	disks, err := slaves(m.tools.sys, below[0])
 	if err != nil || len(disks) != 1 || disks[0] != m.dev {
