@@ -79,6 +79,7 @@ type disk struct {
 	h    *harness
 	path string
 	loop string
+	size int64 // root.raw's size now; a boot is given this as DiskBytes
 }
 
 func (h *harness) newDisk(size int64) *disk {
@@ -91,7 +92,17 @@ func (h *harness) newDisk(size int64) *disk {
 		h.t.Fatal(err)
 	}
 	f.Close()
-	return &disk{h: h, path: p}
+	return &disk{h: h, path: p, size: size}
+}
+
+// resize truncates root.raw to size, as a launcher that presents the disk
+// at another size would.
+func (d *disk) resize(size int64) {
+	d.h.t.Helper()
+	if err := os.Truncate(d.path, size); err != nil {
+		d.h.t.Fatal(err)
+	}
+	d.size = size
 }
 
 func randomHex(n int) string {
@@ -166,7 +177,7 @@ func (d *disk) readAt(off int64, n int) []byte {
 	return b
 }
 
-func (d *disk) intentArea() []byte { return d.readAt(testDisk-IntentAreaBytes, IntentAreaBytes) }
+func (d *disk) intentArea() []byte { return d.readAt(d.size-IntentAreaBytes, IntentAreaBytes) }
 
 // powerOff removes every mapping of this harness, as a reboot does.
 func (h *harness) powerOff() {
@@ -234,7 +245,7 @@ func (h *harness) bootWith(d *disk, id vmidentity.Identity, k key, tool Tool, se
 	f := d.attach()
 	defer func() { f.Close(); h.powerOff(); d.detach() }()
 	var lines []string
-	out, err := Run(context.Background(), Config{Disk: f, DiskBytes: testDisk, Identity: id, Passphrase: k.pass,
+	out, err := Run(context.Background(), Config{Disk: f, DiskBytes: d.size, Identity: id, Passphrase: k.pass,
 		Measurement: k.meas, Cryptsetup: tool, Names: h.names, Setup: setup,
 		Log: func(s string) { lines = append(lines, s) }})
 	if out.FSArea != nil {
@@ -290,7 +301,7 @@ func (h *harness) inspect(d *disk, k key) report {
 		h.t.Fatal(err)
 	}
 	dev := st.Sys().(*syscall.Stat_t).Rdev
-	luksDev, err := ctl.createLinear(h.names.LUKS, true, dev, 0, uint64((testDisk-IntentAreaBytes)/sectorBytes))
+	luksDev, err := ctl.createLinear(h.names.LUKS, true, dev, 0, uint64((d.size-IntentAreaBytes)/sectorBytes))
 	if err != nil {
 		h.t.Fatal(err)
 	}
