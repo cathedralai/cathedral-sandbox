@@ -178,3 +178,61 @@ the private file and invokes `ip` directly with one argument per value, without 
 shell. SSH requires successful network setup. No DHCP or alternate network
 manager is enabled. A root image alone is not the reference init, kernel,
 optional owner data-disk unlock helper, or a complete bootable test image.
+
+### Static verity helper
+
+`scripts/build_custom_guest_verity.py` builds cryptsetup 2.8.4's static
+`veritysetup` with a static device-mapper library. The adjacent
+`custom_guest_verity_inputs.json` pins the source archives and Debian-format
+development packages by SHA-256. Acquire those files separately into a directory
+containing exactly the lock's files. The builder does not download or install
+packages. Source archives are from the upstream
+[cryptsetup releases](https://www.kernel.org/pub/linux/utils/cryptsetup/v2.8/)
+and [LVM2 releases](https://sourceware.org/pub/lvm2/); development packages come
+from Ubuntu's signed package metadata. GCC 15.2.0 and Make 4.4.1 are required.
+
+```sh
+python3 scripts/build_custom_guest_verity.py --inputs PINNED_INPUT_DIRECTORY \
+  --output veritysetup --log verity-build.log
+```
+
+The builder snapshots and rechecks inputs, uses the pinned headers and static
+libraries, builds in two separate directories, requires identical output and
+checks the ELF for an interpreter or shared-library dependency. Output and log
+paths must be new. This is a toolchain-specific reproducibility check, not a
+claim of a hermetic compiler bootstrap.
+
+The helper was checked unprivileged in an otherwise empty chroot containing
+only the executable, root image and `/dev/random` and `/dev/urandom`. It accepted
+the correct verity root and refused a wrong one. Cryptsetup requires both entropy
+devices even for verification; init must mount devtmpfs before invoking it.
+This userspace check does not prove a device-mapper mount or guest boot.
+
+### Reference kernel candidate
+
+`scripts/build_custom_guest_kernel.sh SOURCE_DEB EMPTY_WORK_DIRECTORY NEW_OUTPUT`
+builds from the pinned Ubuntu `linux-source-7.0.0_7.0.0-44.44_all.deb` input with
+GCC 15.2.0 and Make 4.4.1. Use a scratch filesystem with at least 6 GiB free.
+No kernel is installed, and no VM is launched. The source digest is checked
+before extraction. SNP, TSM, virtio, dm-verity, dm-crypt, dm-integrity, SquashFS
+and config extraction are built in. Modules, built-in command lines, embedded
+boot configuration, embedded initramfs and unused hardware drivers are disabled.
+
+The recipe contains one explicit source adjustment: x86 `COMMAND_LINE_SIZE`
+is increased from 2048 to 4096. Linux advertises one less in the boot header;
+the unmodified kernel advertises 2047 and fails spec-r9's minimum of 2048.
+This does not widen the signed command-line allowlist or exact boot comparison.
+Output includes the kernel, config and input/output hashes. Embedded config must
+match the build config; EFI/PE, Linux boot protocol, 64-bit and command-line
+capacity checks must pass. These checks do not establish a hardware boot.
+
+### Volatile SSH key material
+
+The Go `internal/bootkeys` package generates a fresh Ed25519 host key in OpenSSH
+format, copies the validated owner's public key, and prepares the three validated
+network settings. Entropy failure returns no material. The tests use OpenSSH's
+own private-key parser and check that each invocation generates a different key.
+No key is baked into the root or initrd. A reference PID1 must call it only after
+bootstrap, observed-hardware, HOST_DATA and verified-root checks, then write the
+files mode 0600 into the root-owned 0700 tmpfs directory. This package alone does
+not implement PID1 or start SSH.
