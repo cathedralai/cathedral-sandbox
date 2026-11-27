@@ -124,7 +124,11 @@ def link(root, name, target):
     path.symlink_to(target)
 
 
-def configure(root, helper, helper_hash):
+def configure(root, helper, helper_hash, data_helper=None, cryptsetup=None):
+    """data_helper (cathedral-data) and cryptsetup travel together: the unlock tool pins
+    the digest of this static cryptsetup, never the root's own."""
+    if (data_helper is None) != (cryptsetup is None):
+        raise ValueError('cathedral-data and its pinned cryptsetup must be installed together')
     for name in ('sbin/init', 'usr/sbin/sshd', 'usr/bin/ip'):
         path = root / name
         if not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
@@ -164,6 +168,23 @@ def configure(root, helper, helper_hash):
     write(root, 'etc/systemd/system/cathedral-network.service', NETWORK_UNIT)
     write(root, 'usr/bin/cathedral-attest', helper, 0o755)
     write(root, 'usr/share/cathedral/report-helper.sha256', helper_hash + '\n')
+    if data_helper is not None:
+        # mke2fs runs from this verity-protected root; cryptsetup does not.
+        mke2fs = root / 'usr/sbin/mke2fs'
+        if not mke2fs.resolve().is_relative_to(root.resolve()) or not mke2fs.is_file() \
+                or mke2fs.read_bytes()[:4] != b'\x7fELF':
+            raise ValueError('base is missing mke2fs (e2fsprogs)')
+        if not (root / 'mnt').is_dir() or (root / 'mnt').is_symlink():
+            raise ValueError('base is missing a plain /mnt directory')
+        # The root is read-only squashfs at boot, so cathedral-data cannot create its
+        # mount target then; it must already be in the image, owner-only and empty.
+        target = root / 'mnt/cathedral-data'
+        if target.is_symlink() or (target.exists() and (not target.is_dir() or any(target.iterdir()))):
+            raise ValueError('base /mnt/cathedral-data must be absent or an empty directory')
+        target.mkdir(exist_ok=True)
+        target.chmod(0o700)
+        write(root, 'usr/bin/cathedral-data', data_helper, 0o755)
+        write(root, 'usr/lib/cathedral/cryptsetup', cryptsetup, 0o755)
     write(root, 'etc/hostname', 'cathedral-guest\n')
     write(root, 'etc/hosts', '127.0.0.1 localhost\n::1 localhost\n')
     write(root, 'etc/resolv.conf', '')
@@ -184,13 +205,23 @@ def run(argv):
                           env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'}, timeout=300)
 
 
-def build(base, base_sha, helper_path, helper_sha, epoch, output):
+def pinned_binary(path, sha):
+    checked(path, sha)
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != sha:
+        raise ValueError('input changed during read')
+    static_elf(data)
+    return data
+
+
+def build(base, base_sha, helper_path, helper_sha, epoch, output, data=None, cryptsetup=None):
+    """data and cryptsetup are optional (path, sha256) pairs, given together for a data-disk image."""
     checked(base, base_sha)
-    checked(helper_path, helper_sha)
-    helper = helper_path.read_bytes()
-    if hashlib.sha256(helper).hexdigest() != helper_sha:
-        raise ValueError('helper changed during read')
-    static_elf(helper)
+    helper = pinned_binary(helper_path, helper_sha)
+    if (data is None) != (cryptsetup is None):
+        raise ValueError('cathedral-data and cryptsetup must be given together')
+    data_bytes = pinned_binary(*data) if data else None
+    cryptsetup_bytes = pinned_binary(*cryptsetup) if cryptsetup else None
     if output.exists() or not 0 <= epoch <= 2**32 - 1:
         raise ValueError('output must be new; epoch must fit squashfs')
     versions = {}
@@ -207,7 +238,7 @@ def build(base, base_sha, helper_path, helper_sha, epoch, output):
         shutil.copyfile(base, pinned_base)
         checked(pinned_base, base_sha)
         extract(pinned_base, root)
-        configure(root, helper, helper_sha)
+        configure(root, helper, helper_sha, data_bytes, cryptsetup_bytes)
         image = scratch / 'root.raw'
         run(['mksquashfs', str(root), str(image), '-noappend', '-all-root', '-no-xattrs',
              '-comp', 'zstd', '-processors', '1', '-mkfs-time', str(epoch), '-all-time', str(epoch), '-no-progress'])
@@ -225,7 +256,8 @@ def build(base, base_sha, helper_path, helper_sha, epoch, output):
         root_hash = roots[0]
         run(['veritysetup', 'verify', str(image), str(image), root_hash, '--hash-offset=' + str(size)])
         result = {'schema': 'cathedral.custom_guest.root-build/v1', 'base_sha256': base_sha,
-                  'helper_sha256': helper_sha, 'source_date_epoch': epoch, 'tools': versions,
+                  'helper_sha256': helper_sha, 'data_helper_sha256': data[1] if data else None,
+                  'cryptsetup_sha256': cryptsetup[1] if cryptsetup else None, 'source_date_epoch': epoch, 'tools': versions,
                   'root_verity': root_hash, 'root_data_bytes': size, 'bytes': image.stat().st_size,
                   'sha256': digest(image), 'verity_verified': True, 'boot_verified': False,
                   'packages_sha256': digest(root / 'var/lib/dpkg/status')}
@@ -241,11 +273,21 @@ def main():
     parser.add_argument('--base-sha256', required=True)
     parser.add_argument('--helper', type=Path, required=True)
     parser.add_argument('--helper-sha256', required=True)
+    parser.add_argument('--data-helper', type=Path, help='static cathedral-data (needs --cryptsetup)')
+    parser.add_argument('--data-helper-sha256')
+    parser.add_argument('--cryptsetup', type=Path, help='static pinned cryptsetup for cathedral-data')
+    parser.add_argument('--cryptsetup-sha256')
     parser.add_argument('--epoch', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    data = cryptsetup = None
+    if args.data_helper or args.cryptsetup:
+        if not (args.data_helper and args.data_helper_sha256 and args.cryptsetup and args.cryptsetup_sha256):
+            parser.error('--data-helper, --cryptsetup and their digests are given together')
+        data = (args.data_helper, args.data_helper_sha256)
+        cryptsetup = (args.cryptsetup, args.cryptsetup_sha256)
     print(json.dumps(build(args.base, args.base_sha256, args.helper, args.helper_sha256,
-                           args.epoch, args.output), sort_keys=True))
+                           args.epoch, args.output, data, cryptsetup), sort_keys=True))
 
 
 if __name__ == '__main__':

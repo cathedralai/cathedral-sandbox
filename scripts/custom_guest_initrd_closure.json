@@ -1,0 +1,7 @@
+{
+  "schema": "cathedral.custom_guest.initrd-recipe/v1",
+  "executables": {
+    "init": "cathedral-init",
+    "usr/lib/cathedral/veritysetup": "veritysetup"
+  }
+}

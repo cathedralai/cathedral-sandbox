@@ -22,6 +22,7 @@ type testDisk struct {
 	mounted                 bool
 	closeSawCancellation    bool
 	verifyCount, failVerify int
+	fresh                   string // what Filesystem reports right after Format; "" means "empty"
 }
 
 func (d *testDisk) step(name string) error {
@@ -58,6 +59,11 @@ func (d *testDisk) Format(ctx context.Context, key []byte) error {
 	d.formats++
 	d.header = []byte(policyFixture)
 	d.dirty = true
+	// A fresh LUKS2 volume with integrity reads back as zeros.
+	d.fs = "empty"
+	if d.fresh != "" {
+		d.fs = d.fresh
+	}
 	return d.step("format")
 }
 func (d *testDisk) Open(ctx context.Context, key []byte) (OwnedMapping, error) {
@@ -110,7 +116,7 @@ func TestNewAndExistingVolume(t *testing.T) {
 	if d.formats != 1 || d.mkfs != 1 || !d.mounted || d.closes != 0 {
 		t.Fatalf("first use state %+v", d)
 	}
-	want := "header,read,format,header,open,verify,mkfs,filesystem,verify,mount"
+	want := "header,read,format,header,open,verify,filesystem,mkfs,filesystem,verify,mount"
 	if strings.Join(d.events, ",") != want {
 		t.Fatalf("unsafe order %v", d.events)
 	}
@@ -141,6 +147,24 @@ func TestExistingWorkNeverFormatted(t *testing.T) {
 	d := &testDisk{dirty: true}
 	if unlockTest(t, context.Background(), d) == nil || d.formats != 0 || d.mkfs != 0 {
 		t.Fatal("lost-header payload overwritten")
+	}
+}
+
+// mke2fs -F would overwrite anything, so a fresh volume whose plaintext is not
+// all zero is preserved, never given a filesystem.
+func TestNewVolumeMakesFilesystemOnlyWhenEmpty(t *testing.T) {
+	for _, fresh := range []string{"ext4", "unknown"} {
+		d := &testDisk{fresh: fresh}
+		if unlockTest(t, context.Background(), d) == nil {
+			t.Fatalf("%s: accepted", fresh)
+		}
+		if d.formats != 1 || d.mkfs != 0 || d.mounted || d.closes != 1 {
+			t.Fatalf("%s: formats=%d mkfs=%d mounted=%v closes=%d", fresh, d.formats, d.mkfs, d.mounted, d.closes)
+		}
+	}
+	d := &testDisk{fail: "filesystem"}
+	if unlockTest(t, context.Background(), d) == nil || d.mkfs != 0 {
+		t.Fatal("unreadable fresh plaintext was formatted")
 	}
 }
 func TestProbeFailureIsNotBlankEvidence(t *testing.T) {
