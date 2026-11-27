@@ -31,6 +31,7 @@ hosts.conf: one line per hotel: <hotel> <ssh target> <repo dir on the host> <pub
 from __future__ import annotations
 
 import argparse
+import calendar
 import hashlib
 import http.client
 import json
@@ -79,6 +80,11 @@ class Abort(Blocked):
 
 class Transport(Exception):
     """No answer: the effect may or may not have happened. observe() decides."""
+
+
+def utc(stamp: str) -> float:
+    """Seconds since the epoch of a YYYY-MM-DDTHH:MM:SSZ stamp, whatever the local zone."""
+    return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
 
 
 def now_iso() -> str:
@@ -189,6 +195,11 @@ class Journal:
 def phase_at_least(rec: dict, phase: str) -> bool:
     hp = rec.get("hold_phase")
     return hp in HOLD_PHASES and HOLD_PHASES.index(hp) >= HOLD_PHASES.index(phase)
+
+
+def host_of(rec: dict) -> dict:
+    """The record's operator facts and hold evidence (PR 3 admin_view: record["host"])."""
+    return rec.get("host") or {}
 
 
 def tuple_of(view: dict) -> dict:
@@ -322,9 +333,13 @@ class Op:
             raise Blocked(error_code(doc), f"broker drain {value}: {status}")
 
     # ---------------- verify before act (5.4)
-    def sub(self, step: str, name: str, observe, act=None, generation: int | None = None) -> None:
-        """observe() -> True (done) or False (ready), or raises Blocked. act(seq) may lose its reply."""
-        if self.j.done(self.launch, step, name):
+    def sub(self, step: str, name: str, observe, act=None, generation: int | None = None,
+            recheck: bool = False) -> None:
+        """observe() -> True (done) or False (ready), or raises Blocked. act(seq) may lose its reply.
+
+        recheck: observe again even when the journal shows the sub done (evidence a host reboot can make stale).
+        """
+        if self.j.done(self.launch, step, name) and not recheck:
             return
         seq = self.j.write(self.launch, generation, step, name, "intent")
         try:
@@ -364,10 +379,9 @@ class Op:
 
         self.sub(step, f"phase_{phase}", observe, act)
 
-    def reservation(self, **changes) -> dict:
-        res = dict(self.record().get("reservation") or {})
-        res.update(changes)
-        return res
+    def res(self, rec: dict | None = None) -> dict:
+        """host.reservation: the API writes the tuples (H1 and the fence intents), never this script."""
+        return host_of(rec or self.record()).get("reservation") or {}
 
     # ================================================================ fetch and intake
     def files_dir(self) -> str:
@@ -457,8 +471,11 @@ class Op:
 
         self.sub(step, "gate", gate)
         self.sub(step, "broker", lambda: bool(self.broker_eligible(self.view(), at_hold=False)) or True)
-        self.sub(step, "inbox", lambda: rec["state"] != "requested" and self.record()["state"] != "requested",
-                 lambda seq: self.host_ok("inbox"))
+        def inbox(seq: int) -> None:
+            self.stash["inbox"] = self.host_ok("inbox")
+
+        # The host phase is idempotent; a rerun after a lost answer runs it again.
+        self.sub(step, "inbox", lambda: "inbox" in self.stash or self.record()["state"] != "requested", inbox)
         target, _, _ = self.host_conf()
         d = self.files_dir()
 
@@ -484,12 +501,12 @@ class Op:
 
         def staged(seq: int) -> None:
             inputs = self.inputs()
-            self.patch(seq, "requested", "staged", {
+            self.patch(seq, "requested", "staged", {"host": {
                 "reference_initrd_version": req["initrd"]["reference"], "reference_initrd_sha256": req["initrd"]["sha256"],
                 "reference_initrd_url": f"{SITE}/dedicated/inputs/{req['initrd']['sha256']}/"
                                         f"cathedral-custom-initrd-{req['initrd']['reference']}.cpio.zst",
                 "ovmf_sha256": inputs.get("ovmf_sha256"),
-                "ovmf_url": f"{SITE}/dedicated/inputs/{inputs.get('ovmf_sha256')}/OVMF.amdsev.fd"})
+                "ovmf_url": f"{SITE}/dedicated/inputs/{inputs.get('ovmf_sha256')}/OVMF.amdsev.fd"}})
 
         self.sub(step, "staged", lambda: self.record()["state"] != "requested", staged)
         self.end(step)
@@ -505,12 +522,13 @@ class Op:
         def act(seq: int) -> None:
             r = self.host_ok("measure", data)
             chip = (self.view().get("admission") or {}).get("chip_id")
-            req = rec["request"]
+            # PR 3 takes the documents as fields and the host and chip facts under fields.host (4.5).
+            host = {"qemu_version": r["qemu_version"], "sev_snp_measure_version": r["sev_snp_measure_version"],
+                    "policy": "0x30000", "public_host": public_host, "ports": r["bootstrap"]["ports"]}
+            if chip:
+                host["chip_id"] = chip
             self.patch(seq, "staged", "measured", {
-                **{k: r[k] for k in ("manifest", "manifest_sha256", "bootstrap", "bootstrap_sha256", "host_data_hex",
-                                     "expected_measurement", "cmdline_hex", "qemu_version", "sev_snp_measure_version")},
-                "vcpus": req["vcpus"], "cpu_model": req["cpu_model"], "policy": "0x30000", "chip_id": chip,
-                "public_host": public_host, "ports": r["bootstrap"]["ports"]})
+                **{k: r[k] for k in ("manifest", "bootstrap", "host_data_hex", "expected_measurement")}, "host": host})
 
         self.sub(step, "measured", lambda: self.record()["state"] != "staged", act)
         self.end(step)
@@ -518,15 +536,18 @@ class Op:
     # ================================================================ hold (11.2)
     def attempt(self) -> int:
         rec = self.record()
-        if rec["state"] == "holding":
-            return int((rec.get("reservation") or {}).get("attempt") or 1)
-        return 1 + len({e["step"] for e in self.j.find(self.launch) if e.get("step", "").startswith("hold#")})
+        attempt = int(self.res(rec).get("attempt") or 0)
+        # The API counts attempts at H1 (_start_hold): the next one is the last one plus 1.
+        return max(attempt, 1) if rec["state"] == "holding" else attempt + 1
 
     def step_hold(self) -> None:
         rec = self.record()
         if rec["state"] == "held":
+            n = int(self.res(rec).get("attempt") or 1)
+            if self.open_step(f"hold#{n}"):
+                self.end(f"hold#{n}")  # H9 landed and the run died before its end entry
             print(json.dumps({"ok": True, "state": "held"}))
-            return
+            return False
         if rec["state"] not in ("approved", "holding"):
             raise Blocked("custom_guest_state_conflict", f"hold needs approved, the record is {rec['state']}")
         if not rec.get("hold_ack"):
@@ -555,17 +576,15 @@ class Op:
         # H1 intent: the original tuple, drain and the reservation guest, read live.
         def h1_observe() -> bool:
             r = self.record()
-            if r["state"] == "holding" and (r.get("reservation") or {}).get("attempt") == n:
+            if r["state"] == "holding" and self.res(r).get("attempt") == n:
                 return True
             if r["state"] == "approved":
                 return False
             raise Blocked("custom_guest_state_conflict", f"record {r['state']}")
 
         def h1_act(seq: int) -> None:
-            v = self.view()
-            self.patch(seq, "approved", "holding", {
-                "hold_phase": "intent", "drain_before": bool(v.get("drain")), "reservation_guest": v.get("reserved_for"),
-                "reservation": {"original": tuple_of(v), "expect": "original", "attempt": n}, "error_code": None})
+            # The API reads the original tuple, drain and reservation guest live at this PATCH (_start_hold).
+            self.patch(seq, "approved", "holding", {"hold_phase": "intent", "error_code": None})
 
         self.sub(step, "H1", h1_observe, h1_act)
 
@@ -575,23 +594,21 @@ class Op:
 
         # H3 fence and hold: one PATCH moves the ref and sets the hold.
         def h3_observe() -> bool:
-            v, res = self.view(), self.record().get("reservation") or {}
+            v, res = self.view(), self.res()
             t, hold = tuple_of(v), v.get("custom_guest_hold") or {}
             orig = res["original"]
-            if t == {"generation": orig["generation"] + 1, "ref": ref} and hold.get("launch") == self.launch:
+            fenced = res.get("fenced") or {"generation": orig["generation"] + 1, "ref": ref}
+            if t == fenced and hold.get("launch") == self.launch:
                 return True
             if t == orig:
                 return False
             raise Blocked("custom_guest_reservation_moved", f"live tuple {t}")
 
         def h3_act(seq: int) -> None:
-            orig = self.record()["reservation"]["original"]
-            self.patch(seq, "holding", "holding",
-                       {"reservation": self.reservation(fenced={"generation": orig["generation"] + 1, "ref": ref})})
-            self.fence_until("fenced", Abort)
+            self.fence_until("fenced", Abort)  # the API writes the fenced tuple before its PATCH
 
         self.sub(step, "H3", h3_observe, h3_act)
-        self.set_phase(step, "fenced", {"reservation": self.reservation(expect="fenced")})
+        self.set_phase(step, "fenced")
 
         # H4 inventory: zero rooms and zero stored work, from both sides.
         def h4() -> bool:
@@ -599,7 +616,9 @@ class Op:
             if "claims" not in rc:
                 raise Abort("custom_guest_hold_unsupported", "restart-check has no claims count (broker below PR 2)")
             counts = {k: rc.get(k) for k in ("rooms", "creating", "queued", "pool_claims", "unreaped", "hotel_rooms", "claims")}
-            rooms = sum(len(x) for k, x in rows.items() if isinstance(x, list) and k != "stored_work")
+            rooms = rows.get("room_count")
+            if not isinstance(rooms, int) or isinstance(rooms, bool):
+                raise Abort("custom_guest_barrier_failed", "live-rows has no room_count")
             if not rc.get("count_known") or any(counts.values()) or v.get("rooms_in_use") or rooms:
                 raise Abort("custom_guest_rooms_present", f"counts {counts}, rooms_in_use {v.get('rooms_in_use')}, live rows {rooms}")
             if "stored_work" not in rows or rows["stored_work"] is not None:
@@ -610,14 +629,14 @@ class Op:
 
         self.sub(step, "H4", h4)
         evidence = (self.j.find(self.launch, step, "H4", "done") or [{}])[-1].get("detail")
-        self.set_phase(step, "inventoried", {"barrier_evidence": evidence})
+        self.set_phase(step, "inventoried", {"host": {"barrier_evidence": evidence}})
 
         # H5 earlier holders.
         def h5() -> bool:
             f = self.facts()
             start = (f.get("kit_unit") or {}).get("active_enter")
             since = self.o.dedicated_since
-            since_t = time.mktime(time.strptime(since, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone if since else None
+            since_t = utc(since) if since else None
             ok = [e for e in self.j.find(self.launch, "h5", "toby_ok", "done")]
             if start is not None and since_t is not None and start > since_t:
                 self.stash["H5"] = {"kit_start": start, "dedicated_since": since, "result": "later"}
@@ -629,7 +648,7 @@ class Op:
                         "the kit started before the dedication (or the time is unknown) and no Toby OK is journaled")
 
         if self.o.h5_ok:
-            self.sub("h5", "toby_ok", lambda: bool(self.j.find(self.launch, "h5", "toby_ok", "done")),
+            self.sub("h5", "toby_ok", lambda: "toby_ok" in self.stash,
                      lambda seq: self.stash.__setitem__("toby_ok", {"ref": self.o.h5_ok, "holder": self.o.h5_holder}))
         self.sub(step, "H5", h5)
 
@@ -644,7 +663,7 @@ class Op:
 
         def h6a_act(seq: int) -> None:
             v, rc = self.view(), self.restart_check()
-            res = self.record().get("reservation") or {}
+            res = self.res()
             hold = v.get("custom_guest_hold") or {}
             if hold.get("launch") != self.launch:
                 raise Blocked("custom_guest_hold_lost", "the hold is missing: send fence fenced again before the kit stops")
@@ -655,7 +674,9 @@ class Op:
                 raise Blocked("custom_guest_rooms_present", "restart-check is not zero with a known count")
             self.j.write(self.launch, None, step, "H6a_reads", "done", {"hold": hold, "tuple": tuple_of(v), "restart_check": rc})
             if not phase_at_least(self.record(), "kit_stopping"):
-                self.patch(seq, "holding", "holding", {"hold_phase": "kit_stopping"})
+                h5 = (self.j.find(self.launch, step, "H5", "done") or [{}])[-1].get("detail")
+                self.patch(seq, "holding", "holding",
+                           {"hold_phase": "kit_stopping", **({"host": {"earlier_holders": h5}} if h5 else {})})
             r = self.host_ok("hold-stop", part="a")
             self.stash["H6a"] = {"kit_attestation_before": r.get("kit_attestation_before")}
 
@@ -668,12 +689,13 @@ class Op:
         def h6b_act(seq: int) -> None:
             v, rec = self.view(), self.record()
             hold = v.get("custom_guest_hold") or {}
-            if hold.get("launch") != self.launch or tuple_of(v) != (rec.get("reservation") or {}).get("fenced") \
-                    or not rec.get("barrier_evidence"):
+            if hold.get("launch") != self.launch or tuple_of(v) != self.res(rec).get("fenced") \
+                    or not host_of(rec).get("barrier_evidence"):
                 raise Blocked("custom_guest_hold_lost", "H6b needs the hold, the fenced tuple and H4's evidence: Toby decides")
             r = self.host_ok("hold-stop", part="b")
-            self.patch(seq, "holding", "holding", {"hold_phase": "kit_stopped",
-                                                   "kit_attestation_before": r.get("kit_attestation_before")})
+            att = r.get("kit_attestation_before")
+            self.patch(seq, "holding", "holding",
+                       {"hold_phase": "kit_stopped", **({"host": {"kit_attestation_before": att}} if att else {})})
 
         self.sub(step, "H6b", h6b_observe, h6b_act)
 
@@ -699,15 +721,17 @@ class Op:
                 raise Blocked(code, f"fence kit_down: {status}")
 
         self.sub(step, "H7", h7_observe, h7_act)
-        self.set_phase(step, "kit_down_set", {"broker_hold": {"kit_down_at": now_iso(),
-                                                              "read_back": self.view().get("custom_guest_hold")}})
+        self.set_phase(step, "kit_down_set")  # the API records broker_hold.kit_down_at at the fence
 
         # H8 host baseline.
         def h8_act(seq: int) -> None:
             self.stash["H8"] = self.host_ok("hold-baseline")
 
         self.sub(step, "H8", lambda: bool(self.hj(self.facts(), "baselined")), h8_act)
-        self.set_phase(step, "baselined")
+        h8 = (self.j.find(self.launch, step, "H8", "done") or [{}])[-1].get("detail") or {}
+        evidence = {k: v for k, v in (("sev_baseline", h8.get("sev_baseline")),
+                                      ("disk_fingerprint", h8.get("fingerprint_sha256"))) if v is not None}
+        self.set_phase(step, "baselined", {"host": evidence} if evidence else None)
 
         # H9 held.
         def h9_act(seq: int) -> None:
@@ -732,6 +756,12 @@ class Op:
     def abort(self, n: int, code: str) -> None:
         step = f"abort#{n}"
         self.begin(step)
+        # The first run's error code is the one the record gets, whatever a resumed run was told.
+        first = self.j.find(self.launch, step, "reason", "done")
+        if first:
+            code = first[-1]["detail"]["error_code"]
+        else:
+            self.j.write(self.launch, None, step, "reason", "done", {"error_code": code})
 
         def kit_never_stopped() -> bool:
             f = self.facts()
@@ -745,42 +775,36 @@ class Op:
                  lambda seq: self.host_ok("unhold"))
 
         def restored_observe() -> bool:
-            v, res = self.view(), self.record().get("reservation") or {}
+            v, res = self.view(), self.res()
             t, orig = tuple_of(v), res.get("original")
-            if v.get("custom_guest_hold") is None and t == orig:
-                return True  # H3 never ran
-            want = {"generation": orig["generation"] + 2, "ref": orig["ref"]}
-            if t == want and v.get("custom_guest_hold") is None and v.get("drain") is True:
+            if v.get("custom_guest_hold") is None and t == orig and res.get("expect") == "original":
+                return True  # the fence never landed
+            if restored_now(v, res):
                 return True
-            if t == res.get("fenced"):
+            if res.get("fenced") and t == res["fenced"]:
                 return False
             raise Blocked("custom_guest_reservation_moved", f"live tuple {t}: Toby decides")
 
-        def restored_act(seq: int) -> None:
-            orig = self.record()["reservation"]["original"]
-            self.patch(seq, "holding", "holding", {"reservation": self.reservation(
-                restored={"generation": orig["generation"] + 2, "ref": orig["ref"]})})
-            self.fence_until("restored", Blocked)
-
-        self.sub(step, "restore", restored_observe, restored_act)
-        before = bool(self.record().get("drain_before"))
+        self.sub(step, "restore", restored_observe, lambda seq: self.fence_until("restored", Blocked))
+        before = bool(host_of(self.record()).get("drain_before"))
         self.sub(step, "drain", lambda: bool(self.view().get("drain")) == before, lambda seq: self.drain(before))
 
         def approved(seq: int) -> None:
-            v = self.view()
-            res = self.record().get("reservation") or {}
-            self.patch(seq, "holding", "approved", {"error_code": code, "hold_phase": None,
-                                                    "reservation": {**res, "expect": None,
-                                                                    "final": tuple_of(v)}})
+            self.patch(seq, "holding", "approved", {"error_code": code})
 
         self.sub(step, "approved", lambda: self.record()["state"] == "approved", approved)
+        if self.open_step(f"hold#{n}"):
+            self.end(f"hold#{n}")  # the attempt is over: resume must not take it up again
         self.end(step)
 
     def step_abort(self) -> None:
         rec = self.record()
-        if rec["state"] != "holding":
+        n = int(self.res(rec).get("attempt") or 1)
+        # An abort whose approved PATCH landed before the run died is finished (its subs observe done).
+        if rec["state"] != "holding" and not (rec["state"] == "approved" and self.open_step(f"abort#{n}")):
             raise Blocked("custom_guest_state_conflict", f"abort needs holding, the record is {rec['state']}")
-        self.abort(int((rec.get("reservation") or {}).get("attempt") or 1), self.o.reason or "custom_guest_hold_failed")
+        self.abort(int(self.res(rec).get("attempt") or 1), self.o.reason or "custom_guest_hold_failed")
+        return None
 
     # ================================================================ boot, stop (11.3, 11.5)
     def step_boot(self) -> None:
@@ -799,7 +823,7 @@ class Op:
         frm = rec["state"]
 
         def booting(seq: int) -> None:
-            self.patch(seq, frm, "booting", {"stop_reason": None, "error_code": None}, generation=gen)
+            self.patch(seq, frm, "booting", {"error_code": None}, generation=gen)
 
         self.sub(step, "booting", lambda: self.record()["state"] in ("booting", "running")
                  and int(self.record().get("generation") or 0) == gen, booting, gen)
@@ -809,11 +833,17 @@ class Op:
         try:
             self.sub(step, "host_boot", lambda: bool([e for e in self.hj(self.facts(), "booted") if e.get("generation") == gen]),
                      lambda seq: self.host_ok("boot", data), gen)
-            self.sub(step, "disks", lambda: False, lambda seq: self.host_ok("verify-disks", context=f"boot{gen}"), gen) \
-                if not self.j.done(self.launch, step, "disks") else None
+            # verify-disks only reads and compares; a rerun runs it again.
+            self.sub(step, "disks", lambda: "disks" in self.stash,
+                     lambda seq: self.stash.__setitem__("disks", self.host_ok("verify-disks", context=f"boot{gen}")), gen)
         except Blocked as e:
             if self.record()["state"] == "booting":
                 seq = self.j.write(self.launch, gen, step, "boot_failed", "intent", {"error_code": e.code})
+                # QEMU may have started: the record says stopped only once the host shows the unit down.
+                if not self.guest_down():
+                    self.j.write(self.launch, gen, step, "boot_failed", "failed", {"error_code": e.code})
+                    raise Blocked("custom_guest_stop_failed",
+                                  f"boot failed ({e.code}) and the guest unit did not stop; the record stays booting")
                 self.patch(seq, "booting", "stopped", {"stop_reason": "boot_failed", "error_code": e.code,
                                                        "error_detail": e.detail[:300]})
                 self.j.write(self.launch, gen, step, "boot_failed", "done")
@@ -825,6 +855,15 @@ class Op:
 
         self.sub(step, "running", lambda: self.record()["state"] == "running", running, gen)
         self.end(step, gen)
+
+    def guest_down(self) -> bool:
+        """Run the host stop phase (idempotent) and read the unit back: True only when it is not running."""
+        try:
+            self.host_ok("stop")
+            unit = self.facts().get("custom_unit") or {}
+        except (Blocked, Transport):
+            return False
+        return unit.get("ActiveState", "inactive") in ("inactive", "failed")
 
     def step_stop(self) -> None:
         rec = self.record()
@@ -838,8 +877,9 @@ class Op:
         self.begin(step, gen)
         self.sub(step, "stopping", lambda: self.record()["state"] in ("stopping", "stopped"),
                  lambda seq: self.patch(seq, "running", "stopping"), gen)
-        self.sub(step, "host_stop", lambda: False, lambda seq: self.host_ok("stop"), gen) \
-            if not self.j.done(self.launch, step, "host_stop") else None
+        # The host stop phase is idempotent; a rerun after a lost answer runs it again.
+        self.sub(step, "host_stop", lambda: "host_stop" in self.stash,
+                 lambda seq: self.stash.__setitem__("host_stop", self.host_ok("stop")), gen)
         self.sub(step, "stopped", lambda: self.record()["state"] == "stopped",
                  lambda seq: self.patch(seq, "stopping", "stopped"), gen)
         self.end(step, gen)
@@ -848,9 +888,11 @@ class Op:
     def notice_ok(self, rec: dict) -> bool:
         for r in reversed(rec.get("owner_requests") or []):
             if r.get("action") == "return":
-                return bool(r.get("waive_notice"))
+                if r.get("waive_notice"):
+                    return True
+                break  # no waiver: the 72 h notice decides
         if self.o.notice_sent_at:
-            t = time.mktime(time.strptime(self.o.notice_sent_at, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+            t = utc(self.o.notice_sent_at)
             return time.time() - t >= NOTICE_SECONDS
         return False
 
@@ -868,28 +910,34 @@ class Op:
             self.end(step)
             return
         self.sub(step, "R0", lambda: self.record()["state"] in ("returning", "returned"),
-                 lambda seq: self.patch(seq, self.record()["state"], "returning",
-                                        {"reservation": self.reservation(expect="fenced")}))
+                 lambda seq: self.patch(seq, self.record()["state"], "returning"))
 
         def kit(seq: int) -> None:
             r = self.host_ok("return-kit")
-            self.patch(seq, "returning", "returning", {"kit_boot": r["kit_boot"], "disk_verified": r["disk_verified"]})
+            self.patch(seq, "returning", "returning",
+                       {"host": {"kit_boot": r["kit_boot"], "disk_verified": r["disk_verified"]}})
 
-        self.sub(step, "R1_R10", lambda: bool(self.record().get("kit_boot")) and
-                 (self.record().get("kit_boot") or {}).get("invocation_id") ==
-                 (self.facts().get("kit_unit") or {}).get("invocation_id"), kit)
+        def kit_current() -> bool:
+            boot, unit = host_of(self.record()).get("kit_boot") or {}, self.facts().get("kit_unit") or {}
+            return bool(boot) and unit.get("state") == "active" and boot.get("invocation_id") == unit.get("invocation_id")
+
+        # Until R12 gives the hotel back, the evidence must be about the kit boot that runs now: a host reboot
+        # after R11 makes the journaled R1 to R11 stale, so both are observed again on every run (5.4, 11.6).
+        before_r12 = not self.j.done(self.launch, step, "R12")
+        self.sub(step, "R1_R10", kit_current, kit, recheck=before_r12)
 
         def r11() -> bool:
-            boot = self.record()["kit_boot"]
+            boot = host_of(self.record())["kit_boot"]
             end = time.time() + ADMIT_WAIT
             while True:
                 v = self.view()
                 adm = v.get("admission") or {}
                 at = adm.get("attested_at")
-                at_t = time.mktime(time.strptime(at, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone if at else 0
+                at_t = utc(at) if at else 0
                 rc = self.restart_check()
                 if v.get("up") and adm.get("state") == "admitted" and adm.get("measurement") == boot["measurement"] \
-                        and at_t >= (boot.get("active_enter") or 0) and rc.get("count_known") is True:
+                        and at_t >= (boot.get("active_enter") or 0) and rc.get("count_known") is True \
+                        and kit_current():
                     self.stash["R11"] = {"admission": adm, "count_known": True}
                     return True
                 if time.time() >= end:
@@ -898,30 +946,21 @@ class Op:
                     raise Blocked("custom_guest_return_not_admitted", "no admission for the R9 boot")
                 time.sleep(POLL)
 
-        self.sub(step, "R11", r11)
+        self.sub(step, "R11", r11, recheck=before_r12)
 
         def r12_observe() -> bool:
-            v, res = self.view(), self.record().get("reservation") or {}
-            t, orig = tuple_of(v), res["original"]
-            if t == {"generation": orig["generation"] + 2, "ref": orig["ref"]} and v.get("custom_guest_hold") is None \
-                    and v.get("drain") is True:
+            v, res = self.view(), self.res()
+            if restored_now(v, res):
                 return True
-            if t == res.get("fenced"):
+            if tuple_of(v) == res.get("fenced"):
                 return False
-            raise Blocked("custom_guest_reservation_moved", f"live tuple {t}: Toby decides")
+            raise Blocked("custom_guest_reservation_moved", f"live tuple {tuple_of(v)}: Toby decides")
 
-        def r12_act(seq: int) -> None:
-            orig = self.record()["reservation"]["original"]
-            self.patch(seq, "returning", "returning", {"reservation": self.reservation(
-                restored={"generation": orig["generation"] + 2, "ref": orig["ref"]})})
-            self.fence_until("restored", Blocked)
-
-        self.sub(step, "R12", r12_observe, r12_act)
-        before = bool(self.record().get("drain_before"))
+        self.sub(step, "R12", r12_observe, lambda seq: self.fence_until("restored", Blocked))
+        before = bool(host_of(self.record()).get("drain_before"))
         self.sub(step, "R13", lambda: bool(self.view().get("drain")) == before, lambda seq: self.drain(before))
         self.sub(step, "R14", lambda: self.record()["state"] == "returned",
-                 lambda seq: self.patch(seq, "returning", "returned",
-                                        {"reservation": self.reservation(expect="restored"), "error_code": None}))
+                 lambda seq: self.patch(seq, "returning", "returned", {"error_code": None}))
         self.return_finish(step)
         self.end(step)
 
@@ -942,7 +981,11 @@ class Op:
         step = "cancel"
         self.begin(step)
         frm = rec["state"]
-        self.sub(step, "discard", lambda: not self.facts().get("launch_dir"), lambda seq: self.host_ok("discard"))
+        def discarded() -> bool:
+            f = self.facts()
+            return not (f.get("launch_dir") or f.get("inbox_dir") or f.get("staging_dir"))
+
+        self.sub(step, "discard", discarded, lambda seq: self.host_ok("discard"))
         self.sub(step, "cancelled", lambda: self.record()["state"] == "cancelled",
                  lambda seq: self.patch(seq, frm, "cancelled"))
         self.end(step)
@@ -954,9 +997,18 @@ class Op:
                 opened.append(e["step"])
         if not opened:
             print(json.dumps({"ok": True, "open": None}))
-            return
+            return False
         step = opened[-1]
         kind = step.split("#", 1)[0]
+        # The options the step began with (--path, --dedicated-since, --h5-ok, ...) carry over unless given now.
+        argv = (self.j.find(self.launch, step, "begin")[-1].get("detail") or {}).get("argv") or []
+        try:
+            saved = parser().parse_args(argv)
+        except SystemExit:
+            saved = None
+        for k in RESUMED_OPTIONS:
+            if saved is not None and getattr(self.o, k, None) is None:
+                setattr(self.o, k, getattr(saved, k))
         {"intake": self.step_intake, "measure": self.step_measure, "hold": self.step_hold, "abort": self.step_abort,
          "boot": self.step_boot, "stop": self.step_stop, "return": self.step_return,
          "cancel": self.step_cancel}[kind]()
@@ -1011,6 +1063,18 @@ class Op:
         return 2 if alerts else 0
 
 
+def restored_now(view: dict, res: dict) -> bool:
+    """The live state of fence restored: (fenced G + 1, ref0), no hold, drain on (7.2)."""
+    if not res.get("fenced") or not res.get("original"):
+        return False
+    want = res.get("restored") or {"generation": res["fenced"]["generation"] + 1, "ref": res["original"]["ref"]}
+    return tuple_of(view) == want and view.get("custom_guest_hold") is None and view.get("drain") is True
+
+
+RESUMED_OPTIONS = ("toby_go", "path", "direct_guest", "order", "dedicated_since", "h5_ok", "h5_holder",
+                   "notice_sent_at", "reason")
+
+
 def step_record_versions(hotel: str, where: list[str], commits: list[str]) -> None:
     if not where or len(where) != len(commits) or not all(re.fullmatch(r"[0-9a-f]{7,40}", c) for c in commits):
         raise Blocked("custom_guest_request_invalid", "--where NAME --commit SHA, one pair per conveyor or operator machine")
@@ -1019,7 +1083,7 @@ def step_record_versions(hotel: str, where: list[str], commits: list[str]) -> No
     print(json.dumps({"ok": True, "versions": dict(zip(where, commits))}))
 
 
-def main(argv: list[str]) -> int:
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="custom-guest.sh", description=__doc__.splitlines()[0])
     ap.add_argument("step", choices=["fetch", "intake", "measure", "hold", "abort", "boot", "stop", "return", "resume",
                                      "reconcile", "cancel", "record-versions"])
@@ -1036,7 +1100,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--reason", help="abort: the error code to record")
     ap.add_argument("--where", action="append", default=[])
     ap.add_argument("--commit", action="append", default=[])
-    o = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str]) -> int:
+    o = parser().parse_args(argv)
     try:
         if o.step == "record-versions":
             step_record_versions(o.hotel, o.where, o.commit)
@@ -1046,8 +1114,8 @@ def main(argv: list[str]) -> int:
         op = Op(o.hotel, o.launch_id, o)
         if o.step == "reconcile":
             return op.step_reconcile()
-        getattr(op, "step_" + o.step.replace("-", "_"))()
-        if o.step not in ("fetch",):
+        printed = getattr(op, "step_" + o.step.replace("-", "_"))() is False
+        if o.step != "fetch" and not printed:
             print(json.dumps({"ok": True, "state": op.record()["state"]}))
         return 0
     except Blocked as e:
