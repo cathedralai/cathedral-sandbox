@@ -1,14 +1,17 @@
-# Customer VM host runtime (AB#991)
+# Customer VM host runtime (AB#991, AB#999)
 
-Long-lived customer Linux VMs on a KVM host: a persistent disk, the customer's
-SSH key, explicit start, stop, reboot and delete. Same pattern as the sealed
-hotel unit (`../sealed/launch-guest.sh`, `write-units.sh`, `host-net.sh`).
+Long-lived sealed customer Linux VMs on an AMD SEV-SNP host: a persistent disk,
+the customer's SSH key, explicit start, stop, reboot and delete. Same pattern as
+the sealed hotel unit (`../sealed/launch-guest.sh`, `write-units.sh`, `host-net.sh`).
 
 **VMs are SEV-SNP only.** There is no plain KVM mode and no flag for one.
-`launch-vm.sh` refuses to start QEMU (exit 78, "VM launch refused: SEV-SNP is
-required (AB#999)") and the broker refuses a VM create (409
-`vm_runtime_not_sealed`) unless the host is sealed and declares
-`snp_vm_runtime`. Both stay refused until the SNP VM launch ships (AB#999).
+`launch-vm.py` builds every argv through `snp_qemu.snp_argv`, which always has
+the `sev-snp-guest` object (policy `0x30000`, `kernel-hashes=on`), and checks it
+again before QEMU runs. Off by default, on three switches: the broker refuses a
+VM create (409 `vm_runtime_not_sealed`) unless the host is sealed and declares
+`snp_vm_runtime`; `create` refuses (`snp_vm_host_disabled`) and every launch
+refuses (exit 78) unless the host file `/etc/cathedral/snp-vm-host.json` exists
+and lists the VM's bundle.
 
 ## Files
 
@@ -16,15 +19,19 @@ required (AB#999)") and the broker refuses a VM create (409
 |------|------|
 | `vm-ctl.sh` (`vm_ctl.py`) | The control command. One JSON line on stdout per call. |
 | `vm_capacity.py` | The host admission ledger across VMs and sealed hotel kits (AB#999). |
-| `launch-vm.sh` | `ExecStart` of `cathedral-vm-<name>.service`: QEMU in the foreground. |
-| `vm-net.sh up\|down\|check vm.env` | Tap /30, NAT out, SSH port forward, isolation. |
-| `images.lock`, `fetch-image.sh` | Pinned Ubuntu 24.04 cloud image and its sha256. |
+| `launch-vm.py` | `ExecStart` of `cathedral-vm-<name>.service`, as the VM's user: QEMU in the foreground, exit 75 on a guest reset, 0 on a poweroff. `--print` shows the argv. |
+| `snp_qemu.py` | The SEV-SNP argv lines and their property check, shared with `ops/custom-guest/launch-custom-guest.py`. |
+| `vm-net.sh up\|down\|check vm.env` | Tap /30 owned by the VM user, NAT out, SSH port forward, isolation. |
 | `vm.env.example` | What `create` writes per VM. |
+| `vm_measure.py` | Sealed VM launch values: identity document, measured cmdline, HOST_DATA, expected measurement; bundle manifest. |
+| `build-bundle.sh`, `bundle.env.example` | Recipe for one sealed VM bundle: base root, kernel and modules, manifest. |
 
 ## Use
 
 ```
-sudo ./fetch-image.sh                       # once per host: $VM_ROOT/images/
+# once per host: the bundle at $VM_ROOT/bundles/<id>/ and /etc/cathedral/snp-vm-host.json (mode 0644):
+# {"version": 1, "cpu_family": "genoa", "bundles": ["<id>"], "default_bundle": "<id>",
+#  "sev_snp_measure": "/opt/vm-measure/bin/sev-snp-measure"}
 sudo ./vm-ctl.sh create vm1 --vcpus 2 --mem-gib 4 --disk-gib 40 --ssh-key-file key.pub --ssh-port 22001
 sudo ./vm-ctl.sh authorize vm1 <paid_through_unix> <generation>
 sudo ./vm-ctl.sh start vm1                  # ssh -p 22001 cathedral@<host>
@@ -43,14 +50,32 @@ the host (`{"error": "host_capacity", "resource": ...}`, see Host admission), 1 
 
 ## What a VM is
 
-- `$VM_ROOT/<name>/`: `vm.env`, `disk.qcow2` (overlay on the pinned image,
-  sized to `--disk-gib`), `seed.iso` (cloud-init NoCloud: user `cathedral`
-  with the customer key and sudo, no password login, root login off, static
-  IP), `authorization.json`, `stop.json`, `run/` (QMP socket, serial log).
-- `cathedral-vm-<name>.service`: loads KVM, waits for `/dev/kvm`, checks
-  `paid_through`, brings the link up, runs QEMU. `Restart=on-failure`, at most
-  5 starts in 15 min. Enabled while it should run, so it returns after a host
-  reboot. A guest reboot stays inside the same QEMU process.
+- `$VM_ROOT/<name>/` (root, 0700): `vm.env`, `vm-identity.json` (immutable: VM id, salt,
+  first-boot key, base root hash), `launch.json` (bundle, identity sha256, expected
+  measurement, HOST_DATA; `status` returns them), `root.raw` (sparse, `--disk-gib`, all
+  zero until the guest formats it), `mailbox.raw` (1 MiB), `authorization.json`,
+  `stop.json`, `run/` (the two QMP sockets). `root.raw`, `mailbox.raw` and `run/` belong
+  to the VM's user; everything else stays root's.
+- One system user `cvm-<slot>` per VM, made at create and removed at delete. QEMU runs
+  as it (no `-runas`), with groups `kvm` and `cvm-sev` (a udev rule gives `cvm-sev` rw on
+  `/dev/sev`).
+- `cathedral-vm-<name>.service` (spec r2 8.2, the dedicated unit's confinement): root
+  steps (`+`) load KVM, wait for `/dev/kvm`, check `paid_through` and the start line,
+  bring the link up with a tap the VM user owns. `TemporaryFileSystem=/srv:ro` (and
+  `$VM_ROOT` when it is elsewhere) hides every other VM and kit; `BindReadOnlyPaths`
+  gives back the kit code, the bundle, `vm.env` and `vm-identity.json`, `BindPaths` the
+  two disks and `run/`. `Restart=on-failure`, at most 5 starts in 15 min,
+  `RestartForceExitStatus=75`, `RestartPreventExitStatus=78`. Enabled while it should
+  run, so it returns after a host reboot.
+- Reboot is a relaunch (`-no-reboot`): a guest reset ends QEMU, the launcher exits 75
+  and systemd starts it again in the same generation; `vm-ctl reboot` asks the guest to
+  power off, waits up to 60 s, then restarts the unit. Neither adds a history line. A
+  `vm-ctl reboot` cut after the powerdown leaves `reboot-pending.json`, and its retry
+  relaunches the same paid, open generation.
+- QEMU starts paused (`-S`); the launcher lets the guest run (`cont`) only after it
+  listens for QMP events, so no poweroff or reset goes unseen.
+- Root's QMP commands (`stop`, `reboot`, the unit's `ExecStop`) connect as the VM's
+  user from inside `run/`, so a link put there reaches nothing that user cannot.
 - Network: guest `.2` on its own /30 in 10.216.0.0/16, NAT to the internet,
   no access to private ranges or to this host, and one way in: the host's
   `--ssh-port` forwarded to guest port 22.
@@ -188,9 +213,46 @@ command="/opt/cathedral/room-kit/vm/vm-ctl.sh --from-broker",restrict ssh-ed2551
 
 `SSH_ORIGINAL_COMMAND` must hold only letters, digits, spaces, `.`, `_`, `-`;
 it is split on spaces, never passed to a shell, and only the public
-subcommands are allowed. `create` takes the customer key on stdin and always
-uses the pinned image (no `--ssh-key-file`, no `--image`).
+subcommands are allowed. `create` takes the customer key on stdin (no
+`--ssh-key-file`) and the host's default bundle unless `--bundle` names another
+enabled one.
 
-## Not in v1
+## Sealed VM bundle and launch values (AB#999, PR VM1a)
 
-The SNP launch itself (AB#999), resize, snapshots.
+`create` writes the identity and the launch values below; the launcher recomputes the
+cmdline and HOST_DATA from the identity on every launch.
+
+- **Bundle:** one directory addressed by `sha256(manifest.json)`: `OVMF.amdsev.fd`,
+  `vmlinuz`, `initrd.cpio.zst` (the VM initrd, PR VM1b), `base-root.raw` (ext4 plus its
+  dm-verity tree after the data), the two `packages.lock` files and `manifest.json`
+  (schema `cathedral.vm.bundle/v1`, canonical JSON, every file's sha256 and size, the
+  cmdline template, CPU family and model, policy `0x30000`, QEMU, kernel and initrd
+  versions, snapshot, verity root hash). `build-bundle.sh` builds the base root and the
+  kernel from one pinned snapshot, then writes the manifest.
+- **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random
+  salt, the first-boot SSH key and the bundle's base root hash. Written once at create.
+- **Cmdline:** the bundle template with `cathedral.vm=<sha256 of vm-identity.json>`, so
+  every VM has its own launch measurement. It masks every getty, the emergency, rescue
+  and debug shells, and the guest agent.
+- **HOST_DATA:** `sha256(b"cathedral-vm-v1\0" || sha256(vm-identity.json))`: 64 hex in a
+  report, base64 for QEMU `host-data=`.
+- **Measurement:** `sev-snp-measure 0.0.12 --mode snp` (requirements/vm-measure.txt) over
+  digest-checked private copies. Every VM runs QEMU `-cpu EPYC-v4`, on Genoa and Turin
+  alike (Toby, 27 Nov 12:19Z: until the tool supports Turin); a manifest naming another
+  model is refused. Only the model's CPUID signature (family, model, stepping) is
+  measured, not its feature set: EPYC-v1 and EPYC-v4 give one digest. The guest checks
+  its features itself (VM1b).
+
+```
+vm_measure.py identity --bundle B --vm-id vm-0123456789ab --ssh-key-file key.pub --out vm-identity.json
+vm_measure.py launch --bundle B --identity vm-identity.json --vcpus 2 --cpu-family genoa
+vm_measure.py check-bundle B
+```
+
+Shared vectors: `tests/fixtures/vm_measure_v1.json` (identity, cmdline, HOST_DATA, five
+measurements) for the VM init (VM1b) and the verifier (VM2).
+
+## Not here yet
+
+Admission across VMs and kits (VM4), the pre-launch gates and host change gate (VM5),
+re-wrap (VM6), resize, snapshots.

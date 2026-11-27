@@ -16,6 +16,8 @@ source "$(readlink -f "${2:?vm.env}")"
 IP_RE='^10\.216\.[0-9]{1,3}\.[0-9]{1,3}$'
 [[ "${VM_HOST_IP:-}" =~ $IP_RE && "${VM_GUEST_IP:-}" =~ $IP_RE ]] || { echo "cathedral-vm: bad VM_HOST_IP or VM_GUEST_IP" >&2; exit 1; }
 [[ "${VM_SSH_PORT:-}" =~ ^[1-9][0-9]{3,4}$ ]] && [ "$VM_SSH_PORT" -le 65535 ] || { echo "cathedral-vm: bad VM_SSH_PORT" >&2; exit 1; }
+# The VM's QEMU user (sealed VMs, AB#999): QEMU runs unprivileged, so the tap must be its own.
+[ -z "${VM_USER:-}" ] || [[ "$VM_USER" == "cvm-${VM_TAP#cvm}" ]] || { echo "cathedral-vm: VM_USER is not the user of $VM_TAP" >&2; exit 1; }
 TAP=$VM_TAP
 GUEST=$VM_GUEST_IP
 FWD=CVM-${TAP^^}-FWD
@@ -106,7 +108,14 @@ case "${1:?up|down|check|purge}" in
 up)
   lock
   port_clash
-  ip link show "$TAP" >/dev/null 2>&1 || ip tuntap add dev "$TAP" mode tap
+  if [ -n "${VM_USER:-}" ]; then
+    # QEMU (not root) can attach only to a tap its user owns: a leftover tap of another
+    # owner, or of none, is replaced. QEMU is not running while the unit runs "up".
+    ip link del "$TAP" 2>/dev/null || true
+    ip tuntap add dev "$TAP" mode tap user "$VM_USER" group "$VM_USER"
+  else
+    ip link show "$TAP" >/dev/null 2>&1 || ip tuntap add dev "$TAP" mode tap
+  fi
   ip addr replace "$VM_HOST_IP/30" dev "$TAP"
   # No IPv6 on the link: the rules here are IPv4 only, and root in the guest could
   # otherwise reach this host over the tap's link-local address.

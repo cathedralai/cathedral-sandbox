@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+import vm_host_support
+
 REPO = Path(__file__).resolve().parents[1]
 KIT = REPO / "room-kit" / "vm"
 SEALED = REPO / "room-kit" / "sealed"
@@ -100,7 +102,8 @@ class Host:
         for d in (self.root, self.units, self.vms):
             d.mkdir(parents=True, exist_ok=True)
         write_fakes(tmp / "bin")
-        self.env = {**os.environ, "PATH": f"{tmp / 'bin'}:{os.environ['PATH']}", "FAKE_STATE": str(self.state),
+        sealed = vm_host_support.sealed_host(tmp, tmp / "bin")  # a bundle and the VM host config (VM3)
+        self.env = {**sealed, **os.environ, "PATH": f"{tmp / 'bin'}:{os.environ['PATH']}", "FAKE_STATE": str(self.state),
                     "VM_CAPACITY_ROOT": str(self.root), "SYSTEMD_UNIT_DIR": str(self.units),
                     "VM_ROOT": str(self.vms), "VM_GUEST_OVERHEAD_MIB": "1024", "VM_MIN_HOST_FREE_GIB": "0",
                     "VM_STOP_WAIT": "1", "VM_LOCK_DIR": str(tmp / "lock"), "VM_IPV6_CONF_DIR": str(tmp / "ipv6")}
@@ -144,7 +147,8 @@ class Host:
         """A kit as install-sealed.sh leaves it: sealed.env in SEALED_DIR and the units write-units.sh writes."""
         env = self.kit_env(name, **kw)
         p = subprocess.run(["bash", str(SEALED / "write-units.sh"), str(env)], capture_output=True, text=True,
-                           env={**os.environ, "ROOM_DESTDIR": str(self.destdir)}, timeout=30)
+                           env={**os.environ, "PATH": self.env["PATH"], "FAKE_STATE": self.env["FAKE_STATE"],
+                                "ROOM_DESTDIR": str(self.destdir)}, timeout=30)  # its host lock: the fake flock
         assert p.returncode == 0, p.stderr
         self.set_unit(f"room-sealed-{name}.service", active)
         return env
@@ -186,11 +190,8 @@ class Host:
 
     def create(self, name="vm1", port="22001", mem="1", vcpus="1", disk="4", extra=None):
         (self.tmp / "id.pub").write_text(KEY + "\n")
-        image = self.tmp / "base.img"
-        image.write_bytes(b"not really an image")
         return self.ctl("create", name, "--vcpus", vcpus, "--mem-gib", mem, "--disk-gib", disk,
-                        "--ssh-key-file", str(self.tmp / "id.pub"), "--ssh-port", port, "--image", str(image),
-                        extra=extra)
+                        "--ssh-key-file", str(self.tmp / "id.pub"), "--ssh-port", port, extra=extra)
 
     def lock_path(self) -> Path:
         return self.root / "run" / "lock" / "cathedral-snp-capacity.lock"
@@ -629,7 +630,10 @@ def test_commit_kit_runs_only_after_the_measurement_matched():
     block = match[match.index("commit-kit"):]
     assert "&& VM_LEDGER_COMMITTED=1" in block[:300] and "|| log " in block[:300] and "|| exit" not in block[:300]
     # Every exit runs the ledger's exit step (log the open record, unlock), after the volume restore.
-    assert "trap 'data_volume_restore_on_exit; vm_ledger_on_exit' EXIT" in text
+    assert "trap 'data_volume_restore_on_exit; vm_ledger_on_exit; snp_lock_release' EXIT" in text
+    # The ledger's own trap keeps the host lock's release (host-lock.sh), set just before it.
+    assert "trap 'vm_ledger_on_exit; snp_lock_release' EXIT" in _assess_block()
+    assert text.index("trap snp_lock_release EXIT") < text.index("# Customer VMs on this host")
 
 
 def reset_host(host, cap, avail_gib, data_gib, allocated_gib, new_data_gib, vm_growth_gib=100):
@@ -758,6 +762,7 @@ def run_assess_slice(host: Host, env_file: Path, tail: str = ""):
     script.write_text("#!/bin/bash\nset -euo pipefail\n"
                       f"KIT={shlex.quote(str(REPO / 'room-kit'))}\nENV_FILE={shlex.quote(str(env_file))}\n"
                       "SEALED_NAME=$(sed -n 's/^SEALED_NAME=//p' \"$ENV_FILE\")\n"
+                      "snp_lock_release() { :; }  # the host lock step before this block (host-lock.sh)\n"
                       + _assess_block() + 'echo "ledger id ${VM_LEDGER_ID}"\n' + tail + 'echo "slice passed"\n')
     return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=host.env, timeout=60)
 
@@ -1041,9 +1046,8 @@ def test_the_credit_cutoff_never_loads_the_ledger(host):
         return p.returncode, json.loads(p.stdout.strip().splitlines()[-1])
 
     (host.tmp / "id.pub").write_text(KEY + "\n")
-    (host.tmp / "base.img").write_bytes(b"x")
     assert run("create", "vm1", "--vcpus", "1", "--mem-gib", "1", "--disk-gib", "4", "--ssh-key-file",
-               str(host.tmp / "id.pub"), "--ssh-port", "22001", "--image", str(host.tmp / "base.img"))[0] == 0
+               str(host.tmp / "id.pub"), "--ssh-port", "22001")[0] == 0
     now = int(time.time())
     assert run("authorize", "vm1", str(now + 600), "1")[0] == 0
     assert run("start", "vm1", "--generation", "1")[0] == 0
@@ -1053,5 +1057,5 @@ def test_the_credit_cutoff_never_loads_the_ledger(host):
     code, out = run("stop", "vm1", "--generation", "1")
     assert code == 0 and out["state"] == "stopped", out
     code, out = run("create", "vm2", "--vcpus", "1", "--mem-gib", "1", "--disk-gib", "4", "--ssh-key-file",
-                    str(host.tmp / "id.pub"), "--ssh-port", "22002", "--image", str(host.tmp / "base.img"))
+                    str(host.tmp / "id.pub"), "--ssh-port", "22002")
     assert code == 1 and "broken on purpose" in out["detail"], out

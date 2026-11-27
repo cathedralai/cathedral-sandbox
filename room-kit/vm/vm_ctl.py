@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Host runtime for long-lived customer VMs (AB#991). Run through vm-ctl.sh.
 
-One VM is one directory $VM_ROOT/<name>/ (vm.env, disk.qcow2, seed.iso,
-authorization.json, stop.json, run/) and one systemd unit
-cathedral-vm-<name>.service that runs QEMU/KVM. Every command prints one JSON
-line on stdout; a refusal prints {"error": ...} and exits nonzero:
+One VM is one directory $VM_ROOT/<name>/ (vm.env, vm-identity.json, launch.json,
+root.raw, mailbox.raw, authorization.json, stop.json, run/), one system user
+cvm-<slot> and one systemd unit cathedral-vm-<name>.service that runs the SEV-SNP
+guest as that user (launch-vm.py; VM runtime spec r2 6.3, 7.1, 8.1, 8.2).
+Every command prints one JSON line on stdout; a refusal prints {"error": ...} and exits nonzero:
   2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or exists, or
   {"error": "host_capacity", "resource": ...} from create and start (vm_capacity.py), 1 anything else.
 
@@ -39,6 +40,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import stat
 import sys
 import tempfile
 import threading
@@ -46,6 +48,9 @@ import time
 from pathlib import Path
 
 KIT = Path(__file__).resolve().parent
+# -I keeps the script's directory off sys.path; vm_measure.py beside this file is the kit's.
+sys.path.insert(0, str(KIT))
+import vm_measure  # noqa: E402
 
 
 def capacity():
@@ -60,6 +65,8 @@ def capacity():
         spec.loader.exec_module(mod)
     return mod
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+# Entries of $VM_ROOT that are not VMs: no VM may take their name.
+RESERVED_NAMES = (".history", "bundles")
 # Must equal the broker's vmKeyTypes (broker/vms.go); both test files pin the same set.
 # The sk-* security-key types are accepted by the guest sshd (OpenSSH 9.6 on the pinned Ubuntu 24.04).
 KEY_TYPES = (
@@ -76,6 +83,14 @@ SLOTS = NET.num_addresses // 4
 COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce",
             "cancel", "history")
 STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
+MAILBOX_BYTES = 1 << 20
+# MemoryMax headroom over guest memory: the dedicated unit's figure (D 5.8) until rehearsal A2
+# measures the SNP QEMU overhead. A cap, not a reservation: admission (VM4) counts its own.
+MEM_OVERHEAD_GIB = 16
+SEV_GROUP = "cvm-sev"
+# Fields of launch.json (vm_measure.launch_values at create) that status returns.
+LAUNCH_STATUS = ("vm_id", "bundle", "identity_sha256", "expected_measurement", "host_data", "cpu_family",
+                 "cpu_model", "cpu_signature", "policy")
 # Credit cutoff: a short grace, and every expired VM at once, so one guest that ignores
 # the powerdown cannot keep the next one running past its paid_through.
 CUTOFF_WAIT = int(os.environ.get("VM_CUTOFF_WAIT", "15"))
@@ -99,6 +114,42 @@ def unit_dir() -> Path:
     return Path(os.environ.get("SYSTEMD_UNIT_DIR", "/etc/systemd/system"))
 
 
+def udev_rules_dir() -> Path:
+    return Path(os.environ.get("VM_UDEV_RULES_DIR", "/etc/udev/rules.d"))
+
+
+def host_config_path() -> Path:
+    # launch-vm.py reads the same file at its fixed path (HOST_CONFIG); only tests move it.
+    return Path(os.environ.get("VM_HOST_CONFIG", "/etc/cathedral/snp-vm-host.json"))
+
+
+def host_config() -> dict:
+    """The host's sealed VM switch: absent, every create (and every launch) refuses.
+
+    {"version": 1, "cpu_family": "genoa"|"turin", "bundles": [<bundle id>, ...],
+     "default_bundle": <one of bundles>, "sev_snp_measure": <absolute path, optional>}"""
+    path = host_config_path()
+    try:
+        doc = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise Refusal("snp_vm_host_disabled", f"{path} is missing: this host runs no sealed VM", 1) from None
+    except (OSError, ValueError):
+        raise Refusal("snp_vm_host_config", f"{path} is not readable JSON", 1) from None
+    bundles = doc.get("bundles") if isinstance(doc, dict) else None
+    tool = doc.get("sev_snp_measure") if isinstance(doc, dict) else None
+    if not (isinstance(doc, dict) and doc.get("version") == 1 and doc.get("cpu_family") in vm_measure.CPU_MODELS
+            and isinstance(bundles, list) and bundles
+            and all(isinstance(b, str) and re.fullmatch(r"[0-9a-f]{64}", b) for b in bundles)
+            and doc.get("default_bundle") in bundles
+            and (tool is None or (isinstance(tool, str) and tool.startswith("/")))):
+        raise Refusal("snp_vm_host_config", f"{path}: version, cpu_family, bundles or default_bundle is wrong", 1)
+    return doc
+
+
+def vm_user(slot: int) -> str:
+    return f"cvm-{slot}"
+
+
 def unit_name(name: str) -> str:
     return f"cathedral-vm-{name}.service"
 
@@ -108,7 +159,7 @@ def out(obj: dict) -> None:
 
 
 def check_name(name: str) -> str:
-    if name == ".history" or not isinstance(name, str) or not NAME_RE.fullmatch(name):
+    if name in RESERVED_NAMES or not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise Refusal("invalid_name", "name must match ^[a-z0-9][a-z0-9-]{0,40}$")
     return name
 
@@ -266,13 +317,12 @@ def unit_absent(name: str) -> bool:
     return p.returncode == 0 and props.get("LoadState") == "not-found" and props.get("ActiveState") == "inactive"
 
 
-def qmp(name: str, command: str, timeout: float = 5) -> bool:
-    """Send one QMP command; False when QEMU is not there to take it."""
-    path = root() / name / "run" / "qmp.sock"
+def qmp_exchange(sock_path: str, command: str, timeout: float) -> bool:
+    """qmp_capabilities, then one command, on one QMP socket. True when both returned."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            s.connect(str(path))
+            s.connect(sock_path)
             f = s.makefile("rwb")
             f.readline()  # greeting
             for cmd in ("qmp_capabilities", command):
@@ -287,6 +337,57 @@ def qmp(name: str, command: str, timeout: float = 5) -> bool:
             return True
     except (OSError, ValueError):
         return False
+
+
+QMP_COMMANDS = ("system_powerdown",)
+
+
+def qmp(name: str, command: str, timeout: float = 5) -> bool:
+    """Send one QMP command; False when QEMU is not there to take it.
+
+    run/ belongs to the VM's QEMU user, who can replace qmp.sock with a link to any path at
+    any time, so no check made by root before connect() holds (Astra #789 P1). The connect
+    therefore runs as that user: a child process starts in run/ (root resolves only the
+    root-owned path down to it), drops to the VM user with no supplementary groups, and
+    connects to "qmp.sock" relative to it. Whatever the link names, it is followed with the
+    VM user's rights, which reach no other VM (every VM directory is root's, mode 0700).
+    The lstat check below only fails fast; it is not what makes this safe."""
+    d = root() / name
+    run_dir = d / "run"
+    try:
+        st = os.lstat(run_dir / "qmp.sock")
+        if not stat.S_ISSOCK(st.st_mode):
+            return False
+        user = read_env(d / "vm.env").get("VM_USER")
+    except OSError:
+        return False
+    if user is None:
+        # A VM from before AB#999 VM3: QEMU ran as root and run/ is root's.
+        return qmp_exchange(str(run_dir / "qmp.sock"), command, timeout)
+    try:
+        import pwd
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return False
+    drop = {"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": []} if os.geteuid() == 0 else {}
+    try:
+        p = subprocess.run([sys.executable, "-I", str(KIT / "vm_ctl.py"), "qmp-as-vm-user", command, str(timeout)],
+                           cwd=str(run_dir), capture_output=True, timeout=timeout + 10, env={"PATH": "/usr/bin:/bin"},
+                           **drop)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0
+
+
+def cmd_qmp_as_vm_user(args: list[str]) -> dict:
+    """Internal (never from the broker): the child of qmp(), already the VM user, cwd run/."""
+    if len(args) != 2 or args[0] not in QMP_COMMANDS:
+        raise Refusal("usage", "qmp-as-vm-user <command> <timeout>")
+    if os.geteuid() == 0:
+        raise Refusal("usage", "qmp-as-vm-user runs only as a VM user, never as root")
+    if not qmp_exchange("qmp.sock", args[0], float(args[1])):
+        raise Refusal("qmp_failed", "QEMU did not take the command", 1)
+    return {"sent": args[0]}
 
 
 # ---- authorization -------------------------------------------------------------
@@ -674,6 +775,7 @@ def close_open_generation(name: str, d: Path, a: dict, reason: str) -> None:
 def status_of(name: str) -> dict:
     d = vm_dir(name)
     env, a = read_env(d / "vm.env"), auth_of(d)
+    launch = read_json(d / "launch.json", {})
     if unit_active(name):
         state = "running"
     else:
@@ -685,27 +787,15 @@ def status_of(name: str) -> dict:
         "closed": a["generation"] <= a.get("closed_generation", 0) and a["generation"] > 0,
         "ssh_port": int(env["VM_SSH_PORT"]), "guest_ip": env["VM_GUEST_IP"], "vcpus": int(env["VM_VCPUS"]),
         "mem_gib": int(env["VM_MEM_GIB"]), "disk_gib": int(env["VM_DISK_GIB"]),
+        # Sealed VM launch values (spec r2 6.3): the customer recomputes expected_measurement from
+        # the published bundle and their identity document; the broker passes these through.
+        **{k: launch[k] for k in LAUNCH_STATUS if k in launch},
+        **({"disks": {"root": (d / "root.raw").is_file(), "mailbox": (d / "mailbox.raw").is_file()}}
+           if launch else {}),
     }
 
 
 # ---- create ---------------------------------------------------------------------
-
-def image_lock() -> dict:
-    vals = {}
-    for line in (KIT / "images.lock").read_text().splitlines():
-        m = re.fullmatch(r"(IMAGE_[A-Z0-9]+)=(\S+)", line.strip())
-        if m:
-            vals[m.group(1)] = m.group(2)
-    return vals
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
 
 def host_taken() -> tuple[set[str], list[ipaddress.IPv4Network]]:
     links = run("ip", "-o", "link", "show", check=False).stdout
@@ -735,73 +825,139 @@ def allocate(port: int) -> int:
     raise Refusal("no_free_link", "no free /30 in 10.216.0.0/16", 1)
 
 
-def make_seed(d: Path, name: str, key: str, env: dict) -> None:
-    seed = d / "seed"
-    seed.mkdir(mode=0o700)
-    # JSON is YAML: every value is quoted by json.dumps, so a key cannot add keys.
-    user_data = "#cloud-config\n" + json.dumps({
-        "disable_root": True,
-        "ssh_pwauth": False,
-        "users": [{
-            "name": "cathedral", "shell": "/bin/bash", "lock_passwd": True,
-            "sudo": "ALL=(ALL) NOPASSWD:ALL", "groups": ["sudo"], "ssh_authorized_keys": [key],
-        }],
-    }, indent=1) + "\n"
-    meta = json.dumps({"instance-id": f"cvm-{name}-{secrets.token_hex(6)}", "local-hostname": name}) + "\n"
-    dns = os.environ.get("VM_DNS", "1.1.1.1 8.8.8.8").split()
-    network = json.dumps({"version": 2, "ethernets": {"eth0": {
-        "match": {"macaddress": env["VM_MAC"]}, "set-name": "eth0",
-        "addresses": [env["VM_GUEST_IP"] + "/30"],
-        "routes": [{"to": "default", "via": env["VM_HOST_IP"]}],
-        "nameservers": {"addresses": dns},
-    }}}) + "\n"
-    for fname, text in (("user-data", user_data), ("meta-data", meta), ("network-config", network)):
-        (seed / fname).write_text(text)
-    iso = str(d / "seed.iso")
-    if shutil.which("cloud-localds"):
-        run("cloud-localds", "-N", str(seed / "network-config"), iso, str(seed / "user-data"), str(seed / "meta-data"))
-    else:
-        tool = shutil.which("genisoimage") or shutil.which("mkisofs")
-        if not tool:
-            raise Refusal("missing_tool", "need cloud-localds, genisoimage or mkisofs", 1)
-        run(tool, "-quiet", "-output", iso, "-volid", "cidata", "-joliet", "-rock",
-            str(seed / "user-data"), str(seed / "meta-data"), str(seed / "network-config"))
+# ---- the VM user, its disks and its unit (spec r2 7.1, 8.2) ----------------------------
+
+def ensure_user(user: str) -> None:
+    """One system user per VM. A user left by a delete cut before userdel owns no file: reused."""
+    if run("getent", "passwd", user, check=False).returncode == 0:
+        return
+    run("useradd", "--system", "--user-group", "--no-create-home", "--home-dir", "/nonexistent",
+        "--shell", "/usr/sbin/nologin", user)
 
 
-def write_unit(name: str, d: Path) -> None:
-    ctl, net, launch = KIT / "vm-ctl.sh", KIT / "vm-net.sh", KIT / "launch-vm.sh"
-    env = d / "vm.env"
-    # Same shape as the sealed hotel unit (room-kit/sealed/write-units.sh): load
-    # KVM, wait for /dev/kvm (late after a host reboot), restart on failure, at
-    # most 5 starts in 15 min. Plus the credit check before every start, so a host
-    # reboot or a crash restart never runs past paid_through.
-    text = f"""[Unit]
-Description=Cathedral customer VM {name}
+SEV_RULE = f'KERNEL=="sev", GROUP="{SEV_GROUP}", MODE="0660"\n'
+
+
+def ensure_sev_access() -> None:
+    """QEMU opens /dev/sev unprivileged: rw for the cvm-sev group (the dedicated cg-sev pattern).
+
+    Root keeps its access, so the hotel kits' QEMU (root) is not affected."""
+    if run("getent", "group", SEV_GROUP, check=False).returncode != 0:
+        run("groupadd", "--system", SEV_GROUP)
+    rule = udev_rules_dir() / "60-cathedral-vm-sev.rules"
+    try:
+        if rule.read_text() == SEV_RULE:
+            return
+    except FileNotFoundError:
+        pass
+    udev_rules_dir().mkdir(parents=True, exist_ok=True)
+    write_atomic(rule, SEV_RULE, 0o644)
+    run("udevadm", "control", "--reload", check=False)
+    run("udevadm", "trigger", "--action=change", "--sysname-match=sev", check=False)
+
+
+def make_sparse(path: Path, size: int) -> None:
+    """A new all-zero sparse file: the guest formats only a disk it reads as all zero (7.2)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.ftruncate(fd, size)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def bundle_dir(bundle: str) -> Path:
+    return root() / "bundles" / bundle
+
+
+def unit_mounts(d: Path, env: dict) -> tuple[list[str], list[str], list[str]]:
+    """(TemporaryFileSystem, BindReadOnlyPaths, BindPaths) of the VM unit.
+
+    /srv is hidden, and VM_ROOT too when it is elsewhere, so one VM's QEMU sees no other VM and
+    no kit. What launch-vm.py reads comes back read only: the kit code, the bundle, vm.env and
+    the identity (Astra r2 P1 #2: without the last two the launcher cannot build its argv).
+    What QEMU writes comes back read-write: the root and mailbox disks and run/ (QMP sockets)."""
+    hidden = ["/srv:ro"]
+    r = root().resolve()
+    if r != Path("/srv") and Path("/srv") not in r.parents:
+        hidden.append(f"{r}:ro")
+    read_only = [str(KIT), str(bundle_dir(env["VM_BUNDLE"])), str(d / "vm.env"), str(d / "vm-identity.json")]
+    read_write = [str(d / "root.raw"), str(d / "mailbox.raw"), str(d / "run")]
+    return hidden, read_only, read_write
+
+
+def unit_text(name: str, d: Path, env: dict) -> str:
+    ctl, net, launch = KIT / "vm-ctl.sh", KIT / "vm-net.sh", KIT / "launch-vm.py"
+    vm_env, user = d / "vm.env", env["VM_USER"]
+    hidden, read_only, read_write = unit_mounts(d, env)
+    tmpfs = "".join(f"TemporaryFileSystem={h}\n" for h in hidden)
+    mem = int(env["VM_MEM_GIB"]) + MEM_OVERHEAD_GIB
+    # The dedicated unit (D 5.8) as the VM's own user, never root and no -runas. The '+' steps
+    # run as root outside the sandbox: KVM, the credit check, the link with a tap the VM user
+    # owns, stale QMP sockets. Restart: a guest reset exits 75 and relaunches in the same
+    # generation (check-paid needs its start line and no close line, so no new charge); a
+    # poweroff exits 0 and stays down; a refused launch exits 78 and stays down.
+    return f"""[Unit]
+Description=Cathedral sealed customer VM {name}
 After=network-online.target systemd-modules-load.service
 Wants=network-online.target
 StartLimitIntervalSec=900
 StartLimitBurst=5
 [Service]
 Type=simple
+User={user}
+Group={user}
+SupplementaryGroups=kvm {SEV_GROUP}
 Environment=VM_ROOT={root()}
-ExecStartPre=-/sbin/modprobe -q kvm_amd
-ExecStartPre=-/sbin/modprobe -q kvm_intel
-ExecStartPre=/bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
-ExecStartPre={ctl} check-paid {name}
-ExecStartPre={net} up {env}
-ExecStart={launch} {env}
-ExecStop={ctl} powerdown {name}
-ExecStopPost={net} down {env}
+ExecStartPre=+-/sbin/modprobe -q kvm_amd
+ExecStartPre=+/bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
+ExecStartPre=+{ctl} check-paid {name}
+ExecStartPre=+{net} up {vm_env}
+ExecStartPre=+/bin/rm -f {d}/run/qmp.sock {d}/run/events.sock
+ExecStart=/usr/bin/python3 -I {launch} {d}
+ExecStop=+{ctl} powerdown {name}
+ExecStopPost=+{net} down {vm_env}
 KillSignal=SIGTERM
 TimeoutStopSec=90
 TimeoutStartSec=180
 Restart=on-failure
 RestartSec=15
+RestartForceExitStatus=75
+RestartPreventExitStatus=78
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/sev rw
+DeviceAllow=/dev/vhost-net rw
+DeviceAllow=/dev/net/tun rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+{tmpfs}BindReadOnlyPaths={' '.join(read_only)}
+BindPaths={' '.join(read_write)}
+MemoryMax={mem}G
+MemorySwapMax=0
+TasksMax=512
+LimitNOFILE=4096
+LimitCORE=0
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def write_unit(name: str, d: Path, env: dict) -> None:
     unit_dir().mkdir(parents=True, exist_ok=True)
-    write_atomic(unit_dir() / unit_name(name), text, 0o644)
+    write_atomic(unit_dir() / unit_name(name), unit_text(name, d, env), 0o644)
 
 
 def ensure_enforce_timer() -> None:
@@ -830,12 +986,12 @@ WantedBy=timers.target
 
 
 def cmd_create(args: list[str], key_text: str | None) -> dict:
-    opts = parse_opts(args, {"--vcpus", "--mem-gib", "--disk-gib", "--ssh-key-file", "--ssh-port", "--image"}, 1)
+    opts = parse_opts(args, {"--vcpus", "--mem-gib", "--disk-gib", "--ssh-key-file", "--ssh-port", "--bundle"}, 1)
     name = check_name(opts["_"][0])
     for req in ("--vcpus", "--mem-gib", "--disk-gib", "--ssh-port"):
         if req not in opts:
             raise Refusal("missing_option", f"create needs {req}")
-    vcpus = check_int(opts["--vcpus"], "vcpus", 1, 64)
+    vcpus = check_int(opts["--vcpus"], "vcpus", 1, vm_measure.VCPUS_MAX)
     mem = check_int(opts["--mem-gib"], "mem_gib", 1, 512)
     disk = check_int(opts["--disk-gib"], "disk_gib", 4, 4096)
     port = check_int(opts["--ssh-port"], "ssh_port", 1024, 65535)
@@ -847,15 +1003,29 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
         except (OSError, UnicodeDecodeError):
             raise Refusal("invalid_ssh_key", "cannot read --ssh-key-file") from None
     key = check_key(key_text)
-    lock = image_lock()
-    if "--image" in opts:
-        image = Path(opts["--image"]).resolve()
-        pinned = None
-    else:
-        image = Path(os.environ.get("VM_BASE_IMAGE", root() / "images" / lock["IMAGE_FILE"]))
-        pinned = lock["IMAGE_SHA256"]
-    if not image.is_file():
-        raise Refusal("no_image", f"base image {image} is missing (run fetch-image.sh)", 1)
+    cfg = host_config()
+    bundle = opts.get("--bundle", cfg["default_bundle"])
+    if bundle not in cfg["bundles"]:
+        raise Refusal("bundle_not_enabled", f"bundle {bundle[:64]} is not enabled on this host", 1)
+    try:
+        manifest, raw = vm_measure.read_manifest(bundle_dir(bundle))
+    except vm_measure.Refusal as e:
+        raise Refusal("no_bundle", f"bundle {bundle}: {e}", 1) from None
+    if hashlib.sha256(raw).hexdigest() != bundle:
+        raise Refusal("no_bundle", f"bundle {bundle}: the manifest is not the one its directory names", 1)
+    # The broker names a VM by its id (vms.go vmIDRE), which the identity carries; an operator
+    # name gets a fresh id.
+    vm_id = name if vm_measure.VM_ID_RE.fullmatch(name) else "vm-" + secrets.token_hex(6)
+    # The identity and its launch values first: nothing is written and no lock is held while
+    # sev-snp-measure runs. The salt comes from the CSPRNG (vm_measure.identity_document).
+    try:
+        identity = vm_measure.identity_document(vm_id, key, manifest["base_root_verity"],
+                                                manifest["base_root_data_bytes"])
+        launch = vm_measure.launch_values(bundle_dir(bundle), identity, vcpus, cfg["cpu_family"],
+                                          cfg.get("sev_snp_measure"))
+    except vm_measure.Refusal as e:
+        raise Refusal("launch_values", str(e), 1) from None
+    launch["vm_id"] = vm_id
     with global_lock(), contextlib.ExitStack() as admission:
         d = root() / name
         if d.exists() or d.is_symlink():
@@ -863,9 +1033,6 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
         if history_path(name).exists():
             raise Refusal("exists", f"name {name} was used before: its history is kept, pick a new name", 5)
         slot = allocate(port)
-        digest = sha256_file(image)
-        if pinned and digest != pinned:
-            raise Refusal("image_mismatch", f"{image} sha256 {digest} is not the pinned {pinned}", 1)
         admit(capacity().refuse_custom_guest_host)
         if capacity().enforced():
             # Check and record under one hold: vm.env, written below, is this VM's line in the
@@ -873,12 +1040,13 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
             hold_capacity_lock(admission)
             admit(capacity().check_create, vcpus, mem, disk, d)
         base = int(NET.network_address) + 4 * slot
+        user = vm_user(slot)
         env = {
             "VM_NAME": name, "VM_DIR": str(d), "VM_VCPUS": str(vcpus), "VM_MEM_GIB": str(mem),
             "VM_DISK_GIB": str(disk), "VM_SSH_PORT": str(port), "VM_SLOT": str(slot), "VM_TAP": f"cvm{slot}",
             "VM_HOST_IP": str(ipaddress.IPv4Address(base + 1)), "VM_GUEST_IP": str(ipaddress.IPv4Address(base + 2)),
             "VM_MAC": "52:54:00:d8:%02x:%02x" % (slot >> 8, slot & 0xFF),
-            "VM_BASE_IMAGE": str(image), "VM_BASE_SHA256": digest, "VM_CREATED_AT": str(int(time.time())),
+            "VM_USER": user, "VM_ID": vm_id, "VM_BUNDLE": bundle, "VM_CREATED_AT": str(int(time.time())),
         }
         d.mkdir(mode=0o700)
         # The VM lock is held from before anything is published until create is done, and the
@@ -887,14 +1055,20 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
         with Lock(d / ".lock"):
             try:
                 (d / "run").mkdir(mode=0o700)
-                make_seed(d, name, key, env)
-                run("qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(image),
-                    str(d / "disk.qcow2"), f"{disk}G")
+                write_atomic(d / "vm-identity.json", identity.decode("ascii"), 0o644)
+                write_atomic(d / "launch.json", json.dumps(launch, sort_keys=True) + "\n", 0o644)
+                make_sparse(d / "root.raw", disk << 30)
+                make_sparse(d / "mailbox.raw", MAILBOX_BYTES)
+                ensure_sev_access()
+                ensure_user(user)
+                # QEMU writes only these; everything else in the VM directory stays root's.
+                run("chown", "--no-dereference", f"{user}:{user}",
+                    str(d / "root.raw"), str(d / "mailbox.raw"), str(d / "run"))
                 write_atomic(d / "authorization.json",
                              json.dumps({"generation": 0, "paid_through": 0, "closed_generation": 0}) + "\n")
                 history_append(name, {"event": "tracked_from", "generation": 1})
                 write_atomic(d / "vm.env", "".join(f"{k}='{v}'\n" for k, v in env.items()), 0o644)
-                write_unit(name, d)
+                write_unit(name, d, env)
                 ensure_enforce_timer()
             except BaseException:
                 h = read_history(name, durable=False)
@@ -902,6 +1076,7 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
                     history_path(name).unlink(missing_ok=True)  # nothing ran: do not burn the name
                 shutil.rmtree(d, ignore_errors=True)
                 (unit_dir() / unit_name(name)).unlink(missing_ok=True)
+                run("userdel", user, check=False)
                 raise
     return status_of(name)
 
@@ -1021,7 +1196,7 @@ def stop_locked(name: str, d: Path, reason: str, wait: float | None = None) -> d
     if not unit_gone:
         systemctl("disable", "-q", unit_name(name))
     graceful = False
-    marker = d / "run" / "powerdown-sent"
+    marker = powerdown_marker(d)
     if was_running:
         # The unit's ExecStop would ask again and wait again; this marker says it was asked.
         marker.touch()
@@ -1080,10 +1255,15 @@ def cmd_stop(args: list[str]) -> dict:
         return stop_locked(name, d, "requested")
 
 
+def powerdown_marker(d: Path) -> Path:
+    # In the root-owned VM directory, not in run/, which the VM's QEMU user can write.
+    return d / "powerdown-sent"
+
+
 def cmd_powerdown(args: list[str]) -> dict:
     """ExecStop of the unit (host shutdown, systemctl stop): ask the guest to power off first."""
     name = check_name(parse_opts(args, set(), 1)["_"][0])
-    if (root() / name / "run" / "powerdown-sent").exists():
+    if powerdown_marker(root() / name).exists():
         return {"name": name, "powerdown_sent": False, "detail": "vm-ctl stop already asked and waited"}
     sent = qmp(name, "system_powerdown")
     pid = os.environ.get("MAINPID", "")
@@ -1093,18 +1273,51 @@ def cmd_powerdown(args: list[str]) -> dict:
     return {"name": name, "powerdown_sent": sent}
 
 
+def reboot_marker(d: Path) -> Path:
+    return d / "reboot-pending.json"
+
+
 def cmd_reboot(args: list[str]) -> dict:
+    """A fenced relaunch in the same generation (spec r2 8.1): an SNP guest cannot be reset in
+    the same QEMU. Ask the guest to power off, wait up to STOP_WAIT, then restart the unit. The
+    generation keeps its start line and has no close line, so check-paid lets the relaunch
+    through, no history line is added and nothing is charged again.
+
+    reboot-pending.json names the generation before the powerdown and goes only after the
+    restart is queued: a reboot cut between the two (Astra #789 P2) leaves the VM down with
+    the marker, and a retry for that same paid, open generation relaunches it instead of
+    answering not_running. stop, and any newer generation, make the marker inert."""
     opts = parse_opts(args, {"--generation"}, 1)
     name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
         begin(name, d)
-        check_generation(opts, auth_of(d))
-        if not unit_active(name):
+        a = auth_of(d)
+        check_generation(opts, a)
+        g = a["generation"]
+        pending = reboot_marker(d)
+        resume = read_json(pending, {}).get("generation") == g
+        running = unit_active(name)
+        if not running and not resume:
+            pending.unlink(missing_ok=True)
             raise Refusal("not_running", f"VM {name} is not running", 5)
-        if not qmp(name, "system_reset"):
-            raise Refusal("qmp_failed", "QEMU did not take system_reset", 1)
-    return {"name": name, "rebooted_at": int(time.time()), "state": "running"}
+        refusal = paid_refusal(a, int(time.time()))
+        if refusal:
+            raise refusal
+        write_atomic(pending, json.dumps({"generation": g, "at": int(time.time())}) + "\n")
+        marker = powerdown_marker(d)
+        marker.touch()  # the unit's ExecStop would ask and wait again
+        graceful = False
+        try:
+            if running:
+                graceful = qmp(name, "system_powerdown") and wait_inactive(name, STOP_WAIT)
+            systemctl("reset-failed", unit_name(name), check=False)
+            systemctl("restart", unit_name(name))
+        finally:
+            marker.unlink(missing_ok=True)
+        pending.unlink(missing_ok=True)
+    return {"name": name, "rebooted_at": int(time.time()), "state": "running", "generation": g,
+            "graceful": graceful, "resumed": resume and not running}
 
 
 # ---- delete, status, list, enforce ---------------------------------------------
@@ -1138,7 +1351,12 @@ def cmd_delete(args: list[str]) -> dict:
             systemctl("daemon-reload", check=False)
             if d.resolve().parent != root().resolve():
                 raise Refusal("unsafe_path", f"{d} is not inside {root()}", 1)
+            user = read_env(d / "vm.env").get("VM_USER")
             shutil.rmtree(d)
+            if user:
+                # After the files it owned are gone; a delete cut before this leaves a user that
+                # owns nothing, and the next create of that slot reuses it.
+                run("userdel", user, check=False)
         if not all_vms():
             systemctl("disable", "--now", "cathedral-vm-enforce.timer", check=False)
             for f in ("cathedral-vm-enforce.timer", "cathedral-vm-enforce.service"):
@@ -1407,7 +1625,7 @@ def main(argv: list[str]) -> int:
             "authorize": cmd_authorize, "start": cmd_start, "stop": cmd_stop, "reboot": cmd_reboot,
             "delete": cmd_delete, "status": cmd_status, "list": cmd_list, "enforce": cmd_enforce,
             "check-paid": cmd_check_paid, "powerdown": cmd_powerdown, "cancel": cmd_cancel,
-            "history": cmd_history,
+            "history": cmd_history, "qmp-as-vm-user": cmd_qmp_as_vm_user,
         }
         if cmd == "create":
             out(cmd_create(rest, key_text))

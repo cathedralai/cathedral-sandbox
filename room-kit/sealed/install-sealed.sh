@@ -16,6 +16,8 @@ ENV_FILE=$(readlink -f "${1:?usage: install-sealed.sh sealed.env}")
 source "$ENV_FILE"
 # shellcheck disable=SC1091
 source "$KIT/sealed/guest-constants.sh"
+# shellcheck disable=SC1091
+source "$KIT/sealed/host-lock.sh"
 log() { echo "[sealed] $*"; }
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 # Same cap as launch-guest.sh and guest-boot.sh, checked before the image build.
@@ -41,6 +43,18 @@ if [ -n "${SEALED_BOOTSTRAP_SHA256:-}" ]; then
   [ -n "${SEALED_OWNER_PUBKEY_FILE:-}" ] || { echo "SEALED_BOOTSTRAP_SHA256 needs SEALED_OWNER_PUBKEY_FILE" >&2; exit 1; }
   [[ "$SEALED_BOOTSTRAP_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "SEALED_BOOTSTRAP_SHA256 must be 64 lowercase hex digits (owner_sign.py --bootstrap-digest)" >&2; exit 1; }
 fi
+# >>> host lock
+# One kit or custom guest lifecycle step per host at a time (AB#1008; spec r9 5.3), taken before the
+# first host change and held to the end. Under a roll's host step this checks the roll's lock
+# instead of taking a second one. While a custom guest holds this hotel (5.10) nothing here runs:
+# its return starts the kit itself, never through this installer (11.6).
+snp_lock_take install-sealed install-sealed "$SEALED_NAME" - - || exit 1
+trap snp_lock_release EXIT
+if HOLD=$(snp_hold_marker "$SEALED_DIR"); then
+  echo "custom_guest_held: launch=${HOLD#* } state=${HOLD%% *}: a custom guest holds $SEALED_NAME ($SEALED_DIR/custom-guest.hold). install-sealed.sh changes nothing until its return finishes." >&2
+  exit 1
+fi
+# <<< host lock
 # Several guests on one host (AB#432): a /30 another interface or hotel uses,
 # or a move of this hotel's link while its guest runs, stops here: before the
 # 10 to 20 minute build and before any installed file changes.
@@ -73,7 +87,7 @@ vm_ledger_on_exit() {
   [ -z "$KIT_INSTALL_LOCK" ] || flock -u 8 2>/dev/null || true
 }
 if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
-  trap vm_ledger_on_exit EXIT
+  trap 'vm_ledger_on_exit; snp_lock_release' EXIT
   KIT_INSTALL_LOCK="${VM_CAPACITY_ROOT:-}/run/lock/cathedral-kit-$SEALED_NAME.install.lock"
   mkdir -p "${KIT_INSTALL_LOCK%/*}"
   exec 8>"$KIT_INSTALL_LOCK"
@@ -168,11 +182,12 @@ data_volume_restore_on_exit() {
     log "data volume: roll not confirmed; restored the owner's volume from data.raw.prev"
   fi
 }
-# With the VM host ledger, its exit step runs too, after the volume is back.
+# The owner record goes last, just before the lock is released with this process. With the VM
+# host ledger, its exit step runs before that, after the volume is back.
 if [ -n "${VM_LEDGER_ID:-}" ]; then
-  trap 'data_volume_restore_on_exit; vm_ledger_on_exit' EXIT
+  trap 'data_volume_restore_on_exit; vm_ledger_on_exit; snp_lock_release' EXIT
 else
-  trap data_volume_restore_on_exit EXIT
+  trap 'data_volume_restore_on_exit; snp_lock_release' EXIT
 fi
 data_volume_launch_id() { # launch id of the build we are about to start: <host_data hex>
   python3 -c 'import hashlib,sys; print(hashlib.sha256((":".join(sys.argv[1:4])).encode()).hexdigest())' \

@@ -328,13 +328,13 @@ func (b *broker) compatImport(w http.ResponseWriter, r *http.Request, g *guestSt
 
 // claimForImport decides whether the compat image import may pull on ht as g
 // and takes the claim in the same b.mu hold: the hotel is in the guest's list
-// now (a reservation made a moment ago counts), is not pin_only, and its
-// scratch is not full (AB#861). It returns ht.warmGen for the pull. The caller
+// now (a reservation made a moment ago counts), is not pin_only or held by a
+// custom guest, and its scratch is not full (AB#861). It returns ht.warmGen for the pull. The caller
 // releases the claim (pin_only.go, AB#982).
 func (b *broker) claimForImport(g *guestState, ht *hotel) (gen int, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !g.allowsHotel(ht) || ht.closedToShared() || b.prefetchDiskFull(ht) {
+	if !g.allowsHotel(ht) || ht.closedToShared() || ht.held() || b.prefetchDiskFull(ht) {
 		return 0, false
 	}
 	ht.claim()
