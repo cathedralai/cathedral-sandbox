@@ -18,7 +18,10 @@ func TestUntaggedInitHasNoCutHook(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the init twice")
 	}
-	goTool := filepath.Join(runtime.GOROOT(), "bin", "go")
+	goTool := "go"
+	if root := runtime.GOROOT(); root != "" {
+		goTool = filepath.Join(root, "bin", "go")
+	}
 	build := func(tags string) []byte {
 		out := filepath.Join(t.TempDir(), "init")
 		cmd := exec.Command(goTool, "build", "-trimpath", "-buildvcs=false", "-tags="+tags,
