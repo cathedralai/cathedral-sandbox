@@ -538,7 +538,7 @@ ROOT_SWAP = textwrap.dedent('''
         # The kit in a world-readable place, so the dropped child can run it.
         kit_copy = os.path.join(base, "kit")
         os.mkdir(kit_copy, 0o755)
-        for f in ("vm_ctl.py", "vm_measure.py"):
+        for f in ("vm_ctl.py", "vm_measure.py", "vm_mailbox.py"):
             shutil.copy(os.path.join(kit, f), kit_copy)
         vms = os.path.join(base, "vms")
 
