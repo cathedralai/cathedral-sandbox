@@ -93,6 +93,25 @@ jobs:
           python -c "from pathlib import Path; import cathedral, cathedral_distill, cathedral_thin; root = Path.cwd().parent.resolve(); assert Path(cathedral.__file__).resolve().is_relative_to(root / 'compute'); assert Path(cathedral_distill.__file__).resolve().is_relative_to(root / 'distill'); assert Path(cathedral_thin.__file__).resolve().is_relative_to(root / 'validator')"
           python -m pytest -q -p no:cacheprovider tests/test_cross_repo_receipt_v2_contract.py
 
+  custom-guest-helper:
+    name: Static custom guest report helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.11"
+          cache: false
+      - name: Test native ABI and shared report vectors
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go test -race ./...
+          go vet ./...
+      - name: Build twice and require static identical bytes
+        run: python3 scripts/build_custom_guest_helper.py --output "$RUNNER_TEMP/cathedral-attest"
+
   broker:
     name: Broker (Go)
     runs-on: ubuntu-latest
