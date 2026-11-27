@@ -43,7 +43,7 @@ def make_launch(tmp_path: Path, data_disk_gib: int = 0, cmdline: str = CMDLINE) 
                  "manifest_sha256": hashlib.sha256(m_raw).hexdigest(), "ssh_public_key": "ssh-ed25519 AAAA",
                  "launch_nonce_hex": "00" * 32, "ports": [{"guest": 22, "proto": "tcp", "public": 20022}],
                  "network": {"guest_ip": "10.217.0.2", "host_ip": "10.217.0.1", "prefix": 30,
-                             "guest_mac": "52:54:00:c7:01:23", "public_host": "84.32.63.93"}}
+                             "guest_mac": "52:54:00:c7:01:23", "public_host": "203.0.113.10"}}
     (img / "manifest.json").write_bytes(m_raw)
     (img / "bootstrap.json").write_bytes(canonical(bootstrap))
     (img / "bootstrap.sig").write_bytes(b"\0" * 64)
