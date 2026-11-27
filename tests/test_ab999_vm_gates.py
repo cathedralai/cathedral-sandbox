@@ -703,6 +703,20 @@ def test_documented_recovery_for_a_persistent_change(host, capsys):
     refused(host, capsys, "sev_platform_changed")
 
 
+def test_replace_does_not_call_an_earlier_boots_change_this_boots(host, capsys):
+    """Boot 1 records a change, the host reboots with a matching status: the durable copy names boot 1,
+    so baseline --replace deletes it but reports it apart from this boot's change."""
+    host.sev = drifted("snp", "current_tcb")
+    refused(host, capsys, "sev_platform_changed")
+    assert json.loads(host.durable.read_text())["boot_id"] == "boot-1"
+    host.sev = copy.deepcopy(STATUS)
+    host.reboot("boot-2")
+    code, doc, err = host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)
+    assert code == 0 and not host.durable.exists()
+    assert doc["cleared_change"] is False and doc["removed_stale_change"] is True
+    assert "cleared this boot's SEV change record" not in err
+
+
 def test_replace_is_the_explicit_accept_in_the_same_boot(host, capsys):
     host.sev = drifted("snp", "mask_chip_id")
     refused(host, capsys, "sev_platform_changed", "enforce")
