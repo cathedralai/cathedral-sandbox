@@ -1,0 +1,46 @@
+{
+  "schema": "cathedral.custom_guest.reference-build-inputs/v1",
+  "note": "Downloads for .github/workflows/reference-build.yml beyond the verity builder's own lock. The verity inputs are not repeated here: fetch_reference_build_inputs.py takes their names and sha256 from scripts/custom_guest_verity_inputs.json and each URL from scripts/vm_initrd_tools_inputs.json, matched by sha256. kernel-host holds the two build tools the hosted Ubuntu 26.04 image lacks (bc, libelf-dev for objtool) and the libelf-dev dependencies; each sha256 equals the SHA256 line of the signed resolute or resolute-updates Packages index. The Go and python-zstandard sha256 are the ones go.dev and PyPI publish. Every file is checked against its sha256 before use.",
+  "files": {
+    "linux-source-7.0.0_7.0.0-44.44_all.deb": {
+      "group": "kernel",
+      "sha256": "1ebe9c770567b8b45e81d490c4af8aa2ccb0e21433c80b94c43423a358447a03",
+      "url": "https://launchpad.net/ubuntu/+archive/primary/+files/linux-source-7.0.0_7.0.0-44.44_all.deb"
+    },
+    "bc_1.07.1-4build1_amd64.deb": {
+      "group": "kernel-host",
+      "sha256": "cbc2e84d1f5dfe8debebebf24869988b8cf12151de5a66cce298d3f370dfe919",
+      "url": "http://archive.ubuntu.com/ubuntu/pool/main/b/bc/bc_1.07.1-4build1_amd64.deb"
+    },
+    "libelf-dev_0.194-4_amd64.deb": {
+      "group": "kernel-host",
+      "sha256": "5a67bec4ff050ae031206f05e4d6ea79aa15b1d1dbd503bdac955966aa7a8699",
+      "url": "http://archive.ubuntu.com/ubuntu/pool/main/e/elfutils/libelf-dev_0.194-4_amd64.deb"
+    },
+    "libelf1t64_0.194-4_amd64.deb": {
+      "group": "kernel-host",
+      "sha256": "c2feae172b14d2a8317348023c5e0b6572314c097a9f7b8225c62b0988cc8d92",
+      "url": "http://archive.ubuntu.com/ubuntu/pool/main/e/elfutils/libelf1t64_0.194-4_amd64.deb"
+    },
+    "zlib1g-dev_1.3.dfsg+really1.3.1-1ubuntu3.2_amd64.deb": {
+      "group": "kernel-host",
+      "sha256": "2e4663ab8d018aff8351ee949e53971911b2aca3491eefde61e82111ee83cbc3",
+      "url": "http://archive.ubuntu.com/ubuntu/pool/main/z/zlib/zlib1g-dev_1.3.dfsg+really1.3.1-1ubuntu3.2_amd64.deb"
+    },
+    "libzstd-dev_1.5.7+dfsg-3_amd64.deb": {
+      "group": "kernel-host",
+      "sha256": "6d81369284ba3fd094f635fe6b9f8dfc71baaca36c1f758fe62244839e25ecf0",
+      "url": "http://archive.ubuntu.com/ubuntu/pool/main/libz/libzstd/libzstd-dev_1.5.7+dfsg-3_amd64.deb"
+    },
+    "go1.26.11.linux-amd64.tar.gz": {
+      "group": "go",
+      "sha256": "9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec",
+      "url": "https://go.dev/dl/go1.26.11.linux-amd64.tar.gz"
+    },
+    "zstandard-0.25.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl": {
+      "group": "python",
+      "sha256": "e09bb6252b6476d8d56100e8147b803befa9a12cea144bbe629dd508800d1ad0",
+      "url": "https://files.pythonhosted.org/packages/31/dc/cc50210e11e465c975462439a492516a73300ab8caa8f5e0902544fd748b/zstandard-0.25.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+    }
+  }
+}

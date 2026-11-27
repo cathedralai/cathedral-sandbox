@@ -1,0 +1,190 @@
+name: Reference guest build
+
+# The reference kernel and the reference initrd of the dedicated custom guest (AB#1004,
+# AB#1008), with real pins: cathedral-init pins the static veritysetup and the
+# cathedral-attest of the same build, cathedral-data pins the static cryptsetup. Each
+# is built on two fresh hosted runners (the kernel in work directories of different
+# lengths), and the summary job requires byte-identical output from both lanes before it
+# prints the digests and uploads the set the site publishes. Every download is checked
+# against a sha256 in scripts/reference_build_inputs.json or
+# scripts/custom_guest_verity_inputs.json. GitHub-hosted only: never a hotel or Contabo.
+# This builds; it does not boot or qualify a guest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      initrd_version:
+        description: "Reference initrd version: the file is cathedral-custom-initrd-<version>.cpio.zst"
+        required: true
+        default: v1
+  pull_request:
+    paths:
+      - "scripts/build_custom_guest_kernel.sh"
+      - "scripts/build_custom_guest_verity.py"
+      - "scripts/custom_guest_verity_inputs.json"
+      - "scripts/vm_initrd_tools_inputs.json"
+      - "scripts/build_custom_guest_helper.py"
+      - "scripts/make_custom_guest_initrd.py"
+      - "scripts/custom_guest_initrd_closure.json"
+      - "scripts/reference_build_inputs.json"
+      - "scripts/fetch_reference_build_inputs.py"
+      - "scripts/reference_build_summary.py"
+      - "room-kit/custom_guest_initrd.py"
+      - "room-kit/custom-guest/**"
+      - ".github/workflows/reference-build.yml"
+
+concurrency:
+  group: reference-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # An explicit bash shell runs with -eo pipefail; the default on Linux has no pipefail.
+    shell: bash
+
+env:
+  INITRD_VERSION: ${{ inputs.initrd_version || 'v1' }}
+
+jobs:
+  kernel:
+    name: Reference kernel (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: first
+            work: k
+          - lane: second
+            work: kernel-work-of-another-length
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Fetch the pinned inputs (each sha256 is checked)
+        run: python3 scripts/fetch_reference_build_inputs.py --out "$RUNNER_TEMP/inputs" --group kernel --group kernel-host
+      - name: Kernel host tools (bc, libelf-dev) from the pinned packages
+        run: |
+          sudo -n dpkg -i "$RUNNER_TEMP"/inputs/kernel-host/*.deb
+          mkdir "$RUNNER_TEMP/record"
+          {
+            echo "image: $ImageOS $ImageVersion"
+            gcc --version | head -n 1
+            ld --version | head -n 1
+            make --version | head -n 1
+            flex --version
+            bison --version | head -n 1
+            bc --version | head -n 1
+            /usr/bin/python3 --version
+            dpkg-query -W bc libelf-dev libelf1t64 zlib1g-dev libzstd-dev libssl-dev
+          } | tee "$RUNNER_TEMP/record/toolchain.txt"
+          df -h "$RUNNER_TEMP" | tail -n 1
+          nproc
+      - name: Build the reference kernel
+        run: |
+          mkdir "$RUNNER_TEMP/${{ matrix.work }}"
+          start=$(date +%s)
+          bash scripts/build_custom_guest_kernel.sh \
+            "$RUNNER_TEMP/inputs/kernel/linux-source-7.0.0_7.0.0-44.44_all.deb" \
+            "$RUNNER_TEMP/${{ matrix.work }}" "$RUNNER_TEMP/kernel-out"
+          echo "kernel build took $(( $(date +%s) - start )) s"
+          cp "$RUNNER_TEMP/record/toolchain.txt" "$RUNNER_TEMP/kernel-out/"
+          sha256sum "$RUNNER_TEMP"/kernel-out/vmlinuz "$RUNNER_TEMP"/kernel-out/kernel.config
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-${{ matrix.lane }}
+          path: |
+            ${{ runner.temp }}/kernel-out/vmlinuz
+            ${{ runner.temp }}/kernel-out/kernel.config
+            ${{ runner.temp }}/kernel-out/embedded.config
+            ${{ runner.temp }}/kernel-out/toolchain.txt
+          if-no-files-found: error
+
+  initrd:
+    name: Reference initrd and helpers (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Fetch the pinned inputs (each sha256 is checked)
+        run: python3 scripts/fetch_reference_build_inputs.py --out "$RUNNER_TEMP/inputs" --group verity --group go --group python
+      - name: Pinned Go and python-zstandard, toolchain record
+        run: |
+          mkdir "$RUNNER_TEMP/go-root" "$RUNNER_TEMP/pylib" "$RUNNER_TEMP/out"
+          tar -xzf "$RUNNER_TEMP/inputs/go/go1.26.11.linux-amd64.tar.gz" -C "$RUNNER_TEMP/go-root"
+          echo "GO_BIN=$RUNNER_TEMP/go-root/go/bin/go" >> "$GITHUB_ENV"
+          /usr/bin/python3 -I -m zipfile -e "$RUNNER_TEMP"/inputs/python/zstandard-0.25.0-*.whl "$RUNNER_TEMP/pylib"
+          {
+            echo "image: $ImageOS $ImageVersion"
+            gcc --version | head -n 1
+            ld --version | head -n 1
+            make --version | head -n 1
+            /usr/bin/python3 --version
+            "$RUNNER_TEMP/go-root/go/bin/go" version
+            PYTHONPATH="$RUNNER_TEMP/pylib" /usr/bin/python3 -c 'import zstandard; print("python-zstandard", zstandard.__version__, "libzstd", zstandard.ZSTD_VERSION)'
+          } | tee "$RUNNER_TEMP/out/toolchain.txt"
+      - name: Static veritysetup and cryptsetup 2.8.4 (built twice, identical)
+        run: |
+          /usr/bin/python3 scripts/build_custom_guest_verity.py --inputs "$RUNNER_TEMP/inputs/verity" \
+            --output "$RUNNER_TEMP/out/veritysetup" --cryptsetup-output "$RUNNER_TEMP/out/cryptsetup" \
+            --log "$RUNNER_TEMP/verity-build.log"
+      - name: Verity build log on failure
+        if: failure()
+        run: tail -n 150 "$RUNNER_TEMP/verity-build.log" || true
+      - name: cathedral-init, cathedral-attest and cathedral-data with real pins (built twice, identical)
+        run: |
+          verity=$(sha256sum "$RUNNER_TEMP/out/veritysetup" | cut -d ' ' -f 1)
+          cryptsetup=$(sha256sum "$RUNNER_TEMP/out/cryptsetup" | cut -d ' ' -f 1)
+          /usr/bin/python3 scripts/build_custom_guest_helper.py --go "$GO_BIN" \
+            --output "$RUNNER_TEMP/out/cathedral-attest" \
+            --init-output "$RUNNER_TEMP/out/cathedral-init" --verity-sha256 "$verity" \
+            --data-output "$RUNNER_TEMP/out/cathedral-data" --cryptsetup-sha256 "$cryptsetup" \
+            | tee "$RUNNER_TEMP/out/helper-build.json"
+      - name: Reference initrd (built twice, identical, unpacked against its closure)
+        run: |
+          PYTHONPATH="$RUNNER_TEMP/pylib" /usr/bin/python3 scripts/make_custom_guest_initrd.py \
+            --cathedral-init "$RUNNER_TEMP/out/cathedral-init" --veritysetup "$RUNNER_TEMP/out/veritysetup" \
+            --archive "$RUNNER_TEMP/out/initrd.cpio.zst" --closure-out "$RUNNER_TEMP/out/closure.json"
+          sha256sum "$RUNNER_TEMP"/out/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: initrd-${{ matrix.lane }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+
+  summary:
+    name: Both lanes identical, digest summary
+    needs: [kernel, initrd]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/lanes
+      - name: Compare the lanes and write the published set
+        run: |
+          /usr/bin/python3 scripts/reference_build_summary.py --lanes "$RUNNER_TEMP/lanes" \
+            --initrd-version "$INITRD_VERSION" --out "$RUNNER_TEMP/reference"
+          cat "$RUNNER_TEMP/reference/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/reference/SHA256SUMS"
+      - name: Fetch python-zstandard (sha256 checked)
+        run: python3 scripts/fetch_reference_build_inputs.py --out "$RUNNER_TEMP/inputs" --group python
+      - name: Consumer check, the published initrd against the published closure
+        run: |
+          mkdir "$RUNNER_TEMP/pylib"
+          /usr/bin/python3 -I -m zipfile -e "$RUNNER_TEMP"/inputs/python/zstandard-0.25.0-*.whl "$RUNNER_TEMP/pylib"
+          PYTHONPATH="$RUNNER_TEMP/pylib" /usr/bin/python3 room-kit/custom_guest_initrd.py check \
+            --closure "$RUNNER_TEMP/reference/closure.json" \
+            --archive "$RUNNER_TEMP/reference/cathedral-custom-initrd-$INITRD_VERSION.cpio.zst"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reference-build
+          path: ${{ runner.temp }}/reference/
+          if-no-files-found: error
