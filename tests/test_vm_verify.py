@@ -53,7 +53,7 @@ def measurement(identity: str, vcpus: int) -> str:
 
 
 def blob(key: Ed25519PrivateKey) -> bytes:
-    return vv.ED25519_BLOB_PREFIX + key.public_key().public_bytes_raw()
+    return vv.protocol.HOST_KEY_PREFIX + key.public_key().public_bytes_raw()
 
 
 # ---- synthetic AMD chain --------------------------------------------------------------
@@ -408,24 +408,22 @@ def test_malformed_answers_are_refused(raw, code):
     assert caught.value.code == code
 
 
-@pytest.mark.parametrize("raw", [
-    b"",
-    b"[203.0.113.10]:22001 ssh-ed25519 AAAA\n[203.0.113.10]:22001 ssh-ed25519 AAAA\n",
-    b"[203.0.113.11]:22001 ssh-ed25519 " + base64.b64encode(blob(HOST_KEY)) + b"\n",
-    b"[203.0.113.10]:22001 ecdsa-sha2-nistp256 " + base64.b64encode(blob(HOST_KEY)) + b"\n",
-    b"[203.0.113.10]:22001 ssh-ed25519 " + base64.b64encode(blob(HOST_KEY)[:-1]) + b"\n",
-])
-def test_connection_key_takes_exactly_one_ed25519_key_for_this_endpoint(raw):
-    with pytest.raises(vv.Refused) as caught:
-        vv.connection_key(raw, "203.0.113.10", 22001)
-    assert caught.value.code == "host_key_invalid"
+def test_ssh_argv_is_776s_with_the_vm_attest_command(tmp_path):
+    """The connection options are verify_custom_guest.ssh_command's; only the program (a test
+    hook, /usr/bin/ssh by default) and the remote command are the VM's."""
+    challenge, known = bytes(range(32)), tmp_path / "known_hosts"
+    ours = vv.ssh_argv("203.0.113.10", 22001, "cathedral", "id_ed25519", known, challenge)
+    theirs = vv.vcg.ssh_command("203.0.113.10", 22001, "cathedral", "id_ed25519", known, challenge)
+    assert ours[0] == vv.SSH_BIN == "/usr/bin/ssh" and ours[1:-1] == theirs[1:-1]
+    assert ours[-1] == "sudo -n /run/cathedral/bin/cathedral-attest " + challenge.hex()
 
 
-def test_connection_key_reads_the_recorded_key():
-    line = b"[203.0.113.10]:22001 ssh-ed25519 " + base64.b64encode(blob(HOST_KEY)) + b"\n"
-    assert vv.connection_key(line, "203.0.113.10", 22001) == blob(HOST_KEY)
-    assert vv.connection_key(line.replace(b"[203.0.113.10]:22001", b"203.0.113.10"), "203.0.113.10", 22) \
-        == blob(HOST_KEY)
+@pytest.mark.parametrize("host,port,user", [("-oProxyCommand=x", 22001, "cathedral"), ("203.0.113.10", 0, "cathedral"),
+                                            ("203.0.113.10", 22001, "Root;id")])
+def test_ssh_target_is_validated_before_any_connection(tmp_path, host, port, user):
+    with pytest.raises(vv.CannotCheck) as caught:
+        vv.ssh_argv(host, port, user, "id_ed25519", tmp_path / "known_hosts", bytes(32))
+    assert caught.value.code == "ssh_target"
 
 
 # ---- the command line, through a fake ssh ---------------------------------------------
@@ -510,18 +508,29 @@ def test_cli_refusal_exits_1(cli, monkeypatch):
     assert code == 1 and result["verdict"] == "FAIL" and result["code"] == "report_data_mismatch"
 
 
-def test_cli_guest_attest_failure_exits_1(cli, monkeypatch):
-    monkeypatch.setenv("FAKE_SSH_EXIT", "1")
-    code, result = cli()
-    assert code == 1 and result["code"] == "attest_failed"
-
-
-def test_cli_ssh_failure_exits_2(cli, monkeypatch):
-    monkeypatch.setenv("FAKE_SSH_EXIT", "255")
+@pytest.mark.parametrize("exit_code", ["1", "255"])
+def test_cli_ssh_or_remote_command_failure_exits_2(cli, monkeypatch, exit_code):
+    # 255: ssh itself failed; 1: the attest command in the VM failed. Neither is a verdict.
+    monkeypatch.setenv("FAKE_SSH_EXIT", exit_code)
     monkeypatch.setenv("FAKE_SSH_STDERR", "ssh: connect to host 203.0.113.10 port 22001: Connection refused")
     code, result = cli()
     assert code == 2 and result["verdict"] == "ERROR" and result["code"] == "ssh_failed"
-    assert "Connection refused" in result["reason"]
+    assert "run the same ssh by hand" in result["reason"]
+
+
+@pytest.mark.parametrize("known", [
+    "",
+    "[203.0.113.11]:22001 ssh-ed25519 {key}\n",
+    "[203.0.113.10]:22001 ecdsa-sha2-nistp256 {key}\n",
+    "[203.0.113.10]:22001 ssh-ed25519 {key}\n[203.0.113.10]:22001 ssh-ed25519 {key}\n",
+    "[203.0.113.10]:22001 ssh-ed25519 {short}\n",
+    "[203.0.113.10]:22001 ssh-ed25519 @@@@\n",
+])
+def test_cli_refuses_a_recorded_host_key_that_is_not_one_ed25519_key_for_this_endpoint(cli, monkeypatch, known):
+    monkeypatch.setenv("FAKE_SSH_KNOWN", known.format(key=base64.b64encode(blob(HOST_KEY)).decode(),
+                                                      short=base64.b64encode(blob(HOST_KEY)[:-1]).decode()))
+    code, result = cli()
+    assert code == 1 and result["verdict"] == "FAIL" and result["code"] == "host_key_invalid"
 
 
 def test_cli_pin_is_reserved(capsys):

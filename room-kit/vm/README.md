@@ -272,8 +272,9 @@ measurements) for the VM init (VM1b) and the verifier (VM2).
 
 The customer runs `verify_vm.py` on a machine they trust, with their own bundle
 directory, their `vm-identity.json` and the AMD root fingerprint they trust for the CPU
-family (spec r3 6.4). It opens one SSH connection to the VM (no user config, agent, mux or
-proxy; an empty known_hosts; ed25519 host keys only), runs
+family (spec r3 6.4). It opens one SSH connection to the VM with the custom guest
+verifier's options (`verify_custom_guest.py`: no user config, agent, mux or proxy; an empty
+known_hosts; ed25519 host keys only), runs
 `sudo -n /run/cathedral/bin/cathedral-attest <challenge>` there, and checks the report:
 
 | Check | Refusal code |
