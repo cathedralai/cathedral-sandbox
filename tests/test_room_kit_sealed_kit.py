@@ -96,10 +96,12 @@ def test_sealed_guest_restarts_after_a_failed_start(tmp_path: Path) -> None:
 def test_sealed_guest_waits_for_kvm_before_the_host_link_and_qemu(tmp_path: Path) -> None:
     unit = _write_units(tmp_path)
     pre = [line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("ExecStartPre=")]
-    assert pre[0] == "-/sbin/modprobe -q kvm_amd"
+    # pre[0] is the custom guest hold guard (AB#999; tests/test_custom_guest_kit_safety.py).
+    assert "custom-guest.hold" in pre[0]
+    assert pre[1] == "-/sbin/modprobe -q kvm_amd"
     # systemd turns $$ into a literal $ for the shell.
-    assert "[ -c /dev/kvm ]" in pre[1] and "$$(seq 1 120)" in pre[1]
-    assert pre[2] == "/srv/sealed-hotel-9/host-net.sh up /srv/sealed-hotel-9/sealed.env"
+    assert "[ -c /dev/kvm ]" in pre[2] and "$$(seq 1 120)" in pre[2]
+    assert pre[3] == "/srv/sealed-hotel-9/host-net.sh up /srv/sealed-hotel-9/sealed.env"
     assert "ExecStart=/srv/sealed-hotel-9/launch-guest.sh /srv/sealed-hotel-9/sealed.env" in unit
 
 
