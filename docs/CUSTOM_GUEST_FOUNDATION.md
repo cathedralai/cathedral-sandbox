@@ -409,3 +409,24 @@ including nested network and port objects. Case aliases and simultaneous
 case variants are refused before decoding into Go structs. The optional
 `data_disk_gib` field remains optional; fixture signatures and HOST_DATA are
 unchanged. Eight signed regression cases failed before the fix.
+
+### Data-volume preservation checks (not yet wired)
+
+`internal/datavolume` adds two read-only guards for the planned owner unlock
+command. `CheckBlank` reads every byte of the bounded candidate and refuses
+nonzero data, incomplete reads or cancellation. A blank header is insufficient:
+data behind a lost header can remain recoverable with its backup.
+
+`CheckHeaderPolicy` checks the encryption fields of cryptsetup JSON metadata:
+one AES-XTS segment, 4096-byte sectors, HMAC-SHA256 integrity, encrypted keyslots,
+and no persistent bypass or reencryption flags. It rejects duplicate JSON keys,
+excessive nesting and oversized metadata. The policy uses the cryptsetup 2.8.4
+layout: 64-byte XTS plus 32-byte HMAC volume keys and 64-byte keyslot wrapping.
+Tests use synthetic metadata, not a complete checksummed LUKS header.
+
+Neither result authorizes a write. The command still needs held device identity,
+exclusive use, bounded passphrase intake, cryptsetup validation, active mapping
+verification and restricted filesystem handling. Existing filesystems must never
+be reformatted; first-use formatting must follow the full blank check under the
+same device hold. Nothing opens the data disk at boot. The owner unlock command,
+complete PID1/initrd integration and hardware acceptance remain unfinished.
