@@ -19,6 +19,7 @@ the unit's `ExecStartPre`, so a host boot, a crash restart and a guest reboot pa
 | 15 | `sev_baseline_missing` | no SEV baseline, or it is unsafe or invalid |
 | 16 | `sev_status_unreadable` | `/dev/sev` did not answer the status commands |
 | 17 | `sev_platform_changed` | the SEV status differs from the baseline, now or earlier in this boot |
+| 18 | `sev_state_unavailable` | this boot's SEV state cannot be held or kept (lock busy, `/run/cathedral-snp` unsafe or not writable) |
 | 13 | `vm_bundle_mismatch` | a bundle file is missing or differs from its manifest |
 
 The gates run in the order of the table. A refusal prints one JSON line on stdout and one line,
@@ -27,6 +28,12 @@ refuse too.
 
 `vm-gates.sh enforce` runs on the enforce tick. It compares only the SEV status. It never stops a
 running VM. A change refuses new starts for the rest of the boot.
+
+The SEV state of a boot is in `/run/cathedral-snp/` (tmpfs, so a reboot clears it). The first
+compare of a boot arms the boot. A change replaces the armed token with a changed marker, and a
+durable copy goes to `/var/lib/cathedral-snp/vm-sev-changed.json` when the boot id is known. A full
+disk cannot lose the change, because the token is renamed and a rename needs no free space. Only a
+host reboot or `baseline --replace` ends the refusal.
 
 ## Host file
 
@@ -169,8 +176,9 @@ sudo room-kit/vm/vm-gates.sh baseline
 sudo python3 -I ops/custom-guest/sev_status.py compare /var/lib/cathedral-snp/vm-sev-baseline.json
 ```
 
-`baseline` does not replace a baseline unless you pass `--replace`, and it refuses in a boot that
-saw a change.
+`baseline` does not replace a baseline unless you pass `--replace`. A baseline, new or replaced, is
+your explicit accept of the current status: it also clears a change that this boot saw, and it arms
+the boot again.
 
 **`sev_platform_changed`.** A platform command reached the chip through a writable `/dev/sev`, or
 the firmware changed.
@@ -180,13 +188,26 @@ the firmware changed.
 2. Find the cause: who can write `/dev/sev` (the `cvm-sev` group, VM spec Q10), and the journal of
    `cathedral-vm-enforce.service` (one `vm-gates: sev_platform_changed: <field>: <old> -> <new>`
    line per tick).
-3. Reboot the host in a window. After the boot, `sudo room-kit/vm/vm-gates.sh enforce` must answer
-   `"sev": "equal"`. Then start the refused VMs (section 2, step 6).
-4. If the status still differs after the boot, the change is persistent (a firmware or microcode
-   update). Verify the new TCB against the floor, then take `baseline --replace`.
+3. Reboot the host in a window. After the boot, run `sudo room-kit/vm/vm-gates.sh enforce`.
+   - `"sev": "equal"`: start the refused VMs (section 2, step 6).
+   - exit 17: the change is persistent, for example a firmware or microcode update. Go to step 4.
+     The enforce tick may also report it before you do.
+4. Read the status with `sudo python3 -I ops/custom-guest/sev_status.py read`. Verify the new TCB
+   against the floor (D 10.4). Make sure the chip key and chip ID masks and VLEK are as you expect.
+   Then accept the new status:
 
-**Planned firmware or microcode update.** Do it in a window like section 2. After the reboot, verify
-the new TCB and take `baseline --replace` before you start the VMs.
+   ```sh
+   sudo room-kit/vm/vm-gates.sh baseline --replace
+   sudo room-kit/vm/vm-gates.sh enforce        # must answer "sev": "equal"
+   ```
+
+   Start the refused VMs (section 2, step 6).
+
+Do not take `baseline --replace` to skip the reboot after a change in the middle of a boot. The
+replace accepts whatever status the chip reports now.
+
+**Planned firmware or microcode update.** Do it in a window like section 2. After the reboot, do
+steps 3 and 4.
 
 ## 4. Off
 

@@ -4,10 +4,13 @@ QEMU binary, and the SEV status read replaced by a dict parsed with sev_status.p
 from __future__ import annotations
 
 import copy
+import errno
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,7 +69,9 @@ class Host:
         monkeypatch.setattr(gates, "read_sev", lambda: copy.deepcopy(self.sev))
 
     baseline = property(lambda self: self.root / gates.BASELINE)
-    latch = property(lambda self: self.root / gates.LATCH)
+    marker = property(lambda self: self.root / gates.CHANGED)
+    durable = property(lambda self: self.root / gates.DURABLE_CHANGED)
+    armed = property(lambda self: self.root / gates.ARMED)
     host_path = property(lambda self: self.root / gates.HOST_FILE)
 
     @staticmethod
@@ -79,6 +84,21 @@ class Host:
 
     def boot(self, boot_id: str) -> None:
         self.write(self.root / "proc/sys/kernel/random/boot_id", boot_id + "\n")
+
+    def reboot(self, boot_id: str) -> None:
+        """A host reboot: a new boot id and an empty /run (tmpfs)."""
+        shutil.rmtree(self.root / "run", ignore_errors=True)
+        self.boot(boot_id)
+
+    def lock_held(self) -> bool:
+        fd = os.open(self.root / gates.SEV_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
 
     def build(self, vcpus, **over) -> dict:
         entry = {"qemu_sha256": hashlib.sha256(self.qemu.read_bytes()).hexdigest(), "qemu_version": "10.2.1",
@@ -133,7 +153,7 @@ def refused(host, capsys, error, *argv):
 
 def test_exit_codes_are_distinct_and_clear_of_the_unit_codes():
     codes = list(gates.EXIT.values())
-    assert len(set(codes)) == len(codes) == 8
+    assert len(set(codes)) == len(codes) == 9
     # 0 pass, 1 internal, 2 usage; 75 (relaunch) and 78 (launcher refusal) belong to the unit.
     assert not set(codes) & {0, 1, 2, 75, 78}
 
@@ -347,8 +367,10 @@ def test_enforce_compare_any_drift_fails_with_its_reason(host, capsys, part, fie
     host.sev = drifted(part, field)
     detail = refused(host, capsys, "sev_platform_changed", "enforce")
     assert detail.startswith(f"{part}.{field}: ")
-    assert json.loads(host.latch.read_text())["diff"] == [d for d in detail.split("; ")]
-    assert (host.latch.stat().st_mode & 0o777) == 0o600
+    for record in (host.marker, host.durable):
+        assert json.loads(record.read_text())["diff"] == detail.split("; ")
+        assert (record.stat().st_mode & 0o777) == 0o600
+    assert not host.armed.exists()
 
 
 @pytest.mark.parametrize("part,field", COMPARED)
@@ -360,7 +382,7 @@ def test_check_any_drift_refuses_the_start(host, capsys, part, field):
 def test_enforce_baseline_equal_passes(host, capsys):
     code, doc, err = host.run("enforce", capsys=capsys)
     assert (code, doc, err) == (0, {"ok": True, "sev": "equal"}, "")
-    assert not host.latch.exists()
+    assert host.armed.is_file() and not host.marker.exists() and not host.durable.exists()
 
 
 def test_guest_count_and_state_are_not_compared(host, capsys):
@@ -396,7 +418,9 @@ def test_change_latches_until_a_host_reboot(host, capsys):
     host.sev = copy.deepcopy(STATUS)  # flipped back by a second platform command
     assert "changed earlier in this boot" in refused(host, capsys, "sev_platform_changed")
     assert "snp.vlek_en" in refused(host, capsys, "sev_platform_changed", "enforce")
-    host.boot("boot-2")  # host reboot, status equal to the baseline: starts resume
+    host.boot("boot-1b")  # a new boot id alone, with /run kept, still refuses (the marker is in /run)
+    refused(host, capsys, "sev_platform_changed")
+    host.reboot("boot-2")  # host reboot, status equal to the baseline: starts resume
     assert host.run("check", "vm1", capsys=capsys)[0] == 0
     assert host.run("enforce", capsys=capsys)[0] == 0
 
@@ -404,18 +428,116 @@ def test_change_latches_until_a_host_reboot(host, capsys):
 def test_reboot_with_the_change_still_there_refuses(host, capsys):
     host.sev = drifted("snp", "current_tcb")
     refused(host, capsys, "sev_platform_changed")
-    host.boot("boot-2")
+    host.reboot("boot-2")
     refused(host, capsys, "sev_platform_changed")
-    assert json.loads(host.latch.read_text())["boot_id"] == "boot-2"
+    assert json.loads(host.durable.read_text())["boot_id"] == "boot-2"
+    assert json.loads(host.marker.read_text())["boot_id"] == "boot-2"
 
 
-def test_unreadable_latch_or_boot_id_fails_closed(host, capsys):
-    host.write(host.latch, "{", 0o600)
-    assert "unreadable" in refused(host, capsys, "sev_platform_changed")
-    host.write(host.latch, json.dumps({"boot_id": "boot-0", "at": "t", "diff": ["snp.vlek_en: 0 -> 1"]}), 0o600)
-    assert host.run("check", "vm1", capsys=capsys)[0] == 0  # an earlier boot's latch
+def test_full_disk_cannot_lose_a_change(host, capsys, monkeypatch):
+    """Astra P1: drift, the latch write fails with ENOSPC, the status flips back: still refused."""
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0  # the boot is armed
+    def full(*a, **k):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+    monkeypatch.setattr(gates, "write_atomic", full)
+    host.sev = drifted("snp", "mask_chip_key")
+    detail = refused(host, capsys, "sev_platform_changed", "enforce")
+    assert "not kept" not in detail and host.marker.exists() and not host.armed.exists()
+    host.sev = copy.deepcopy(STATUS)
+    refused(host, capsys, "sev_platform_changed")
+    refused(host, capsys, "sev_platform_changed", "enforce")
+
+
+def test_change_kept_when_the_rename_fails(host, capsys, monkeypatch):
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    def no_rename(*a, **k):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+    monkeypatch.setattr(gates.os, "rename", no_rename)
+    host.sev = drifted("sev", "build")
+    refused(host, capsys, "sev_platform_changed", "enforce")
+    host.sev = copy.deepcopy(STATUS)
+    refused(host, capsys, "sev_platform_changed")  # the marker was written instead
+
+
+def test_a_change_nothing_could_keep_says_so(host, capsys, monkeypatch):
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    def fail(*a, **k):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+    monkeypatch.setattr(gates.os, "rename", fail)
+    monkeypatch.setattr(gates, "write_atomic", fail)
+    host.sev = drifted("sev", "build")
+    assert "not kept for this boot" in refused(host, capsys, "sev_platform_changed", "enforce")
+
+
+def test_unknown_boot_id_never_writes_a_durable_change(host, capsys):
+    """Astra P2: a change seen without a boot id refuses for this boot only."""
     (host.root / "proc/sys/kernel/random/boot_id").unlink()
-    refused(host, capsys, "sev_platform_changed")  # cannot tell the boots apart
+    host.sev = drifted("snp", "vlek_en")
+    refused(host, capsys, "sev_platform_changed", "enforce")
+    assert host.marker.exists() and not host.durable.exists()
+    host.sev = copy.deepcopy(STATUS)
+    refused(host, capsys, "sev_platform_changed")
+    host.reboot("boot-2")
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    assert host.run("baseline", "--replace", capsys=capsys)[0] == 0
+
+
+def test_durable_change_counts_only_for_its_own_boot(host, capsys):
+    host.write(host.durable, json.dumps({"boot_id": "boot-0", "at": "t", "diff": ["snp.vlek_en: 0 -> 1"]}), 0o600)
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0  # an earlier boot's change
+    host.write(host.durable, json.dumps({"boot_id": "boot-1", "at": "t", "diff": ["snp.vlek_en: 0 -> 1"]}), 0o600)
+    assert "snp.vlek_en" in refused(host, capsys, "sev_platform_changed")  # /run lost it, the copy did not
+    host.write(host.durable, "{", 0o600)
+    assert "unreadable" in refused(host, capsys, "sev_platform_changed")
+
+
+def test_unreadable_marker_fails_closed(host, capsys):
+    host.marker.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    host.write(host.marker, "{", 0o600)
+    assert "unreadable" in refused(host, capsys, "sev_platform_changed")
+    host.marker.unlink()
+    host.marker.symlink_to(host.baseline)
+    refused(host, capsys, "sev_platform_changed")
+
+
+def test_state_dir_unsafe_or_unwritable(host, capsys):
+    d = host.root / gates.SEV_STATE
+    d.mkdir(parents=True, mode=0o700)
+    d.chmod(0o755)
+    assert "mode 0700" in refused(host, capsys, "sev_state_unavailable")
+    d.rmdir()
+    d.write_text("not a directory")
+    refused(host, capsys, "sev_state_unavailable")
+    host.sev = drifted("snp", "build_id")  # an arm failure still compares and reports the change
+    refused(host, capsys, "sev_platform_changed")
+
+
+def test_compare_and_baseline_run_under_the_sev_lock(host, capsys, monkeypatch):
+    """Astra P2: the baseline read, the compare, the state write and the replace hold one lock."""
+    seen = []
+    real_baseline = gates.sev_baseline
+    monkeypatch.setattr(gates, "sev_baseline", lambda: (seen.append(("baseline", host.lock_held())), real_baseline())[1])
+    monkeypatch.setattr(gates, "read_sev", lambda: (seen.append(("read", host.lock_held())), copy.deepcopy(host.sev))[1])
+    real_write = gates.write_atomic
+    monkeypatch.setattr(gates, "write_atomic", lambda p, d: (seen.append(("write", host.lock_held())), real_write(p, d))[1])
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    host.sev = drifted("snp", "build_id")
+    refused(host, capsys, "sev_platform_changed", "enforce")
+    assert host.run("baseline", "--replace", capsys=capsys)[0] == 0
+    assert {k for k, _ in seen} == {"baseline", "read", "write"} and all(held for _, held in seen), seen
+    assert not host.lock_held()
+
+
+def test_sev_lock_busy_refuses(host, capsys, monkeypatch):
+    monkeypatch.setattr(gates, "SEV_LOCK_WAIT", 0.2)
+    (host.root / gates.SEV_LOCK).parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(host.root / gates.SEV_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        assert "is held" in refused(host, capsys, "sev_state_unavailable")
+        assert host.run("baseline", "--replace", capsys=capsys)[0] == 18
+    finally:
+        os.close(fd)
 
 
 # ---- gate 13: bundle digests ----------------------------------------------------------------
@@ -505,14 +627,29 @@ def test_baseline_never_overwritten_without_replace(host, capsys):
     assert json.loads(host.baseline.read_text()) == host.sev
 
 
-def test_no_new_baseline_after_a_change_in_the_same_boot(host, capsys):
+def test_documented_recovery_for_a_persistent_change(host, capsys):
+    """Astra P1, the runbook's exact order: firmware change, reboot, enforce, verify, baseline --replace,
+    enforce, start."""
+    host.sev = drifted("snp", "current_tcb")  # a firmware update that stays after the reboot
+    host.reboot("boot-2")
+    refused(host, capsys, "sev_platform_changed", "enforce")
+    refused(host, capsys, "sev_platform_changed")
+    code, doc, _ = host.run("baseline", "--replace", capsys=capsys)
+    assert code == 0 and json.loads(host.baseline.read_text()) == host.sev
+    assert not host.marker.exists() and not host.durable.exists() and host.armed.is_file()
+    assert host.run("enforce", capsys=capsys)[:2] == (0, {"ok": True, "sev": "equal"})
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    host.sev = copy.deepcopy(STATUS)  # back to the old status: a change against the new baseline
+    refused(host, capsys, "sev_platform_changed")
+
+
+def test_replace_is_the_explicit_accept_in_the_same_boot(host, capsys):
     host.sev = drifted("snp", "mask_chip_id")
     refused(host, capsys, "sev_platform_changed", "enforce")
-    before = host.baseline.read_bytes()
-    assert "reboot the host" in refused(host, capsys, "sev_platform_changed", "baseline", "--replace")
-    assert host.baseline.read_bytes() == before
-    host.boot("boot-2")
+    host.sev = copy.deepcopy(STATUS)
+    refused(host, capsys, "sev_platform_changed")
     assert host.run("baseline", "--replace", capsys=capsys)[0] == 0
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
 
 
 if __name__ == "__main__":
