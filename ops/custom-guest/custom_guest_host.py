@@ -749,6 +749,17 @@ def verify_isolation(ctx: Ctx) -> None:
 
 # ---------------------------------------------------------------- unit text (5.8)
 
+# Every `+` hook of the custom unit runs in the host's mount namespace. systemd runs a `+` command with
+# full privileges but, from systemd 259, still inside the unit's own mount namespace. This unit's namespace
+# has TemporaryFileSystem=/srv:ro (so the guest user sees no other hotel or launch) and ProtectSystem=strict
+# (so /run and /var are read-only). Seen from there, check-start finds an empty /srv and no host journal, the
+# exited hook cannot append to it (EROFS), and custom-net.sh cannot take its lock under /run/lock.
+# `nsenter --mount=/proc/1/ns/mnt` puts only the hook, never the guest process, in PID 1's namespace.
+# Chosen over binding the hooks' files into the unit (they would then be visible to the guest user, and
+# the list would grow with every hook) and over separate helper units (more moving parts and ordering to get
+# right for the same effect). The guest's ExecStart is unchanged: it still sees images (ro), disks and run.
+HOST_NS = "/usr/bin/nsenter --mount=/proc/1/ns/mnt --"
+
 def unit_text(ctx: Ctx, mem_gib: int) -> str:
     d, lib, h, l = ctx.d, LIBDIR, ctx.hotel, ctx.launch
     return f"""[Unit]
@@ -759,13 +770,13 @@ Type=simple
 User=cg-{h}
 Group=cg-{h}
 SupplementaryGroups=kvm cg-sev
-ExecStartPre=+{lib}/custom-guest-host.sh check-start --hotel {h} --launch-id {l}
-ExecStartPre=+-/sbin/modprobe -q kvm_amd
-ExecStartPre=+/bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
-ExecStartPre=+{lib}/custom-net.sh up {h} {l}
-ExecStartPre=+/bin/rm -f {d}/run/qmp.sock
+ExecStartPre=+{HOST_NS} {lib}/custom-guest-host.sh check-start --hotel {h} --launch-id {l}
+ExecStartPre=+-{HOST_NS} /sbin/modprobe -q kvm_amd
+ExecStartPre=+{HOST_NS} /bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
+ExecStartPre=+{HOST_NS} {lib}/custom-net.sh up {h} {l}
+ExecStartPre=+{HOST_NS} /bin/rm -f {d}/run/qmp.sock
 ExecStart=/usr/bin/python3 -I {lib}/launch-custom-guest.py {d}
-ExecStopPost=+{lib}/custom-guest-host.sh exited --hotel {h} --launch-id {l}
+ExecStopPost=+{HOST_NS} {lib}/custom-guest-host.sh exited --hotel {h} --launch-id {l}
 Restart=no
 KillSignal=SIGTERM
 TimeoutStartSec=180

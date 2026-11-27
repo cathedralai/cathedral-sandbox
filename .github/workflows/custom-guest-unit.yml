@@ -1,0 +1,45 @@
+name: Custom guest unit
+
+# The generated custom guest unit under a real systemd, with stub scripts in place of QEMU (tests/test_custom_guest_unit_systemd.py).
+# It catches what the fake systemctl of the other tests cannot: what a `+` hook sees inside the unit's mount namespace.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ops/custom-guest/**"
+      - "tests/test_custom_guest_unit_systemd.py"
+      - ".github/workflows/custom-guest-unit.yml"
+  pull_request:
+    paths:
+      - "ops/custom-guest/**"
+      - "tests/test_custom_guest_unit_systemd.py"
+      - ".github/workflows/custom-guest-unit.yml"
+
+concurrency:
+  group: custom-guest-unit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Generated unit under real systemd (root)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Versions
+        run: |
+          systemctl --version | head -1
+          nsenter --version
+          python3 --version
+      - name: Test environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q pytest
+      - name: Run the unit test as root
+        run: sudo env CG_SYSTEMD_TESTS=1 "$RUNNER_TEMP/venv/bin/python" -m pytest -v -s tests/test_custom_guest_unit_systemd.py
+      - name: Journal on failure
+        if: failure()
+        run: sudo journalctl --no-pager -n 120 -o cat || true
