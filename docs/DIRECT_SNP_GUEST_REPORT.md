@@ -6,6 +6,25 @@ ioctl work inside a gVisor sandbox, and does not use the existing report socket.
 The custom image launch and HOST_DATA setup are separate release requirements.
 This document is not evidence that either has been deployed.
 
+## Account access and owner signing
+
+The agreed UR API flow uses the customer's existing Cathedral `cat_sk_` key.
+Do not mint a second dedicated booking key for this flow. Account authentication
+and the dedicated owner check still apply; an API key alone does not establish
+the guest's bootstrap binding.
+
+The Ed25519 owner signing pair is separate from the API key and the guest's SSH
+host key. Its public half is an input to the HOST_DATA hash below. The measured
+guest must enforce the corresponding signature/bootstrap contract. Keep the
+private half with the signer, never in the report or public evidence.
+
+An administrator-generated pair is suitable for the authorized rehearsal.
+Record it as operator-controlled test ownership, not customer-exclusive control.
+Use one agreed pair across signing, launch inputs and verification. For
+customer-controlled operation, use their public key while they retain the
+private key. Changing that input changes HOST_DATA and requires a new verified
+launch; it is not a Cathedral API-key rotation.
+
 ## Prerequisites
 
 The guest must run a 64-bit little-endian Linux kernel with the SEV guest driver
@@ -144,7 +163,8 @@ floor, with debug and migration-agent policies disabled. The authenticated
 connection must be bound to that intended guest by the reviewed launch/channel
 contract; this standalone report verifier does not establish that connection.
 
-Spock owns the end-to-end run with the authorized dedicated key. First rehearse
+Spock owns the end-to-end run using the authorized Cathedral account key and
+the agreed test owner signing pair in their separate roles. First rehearse
 on separate SNP capacity without customer work. Record the deployed launch
 revision, image digests, independently calculated measurement and HOST_DATA,
 device/driver evidence, collection exit status, and verifier output. Negative
