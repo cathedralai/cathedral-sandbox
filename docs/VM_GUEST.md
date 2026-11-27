@@ -137,3 +137,21 @@ pinned files and downloads nothing, builds twice and requires identical static E
   e2fsprogs; the cut-point reruns, a flipped base block, a wrong root hash, the pinned-helper
   refusals, `Finish`) and `tools` (the static build, in an Ubuntu 26.04 container pinned by digest).
 - The mailbox tests read `tests/fixtures/vm_mailbox_v1.json` from main and fail if it is missing.
+
+## Wiring into `cmd/cathedral-vm-init`
+
+`wire_linux_amd64.go` replaces the `unwired` stand-ins:
+
+- `Root()` is `rootAdapter` over `internal/vmroot`. `CheckLink` is `vmroot.ParseLink`. `FirstBoot` runs
+  `vmroot.FirstBoot` (copy, resize, user, host key, cloud-init, recovery record), unmounts strictly and
+  returns R for the disk package's keyslot step. `Start` mounts, runs `Finish` (modules, `/run`,
+  network file, tool binds, cloud-init marker) and then `SwitchRoot(ready)`, where `ready` writes the
+  status record. The tool pins (`veritysetup`, `resize2fs`, and the two bound tools) come from the
+  measured `usr/lib/cathedral/vm-closure.json`; a manifest missing any of them makes every call refuse.
+- `Mailbox()` is `mailboxAdapter` over `vmmailbox`. The init already opens the disk with O_DIRECT after
+  proving it is the block device sysfs names (`openDisk`, stronger than a path open), so it hands that
+  file to `vmmailbox.New`, not `OpenDevice`. It zeroes the offer slot, then writes the status.
+- `wire_root_linux_amd64_test.go` runs the real `vmdisk` and the real adapter on loop devices: blank
+  disk, first boot, power off, ready boot (same host key and recovery record, status `new` then `open`),
+  plus refusals (an unpinned tool, a flipped base block, a bad link). `switch_root` cannot run in a test;
+  the hybrid stops after `ready`.
