@@ -25,7 +25,8 @@ never printed and never in argv. Host phases run over SSH
 Config (env): CG_HOME (~/.cathedral-custom-guest: journals, hosts.conf, inputs.json,
 test-image.json), CG_API_URL, CG_ADMIN_KEY_FILE, CG_BROKER_URL, CG_OPERATOR_KEY_FILE,
 CG_SITE_URL, CG_SSH, CG_SCP, CG_PLATFORM_GUEST, and the waits CG_FENCE_WAIT (1800 s),
-CG_H7_WAIT (600 s), CG_ADMIT_WAIT (1800 s), CG_POLL (15 s).
+CG_H7_WAIT (600 s), CG_ADMIT_WAIT (1800 s), CG_SEND_WAIT (900 s: a broker PATCH the API calls
+unresolved), CG_POLL (15 s).
 hosts.conf: one line per hotel: <hotel> <ssh target> <repo dir on the host> <public host>.
 """
 from __future__ import annotations
@@ -57,6 +58,7 @@ SCP = shlex.split(os.environ.get("CG_SCP", "scp -q -o BatchMode=yes -o StrictHos
 FENCE_WAIT = float(os.environ.get("CG_FENCE_WAIT", "1800"))
 H7_WAIT = float(os.environ.get("CG_H7_WAIT", "600"))
 ADMIT_WAIT = float(os.environ.get("CG_ADMIT_WAIT", "1800"))
+SEND_WAIT = float(os.environ.get("CG_SEND_WAIT", "900"))
 POLL = float(os.environ.get("CG_POLL", "15"))
 UA = "cathedral-custom-guest/1"
 ADMIN = "/api/admin/cathedral/dedicated/custom-guest"
@@ -92,7 +94,8 @@ def now_iso() -> str:
 
 
 def fault(where: str) -> None:
-    """Test hook: CG_FAULT=op:<step>:<sub> kills the script right after that act, before the journal."""
+    """Test hook: CG_FAULT=op:<step>:<sub> kills the script right after that act, before the journal
+    (op:fence:<target>: right after a fence POST, its answer unread)."""
     if os.environ.get("CG_FAULT") == where:
         os._exit(137)
 
@@ -206,6 +209,43 @@ def tuple_of(view: dict) -> dict:
     return {"generation": view.get("reservation_generation"), "ref": view.get("reservation_ref")}
 
 
+def unresolved_of(rec: dict) -> dict | None:
+    """The broker PATCH the API sent and has no answer for (PR 3 host.reservation.unresolved), or None."""
+    return (host_of(rec).get("reservation") or {}).get("unresolved") or None
+
+
+def target_live(rec: dict, to: str, view: dict) -> bool:
+    """Whether a broker read shows fence target ``to`` for this record (the read side of the API's _at_target)."""
+    host = host_of(rec)
+    res = host.get("reservation") or {}
+    if not res.get("fenced") or view.get("reserved_for") != host.get("reservation_guest"):
+        return False
+    hold, live = view.get("custom_guest_hold"), tuple_of(view)
+    if to == "fenced":
+        return live == res["fenced"] and hold == {"launch": rec["launch_id"], "kit_down": False}
+    if to == "kit_down":
+        return live == res["fenced"] and hold == {"launch": rec["launch_id"], "kit_down": True}
+    restored = res.get("restored") or {"generation": res["fenced"]["generation"] + 1, "ref": res["original"]["ref"]}
+    return live == restored and hold is None
+
+
+OUT = ("sending", "unanswered")  # PR 3 send entries whose PATCH may have left ("claimed" never did)
+
+
+def sends_out(pending: dict) -> int:
+    """How many calls' copies of the unresolved PATCH may be out (PR 3 sends: intent_id -> claimed, sending,
+    unanswered or answered)."""
+    return sum(1 for v in (pending.get("sends") or {}).values() if v in OUT)
+
+
+def settled_by_read(rec: dict, pending: dict, view: dict) -> bool:
+    """The API's settle rule, read side (4.6): resolved when no copy can be out, or a read shows the whole target
+    and the PATCH moves the generation or only one copy can be out. A generation past the fence alone is not
+    enough: the hold must agree with the tuple."""
+    out = sends_out(pending)
+    return out == 0 or (target_live(rec, pending.get("to"), view) and (bool(pending.get("bumps")) or out == 1))
+
+
 class Op:
     def __init__(self, hotel: str, launch: str, opts: argparse.Namespace):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,58}", hotel) or not re.fullmatch(r"cg-[0-9a-f]{12}", launch):
@@ -317,15 +357,109 @@ class Op:
 
     # ---------------- writes
     def patch(self, seq: int, frm: str, to: str, fields: dict | None = None, generation: int | None = None) -> None:
-        rec = self.record()
-        body = {"from": frm, "to": to, "generation": rec.get("generation", 0) if generation is None else generation,
-                "journal_seq": seq, "fields": fields or {}}
-        status, doc = self.api.call("PATCH", f"{ADMIN}/{self.launch}", body)
-        if status != 200:
-            raise Blocked(error_code(doc), f"PATCH {frm} -> {to}: {status}")
+        end = time.time() + SEND_WAIT
+        while True:
+            rec = self.record()
+            body = {"from": frm, "to": to, "generation": rec.get("generation", 0) if generation is None else generation,
+                    "journal_seq": seq, "fields": fields or {}}
+            status, doc = self.api.call("PATCH", f"{ADMIN}/{self.launch}", body)
+            if status == 200:
+                return
+            code = error_code(doc)
+            if status == 409 and code == "custom_guest_send_unresolved":
+                # A record PATCH never reaches the broker: sent again only once a read shows the send resolved.
+                self.wait_unresolved(f"PATCH {frm} -> {to}", end)
+                continue
+            if status == 409 and code == "custom_guest_state_conflict":
+                raise self.conflict(f"PATCH {frm} -> {to}")
+            raise Blocked(code, f"PATCH {frm} -> {to}: {status}")
 
     def fence(self, to: str) -> tuple[int, dict]:
         return self.api.call("POST", f"{ADMIN}/{self.launch}/fence", {"to": to}, timeout=60)
+
+    def conflict(self, what: str) -> Blocked:
+        """custom_guest_state_conflict: the record moved under this call. Read it back, say what it shows, stop."""
+        rec = self.record()
+        res, pending = self.res(rec), unresolved_of(rec) or {}
+        return Blocked("custom_guest_state_conflict",
+                       f"{what}: refused, nothing sent. The record is now {rec['state']}/{rec.get('hold_phase')}, "
+                       f"intent {res.get('intent')}, expect {res.get('expect')}, unresolved {pending.get('to')}. "
+                       f"Stopped: read the record before the next step")
+
+    def wait_unresolved(self, why: str, end: float) -> None:
+        """A broker PATCH may still be in flight (4.6, 11.2). Wait on reads of the record and the broker; send
+        nothing. Returns once a read shows the send resolved; past ``end`` it stops for Toby."""
+        while True:
+            pending = unresolved_of(self.record()) or {}
+            view = self.view()
+            print(json.dumps({"waiting": "unresolved_broker_send", "launch_id": self.launch, "for": why,
+                              "send": pending.get("to"), "sent_at": pending.get("at"), "out": sends_out(pending),
+                              "live": tuple_of(view)}), file=sys.stderr, flush=True)
+            if time.time() >= end:
+                raise Blocked("custom_guest_send_unresolved",
+                              f"{why}: the {pending.get('to')} PATCH sent at {pending.get('at')} is still unresolved "
+                              f"after {int(SEND_WAIT)} s. Nothing was resent. Toby decides, or rerun once it lands")
+            time.sleep(POLL)  # at least one wait per refusal: the API's own read just said unresolved
+            rec = self.record()
+            pending = unresolved_of(rec)
+            if pending is None or settled_by_read(rec, pending, self.view()):
+                return
+
+    def fence_step(self, to: str, exc: type, retry: tuple[str, ...] = ("rooms_active",),
+                   wait: float | None = None) -> None:
+        """Drive POST .../fence to a 200 (4.3, 7.2). The API reads the hotel before it sends and answers sent:false
+        at the target, so a POST after a lost answer finishes the API's own transaction instead of skipping it.
+
+        - ``retry`` codes (rooms_active; secret_calls_in_flight at H7): wait and POST again until ``wait``.
+        - no answer, or reservation_moved with this target unresolved in the record: the send is in doubt. Only a
+          generation-moving PATCH (fenced from original, restored) is sent again: the first copy to land moves the
+          generation past every other copy. Any other send is waited on by reads, never resent.
+        - custom_guest_send_unresolved: another send is in doubt: wait on reads, then POST again.
+        - custom_guest_state_conflict: read the record back and stop.
+        Waiting on a send that never resolves stops with custom_guest_send_unresolved (a Blocked, never an abort).
+        """
+        end = time.time() + (FENCE_WAIT if wait is None else wait)
+        send_end = time.time() + SEND_WAIT
+        while True:
+            try:
+                status, doc = self.fence(to)
+            except Transport:
+                status, doc = 0, {}
+            fault(f"op:fence:{to}")  # test hook: die with the API's answer unread
+            if status == 200:
+                if doc.get("stale"):
+                    # PR 3 recorded the answer but the record moved on (another call settled this step): it did
+                    # not finalize. The sub's observe reads the record back and decides.
+                    print(json.dumps({"stale_answer": to, "launch_id": self.launch}), file=sys.stderr, flush=True)
+                return
+            code = error_code(doc) if 0 < status < 500 else "no_answer"
+            if status == 409 and code in retry and time.time() < end:
+                time.sleep(POLL if code == "rooms_active" else min(POLL, 5))
+                continue
+            if status == 409 and code == "custom_guest_state_conflict":
+                raise self.conflict(f"fence {to}")
+            pending = unresolved_of(self.record())
+            if code in ("no_answer", "custom_guest_reservation_moved") and pending is not None \
+                    and pending.get("to") == to and pending.get("bumps"):
+                if time.time() >= send_end:
+                    raise Blocked("custom_guest_send_unresolved", f"fence {to}: {sends_out(pending)} copies may be "
+                                  f"out, none answered or seen; Toby decides")
+                print(json.dumps({"resending": to, "launch_id": self.launch, "out": sends_out(pending),
+                                  "why": "it moves the generation: the first copy to land fails every other"}),
+                      file=sys.stderr, flush=True)
+                time.sleep(min(POLL, 5))
+                continue
+            if code == "custom_guest_send_unresolved" or (
+                    code in ("no_answer", "custom_guest_reservation_moved") and pending is not None):
+                self.wait_unresolved(f"fence {to}", send_end)
+                continue
+            if code == "no_answer":
+                # Nothing unresolved: the API finished or never began. A POST reads first, so it is safe again.
+                if time.time() >= end:
+                    raise Blocked("custom_guest_hold_failed", f"fence {to}: the API did not answer")
+                time.sleep(min(POLL, 5))
+                continue
+            raise exc("custom_guest_barrier_failed" if code == "rooms_active" else code, f"fence {to}: {status} {code}")
 
     def drain(self, value: bool) -> None:
         status, doc = self.broker.call("PATCH", f"/v1/broker/hotels/{self.hotel}", {"drain": value})
@@ -339,7 +473,7 @@ class Op:
 
         recheck: observe again even when the journal shows the sub done (evidence a host reboot can make stale).
         """
-        if self.j.done(self.launch, step, name) and not recheck:
+        if self.done_now(step, name) and not recheck:
             return
         seq = self.j.write(self.launch, generation, step, name, "intent")
         try:
@@ -357,6 +491,16 @@ class Op:
             self.j.write(self.launch, generation, step, name, "failed", {"error_code": e.code, "detail": e.detail[:300]})
             raise
         self.j.write(self.launch, generation, step, name, "done", self.stash.pop(name, None))
+
+    def run_entries(self, step: str, sub: str, phase: str | None = None) -> list[dict]:
+        """Entries of ``sub`` in the current run of ``step``: after its latest begin. A step that was closed and
+        begun again (a refused abort reopened, a boot rerun) never trusts what its earlier run journaled."""
+        begins = self.j.find(self.launch, step, "begin")
+        start = begins[-1]["seq"] if begins else 0
+        return [e for e in self.j.find(self.launch, step, sub, phase) if e["seq"] > start]
+
+    def done_now(self, step: str, sub: str) -> bool:
+        return bool(self.run_entries(step, sub, "done"))
 
     def begin(self, step: str, generation: int | None = None) -> None:
         if not self.open_step(step):
@@ -555,6 +699,12 @@ class Op:
         if not [e for e in self.j.entries() if e.get("step") == "versions" and e.get("phase") == "done"]:
             raise Blocked("custom_guest_hold_unsupported", "record the deployed roll.sh commits first (record-versions, 5.10)")
         n = self.attempt()
+        if rec["state"] == "holding" and self.open_step(f"abort#{n}") and self.abort_untouched(n):
+            self.close_abort(n, "hold")  # no restore was sent: going forward is still allowed (11.2)
+        if rec["state"] == "holding" and self.open_step(f"abort#{n}"):
+            # 11.2: once an abort began, its restore may be sent; after that only the abort follows (PR 3 refuses
+            # every other step). Finish it with resume or abort.
+            raise Blocked("custom_guest_state_conflict", f"attempt {n} is aborting: run resume (or abort), not hold")
         step = f"hold#{n}"
         self.begin(step)
         try:
@@ -594,18 +744,22 @@ class Op:
 
         # H3 fence and hold: one PATCH moves the ref and sets the hold.
         def h3_observe() -> bool:
-            v, res = self.view(), self.res()
+            rec, v = self.record(), self.view()
+            res = self.res(rec)
             t, hold = tuple_of(v), v.get("custom_guest_hold") or {}
             orig = res["original"]
             fenced = res.get("fenced") or {"generation": orig["generation"] + 1, "ref": ref}
-            if t == fenced and hold.get("launch") == self.launch:
+            at = t == fenced and hold.get("launch") == self.launch
+            # Done only when the API recorded it too: a broker result alone leaves the API's fence transaction
+            # unfinished (expect still original), and the next phase PATCH would be refused (4.3, 5.4).
+            if at and res.get("expect") == "fenced" and unresolved_of(rec) is None:
                 return True
-            if t == orig:
-                return False
+            if at or t == orig:
+                return False  # the act POSTs the fence: at the target the API only records it (sent: false)
             raise Blocked("custom_guest_reservation_moved", f"live tuple {t}")
 
         def h3_act(seq: int) -> None:
-            self.fence_until("fenced", Abort)  # the API writes the fenced tuple before its PATCH
+            self.fence_step("fenced", Abort)  # the API writes the fenced tuple before its PATCH
 
         self.sub(step, "H3", h3_observe, h3_act)
         self.set_phase(step, "fenced")
@@ -701,24 +855,16 @@ class Op:
 
         # H7 kit_down, authorized by the record, not a live room list.
         def h7_observe() -> bool:
+            rec = self.record()
             hold = self.view().get("custom_guest_hold") or {}
-            return hold.get("launch") == self.launch and hold.get("kit_down") is True
+            # As at H3: done only once the API recorded broker_hold.kit_down_at, not on the broker result alone.
+            return hold.get("launch") == self.launch and hold.get("kit_down") is True \
+                and bool((host_of(rec).get("broker_hold") or {}).get("kit_down_at")) and unresolved_of(rec) is None
 
         def h7_act(seq: int) -> None:
-            end = time.time() + H7_WAIT
-            while True:
-                try:
-                    status, doc = self.fence("kit_down")
-                except Transport:
-                    return
-                if status == 200:
-                    return
-                code = error_code(doc)
-                # The first attempt closed secret admission; the count can only fall (7.2).
-                if status == 409 and code == "secret_calls_in_flight" and time.time() < end:
-                    time.sleep(min(POLL, 5))
-                    continue
-                raise Blocked(code, f"fence kit_down: {status}")
+            # The first attempt closed secret admission; the count can only fall (7.2). kit_down moves no
+            # generation, so a lost one is waited on by reads, never sent again blind.
+            self.fence_step("kit_down", Blocked, retry=("secret_calls_in_flight",), wait=H7_WAIT)
 
         self.sub(step, "H7", h7_observe, h7_act)
         self.set_phase(step, "kit_down_set")  # the API records broker_hold.kit_down_at at the fence
@@ -739,25 +885,42 @@ class Op:
 
         self.sub(step, "H9", lambda: self.record()["state"] == "held", h9_act)
 
-    def fence_until(self, to: str, exc: type) -> None:
-        """POST fence; on rooms_active wait and retry up to CG_FENCE_WAIT (H3, R12, the abort restore)."""
-        end = time.time() + FENCE_WAIT
-        while True:
-            status, doc = self.fence(to)
-            if status == 200:
-                return
-            code = error_code(doc)
-            if status == 409 and code == "rooms_active" and time.time() < end:
-                time.sleep(POLL)
-                continue
-            raise exc("custom_guest_barrier_failed" if code == "rooms_active" else code, f"fence {to}: {status} {code}")
-
     # ================================================================ abort (11.2)
+    def kit_down_code(self) -> str | None:
+        """None while the kit runs; else why no abort is possible (the kit stopped, only forward or Toby)."""
+        f = self.facts()
+        if (f.get("kit_unit") or {}).get("state") == "active":
+            return None
+        return "custom_guest_kit_failed" if not self.hj(f, "kit_stop") else "custom_guest_hold_failed"
+
+    def abort_untouched(self, n: int) -> bool:
+        """abort#n never began the restore: no restore sub journaled, and the record has no restore intent, no
+        restore expect and no unresolved send."""
+        if self.run_entries(f"abort#{n}", "restore"):
+            return False
+        rec = self.record()
+        res = self.res(rec)
+        return not res.get("intent") and res.get("expect") != "restored" and unresolved_of(rec) is None
+
+    def close_abort(self, n: int, by: str) -> None:
+        self.j.write(self.launch, None, f"abort#{n}", "refused", "done", {"closed_by": by})
+        self.end(f"abort#{n}")
+
     def abort(self, n: int, code: str) -> None:
         step = f"abort#{n}"
+        # Eligibility before any journal entry: a refused abort must leave nothing open that blocks going forward.
+        refused = self.kit_down_code()
+        if refused:
+            if not self.open_step(step):
+                raise Blocked(refused, "the kit is not active: no abort, only forward (or Toby decides); "
+                                       "nothing was journaled, run resume to go on")
+            if self.abort_untouched(n):
+                self.close_abort(n, "abort")
+                raise Blocked(refused, f"the kit is not active: abort#{n} never began the restore and is closed "
+                                       "as refused; run resume to go on")
         self.begin(step)
         # The first run's error code is the one the record gets, whatever a resumed run was told.
-        first = self.j.find(self.launch, step, "reason", "done")
+        first = self.run_entries(step, "reason", "done")
         if first:
             code = first[-1]["detail"]["error_code"]
         else:
@@ -775,17 +938,27 @@ class Op:
                  lambda seq: self.host_ok("unhold"))
 
         def restored_observe() -> bool:
-            v, res = self.view(), self.res()
+            rec, v = self.record(), self.view()
+            res, pending = self.res(rec), unresolved_of(rec)
             t, orig = tuple_of(v), res.get("original")
-            if v.get("custom_guest_hold") is None and t == orig and res.get("expect") == "original":
-                return True  # the fence never landed
-            if restored_now(v, res):
-                return True
-            if res.get("fenced") and t == res["fenced"]:
+            if pending is None and v.get("custom_guest_hold") is None and t == orig and res.get("expect") == "original":
+                return True  # no fence landed and none is in flight: the original tuple is the end state
+            if pending is None and res.get("expect") == "restored" and target_live(rec, "restored", v):
+                return True  # the API recorded the restore
+            # A read showing original cannot prove an unanswered H3 PATCH will not land (4.6): never done here.
+            if pending is not None or t in (orig, res.get("fenced"), res.get("restored")):
                 return False
             raise Blocked("custom_guest_reservation_moved", f"live tuple {t}: Toby decides")
 
-        self.sub(step, "restore", restored_observe, lambda seq: self.fence_until("restored", Blocked))
+        def restore(seq: int) -> None:
+            pending = unresolved_of(self.record())
+            if pending is not None and pending.get("to") == "fenced" and pending.get("bumps"):
+                # The H3 PATCH may still land: move the generation past it (the same fenced PATCH, G+1), then
+                # restore (G+2). A late copy then fails its fence at the broker (11.2).
+                self.fence_step("fenced", Blocked)
+            self.fence_step("restored", Blocked)
+
+        self.sub(step, "restore", restored_observe, restore)
         before = bool(host_of(self.record()).get("drain_before"))
         self.sub(step, "drain", lambda: bool(self.view().get("drain")) == before, lambda seq: self.drain(before))
 
@@ -807,17 +980,51 @@ class Op:
         return None
 
     # ================================================================ boot, stop (11.3, 11.5)
-    def step_boot(self) -> None:
+    def close_boots(self, upto: int) -> None:
+        """End every open boot#N up to ``upto``: that boot is over, and resume must never take it up again (11.4)."""
+        for e in self.j.find(self.launch, sub="begin"):
+            step = e["step"]
+            if step.startswith("boot#") and int(step.split("#", 1)[1]) <= upto and self.open_step(step):
+                self.end(step, int(step.split("#", 1)[1]))
+
+    def booted_now(self, gen: int) -> bool:
+        """The guest of ``gen`` runs now: its "booted" entry is from this host boot and this unit run (11.3)."""
+        f = self.facts()
+        mine = [e for e in self.hj(f, "booted") if e.get("generation") == gen]
+        if not mine:
+            return False
+        e, unit = mine[-1], f.get("custom_unit") or {}
+        if unit.get("ActiveState") == "active" and e.get("boot_id") == f.get("boot_id") \
+                and e.get("invocation_id") and e.get("invocation_id") == unit.get("InvocationID"):
+            return True
+        raise Blocked("custom_guest_boot_failed", f"generation {gen} booted, but not in this host boot and unit run "
+                      "(a host reboot or a QEMU exit since); nothing restarts it (11.4)")
+
+    def step_boot(self, bound: int | None = None) -> bool | None:
+        """bound: resume of an open boot#N. It stays on generation N: it finishes that boot or closes it, and never
+        allocates a new generation (11.4: a relaunch is an explicit boot command)."""
         rec = self.record()
-        if rec["state"] == "booting":
-            gen = int(rec["generation"])
-        elif rec["state"] in ("held", "stopped"):
-            gen = int(rec.get("generation") or 0) + 1
-        elif rec["state"] == "running":
+        st, cur = rec["state"], int(rec.get("generation") or 0)
+        if bound is not None:
+            booting_now = st == "booting" and cur == bound
+            not_started = st in ("held", "stopped") and cur == bound - 1 \
+                and not self.done_now(f"boot#{bound}", "booting")
+            if not (booting_now or not_started):
+                self.close_boots(bound)
+                print(json.dumps({"ok": True, "state": st, "generation": cur, "closed": f"boot#{bound}"}))
+                return False
+            gen = bound
+        elif st == "booting":
+            gen = cur
+        elif st in ("held", "stopped"):
+            gen = cur + 1
+        elif st == "running":
+            self.close_boots(cur)
             print(json.dumps({"ok": True, "state": "running"}))
-            return
+            return False
         else:
             raise Blocked("custom_guest_state_conflict", f"boot needs held or stopped, the record is {rec['state']}")
+        self.close_boots(gen - 1)
         step = f"boot#{gen}"
         self.begin(step, gen)
         frm = rec["state"]
@@ -831,11 +1038,14 @@ class Op:
         data = {"generation": gen, "bootstrap_signature_b64": rec["bootstrap_signature_b64"],
                 "manifest_sha256": rec["manifest_sha256"], "bootstrap_sha256": rec["bootstrap_sha256"]}
         try:
-            self.sub(step, "host_boot", lambda: bool([e for e in self.hj(self.facts(), "booted") if e.get("generation") == gen]),
-                     lambda seq: self.host_ok("boot", data), gen)
+            # Observed on every run of this step: a journaled "booted" from before a host reboot proves nothing.
+            self.sub(step, "host_boot", lambda: self.booted_now(gen), lambda seq: self.host_ok("boot", data), gen,
+                     recheck=True)
             # verify-disks only reads and compares; a rerun runs it again.
             self.sub(step, "disks", lambda: "disks" in self.stash,
                      lambda seq: self.stash.__setitem__("disks", self.host_ok("verify-disks", context=f"boot{gen}")), gen)
+            if not self.booted_now(gen):  # once more right before running is recorded
+                raise Blocked("custom_guest_boot_failed", f"generation {gen} is not running on the host")
         except Blocked as e:
             if self.record()["state"] == "booting":
                 seq = self.j.write(self.launch, gen, step, "boot_failed", "intent", {"error_code": e.code})
@@ -882,6 +1092,7 @@ class Op:
                  lambda seq: self.stash.__setitem__("host_stop", self.host_ok("stop")), gen)
         self.sub(step, "stopped", lambda: self.record()["state"] == "stopped",
                  lambda seq: self.patch(seq, "stopping", "stopped"), gen)
+        self.close_boots(gen)  # an open boot of this generation is over: resume must not start it again
         self.end(step, gen)
 
     # ================================================================ return (11.6)
@@ -923,7 +1134,7 @@ class Op:
 
         # Until R12 gives the hotel back, the evidence must be about the kit boot that runs now: a host reboot
         # after R11 makes the journaled R1 to R11 stale, so both are observed again on every run (5.4, 11.6).
-        before_r12 = not self.j.done(self.launch, step, "R12")
+        before_r12 = not self.done_now(step, "R12")
         self.sub(step, "R1_R10", kit_current, kit, recheck=before_r12)
 
         def r11() -> bool:
@@ -949,14 +1160,15 @@ class Op:
         self.sub(step, "R11", r11, recheck=before_r12)
 
         def r12_observe() -> bool:
-            v, res = self.view(), self.res()
-            if restored_now(v, res):
-                return True
-            if tuple_of(v) == res.get("fenced"):
+            rec, v = self.record(), self.view()
+            res = self.res(rec)
+            if res.get("expect") == "restored" and unresolved_of(rec) is None and target_live(rec, "restored", v):
+                return True  # the API recorded the restore, not only the broker
+            if tuple_of(v) in (res.get("fenced"), res.get("restored")) or unresolved_of(rec) is not None:
                 return False
             raise Blocked("custom_guest_reservation_moved", f"live tuple {tuple_of(v)}: Toby decides")
 
-        self.sub(step, "R12", r12_observe, lambda seq: self.fence_until("restored", Blocked))
+        self.sub(step, "R12", r12_observe, lambda seq: self.fence_step("restored", Blocked))
         before = bool(host_of(self.record()).get("drain_before"))
         self.sub(step, "R13", lambda: bool(self.view().get("drain")) == before, lambda seq: self.drain(before))
         self.sub(step, "R14", lambda: self.record()["state"] == "returned",
@@ -995,6 +1207,14 @@ class Op:
         for e in self.j.find(self.launch, sub="begin"):
             if self.open_step(e["step"]) and e["step"] not in opened:
                 opened.append(e["step"])
+        # An open abort that never began the restore, with the kit already stopped, can never finish: close it
+        # and resume the hold it interrupted (forward recovery, 11.2).
+        while opened and opened[-1].startswith("abort#"):
+            n = int(opened[-1].split("#", 1)[1])
+            if not (self.abort_untouched(n) and self.kit_down_code()):
+                break
+            self.close_abort(n, "resume")
+            opened.pop()
         if not opened:
             print(json.dumps({"ok": True, "open": None}))
             return False
@@ -1009,9 +1229,11 @@ class Op:
         for k in RESUMED_OPTIONS:
             if saved is not None and getattr(self.o, k, None) is None:
                 setattr(self.o, k, getattr(saved, k))
-        {"intake": self.step_intake, "measure": self.step_measure, "hold": self.step_hold, "abort": self.step_abort,
-         "boot": self.step_boot, "stop": self.step_stop, "return": self.step_return,
-         "cancel": self.step_cancel}[kind]()
+        if kind == "boot":
+            return self.step_boot(bound=int(step.split("#", 1)[1]))
+        return {"intake": self.step_intake, "measure": self.step_measure, "hold": self.step_hold,
+                "abort": self.step_abort, "stop": self.step_stop, "return": self.step_return,
+                "cancel": self.step_cancel}[kind]()
 
     def step_reconcile(self) -> int:
         """Reads only, and projects host facts forward into the record. Starts nothing (5.4)."""
@@ -1059,16 +1281,9 @@ class Op:
                 seq = self.j.write(self.launch, rec.get("generation"), "reconcile", "project", "intent", {"reason": reason})
                 self.patch(seq, "running", "stopped", {"stop_reason": reason, "error_code": code})
                 self.j.write(self.launch, rec.get("generation"), "reconcile", "project", "done", {"reason": reason})
+                self.close_boots(int(rec.get("generation") or 0))
         print(json.dumps({"ok": not alerts, "state": self.record()["state"], "alerts": alerts}))
         return 2 if alerts else 0
-
-
-def restored_now(view: dict, res: dict) -> bool:
-    """The live state of fence restored: (fenced G + 1, ref0), no hold, drain on (7.2)."""
-    if not res.get("fenced") or not res.get("original"):
-        return False
-    want = res.get("restored") or {"generation": res["fenced"]["generation"] + 1, "ref": res["original"]["ref"]}
-    return tuple_of(view) == want and view.get("custom_guest_hold") is None and view.get("drain") is True
 
 
 RESUMED_OPTIONS = ("toby_go", "path", "direct_guest", "order", "dedicated_since", "h5_ok", "h5_holder",

@@ -70,6 +70,11 @@ elif phase == "intake":
         h["inbox"], h["staging"], h["launch_dir"] = False, False, True
         log("intake_done")
         r = {"ok": True, "report": {"ok": True}, "files": {}}
+elif phase == "hold-stop" and opts["--part"] == "a" and h.get("die_after_marker"):
+    # interrupted after the marker is written, before the kit stop
+    h["marker"] = {"launch_id": os.environ["FAKE_LAUNCH"], "state": "held"}
+    h["die_after_marker"] = False
+    r = {"ok": False, "error_code": "custom_guest_kit_failed", "detail": "injected after the marker"}
 elif phase == "hold-stop" and opts["--part"] == "a":
     if h["marker"] is None:
         h["marker"] = {"launch_id": os.environ["FAKE_LAUNCH"], "state": "held"}
@@ -100,13 +105,20 @@ elif phase == "hold-baseline":
     r = {"ok": True}
 elif phase == "boot":
     gen = data["generation"]
-    if not has("booted", generation=gen):
+    unit = h["custom_unit"] or {}
+    if unit.get("ActiveState") == "active" and has("booted", generation=gen):
+        r = {"ok": True, "already": True, "generation": gen}
+    elif has("token_used", generation=gen):
+        # as the real host: one start per generation; a relaunch is a new generation (11.4)
+        r = {"ok": False, "error_code": "custom_guest_boot_failed", "detail": "generation already started once"}
+    else:
         log("boot", state="intent", generation=gen, token=uuid.uuid4().hex)
         log("token_used", generation=gen)
-        log("booted", generation=gen)
+        inv = uuid.uuid4().hex
+        h["custom_unit"] = {"ActiveState": "active", "InvocationID": inv}
+        log("booted", generation=gen, invocation_id=inv)
         h["boots"] += 1
-    h["custom_unit"] = {"ActiveState": "active"}
-    r = {"ok": True, "generation": gen}
+        r = {"ok": True, "generation": gen}
 elif phase == "verify-disks":
     r = {"ok": True}
 elif phase == "stop":
@@ -147,8 +159,10 @@ print("RESULT " + json.dumps(r))
 
 # ---------------------------------------------------------------- fake API and broker
 
-# PR 3 contract (bigailabs/polariscomputer#2336 at 4a235e6, polaris/services/cathedral_custom_guest.py):
-# apply_patch, _check_host_fields, _start_hold, _finish_hold, _fence_ready, _finalize, live_rows.
+# PR 3 contract (bigailabs/polariscomputer#2336 at 1b54b25, polaris/services/cathedral_custom_guest.py):
+# apply_patch, _check_host_fields, _start_hold, _finish_hold, _fence_ready, _finalize, live_rows, and the
+# unresolved-send guard (settle_unresolved, _retire, unresolved_error; the three fence transactions with
+# intent_id and one send entry per call: claimed, sending, then answered or unanswered).
 FIELD_KEYS = {"hold_phase", "manifest", "bootstrap", "host_data_hex", "expected_measurement", "host", "stop_reason",
               "error_code", "error_detail"}
 INPUT_KEYS = {"ovmf_url", "ovmf_sha256", "reference_initrd_version", "reference_initrd_url", "reference_initrd_sha256",
@@ -170,6 +184,18 @@ ABORTABLE = {"intent", "drained", "fenced", "inventoried", "kit_stopping"}
 
 def conflict(msg):
     return 409, {"error": "custom_guest_state_conflict", "message": msg}
+
+
+OUT = ("sending", "unanswered")  # PR 3 send entries whose PATCH may have left
+
+
+def moved(msg):
+    return 409, {"error": "custom_guest_reservation_moved", "message": msg}
+
+
+def unresolved_error(pending):
+    return 409, {"error": "custom_guest_send_unresolved",
+                 "message": f"the {pending['to']} PATCH sent at {pending['at']} may still land"}
 
 
 def shape(msg):
@@ -196,6 +222,16 @@ class World:
         self.fence_refuse: dict[str, str] = {}  # target -> broker code passed through
         self.admission: dict | None = None      # overrides the admission derived from the host kit
         self.lose: dict[str, int] = {}  # "<METHOD> <last path part>" -> replies to drop after applying
+        # The unresolved-send knobs (PR 3 at 44364fe, "unresolved sends"):
+        self.lose_before_apply: dict[str, int] = {}  # target -> broker PATCHes that time out before they apply
+        self.delayed: list[dict] = []                # those PATCHes; land_delayed() applies the oldest
+        self.land_after_reads = None                 # land the oldest delayed PATCH after this many operator reads
+        self.race: set[str] = set()                  # target -> another call rewrites the intent between the 2 commits
+        self.crash_after_send: dict[str, int] = {}   # target -> the API dies after the broker applied, before commit
+        self.die_after_claim: dict[str, int] = {}    # target -> the API restarts between its first two transactions
+        self.race_after_send: set[str] = set()       # target -> another call settles the step before transaction 3
+        self.broker_patches: list[str] = []          # every fence PATCH the API sent (applied or delayed), by target
+        self.nonce = 0
         self.calls: list[str] = []
         self.refused: list[str] = []
         self.tuple_moves = 0
@@ -247,6 +283,11 @@ class World:
         want_gen = rec["generation"] + 1 if to == "booting" and frm != "booting" else rec["generation"]
         if body["generation"] != want_gen:
             return conflict(f"generation must be {want_gen}")
+        if (host.get("reservation") or {}).get("unresolved"):
+            self.settle(host)  # on this call's copy, as apply_patch: stored only when the PATCH applies
+            pending = host["reservation"]["unresolved"]
+            if pending and not (to != frm and to in ("stopping", "stopped")):
+                return unresolved_error(pending)
         if any(k in fields for k in ("manifest", "bootstrap", "host_data_hex", "expected_measurement")) and \
                 frm not in DOC_STATES:
             return conflict("documents are fixed")
@@ -283,6 +324,8 @@ class World:
             return conflict("fenced and later need the fence first")
         if to == "holding" and phase and PHASES.index(phase) >= PHASES.index("kit_down_set") and not bh.get("kit_down_at"):
             return conflict("kit_down_set needs fence kit_down first")
+        if frm == "holding" and to != "approved" and "restored" in (res.get("intent"), res.get("expect")):
+            return conflict("a restore was sent for this hold: only the abort follows it")
         if frm == "holding" and to == "held" and phase != "baselined":
             return conflict("held only at baselined")
         if frm == "holding" and to == "approved" and (phase not in ABORTABLE or bh.get("kit_down_at")):
@@ -294,12 +337,14 @@ class World:
                 return 409, {"error": "custom_guest_hold_conflict"}
             prev = host.get("reservation") or {}
             host["reservation"] = {"attempt": int(prev.get("attempt") or 0) + 1, "original": self.live(),
-                                   "fenced": None, "restored": None, "expect": "original", "intent": None}
+                                   "fenced": None, "restored": None, "expect": "original", "intent": None,
+                                   "intent_id": None, "unresolved": None}
             host["reservation_guest"] = self.broker["reserved_for"]
             host["drain_before"] = self.broker["drain"] is True
             host["broker_hold"] = {}
         elif (frm, to) in (("holding", "approved"), ("returning", "returned")):
-            accepted = [res["restored"]] if res.get("restored") and res.get("expect") == "restored" else []
+            accepted = [res["restored"]] if res.get("restored") and "restored" in (res.get("expect"), res.get("intent")) \
+                else []
             if to == "approved" and res.get("expect") == "original":
                 accepted.append(res["original"])
             if self.live() not in accepted:
@@ -308,7 +353,7 @@ class World:
                 return 409, {"error": "custom_guest_hold_conflict"}
             if self.broker["drain"] != bool(host.get("drain_before")):
                 return conflict("restore the drain to drain_before first")
-            host["reservation"] = {**res, "expect": None, "closed": to}
+            host["reservation"] = {**res, "expect": None, "intent": None, "closed": to}
         if phase == "inventoried" and rec["hold_phase"] != "inventoried" and to == "holding":
             if self.room_count:
                 return 409, {"error": "custom_guest_rooms_present"}
@@ -327,65 +372,225 @@ class World:
         rec["host"] = host
         return 200, {"changed": True, "launch": rec}
 
-    def fence(self, to: str) -> tuple[int, dict]:
-        rec, b = self.record, self.broker
-        host = rec["host"]
-        res, bh = host.get("reservation") or {}, host.setdefault("broker_hold", {})
-        state, phase = rec["state"], rec["hold_phase"]
-        if not res or res.get("expect") is None:
-            return conflict("no hold in progress")
-        fenced = res.get("fenced") or {"generation": res["original"]["generation"] + 1,
-                                       "ref": f"cg:{LAUNCH}:{res['attempt']}"}
-        hold = b["custom_guest_hold"]
+    # ---- the fence route, two transactions around one broker PATCH (PR 3 at 44364fe: fence())
+    def fenced_tuple(self, res: dict) -> dict:
+        return res.get("fenced") or {"generation": res["original"]["generation"] + 1, "ref": f"cg:{LAUNCH}:{res['attempt']}"}
+
+    def restored_tuple(self, res: dict) -> dict:
+        return res.get("restored") or {"generation": res["fenced"]["generation"] + 1, "ref": res["original"]["ref"]}
+
+    def hold_is(self, kit_down: bool) -> bool:
+        return self.broker["custom_guest_hold"] == {"launch": LAUNCH, "kit_down": kit_down}
+
+    def at_target(self, host: dict, to: str) -> bool:
+        res = host["reservation"]
+        if self.broker["reserved_for"] != host.get("reservation_guest"):
+            return False
         if to == "fenced":
-            if state != "holding" or phase not in ("drained", "fenced", "inventoried", "kit_stopping") \
-                    or bh.get("kit_down_at"):
-                return conflict("fenced is sent from drained")
-            at = self.live() == fenced and hold == {"launch": LAUNCH, "kit_down": False}
+            return self.live() == self.fenced_tuple(res) and self.hold_is(False)
+        if to == "kit_down":
+            return self.live() == res.get("fenced") and self.hold_is(True)
+        return bool(res.get("fenced")) and self.live() == self.restored_tuple(res) and self.broker["custom_guest_hold"] is None
+
+    def settle(self, host: dict, read: bool = True, keep: str | None = None) -> None:
+        """settle_unresolved: drop entries that cannot be out (claimed but for ``keep``), then clear the send
+        when none can be out, or a read shows its whole target and it bumps or only one copy can be out."""
+        res = host["reservation"]
+        p = res.get("unresolved")
+        if not p:
+            return
+        sends = {k: v for k, v in p["sends"].items() if v in OUT or (k == keep and v == "claimed")}
+        out = [k for k, v in sends.items() if v in OUT]
+        if not sends:
+            res["unresolved"] = None
+            return
+        p["sends"] = sends
+        if out and read and self.at_target(host, p["to"]) and (p["bumps"] or len(out) == 1):
+            res["unresolved"] = None
+
+    def retire(self, host: dict, intent_id: str) -> None:
+        """_retire: a call that never sent drops its own claimed entry."""
+        res = host["reservation"]
+        p = res.get("unresolved")
+        if p is None or p["sends"].get(intent_id) != "claimed":
+            return
+        sends = {k: v for k, v in p["sends"].items() if k != intent_id and v in OUT}
+        res["unresolved"] = {**p, "sends": sends} if sends else None
+
+    def finalize(self, host: dict, to: str) -> None:
+        rec, res, bh = self.record, host["reservation"], host.setdefault("broker_hold", {})
+        if to == "fenced":
+            res.update(fenced=self.fenced_tuple(res), expect="fenced")
+            if rec["state"] == "holding" and rec["hold_phase"] == "drained":
+                rec["hold_phase"] = "fenced"
+        elif to == "kit_down":
+            bh.setdefault("kit_down_at", iso(time.time()))
+            if rec["state"] == "holding" and rec["hold_phase"] == "kit_stopped":
+                rec["hold_phase"] = "kit_down_set"
+        else:
+            res.update(restored=self.restored_tuple(res), expect="restored")
+        if res.get("intent") == to:
+            res["intent"] = res["intent_id"] = None
+
+    def fence_ready(self, host: dict, to: str) -> tuple[int, dict] | None:
+        rec, res, bh = self.record, host["reservation"], host.get("broker_hold") or {}
+        state, phase = rec["state"], rec["hold_phase"]
+        if to == "fenced":
+            if state != "holding" or phase not in ("drained", "fenced", "inventoried", "kit_stopping"):
+                return conflict("fenced is sent from drained, or again before the kit stops")
+            if res["expect"] not in ("original", "fenced") or bh.get("kit_down_at"):
+                return conflict("the hold is past fenced")
         elif to == "kit_down":
             if not ((state == "holding" and phase in ("kit_stopped", "kit_down_set", "baselined"))
                     or state in ("held", "booting", "running", "stopping", "stopped")
                     or (state == "returning" and "disk_verified" not in host)) or res["expect"] != "fenced":
                 return conflict("kit_down from kit_stopped to R7")
-            at = self.live() == res["fenced"] and hold == {"launch": LAUNCH, "kit_down": True}
         else:
             abort = state == "holding" and phase in ABORTABLE and not bh.get("kit_down_at")
             if not (abort or state == "returning") or res["expect"] not in ("fenced", "restored"):
                 return conflict("restored by the abort or R12")
-            restored = res.get("restored") or {"generation": res["fenced"]["generation"] + 1,
-                                               "ref": res["original"]["ref"]}
-            at = self.live() == restored and hold is None
-        if not at:
-            if to == "fenced" and self.rooms_active:
-                self.rooms_active -= 1
-                return 409, {"error": "rooms_active"}
-            if to == "kit_down" and self.secret_calls:
-                self.secret_calls -= 1
-                return 409, {"error": "secret_calls_in_flight"}
-            if to in self.fence_refuse:
-                return 409, {"error": self.fence_refuse[to]}
-            if to == "fenced":
-                if self.live() != res["original"]:
-                    return 409, {"error": "custom_guest_reservation_moved"}
-                self.set_tuple(fenced)
-                b["custom_guest_hold"] = {"launch": LAUNCH, "kit_down": False}
-            elif to == "kit_down":
-                b["custom_guest_hold"] = {"launch": LAUNCH, "kit_down": True}
-            else:
-                self.set_tuple(restored)
-                b["custom_guest_hold"], b["drain"] = None, True
+        return None
+
+    def from_ok(self, host: dict, to: str) -> bool:
+        res = host["reservation"]
+        if self.broker["reserved_for"] != host.get("reservation_guest"):
+            return False
         if to == "fenced":
-            res.update(fenced=fenced, expect="fenced")
-            if state == "holding" and phase == "drained":
-                rec["hold_phase"] = "fenced"
-        elif to == "kit_down":
-            bh.setdefault("kit_down_at", iso(time.time()))
-            if state == "holding" and phase == "kit_stopped":
-                rec["hold_phase"] = "kit_down_set"
+            if res["expect"] == "original":
+                return self.live() == res["original"]
+            return self.live() == res.get("fenced") and not self.hold_is(False)
+        if to == "kit_down":
+            return self.live() == res.get("fenced") and (self.broker["custom_guest_hold"] is None or self.hold_is(False))
+        return self.live() == res.get("fenced")
+
+    def patch_args(self, host: dict, to: str) -> dict:
+        res = host["reservation"]
+        if to == "fenced":
+            return {"to": to, "expect_generation": self.live()["generation"], "tuple": res["fenced"],
+                    "hold": {"launch": LAUNCH, "kit_down": False}}
+        if to == "kit_down":
+            return {"to": to, "expect_generation": res["fenced"]["generation"], "tuple": None,
+                    "hold": {"launch": LAUNCH, "kit_down": True}}
+        return {"to": to, "expect_generation": res["fenced"]["generation"], "tuple": res["restored"], "hold": None,
+                "drain": True}
+
+    def broker_patch(self, spec: dict) -> str | None:
+        """The broker side of one fence PATCH (7.2): None when it applied, else the broker's 409 code."""
+        if spec["expect_generation"] != self.broker["reservation_generation"]:
+            return "reservation_conflict"
+        if spec["tuple"] is not None:
+            self.set_tuple(spec["tuple"])
+        self.broker["custom_guest_hold"] = spec["hold"]
+        if spec.get("drain") is not None:
+            self.broker["drain"] = spec["drain"]
+        return None
+
+    def land_delayed(self) -> str | None:
+        return self.broker_patch(self.delayed.pop(0))
+
+    def fence(self, to: str) -> tuple[int, dict]:
+        rec = self.record
+        host = rec["host"]
+        res = host.get("reservation") or {}
+        if not res or res.get("expect") is None:
+            return conflict("no hold in progress")
+        # 1. Observe, and write the target into the record before anything is sent (its own commit).
+        self.settle(host)
+        if res.get("intent") and self.at_target(host, res["intent"]):
+            self.finalize(host, res["intent"])
+        pending = res.get("unresolved")
+        if pending and not (pending["to"] == to and pending["bumps"]):
+            return unresolved_error(pending)
+        refused = self.fence_ready(host, to)
+        if refused:
+            return refused
+        if self.at_target(host, to):
+            self.finalize(host, to)
+            return 200, {"launch_id": LAUNCH, "to": to, "sent": False, "tuple": self.live()}
+        if not self.from_ok(host, to):
+            return moved("the live reservation or hold is in none of the states this step expects")
+        bumps = to == "restored" or (to == "fenced" and res["expect"] == "original")
+        if to == "fenced":
+            res["fenced"] = self.fenced_tuple(res)
+        elif to == "restored":
+            res["restored"] = self.restored_tuple(res)
+        expect_generation = self.patch_args(host, to)["expect_generation"]
+        if pending and pending["expect_generation"] != expect_generation:
+            return unresolved_error(pending)
+        self.nonce += 1
+        intent_id = f"{res['attempt']}:{self.nonce}"
+        res.update(intent=to, intent_id=intent_id)
+        res["unresolved"] = {"to": to, "intent_id": intent_id, "expect_generation": expect_generation, "bumps": bumps,
+                             "sends": {**((pending or {}).get("sends") or {}), intent_id: "claimed"},
+                             "at": iso(time.time())}
+        if self.die_after_claim.get(to):
+            self.die_after_claim[to] -= 1
+            return 500, {"error": "internal"}  # an API restart between the steps: the entry stays claimed
+        if to in self.race:
+            self.race.discard(to)
+            self.fence(to)  # another call, between this call's first two transactions: it sends and finishes
+
+        def unsent(refusal):
+            self.retire(host, intent_id)  # this call sends nothing: its claimed entry goes
+            return refusal
+
+        # 2. Under the lock again: still this call's claimed intent, then "sending" committed before the PATCH.
+        if res.get("intent_id") != intent_id or res.get("intent") != to or \
+                ((res.get("unresolved") or {}).get("sends") or {}).get(intent_id) != "claimed":
+            return unsent(conflict("another step changed this launch's fence since this call wrote its intent; "
+                                   "nothing sent"))
+        self.settle(host, keep=intent_id)
+        if self.at_target(host, to):
+            self.retire(host, intent_id)
+            self.finalize(host, to)
+            return 200, {"launch_id": LAUNCH, "to": to, "sent": False, "tuple": self.live()}
+        if res.get("unresolved") is None:
+            return unsent(moved("the reservation moved since this call wrote its intent; nothing sent"))
+        refused = self.fence_ready(host, to)
+        if refused:
+            return unsent(refused)
+        if not self.from_ok(host, to):
+            return unsent(moved("the live reservation or hold is in none of the states this step expects"))
+        res["unresolved"]["sends"][intent_id] = "sending"
+        sent_from = (rec["state"], rec["hold_phase"])
+        spec, code, answered = self.patch_args(host, to), None, True
+        self.broker_patches.append(to)
+        if to == "fenced" and self.rooms_active:
+            self.rooms_active -= 1
+            code = "rooms_active"
+        elif to == "kit_down" and self.secret_calls:
+            self.secret_calls -= 1
+            code = "secret_calls_in_flight"
+        elif to in self.fence_refuse:
+            code = self.fence_refuse[to]
+        elif self.lose_before_apply.get(to):
+            self.lose_before_apply[to] -= 1
+            self.delayed.append(spec)
+            answered = False
         else:
-            res.update(restored=restored, expect="restored")
-        host["reservation"] = res
-        return 200, {"launch_id": LAUNCH, "to": to, "sent": not at, "tuple": self.live()}
+            code = self.broker_patch(spec)
+        if answered and code is None and self.crash_after_send.get(to):
+            self.crash_after_send[to] -= 1
+            return 500, {"error": "internal"}  # step 3 never committed: the intent and the "sending" entry stay
+        if to in self.race_after_send:
+            self.race_after_send.discard(to)
+            self.fence(to)  # another call, while this PATCH is out: it reads the target and settles the step
+        # 3. Under the lock again: always record the answer, finalize only at the step the PATCH was sent for.
+        res = host["reservation"]
+        p = res.get("unresolved")
+        if p is not None and p["sends"].get(intent_id) == "sending":
+            p["sends"][intent_id] = "answered" if answered else "unanswered"
+            self.settle(host, read=False)
+        if code is None and (res.get("intent_id") != intent_id or res.get("intent") != to
+                             or (rec["state"], rec["hold_phase"]) != sent_from):
+            return 200, {"launch_id": LAUNCH, "to": to, "sent": True, "stale": True, "record": rec}
+        if code:
+            return 409, {"error": code, "message": f"the broker refused the {to} PATCH"}
+        self.settle(host)
+        if self.at_target(host, to):
+            self.finalize(host, to)
+            return 200, {"launch_id": LAUNCH, "to": to, "sent": True, "tuple": self.live()}
+        return moved("the read-back after the PATCH shows none of the expected states")
 
     def handle(self, method: str, path: str, body: dict | None) -> tuple[int, dict]:
         if method == "GET" and path == f"{ADMIN}?hotel={HOTEL}":
@@ -399,6 +604,11 @@ class World:
         if method == "GET" and path == f"{ADMIN}/{LAUNCH}/live-rows":
             return 200, self.live_rows()
         if method == "GET" and path == f"/v1/broker/hotels/{HOTEL}":
+            if self.land_after_reads is not None and self.delayed:
+                self.land_after_reads -= 1
+                if self.land_after_reads <= 0:
+                    self.land_after_reads = None
+                    self.land_delayed()  # the delayed PATCH reaches the broker while the operator waits
             return 200, self.view()
         if method == "GET" and path == f"/v1/broker/hotels/{HOTEL}/restart-check":
             return 200, {**self.restart, "drain": self.broker["drain"]}
@@ -482,6 +692,7 @@ class Rig:
     def run(self, step: str, *args: str, launch: bool = True, **env: str) -> tuple[int, dict]:
         argv = [sys.executable, str(OP), step, "--hotel", HOTEL, *(["--launch-id", LAUNCH] if launch else []), *args]
         p = subprocess.run(argv, capture_output=True, text=True, env=self.env(**env), timeout=120)
+        self.stderr = p.stderr
         out = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
         return p.returncode, (json.loads(out[-1]) if out else {"stdout": p.stdout, "stderr": p.stderr[-2000:]})
 
@@ -968,3 +1179,249 @@ def test_return_without_a_waiver_after_the_notice(rig):
     rc, out = rig.run("return", "--notice-sent-at", iso(time.time() - 73 * 3600))
     assert rc == 0, out
     assert_returned(rig)
+
+
+# ---------------------------------------------------------------- unresolved broker sends (PR 3 at 44364fe)
+
+def waited(rig: Rig) -> list[dict]:
+    return [json.loads(ln) for ln in rig.stderr.splitlines() if ln.startswith('{"waiting"')]
+
+
+def test_lost_h3_send_is_sent_again_once_and_the_late_copy_fails(rig):
+    """fenced from original moves the generation: the one send the API lets go again; the first to land wins."""
+    rig.world.lose_before_apply["fenced"] = 1
+    rc, out = rig.hold()
+    assert rc == 0, out
+    assert '"resending": "fenced"' in rig.stderr
+    assert rig.world.broker_patches.count("fenced") == 2
+    assert rig.world.land_delayed() == "reservation_conflict", "the late copy fails its fence"
+    assert_held(rig)
+
+
+def test_lost_kit_down_waits_on_reads_and_is_never_sent_again(rig):
+    """send_unresolved: a waiting state and reads, never the send; the delayed PATCH lands, the hold goes on."""
+    rig.world.lose_before_apply["kit_down"] = 1
+    rig.world.land_after_reads = 3
+    rc, out = rig.hold()
+    assert rc == 0, out
+    assert waited(rig) and waited(rig)[0]["send"] == "kit_down", rig.stderr
+    assert rig.world.broker_patches.count("kit_down") == 1, "never resent blind"
+    assert_held(rig)
+
+
+def test_lost_kit_down_that_never_lands_stays_blocked_for_toby(rig):
+    rig.world.lose_before_apply["kit_down"] = 1
+    rc, out = rig.hold(CG_SEND_WAIT="0.3")
+    assert rc == 1 and out["error_code"] == "custom_guest_send_unresolved", out
+    rec = rig.world.record
+    assert rec["state"] == "holding" and rec["hold_phase"] == "kit_stopped", rec
+    assert rec["host"]["reservation"]["unresolved"]["to"] == "kit_down"
+    rc, out = rig.run("resume", CG_SEND_WAIT="0.3")
+    assert rc == 1 and out["error_code"] == "custom_guest_send_unresolved", out
+    assert rig.world.broker_patches.count("kit_down") == 1, "a resume reads, it does not resend"
+    assert rig.world.land_delayed() is None  # the broker finally applies it
+    rc, out = rig.run("resume")
+    assert rc == 0, out
+    assert rig.world.broker_patches.count("kit_down") == 1
+    assert_held(rig)
+
+
+def test_state_conflict_rereads_the_record_and_stops(rig):
+    """A stale intent_id: the second transaction refuses without sending. The operator stops, never aborts."""
+    rig.world.race.add("fenced")
+    rc, out = rig.hold()
+    assert rc == 1 and out["error_code"] == "custom_guest_state_conflict", out
+    assert "The record is now holding/fenced" in out["detail"], out
+    assert rig.world.record["state"] == "holding"
+    assert not [e for e in rig.journal() if e.get("step", "").startswith("abort#")], "no abort on a conflict"
+    assert rig.world.broker_patches == ["fenced"], "only the other call sent"
+    rc, out = rig.run("resume")
+    assert rc == 0, out
+    assert_held(rig)
+
+
+def test_abort_settles_an_unresolved_h3_send_before_it_restores(rig):
+    """Astra r2 #4: original on a read does not prove the lost H3 PATCH will not land. The abort moves the
+    generation past it (fenced, then restored) and never records the restore done on the original tuple."""
+    rig.world.lose_before_apply["fenced"] = 10 ** 6
+    rc, out = rig.hold(CG_SEND_WAIT="0.3")
+    assert rc == 1 and out["error_code"] == "custom_guest_send_unresolved", out
+    assert rig.world.record["hold_phase"] == "drained" and rig.world.delayed
+    rig.world.lose_before_apply = {}
+    rc, out = rig.run("abort", "--reason", "custom_guest_hold_failed")
+    assert rc == 0, out
+    assert_approved_after_abort(rig, "custom_guest_hold_failed", fenced=True)
+    while rig.world.delayed:
+        assert rig.world.land_delayed() == "reservation_conflict", "every late H3 copy fails"
+    assert (rig.world.broker["reservation_generation"], rig.world.broker["reservation_ref"]) == (G0 + 2, REF0)
+
+
+def test_abort_with_an_unresolved_send_and_no_way_to_settle_it_stops(rig):
+    """reservation_moved and send_unresolved during an abort: it waits, then stops; the drain stays and the record
+    stays holding, so nothing claims the hotel is back while a PATCH may still land."""
+    rig.world.lose_before_apply["fenced"] = 10 ** 6
+    rc, out = rig.hold(CG_SEND_WAIT="0.3")
+    assert rc == 1 and out["error_code"] == "custom_guest_send_unresolved", out
+    rc, out = rig.run("abort", "--reason", "custom_guest_hold_failed", CG_SEND_WAIT="0.3")
+    assert rc == 1 and out["error_code"] == "custom_guest_send_unresolved", out
+    rec, b = rig.world.record, rig.world.broker
+    assert rec["state"] == "holding" and b["drain"] is True, "the drain is restored only after the restore"
+    assert not [c for c in rig.world.calls if c.startswith("PATCH /v1/broker") and '"drain": false' in c]
+
+
+def test_hold_after_a_sent_restore_only_aborts(rig):
+    rig.world.restart["rooms"] = 1
+    rc, _ = rig.hold(CG_FAULT="op:abort#1:restore")
+    assert rc == 137
+    patches = len([c for c in rig.world.calls if c.startswith("PATCH")])
+    rc, out = rig.hold()
+    assert rc == 1 and out["error_code"] == "custom_guest_state_conflict" and "aborting" in out["detail"], out
+    assert len([c for c in rig.world.calls if c.startswith("PATCH")]) == patches, "hold sent nothing"
+    rc, out = rig.run("resume")
+    assert rc == 0, out
+    assert_approved_after_abort(rig, "custom_guest_rooms_present", fenced=True)
+
+
+@pytest.mark.parametrize("to", ["fenced", "kit_down"])
+@pytest.mark.parametrize("killed", [False, True])
+def test_api_crash_after_the_broker_applied_is_finished_through_the_api(rig, to, killed):
+    """Astra r2 #3: the broker applied H3 or H7, the API died before its last commit. The operator POSTs the fence
+    again (the API reads, finds the target and records it, sent: false) before it marks the step done."""
+    rig.world.crash_after_send[to] = 1
+    rc, out = rig.hold(**({"CG_FAULT": f"op:fence:{to}"} if killed else {}))
+    if killed:
+        assert rc == 137
+        assert rig.world.record["host"]["reservation"]["unresolved"]["to"] == to, "the API never committed"
+        rc, out = rig.run("resume")
+    assert rc == 0, out
+    assert rig.world.broker_patches.count(to) == 1, "one PATCH reached the broker"
+    assert rig.fences(to) == 2
+    assert_held(rig)
+
+
+# ---------------------------------------------------------------- boot recovery (Astra r2 #1, #2)
+
+@pytest.mark.parametrize("sub", ["host_boot", "disks"])
+def test_boot_resume_after_a_host_reboot_never_records_running(rig, sub):
+    held(rig)
+    rc, _ = rig.run("boot", CG_FAULT=f"op:boot#1:{sub}")
+    assert rc == 137
+    rig.set_host(boot_id="boot-2", custom_unit={"ActiveState": "inactive", "InvocationID": ""})  # host reboot
+    rc, out = rig.run("resume")
+    assert rc == 1 and out["error_code"] == "custom_guest_boot_failed", out
+    rec = rig.world.record
+    assert rec["state"] == "stopped" and rec["stop_reason"] == "boot_failed" and rec["generation"] == 1, rec
+    assert rig.host()["boots"] == 1, "nothing restarts the guest"
+
+
+def test_boot_resume_with_qemu_restarted_under_another_unit_run_never_records_running(rig):
+    held(rig)
+    rc, _ = rig.run("boot", CG_FAULT="op:boot#1:disks")
+    assert rc == 137
+    rig.set_host(custom_unit={"ActiveState": "active", "InvocationID": "another-run"})
+    rc, out = rig.run("resume")
+    assert rc == 1 and out["error_code"] == "custom_guest_boot_failed", out
+    assert rig.world.record["state"] == "stopped"
+
+
+@pytest.mark.parametrize("resume_while_running", [True, False])
+def test_resume_never_relaunches_a_stopped_guest(rig, resume_while_running):
+    held(rig)
+    rc, _ = rig.run("boot", CG_FAULT="op:boot#1:running")
+    assert rc == 137 and rig.world.record["state"] == "running"
+    if resume_while_running:
+        assert rig.run("resume")[0] == 0
+    rc, out = rig.run("stop")
+    assert rc == 0 and rig.world.record["state"] == "stopped", out
+    rc, out = rig.run("resume")
+    assert rc == 0, out
+    rec = rig.world.record
+    assert rec["state"] == "stopped" and rec["generation"] == 1, rec
+    assert rig.host()["boots"] == 1, "a relaunch is an explicit boot command"
+    assert rig.run("resume") == (0, {"ok": True, "open": None})
+    rc, out = rig.run("boot")
+    assert rc == 0 and rig.world.record["generation"] == 2 and rig.host()["boots"] == 2, out
+
+
+@pytest.mark.parametrize("to", ["fenced", "kit_down"])
+def test_a_claimed_send_never_blocks_after_an_api_restart(rig, to):
+    """1604dad: an API restart between the intent and "sending" leaves a claimed entry that was never out. The
+    operator's read sees nothing can be out, and the next POST settles it and sends once."""
+    rig.world.die_after_claim[to] = 1
+    rc, out = rig.hold(CG_SEND_WAIT="5")
+    assert rc == 0, out
+    assert rig.world.broker_patches.count(to) == 1
+    assert_held(rig)
+
+
+# ---------------------------------------------------------------- refused abort, stale answer (Astra on #785)
+
+def test_a_refused_abort_after_the_kit_stopped_leaves_the_hold_free(rig):
+    """Interrupt after H6a stopped the kit; abort is refused before it journals anything; resume reaches held."""
+    rc, _ = rig.hold(CG_FAULT="op:hold#1:H6a")
+    assert rc == 137 and rig.host()["kit"]["state"] == "inactive"
+    rc, out = rig.run("abort", "--reason", "custom_guest_hold_failed")
+    assert rc == 1 and out["error_code"] == "custom_guest_hold_failed", out
+    assert not [e for e in rig.journal() if e.get("step", "").startswith("abort#")], "nothing journaled"
+    rc, out = rig.run("resume")
+    assert rc == 0, out
+    assert_held(rig)
+
+
+@pytest.mark.parametrize("how", ["resume", "hold", "abort"])
+def test_an_open_abort_that_never_restored_is_closed_for_forward_recovery(rig, how):
+    """An abort#1 opened by an earlier run that stopped before its restore (no restore sent, no intent, nothing
+    unresolved) never traps the hold: resume and hold close it as refused; abort refuses and closes it."""
+    rc, _ = rig.hold(CG_FAULT="op:hold#1:H6a")
+    assert rc == 137
+    path = rig.home / HOTEL / "journal.jsonl"
+    seq = max(e["seq"] for e in rig.journal())
+    for i, (sub, phase, detail) in enumerate([("begin", "intent", {"argv": ["abort"]}),
+                                              ("reason", "done", {"error_code": "custom_guest_hold_failed"})]):
+        path.open("a").write(json.dumps({"seq": seq + 1 + i, "launch_id": LAUNCH, "generation": None,
+                                         "step": "abort#1", "sub": sub, "phase": phase, "at": iso(time.time()),
+                                         "detail": detail}, sort_keys=True) + "\n")
+    if how == "abort":
+        rc, out = rig.run("abort", "--reason", "custom_guest_hold_failed")
+        assert rc == 1 and "closed as refused" in out["detail"], out
+        how = "resume"
+    rc, out = rig.hold() if how == "hold" else rig.run("resume")
+    assert rc == 0, out
+    assert_held(rig)
+    assert [e for e in rig.journal() if e.get("step") == "abort#1" and e["sub"] == "refused"]
+
+
+def test_a_stale_fence_answer_lets_the_observer_decide(rig):
+    """1b54b25: transaction 3 finds the step settled by another call and answers sent, stale. Nothing is
+    finalized twice; the operator reads the record back and goes on."""
+    rig.world.race_after_send.add("fenced")
+    rc, out = rig.hold()
+    assert rc == 0, out
+    assert '"stale_answer": "fenced"' in rig.stderr
+    assert_held(rig)
+
+
+def test_a_reopened_abort_runs_its_cleanup_again(rig):
+    """Astra r2 on #785: abort#1 journals unhold done and dies before its restore; hold closes it and goes on;
+    H6a writes the marker and dies before the kit stop; a second abort must remove that marker."""
+    rc, _ = rig.hold(CG_FAULT="op:hold#1:H3")
+    assert rc == 137
+    path = rig.home / HOTEL / "journal.jsonl"
+    seq = max(e["seq"] for e in rig.journal())
+    for i, (sub, phase, detail) in enumerate([("begin", "intent", {"argv": ["abort"]}),
+                                              ("reason", "done", {"error_code": "custom_guest_hold_failed"}),
+                                              ("kit_active", "intent", None), ("kit_active", "done", None),
+                                              ("unhold", "intent", None), ("unhold", "done", None)]):
+        path.open("a").write(json.dumps({"seq": seq + 1 + i, "launch_id": LAUNCH, "generation": None,
+                                         "step": "abort#1", "sub": sub, "phase": phase, "at": iso(time.time()),
+                                         "detail": detail}, sort_keys=True) + "\n")
+    rig.set_host(die_after_marker=True)
+    rc, out = rig.hold()
+    assert rc == 1 and out["error_code"] == "custom_guest_kit_failed", out
+    h = rig.host()
+    assert h["marker"] == {"launch_id": LAUNCH, "state": "held"} and h["kit"]["state"] == "active"
+    rc, out = rig.run("abort", "--reason", "custom_guest_kit_failed")
+    assert rc == 0, out
+    assert rig.host()["marker"] is None, "the marker of the second run is removed"
+    assert_approved_after_abort(rig, "custom_guest_kit_failed", fenced=True)  # this run's reason, not the old one
+    assert rig.run("resume") == (0, {"ok": True, "open": None})
