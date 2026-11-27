@@ -7,11 +7,11 @@ cvm-<slot> and one systemd unit cathedral-vm-<name>.service that runs the SEV-SN
 guest as that user (launch-vm.py; VM runtime spec r2 6.3, 7.1, 8.1, 8.2).
 Every command prints one JSON line on stdout; a refusal prints {"error": ...} and exits nonzero:
   2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or exists,
-  17 stale bundle selection (rebundle: expect_revision is not the VM's revision), 1 anything else.
+  10 to 18 a pre-launch gate (start; vm_gates.EXIT), 19 stale bundle selection and 20 bundle
+  incompatible (rebundle), 1 anything else. A refusal may add "reason", a token naming the check.
 
-Re-wrap (spec r3 7.5): rebundle moves a stopped VM to another bundle, fenced by its closed
-generation and its bundle_selection_revision, idempotent by op_id; rewrap relays the customer's
-answer, read from stdin only, to the offer the guest left in the mailbox (vm_mailbox.py).
+Rebundle (spec r3 7.5 step 1) moves a stopped VM to another bundle, fenced by its closed
+generation and its bundle_selection_revision, idempotent by op_id.
 
 Credit cutoff (polariscomputer#2290 rules 3, 5, 6) is enforced here, on the host,
 so it holds with the API and the broker down:
@@ -53,7 +53,6 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parent
 # -I keeps the script's directory off sys.path; vm_measure.py beside this file is the kit's.
 sys.path.insert(0, str(KIT))
-import vm_mailbox  # noqa: E402
 import vm_measure  # noqa: E402
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -73,12 +72,13 @@ KEY_TYPES = (
 NET = ipaddress.IPv4Network("10.216.0.0/16")
 SLOTS = NET.num_addresses // 4
 COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce",
-            "cancel", "history", "rebundle", "rewrap")
+            "cancel", "history", "rebundle")
 STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
-MAILBOX_BYTES = vm_mailbox.MAILBOX_BYTES
+MAILBOX_BYTES = 1 << 20
 # Rebundle (spec r3 7.5 step 1): the applied op_ids a VM remembers, with their results.
 SELECTION_OPS_MAX = 64
 BUNDLE_ID_RE = re.compile(r"[0-9a-f]{64}")
+EXIT_STALE_SELECTION, EXIT_BUNDLE_INCOMPATIBLE = 19, 20  # 17 and 18 are the gates' (vm_gates.EXIT)
 OP_ID_RE = re.compile(r"[0-9a-f]{32}")  # 128 random bits from the caller
 # MemoryMax headroom over guest memory: the dedicated unit's figure (D 5.8) until rehearsal A2
 # measures the SNP QEMU overhead. A cap, not a reservation: admission (VM4) counts its own.
@@ -97,9 +97,9 @@ HISTORY_SWEEP_BUDGET = float(os.environ.get("VM_HISTORY_SWEEP_BUDGET", "15"))
 
 
 class Refusal(Exception):
-    def __init__(self, error: str, detail: str = "", code: int = 2):
+    def __init__(self, error: str, detail: str = "", code: int = 2, reason: str = ""):
         super().__init__(detail or error)
-        self.error, self.detail, self.code = error, detail, code
+        self.error, self.detail, self.code, self.reason = error, detail, code, reason
 
 
 def root() -> Path:
@@ -366,118 +366,6 @@ def cmd_qmp_as_vm_user(args: list[str]) -> dict:
     if not qmp_exchange("qmp.sock", args[0], float(args[1])):
         raise Refusal("qmp_failed", "QEMU did not take the command", 1)
     return {"sent": args[0]}
-
-
-# ---- the mailbox disk (spec r3 7.5, vm_mailbox.py) ----------------------------------------
-#
-# mailbox.raw belongs to the VM's QEMU user and its contents are the guest's. Its name sits in
-# the VM directory (root's, mode 0700), which that user cannot write, but nothing here relies on
-# it: the name is opened without following a link and checked by its descriptor, and the one
-# write the host makes runs as the VM user, through that same descriptor. Linux reopens it with
-# /proc/self/fd, so the write is checked against the VM user's rights; elsewhere (development
-# machines only, never a VM host) the child writes through the parent's descriptor.
-
-O_PATH = getattr(os, "O_PATH", 0)
-
-
-def mailbox_fd(d: Path, user: str) -> tuple[int, tuple[int, int]]:
-    """(descriptor, (st_dev, st_ino)) of d/mailbox.raw: a regular file of MAILBOX_BYTES with one
-    link, owned by the VM user. A link is opened as itself (O_PATH | O_NOFOLLOW) and refused."""
-    import pwd
-    try:
-        uid = pwd.getpwnam(user).pw_uid
-    except KeyError:
-        raise Refusal("mailbox_invalid", f"no VM user {user}", 1) from None
-    flags = (O_PATH or os.O_RDWR | os.O_NONBLOCK) | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NOCTTY", 0)
-    try:
-        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            fd = os.open("mailbox.raw", flags, dir_fd=dfd)
-        finally:
-            os.close(dfd)
-    except OSError as e:
-        raise Refusal("mailbox_invalid", f"mailbox.raw: {e.strerror}", 1) from None
-    st = os.fstat(fd)
-    if not (stat.S_ISREG(st.st_mode) and st.st_size == MAILBOX_BYTES and st.st_nlink == 1 and st.st_uid == uid):
-        os.close(fd)
-        raise Refusal("mailbox_invalid", "mailbox.raw is not the VM user's 1 MiB regular file", 1)
-    return fd, (st.st_dev, st.st_ino)
-
-
-def mailbox_reopen(fd: int, flags: int, ident: tuple[int, int]) -> int:
-    """A descriptor for I/O on the inode fd names, checked to be that same inode."""
-    try:
-        new = os.open(f"/proc/self/fd/{fd}", flags | os.O_CLOEXEC) if O_PATH else os.dup(fd)
-    except OSError as e:
-        raise Refusal("mailbox_invalid", f"mailbox.raw: {e.strerror}", 1) from None
-    st = os.fstat(new)
-    if (st.st_dev, st.st_ino) != ident or not stat.S_ISREG(st.st_mode) or st.st_size != MAILBOX_BYTES:
-        os.close(new)
-        raise Refusal("mailbox_invalid", "mailbox.raw changed while it was opened", 1)
-    return new
-
-
-def mailbox_read(d: Path, user: str, offset: int) -> bytes:
-    """One 64 KiB region, as root, from the checked inode: guest-controlled bytes."""
-    fd, ident = mailbox_fd(d, user)
-    try:
-        rfd = mailbox_reopen(fd, os.O_RDONLY, ident)
-    finally:
-        os.close(fd)
-    try:
-        data = os.pread(rfd, vm_mailbox.REGION_BYTES, offset)
-    except OSError as e:
-        raise Refusal("mailbox_invalid", f"mailbox.raw: {e.strerror}", 1) from None
-    finally:
-        os.close(rfd)
-    if len(data) != vm_mailbox.REGION_BYTES:
-        raise Refusal("mailbox_invalid", "short mailbox read", 1)
-    return data
-
-
-def mailbox_write_answer(d: Path, user: str, region: bytes) -> None:
-    """Write the answer region as the VM user (the #789 QMP pattern): a child that runs as that
-    user with no supplementary groups writes through the checked descriptor and nothing else."""
-    import pwd
-    fd, ident = mailbox_fd(d, user)
-    try:
-        pw = pwd.getpwnam(user)
-        drop = {"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": []} if os.geteuid() == 0 else {}
-        try:
-            p = subprocess.run([sys.executable, "-I", str(KIT / "vm_ctl.py"), "mailbox-write-as-vm-user", str(fd),
-                                str(ident[0]), str(ident[1])], input=region, cwd="/", capture_output=True,
-                               timeout=30, env={"PATH": "/usr/bin:/bin"}, pass_fds=(fd,), **drop)
-        except (OSError, subprocess.SubprocessError):
-            raise Refusal("mailbox_write_failed", "the VM user's write did not run", 1) from None
-    finally:
-        os.close(fd)
-    if p.returncode != 0:
-        raise Refusal("mailbox_write_failed", "the VM user could not write the answer region", 1)
-
-
-def cmd_mailbox_write_as_vm_user(args: list[str]) -> dict:
-    """Internal (never from the broker): the child of mailbox_write_answer(), already the VM user.
-    It writes one answer record to the answer region of the inode it was handed, then fsyncs."""
-    if len(args) != 3 or not all(re.fullmatch(r"[0-9]{1,20}", a) for a in args):
-        raise Refusal("usage", "mailbox-write-as-vm-user <fd> <dev> <ino>")
-    if os.geteuid() == 0:
-        raise Refusal("usage", "mailbox-write-as-vm-user runs only as a VM user, never as root")
-    fd, ident = int(args[0]), (int(args[1]), int(args[2]))
-    region = sys.stdin.buffer.read(vm_mailbox.REGION_BYTES + 1)
-    try:
-        if vm_mailbox.decode_record(region, vm_mailbox.KIND_ANSWER) is None:
-            raise vm_mailbox.Refusal("an empty region")
-    except vm_mailbox.Refusal as e:
-        raise Refusal("invalid_rewrap_answer", str(e)) from None
-    wfd = mailbox_reopen(fd, os.O_WRONLY, ident)
-    try:
-        view = memoryview(region)
-        while view:
-            view = view[os.pwrite(wfd, view, vm_mailbox.ANSWER_OFFSET + len(region) - len(view)):]
-        os.fsync(wfd)
-    finally:
-        os.close(wfd)
-    return {"written": True}
 
 
 # ---- authorization -------------------------------------------------------------
@@ -923,23 +811,7 @@ def status_of(name: str) -> dict:
             # The caller passes it back as rebundle --expect-revision (spec r3 7.5 step 1).
             "bundle_selection_revision": launch.get("bundle_selection_revision", 0)}
            if launch else {}),
-        **(waiting_offer(d, env) if launch and state == "running" else {}),
     }
-
-
-def waiting_offer(d: Path, env: dict) -> dict:
-    """{"rewrap_offer": ...} when the running guest left an offer (spec 7.5 step 3). The offer is
-    guest-controlled: strictly parsed, then passed on as data for the customer's tool to verify."""
-    user = env.get("VM_USER")
-    if user is None:
-        return {}
-    try:
-        offer = vm_mailbox.read_offer(mailbox_read(d, user, vm_mailbox.OFFER_OFFSET))
-    except Refusal as e:
-        return {"rewrap_offer_error": e.error}
-    if offer is None:
-        return {}
-    return {"rewrap_offer": {**offer, "offer_sha256": vm_mailbox.offer_sha256(offer)}}
 
 
 # ---- create ---------------------------------------------------------------------
@@ -1516,21 +1388,34 @@ def cmd_reboot(args: list[str]) -> dict:
             "graceful": graceful, "resumed": resume and not running}
 
 
-# ---- rebundle and rewrap (spec r3 7.5) ----------------------------------------------------
+# ---- rebundle (spec r3 7.5 step 1) ----------------------------------------------------------
 
-def selection_values(d: Path, launch: dict, bundle: str) -> dict:
-    """The launch values of this VM's identity on another bundle, as create computes them. The
-    bundle must be enabled here and share the identity's base root: the identity never changes,
-    and launch-vm.py refuses a bundle whose base root it does not name."""
+def incompatible(reason: str, detail: str) -> Refusal:
+    return Refusal("bundle_incompatible", detail, EXIT_BUNDLE_INCOMPATIBLE, reason)
+
+
+def selection_values(name: str, d: Path, launch: dict, bundle: str) -> dict:
+    """Check 4 of spec r3 7.5 step 1, then the launch values of this VM's identity on B2. B2 must
+    pass what create checks (enabled, its manifest is its id) and what start's gates check (a
+    verified build of B2 for this host and the VM's vCPUs, or the VM is a canary: the vm_gates
+    helpers themselves), and carry the identity's base root, which never changes. Any failure is
+    bundle_incompatible (exit 20) with the check as its reason; nothing is written."""
+    import vm_gates
     cfg = host_config()
     if bundle not in cfg["bundles"]:
-        raise Refusal("bundle_not_enabled", f"bundle {bundle} is not enabled on this host", 1)
+        raise incompatible("bundle_not_enabled", f"bundle {bundle} is not enabled on this host")
     try:
         manifest, raw = vm_measure.read_manifest(bundle_dir(bundle))
     except vm_measure.Refusal as e:
-        raise Refusal("no_bundle", f"bundle {bundle}: {e}", 1) from None
+        raise incompatible("no_bundle", f"bundle {bundle}: {e}") from None
     if hashlib.sha256(raw).hexdigest() != bundle:
-        raise Refusal("no_bundle", f"bundle {bundle}: the manifest is not the one its directory names", 1)
+        raise incompatible("no_bundle", f"bundle {bundle}: the manifest is not the one its directory names")
+    env = read_env(d / "vm.env")
+    vcpus = int(env["VM_VCPUS"])
+    try:
+        vm_gates.host_build_gate(vm_gates.host_config(), {"name": name, "bundle": bundle, "vcpus": vcpus})
+    except vm_gates.GateRefusal as e:
+        raise incompatible("no_verified_build", f"{e.error}: {e.detail}") from None
     try:
         with open(d / "vm-identity.json", "rb") as f:
             identity_raw = f.read(vm_measure.DOC_MAX + 1)
@@ -1539,9 +1424,9 @@ def selection_values(d: Path, launch: dict, bundle: str) -> dict:
         raise Refusal("launch_values", f"vm-identity.json: {e}", 1) from None
     if (identity["base_root_verity"], identity["base_root_data_bytes"]) != \
             (manifest["base_root_verity"], manifest["base_root_data_bytes"]):
-        raise Refusal("bundle_incompatible", f"bundle {bundle} has another base root than this VM's identity", 1)
+        raise incompatible("base_root_differs", f"bundle {bundle} has another base root than this VM's identity")
     try:
-        values = vm_measure.launch_values(bundle_dir(bundle), identity_raw, int(read_env(d / "vm.env")["VM_VCPUS"]),
+        values = vm_measure.launch_values(bundle_dir(bundle), identity_raw, vcpus,
                                           cfg["cpu_family"], cfg.get("sev_snp_measure"))
     except vm_measure.Refusal as e:
         raise Refusal("launch_values", str(e), 1) from None
@@ -1550,29 +1435,29 @@ def selection_values(d: Path, launch: dict, bundle: str) -> dict:
 
 
 def cmd_rebundle(args: list[str]) -> dict:
-    """Spec r3 7.5 step 1: move a stopped VM from bundle B1 to B2 (a restore is the same move back).
+    """Spec r3 7.5 step 1: select bundle B2 for a stopped VM (a restore is the same command back).
 
-    Under the VM lock: an op_id already applied returns its stored result unchanged. Otherwise G
-    must be the current generation and closed (0 for a VM never authorized), expect_revision must
-    equal bundle_selection_revision (else stale_selection, exit 17), B1 must be the current bundle
-    and the unit stopped. The new launch values, the revision + 1 and the op are committed in one
-    rename of launch.json; vm.env and the unit follow (sync_selection). The host's verified list
-    is not checked here: a bundle this host build is not verified for is refused at the next start."""
-    opts = parse_opts(args, {"--generation", "--from", "--to", "--expect-revision", "--op-id"}, 1)
+    Under the VM lock, in this order: (1) an op_id in selection_ops with the same generation,
+    expect_revision and to returns its stored result and writes nothing; the same op_id with any
+    other field is stale_selection (reason op_id_reused). (2) G must be the current generation,
+    closed (or 0 for a VM never authorized), with the unit stopped: else stale_generation, exit 3.
+    (3) expect_revision must equal bundle_selection_revision: else stale_selection, exit 19.
+    (4) selection_values: else bundle_incompatible, exit 20. Then launch.json is written once (the
+    commit point) with B2, its measurement, the revision + 1 and the op; vm.env and the unit
+    follow (sync_selection), as start does again before its gates."""
+    want = ("--generation", "--expect-revision", "--op-id", "--to")
+    opts = parse_opts(args, set(want), 1)
     name = check_name(opts["_"][0])
-    for req in ("--generation", "--from", "--to", "--expect-revision", "--op-id"):
+    for req in want:
         if req not in opts:
             raise Refusal("missing_option", f"rebundle needs {req}")
     gen = check_int(opts["--generation"], "generation", 0, 2**53)
     expect = check_int(opts["--expect-revision"], "expect_revision", 0, 2**53)
-    src, dst, op_id = opts["--from"], opts["--to"], opts["--op-id"]
-    if not (BUNDLE_ID_RE.fullmatch(src) and BUNDLE_ID_RE.fullmatch(dst)):
-        raise Refusal("invalid_bundle", "--from and --to are bundle ids (64 lowercase hex)")
-    if src == dst:
-        raise Refusal("invalid_bundle", "--from and --to name the same bundle")
+    dst, op_id = opts["--to"], opts["--op-id"]
+    if not BUNDLE_ID_RE.fullmatch(dst):
+        raise Refusal("invalid_bundle", "--to is a bundle id (64 lowercase hex)")
     if not OP_ID_RE.fullmatch(op_id):
         raise Refusal("invalid_op_id", "--op-id is 32 lowercase hex (128 random bits)")
-    request = {"generation": gen, "from": src, "to": dst, "expect_revision": expect}
     d = vm_dir(name)
     with Lock(d / ".lock"):
         begin(name, d)
@@ -1581,69 +1466,34 @@ def cmd_rebundle(args: list[str]) -> dict:
             raise Refusal("not_sealed", f"VM {name} has no sealed launch record", 1)
         for op in launch.get("selection_ops", []):
             if op["op_id"] == op_id:
-                if op["request"] != request:
-                    raise Refusal("op_id_conflict", "this op_id was applied to another request")
-                sync_selection(name, d)  # a retry after a cut finishes vm.env and the unit
-                return op["result"]
+                if (op["generation"], op["expect_revision"], op["to"]) != (gen, expect, dst):
+                    raise Refusal("stale_selection", "this op_id was applied to another request",
+                                  EXIT_STALE_SELECTION, "op_id_reused")
+                sync_selection(name, d)  # derived files only: a retry after a cut finishes them
+                return {"name": name, "op_id": op_id, **op["result"]}
         a = auth_of(d)
         if gen != a["generation"]:
-            raise Refusal("stale_generation", f"generation {gen} is not the current one ({a['generation']})", 3)
+            raise Refusal("stale_generation", f"generation {gen} is not the current one ({a['generation']})", 3,
+                          "not_current")
         if gen > a.get("closed_generation", 0):
-            raise Refusal("generation_open", f"generation {gen} is open: stop or cancel it first", 3)
+            raise Refusal("stale_generation", f"generation {gen} is open: stop or cancel it first", 3,
+                          "generation_open")
+        if unit_active(name):
+            raise Refusal("stale_generation", f"{unit_name(name)} is active", 3, "unit_active")
         revision = launch.get("bundle_selection_revision", 0)
         if expect != revision:
-            raise Refusal("stale_selection", f"expect_revision {expect} is not the revision ({revision})", 17)
-        if launch["bundle"] != src:
-            raise Refusal("bundle_changed", "--from is not the VM's current bundle", 3)
-        if unit_active(name):
-            raise Refusal("vm_not_stopped", f"{unit_name(name)} is active", 3)
-        values = selection_values(d, launch, dst)
-        result = {"name": name, "op_id": op_id, "generation": gen, "from": src, "to": dst, "bundle": dst,
-                  "bundle_selection_revision": revision + 1, "expected_measurement": values["expected_measurement"]}
-        ops = launch.get("selection_ops", []) + [{"op_id": op_id, "request": request, "result": result}]
+            raise Refusal("stale_selection", f"expect_revision {expect} is not the revision ({revision})",
+                          EXIT_STALE_SELECTION, "revision_changed")
+        values = selection_values(name, d, launch, dst)
+        result = {"bundle": dst, "expected_measurement": values["expected_measurement"],
+                  "bundle_selection_revision": revision + 1}
+        ops = launch.get("selection_ops", []) + [
+            {"op_id": op_id, "generation": gen, "expect_revision": expect, "to": dst, "result": result}]
         committed = {**launch, **values, "bundle_selection_revision": revision + 1,
                      "selection_ops": ops[-SELECTION_OPS_MAX:]}
         write_atomic(d / "launch.json", json.dumps(committed, sort_keys=True) + "\n", 0o644)
         sync_selection(name, d)
-    return result
-
-
-def cmd_rewrap(args: list[str], answer: bytes | None) -> dict:
-    """Spec r3 7.5 step 4: put the customer's answer where the waiting guest reads it. The answer
-    comes on stdin only (from the broker, at most vm_mailbox.ANSWER_MAX bytes), never on argv. It
-    is written only for the running generation G and only for the offer now in the mailbox."""
-    opts = parse_opts(args, {"--generation"}, 1)
-    name = check_name(opts["_"][0])
-    if "--generation" not in opts:
-        raise Refusal("missing_option", "rewrap needs --generation")
-    gen = check_int(opts["--generation"], "generation", 1, 2**53)
-    if answer is None:
-        answer = sys.stdin.buffer.read(vm_mailbox.ANSWER_MAX + 1)
-    try:
-        doc = vm_mailbox.parse_answer(answer)
-    except vm_mailbox.Refusal as e:
-        raise Refusal("invalid_rewrap_answer", str(e)) from None
-    region = vm_mailbox.answer_region(doc)
-    d = vm_dir(name)
-    with Lock(d / ".lock"):
-        begin(name, d)
-        a = auth_of(d)
-        if gen != a["generation"]:
-            raise Refusal("stale_generation", f"generation {gen} is not the current one ({a['generation']})", 3)
-        if gen <= a.get("closed_generation", 0):
-            raise Refusal("generation_closed", f"generation {gen} was stopped: no guest waits", 3)
-        user = read_env(d / "vm.env").get("VM_USER")
-        if user is None or not unit_active(name):
-            raise Refusal("no_rewrap_offer", f"VM {name} is not running: no guest waits for an answer", 3)
-        offer = vm_mailbox.read_offer(mailbox_read(d, user, vm_mailbox.OFFER_OFFSET))
-        if offer is None:
-            raise Refusal("no_rewrap_offer", "the mailbox holds no valid offer", 3)
-        if vm_mailbox.offer_sha256(offer) != doc["offer_sha256"]:
-            raise Refusal("rewrap_offer_changed", "the answer is for another offer than the one waiting", 3)
-        written = mailbox_read(d, user, vm_mailbox.ANSWER_OFFSET) != region
-        if written:
-            mailbox_write_answer(d, user, region)
-    return {"name": name, "generation": gen, "offer_sha256": doc["offer_sha256"], "written": written}
+    return {"name": name, "op_id": op_id, **result}
 
 
 # ---- delete, status, list, enforce ---------------------------------------------
@@ -1906,12 +1756,8 @@ def parse_opts(args: list[str], allowed: set[str], positional: int) -> dict:
 BROKER_SAFE = re.compile(r"[A-Za-z0-9 ._-]{1,512}")
 
 
-def from_broker() -> tuple[list[str], str | bytes | None]:
-    """authorized_keys forced command: SSH_ORIGINAL_COMMAND split on spaces, never a shell.
-
-    stdin is read only for the two commands that take a document: create (the customer key) and
-    rewrap (the answer, at most vm_mailbox.ANSWER_MAX bytes: one more is read, so a longer one
-    is refused rather than cut)."""
+def from_broker() -> tuple[list[str], str | None]:
+    """authorized_keys forced command: SSH_ORIGINAL_COMMAND split on spaces, never a shell."""
     raw = os.environ.get("SSH_ORIGINAL_COMMAND")
     if raw is None:
         raise Refusal("usage", "--from-broker needs SSH_ORIGINAL_COMMAND")
@@ -1926,8 +1772,6 @@ def from_broker() -> tuple[list[str], str | bytes | None]:
         if "--ssh-key-file" in args or "--image" in args:
             raise Refusal("invalid_option", "from the broker the key comes on stdin and the image is the pinned one")
         return args, sys.stdin.read(16385)
-    if args[0] == "rewrap":
-        return args, sys.stdin.buffer.read(vm_mailbox.ANSWER_MAX + 1)
     return args, None
 
 
@@ -1946,19 +1790,16 @@ def main(argv: list[str]) -> int:
             "delete": cmd_delete, "status": cmd_status, "list": cmd_list, "enforce": cmd_enforce,
             "check-paid": cmd_check_paid, "powerdown": cmd_powerdown, "cancel": cmd_cancel,
             "history": cmd_history, "qmp-as-vm-user": cmd_qmp_as_vm_user, "rebundle": cmd_rebundle,
-            "mailbox-write-as-vm-user": cmd_mailbox_write_as_vm_user,
         }
         if cmd == "create":
             out(cmd_create(rest, key_text))
-        elif cmd == "rewrap":
-            out(cmd_rewrap(rest, key_text))
         elif cmd in handlers:
             out(handlers[cmd](rest))
         else:
             raise Refusal("unknown_command", "unknown subcommand")
         return 0
     except Refusal as e:
-        out({"error": e.error, "detail": e.detail})
+        out({"error": e.error, "detail": e.detail, **({"reason": e.reason} if e.reason else {})})
         return e.code
     except Exception as e:  # one JSON line, even on a bug
         out({"error": "internal", "detail": f"{type(e).__name__}: {e}"[:400]})

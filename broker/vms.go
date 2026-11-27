@@ -7,8 +7,7 @@
 //	POST   /v1/broker/vms/{id}/start       optional {"generation": n}
 //	POST   /v1/broker/vms/{id}/stop        {"generation": n}
 //	POST   /v1/broker/vms/{id}/reboot      optional {"generation": n}
-//	POST   /v1/broker/vms/{id}/rebundle    {"generation", "from", "to", "expect_revision", "op_id"} (stopped VM)
-//	POST   /v1/broker/vms/{id}/rewrap      {"generation", "answer": {...}} (running VM; the answer goes on stdin)
+//	POST   /v1/broker/vms/{id}/rebundle    {"generation", "expect_revision", "op_id", "to"} (stopped VM; vm_rebundle.go)
 //	DELETE /v1/broker/vms/{id}             {"confirm": "<id>"}
 //	GET    /v1/broker/vms/{id}/runs/{n}    the closed run n: started_at, stopped_at (vm_history.go)
 //
@@ -366,8 +365,6 @@ func (b *broker) handleVMs(w http.ResponseWriter, r *http.Request, rest string) 
 		b.rebootVM(w, r, id)
 	case action == "rebundle" && r.Method == "POST":
 		b.rebundleVM(w, r, id)
-	case action == "rewrap" && r.Method == "POST":
-		b.rewrapVM(w, r, id)
 	default:
 		writeErr(w, 404, "route_not_found", "no such VM route")
 	}
