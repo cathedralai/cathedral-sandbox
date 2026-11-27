@@ -57,6 +57,17 @@ FAKE_LOG = '#!/bin/sh\necho "$(basename "$0") $*" >> "$FAKE_STATE.tools"\n'
 FAKE_QEMU_IMG = FAKE_LOG + 'eval "f=\\${$(($#-1))}"\n: > "$f"\n'
 FAKE_IPTABLES = FAKE_LOG + 'case " $* " in *" -C "*) exit 1;; esac\n'
 FAKE_LOCALDS = FAKE_LOG + ': > "$3"\n'
+# install-sealed.sh's kit install lock (-n FD, -u FD) is real: the lock belongs to the open file,
+# which the calling shell keeps. Other forms (vm-net.sh's -w) only log, as before.
+FAKE_FLOCK = FAKE_LOG + """case "$1" in -n|-u) exec python3 -I -c '
+import fcntl, sys
+op = fcntl.LOCK_UN if sys.argv[1] == "-u" else fcntl.LOCK_EX | fcntl.LOCK_NB
+try:
+    fcntl.flock(int(sys.argv[2]), op)
+except BlockingIOError:
+    sys.exit(1)
+' "$1" "$2";; esac
+"""
 
 
 def load_capacity():
@@ -71,7 +82,7 @@ def write_fakes(bin_dir: Path) -> None:
     bin_dir.mkdir(exist_ok=True)
     for name, text in {"systemctl": FAKE_SYSTEMCTL, "qemu-img": FAKE_QEMU_IMG, "cloud-localds": FAKE_LOCALDS,
                        "ip": FAKE_LOG, "iptables": FAKE_IPTABLES, "ip6tables": FAKE_IPTABLES, "sysctl": FAKE_LOG,
-                       "flock": FAKE_LOG, "ss": FAKE_LOG}.items():
+                       "flock": FAKE_FLOCK, "ss": FAKE_LOG}.items():
         (bin_dir / name).write_text(text)
         (bin_dir / name).chmod(0o755)
 
@@ -564,40 +575,47 @@ def test_a_shrinking_roll_keeps_the_running_size_until_the_new_guest_is_verified
     cap.check_create(1, 32, 4, host.vms / "vm2")
 
 
-def test_a_commit_removes_only_its_own_install_record(host, cap):
-    """Review r2 P1: on a 194 GiB host with a 32 GiB VM, install A rolls a 128 GiB kit to 64 GiB.
-    Install B assesses 128 GiB before A commits. A's commit must not erase B's reservation."""
+def test_a_confirmed_install_drops_the_record_a_failed_install_left(host, cap):
+    """Review r3 P2: install A rolls a 128 GiB kit to 64 GiB, copies its env and is refused for
+    live rooms: the 128 GiB guest still runs, so A's record stays. A later confirmed install B of
+    the kit (one at a time: the install lock) restarts the guest from the current sealed.env, so
+    its commit drops every open record and the room comes back."""
     host.facts(mem_total_gib=32 + 129 + 33)
     installed = host.kit("alpha", mem=128, active=True)
     host.vm("vm1", mem=32)
     ops = host.tmp / "operator"
     ops.mkdir()
-    env_a, env_b = ops / "a.env", ops / "b.env"
-    env_a.write_text(installed.read_text().replace("SEALED_MEM_GIB=128", "SEALED_MEM_GIB=64"))
-    env_b.write_text(installed.read_text())
+    env_64 = ops / "a.env"
+    env_64.write_text(installed.read_text().replace("SEALED_MEM_GIB=128", "SEALED_MEM_GIB=64"))
 
     def no_room():
         assert refused(cap, cap.check_create, 1, 32, 4, host.vms / "vm2") == "memory"
 
+    a = cap.assess_kit(str(env_64))["install_id"]
+    shutil.copy(env_64, installed)  # A copies its env, then its restart is refused
     no_room()
-    a = cap.assess_kit(str(env_a))["install_id"]
+    assert [r["install_id"] for r in host.records("alpha")] == [a]
+    assert cap.report()["kits"][0]["open_installs"] == [a]
+    b = cap.assess_kit(str(env_64))["install_id"]
     no_room()
-    shutil.copy(env_a, installed)  # A copies its env
-    no_room()
-    b = cap.assess_kit(str(env_b))["install_id"]
-    assert a != b and sorted(r["mem_gib"] for r in host.records("alpha")) == [128, 128]
-    no_room()
-    cap.commit_kit(str(installed), a)  # A's guest verified at 64 GiB
-    assert [(r["install_id"], r["mem_gib"]) for r in host.records("alpha")] == [(b, 128)]
-    no_room()
-    shutil.copy(env_b, installed)  # B copies its env, restarts at 128 GiB
-    no_room()
-    cap.commit_kit(str(installed), b)
-    assert host.records("alpha") == []
-    no_room()
-    # A commit of an unknown or already removed install changes nothing.
-    assert not cap.commit_kit(str(installed), a)["committed"]
-    no_room()
+    res = cap.commit_kit(str(installed), b)  # B's guest verified at 64 GiB from sealed.env
+    assert sorted(res["dropped"]) == sorted([a, b]) and host.records("alpha") == []
+    assert cap.report()["kits"][0]["open_installs"] == []
+    cap.check_create(1, 32, 4, host.vms / "vm2")
+
+
+def test_a_commit_of_an_unknown_install_is_refused(host, cap):
+    env = host.kit("alpha", mem=64)
+    a = cap.assess_kit(str(env))["install_id"]
+    with pytest.raises(ValueError, match="no open record"):
+        cap.commit_kit(str(env), "fedcba9876543210")
+    assert [r["install_id"] for r in host.records("alpha")] == [a]
+    p = subprocess.run([sys.executable, "-I", str(KIT / "vm_capacity.py"), "commit-kit", "--install-id",
+                        "fedcba9876543210", str(env)], capture_output=True, text=True, env=host.env, timeout=60)
+    assert p.returncode == 1 and "no open record" in p.stderr and "committed" not in p.stderr
+    p = subprocess.run([sys.executable, "-I", str(KIT / "vm_capacity.py"), "commit-kit", "--install-id", a, str(env)],
+                       capture_output=True, text=True, env=host.env, timeout=60)
+    assert p.returncode == 0 and "committed" in p.stderr and host.records("alpha") == []
 
 
 def test_commit_kit_runs_only_after_the_measurement_matched():
@@ -607,9 +625,11 @@ def test_commit_kit_runs_only_after_the_measurement_matched():
     assert 'if [ -n "${VM_LEDGER_ID:-}" ]; then' in match
     assert match.index('systemctl enable -q "$UNIT"') < match.index("commit-kit")
     assert text.count("commit-kit") == 1  # never on the refused, failed or mismatched paths
-    # A failed commit only keeps the larger reservation; it never fails a verified install.
+    # A failed commit keeps the records; it never fails a verified install.
     block = match[match.index("commit-kit"):]
-    assert "|| log " in block[:300] and "|| exit" not in block[:300]
+    assert "&& VM_LEDGER_COMMITTED=1" in block[:300] and "|| log " in block[:300] and "|| exit" not in block[:300]
+    # Every exit runs the ledger's exit step (log the open record, unlock), after the volume restore.
+    assert "trap 'data_volume_restore_on_exit; vm_ledger_on_exit' EXIT" in text
 
 
 def reset_host(host, cap, avail_gib, data_gib, allocated_gib, new_data_gib, vm_growth_gib=100):
@@ -711,7 +731,7 @@ def test_a_reset_that_is_not_confirmed_keeps_the_restored_volume_reserved(host, 
 def test_the_reset_branch_asks_the_ledger_before_it_moves_the_volume():
     text = (SEALED / "install-sealed.sh").read_text()
     branch = text[text.index("    reset)"):text.index("    keep)")]
-    ask = branch.index('${VM_LEDGER_ID:+--install-id "$VM_LEDGER_ID"} --data-reset "$ENV_FILE") || exit 1')
+    ask = branch.index('assess-kit --install-id "$VM_LEDGER_ID" --data-reset "$ENV_FILE"')
     assert ask < branch.index('rm -f "$SEALED_DIR/data-on-new-build"')
     assert ask < branch.index('mv -f "$SEALED_DIR/data.raw" "$SEALED_DIR/data.raw.prev"')
     assert ask < branch.index("DATA_RESET=1")  # so the EXIT trap does not stop the running guest
@@ -733,11 +753,12 @@ def _assess_block() -> str:
     return text[start:text.index("\nfi\n", start) + 4]
 
 
-def run_assess_slice(host: Host, env_file: Path):
+def run_assess_slice(host: Host, env_file: Path, tail: str = ""):
     script = host.tmp / "assess-slice.sh"
     script.write_text("#!/bin/bash\nset -euo pipefail\n"
                       f"KIT={shlex.quote(str(REPO / 'room-kit'))}\nENV_FILE={shlex.quote(str(env_file))}\n"
-                      + _assess_block() + 'echo "ledger id ${VM_LEDGER_ID}"\necho "slice passed"\n')
+                      "SEALED_NAME=$(sed -n 's/^SEALED_NAME=//p' \"$ENV_FILE\")\n"
+                      + _assess_block() + 'echo "ledger id ${VM_LEDGER_ID}"\n' + tail + 'echo "slice passed"\n')
     return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=host.env, timeout=60)
 
 
@@ -747,7 +768,9 @@ def test_install_sealed_runs_the_ledger_after_its_own_checks_and_before_the_buil
     assert text.index("only ${MEM_FREE_GIB} GiB RAM available") < block
     assert block < text.index("# ---------------------------------------------------------------- 2. host packages")
     assert block < text.index('"$KIT/sealed/build-guest.sh" "$ENV_FILE"')
-    assert 'VM_LEDGER_ID=$(python3 -I "$KIT/vm/vm_capacity.py" assess-kit "$ENV_FILE") || exit 1' in _assess_block()
+    block = _assess_block()
+    assert 'VM_LEDGER_ID=$(python3 -I "$KIT/vm/vm_capacity.py" assess-kit "$ENV_FILE") || exit 1' in block
+    assert block.index("flock -n 8") < block.index("assess-kit")  # one install of a kit at a time
 
 
 def test_install_sealed_assess_does_nothing_without_the_vm_host_switch(host):
@@ -779,6 +802,73 @@ def test_install_sealed_assess_records_the_kit_or_refuses_with_the_switch_on(hos
     host.vm("vm3", mem=1, disk=9_999_999)
     p = run_assess_slice(host, env)
     assert p.returncode == 1 and "not enough disk" in p.stderr
+
+
+def kit_lock(host, name="alpha"):
+    return host.root / "run" / "lock" / f"cathedral-kit-{name}.install.lock"
+
+
+def lock_is_free(path: Path) -> bool:
+    with open(path, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return True
+
+
+def test_a_second_install_of_a_kit_stops_at_once(host):
+    """Review r3 P1: installs K and I of one kit at once. I holds the kit's install lock (from its
+    assess to its exit); K stops at once, before its assess, with no record and no wait."""
+    host.switch_on()
+    env = host.kit_env("alpha", mem=64, scratch=1)
+    lock = kit_lock(host)
+    lock.parent.mkdir(parents=True)
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        t0 = time.monotonic()
+        p = run_assess_slice(host, env)
+        assert time.monotonic() - t0 < 30
+        assert p.returncode == 1 and "another install of alpha is running" in p.stderr, p.stderr
+        assert host.records("alpha") == [] and "slice passed" not in p.stdout
+    # Once I has exited, K runs; another kit is never blocked by it.
+    other = host.kit_env("beta", mem=8, scratch=1)
+    with open(lock, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert run_assess_slice(host, other).returncode == 0
+    p = run_assess_slice(host, env)
+    assert p.returncode == 0 and len(host.records("alpha")) == 1, p.stderr
+
+
+@pytest.mark.parametrize("path", ["passes", "refused", "fails_later"])
+def test_the_kit_install_lock_is_held_to_the_exit_and_released_on_every_path(host, path):
+    host.switch_on()
+    host.facts(mem_total_gib=32 + 65 + (1 if path == "refused" else 5))
+    host.vm("vm1", mem=4)
+    env = host.kit_env("alpha", mem=64, scratch=1)
+    pid = host.tmp / "child.pid"
+    # A process the install started that outlives it, holding the descriptor: the exit step unlocks.
+    tail = (f'sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid))}\n'
+            'python3 -I -c "import fcntl,sys; f=open(sys.argv[1],\'a\'); fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)"'
+            ' "$KIT_INSTALL_LOCK" 2>/dev/null && echo "lock free during install" || echo "lock held during install"\n')
+    if path == "fails_later":
+        tail += "false\n"
+    p = run_assess_slice(host, env, tail)
+    try:
+        if path == "refused":
+            assert p.returncode == 1 and "not enough memory" in p.stderr and host.records("alpha") == []
+            assert "was not confirmed" not in p.stderr
+        else:
+            assert "lock held during install" in p.stdout, p.stdout + p.stderr
+            [rec] = host.records("alpha")
+            assert p.returncode == (0 if path == "passes" else 1)
+            # No commit on either path: the record stays, and the exit step names it.
+            assert f"install {rec['install_id']} of alpha was not confirmed; its record stays" in p.stderr
+        assert lock_is_free(kit_lock(host))
+    finally:
+        if pid.exists():
+            subprocess.run(["kill", pid.read_text().strip()], capture_output=True)
 
 
 # ---------------------------------------------------------------- vm-ctl.sh wiring

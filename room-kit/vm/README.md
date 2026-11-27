@@ -133,11 +133,19 @@ behave as before.
   is removed must have its records removed too. A unit, env file or record that cannot be read (missing, a line that is not
   `KEY=value`, a size only a shell could read) refuses every create and start: resource
   `kit_unaccounted`.
+- **One install of a kit at a time:** with the switch on, `install-sealed.sh` holds
+  `/run/lock/cathedral-kit-<name>.install.lock` from its assess step to its exit (unlocked by its
+  EXIT trap). A second install of the same kit stops at once; it does not wait.
 - **Rolls:** `assess-kit` prints the install id; the install's record holds the larger of the
-  running build and the replacement until the new guest's measurement matched. Then
-  `commit-kit --install-id <id>` (after `systemctl enable`) removes that record only, so another
-  install of the same kit keeps its reservation. A roll refused or failed after the env copy
-  keeps its record (spec 9), and an operator removes it once the running build is vouched for.
+  running build and the replacement. When the new guest's measurement matched (after
+  `systemctl enable`), `commit-kit --install-id <id>` drops every open record of the kit: the
+  guest now runs from the current `sealed.env`. An id with no open record is refused (exit 1).
+  Any other exit (refused for live rooms, a failed build, a crash) keeps the record, because the
+  env may already be copied while the old guest runs; the exit step logs its id, and `capacity`
+  lists each kit's `open_installs`.
+- **A stale record** may be removed only after the kit's guest has restarted from the current
+  `sealed.env`, or by the next confirmed install. Right after a failed install the running build
+  is still the old one.
 - **Data-volume reset:** reserved before `data.raw` moves (`assess-kit --install-id <id>
   --data-reset`). The fresh `data.raw` is charged its own new size. `data.raw.prev` is detached
   and cannot grow, so it counts only the blocks it holds (already out of `df` avail) until it is

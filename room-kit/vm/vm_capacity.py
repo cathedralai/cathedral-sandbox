@@ -14,11 +14,12 @@ What it counts:
   write-units.sh writes (oneshot, `host-net.sh check <env>`); any other unit is a kit and must
   parse. Plus the kits being installed, from /var/lib/cathedral-snp/kits/<name>.json. The union
   is taken by kit name, each size the larger of the two.
-- Kit records: one per install, kits/<name>.<install id>.json. install-sealed.sh's assess step
-  writes its own record (the larger of the running build and the replacement) and gets the id
-  back; commit-kit removes only that record, after the new guest is verified running. A kit
-  counts the larger of its unit env and every open record, so a roll that fails after the env
-  copy, or a second install of the same kit, never loses a reservation to another install.
+- Kit records: one per install, kits/<name>.<install id>.json. install-sealed.sh holds the kit's
+  install lock from its assess step to its exit (one install of a kit at a time), writes its
+  record (the larger of the running build and the replacement) and gets the id back. A kit
+  counts the larger of its unit env and every open record. A failed install's record stays (its
+  env copy may have left the old guest running on a smaller env). commit-kit, after the new
+  guest is verified running from the current sealed.env, drops every open record of the kit.
 - Data-volume reset (assess-kit --data-reset, before data.raw moves): the volume set aside keeps
   its blocks and cannot grow once detached (data.raw.prev counts only what it holds); the fresh
   data.raw grows to the replacement's own size.
@@ -760,18 +761,30 @@ def assess_kit(env_path: str, data_reset: bool = False, install_id: str | None =
     return {"kit": new.name, "install_id": install_id, "recorded": True, "vms": len(led.vms), "kits": len(led.kits)}
 
 
+def open_records(name: str) -> list[Path]:
+    """Every record file of this kit, readable or not (a damaged one is this kit's too)."""
+    d = hp(KIT_RECORDS)
+    return sorted(f for f in d.glob(f"{name}.*.json") if f.stem.rpartition(".")[0] == name) if d.is_dir() else []
+
+
 def commit_kit(env_path: str, install_id: str) -> dict:
-    """After install-sealed.sh verified the new guest running (its measurement matched): this
-    install's record goes, so the kit counts its installed env and any other open install. A
-    data.raw.prev left by a reset counts its own blocks until the operator removes it."""
+    """After install-sealed.sh verified the new guest running from the current sealed.env (its
+    measurement matched), while it holds the kit's install lock: the guest now matches the unit
+    env, so every open record of the kit goes, this install's and any a failed install left. An
+    id with no open record is refused: it is not this kit's install. A data.raw.prev left by a
+    reset counts its own blocks until the operator removes it."""
     kit = kit_from_env(None, os.path.abspath(env_path), "record")
     if not INSTALL_ID_RE.fullmatch(install_id):
         raise ValueError(f"install id {install_id!r} is not 16 hex characters")
     with capacity_lock():
-        path = record_path(kit.name, install_id)
-        existed = path.exists()
-        path.unlink(missing_ok=True)
-    return {"kit": kit.name, "install_id": install_id, "committed": existed}
+        mine = record_path(kit.name, install_id)
+        if not mine.exists():
+            raise ValueError(f"no open record {mine}: not an install of {kit.name} on this host")
+        dropped = open_records(kit.name)
+        for f in dropped:
+            f.unlink(missing_ok=True)
+    return {"kit": kit.name, "install_id": install_id, "committed": True,
+            "dropped": [f.stem.rpartition(".")[2] for f in dropped]}
 
 
 # ---- the capacity read ------------------------------------------------------------------------------
@@ -824,7 +837,9 @@ def report(broker: dict[str, int] | None = None) -> dict:
                   "host_threads": HOST_THREADS, "vm_min_host_free_gib": VM_MIN_HOST_FREE_GIB},
         "kits": [{"name": k.name, "source": k.source, "unit": k.unit, "env": k.env, "dirs": k.dirs,
                   "vcpus": k.vcpus, "mem_gib": k.mem_gib, "scratch_gib": k.scratch_gib, "data_gib": k.data_gib,
-                  "active": k.active} for k in led.kits],
+                  "active": k.active,
+                  # Open install records: a confirmed install of the kit drops them all.
+                  "open_installs": [f.stem.rpartition(".")[2] for f in open_records(k.name)]} for k in led.kits],
         "unaccounted": led.unaccounted + led.vm_unaccounted,
         "vms": [{"name": v.name, "vcpus": v.vcpus, "mem_gib": v.mem_gib, "disk_gib": v.disk_gib,
                  "active": v.active, "enabled": v.enabled} for v in led.vms],
@@ -885,8 +900,8 @@ def main(argv: list[str]) -> int:
         return 1
     # stdout carries only the install id (install-sealed.sh keeps it for its commit); the log is stderr.
     if cmd == "commit-kit":
-        print(f"[sealed] VM host ledger: install {install_id} of {res['kit']} committed; the kit counts its installed size",
-              file=sys.stderr)
+        print(f"[sealed] VM host ledger: install {install_id} of {res['kit']} committed; open records dropped:"
+              f" {' '.join(res['dropped'])}; the kit counts its installed size", file=sys.stderr)
     else:
         what = ("with a fresh data volume next to data.raw.prev" if reset
                 else f"with {res['vms']} VM(s) and {res['kits']} kit(s)")

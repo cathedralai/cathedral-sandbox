@@ -58,9 +58,29 @@ systemctl is-active -q "$UNIT" || [ "$MEM_FREE_GIB" -gt $(( SEALED_MEM_GIB + 32 
 # Customer VMs on this host (AB#999, VM spec r2 section 9): with the VM host switch on, the disk and
 # memory checks also count every VM and every other kit, and this kit's sizes are recorded in the
 # host ledger, under its capacity lock, before the build. Without the switch nothing here runs.
-# VM_LEDGER_ID is this install's record: only this install's commit removes it.
+# One install of a kit at a time: this install holds the kit's install lock (fd 8) from here to
+# its exit, so the env it copies is the env its guest runs, and its confirmed commit drops every
+# open record of the kit. A second install of the kit stops at once. VM_LEDGER_ID is this
+# install's record; on any exit without the commit it stays (the env may already be copied).
 VM_LEDGER_ID=""
+VM_LEDGER_COMMITTED=0
+KIT_INSTALL_LOCK=""
+vm_ledger_on_exit() {
+  if [ -n "$VM_LEDGER_ID" ] && [ "$VM_LEDGER_COMMITTED" != 1 ]; then
+    echo "sealed: VM host ledger: install $VM_LEDGER_ID of $SEALED_NAME was not confirmed; its record stays until a confirmed install of $SEALED_NAME (vm-ctl.sh capacity lists it)" >&2
+  fi
+  # Unlock, not only close: a process this install started may still hold the descriptor.
+  [ -z "$KIT_INSTALL_LOCK" ] || flock -u 8 2>/dev/null || true
+}
 if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
+  trap vm_ledger_on_exit EXIT
+  KIT_INSTALL_LOCK="${VM_CAPACITY_ROOT:-}/run/lock/cathedral-kit-$SEALED_NAME.install.lock"
+  mkdir -p "${KIT_INSTALL_LOCK%/*}"
+  exec 8>"$KIT_INSTALL_LOCK"
+  if ! flock -n 8; then
+    echo "sealed: another install of $SEALED_NAME is running on this host (it holds $KIT_INSTALL_LOCK); this one stops. Re-run it after that install has finished." >&2
+    exit 1
+  fi
   VM_LEDGER_ID=$(python3 -I "$KIT/vm/vm_capacity.py" assess-kit "$ENV_FILE") || exit 1
 fi
 
@@ -148,7 +168,12 @@ data_volume_restore_on_exit() {
     log "data volume: roll not confirmed; restored the owner's volume from data.raw.prev"
   fi
 }
-trap data_volume_restore_on_exit EXIT
+# With the VM host ledger, its exit step runs too, after the volume is back.
+if [ -n "${VM_LEDGER_ID:-}" ]; then
+  trap 'data_volume_restore_on_exit; vm_ledger_on_exit' EXIT
+else
+  trap data_volume_restore_on_exit EXIT
+fi
 data_volume_launch_id() { # launch id of the build we are about to start: <host_data hex>
   python3 -c 'import hashlib,sys; print(hashlib.sha256((":".join(sys.argv[1:4])).encode()).hexdigest())' \
     "$EXPECTED" "$SEALED_DATA_POLICY" "$1"
@@ -187,9 +212,9 @@ data_volume_new_build() {
       # VM host (AB#999): data.raw.prev keeps its blocks while a fresh data.raw grows, so reserve
       # both in the host ledger before anything moves. A refusal here leaves the volume and the
       # running guest as they are.
-      if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
-        VM_LEDGER_ID=$(python3 -I "$KIT/vm/vm_capacity.py" assess-kit \
-          ${VM_LEDGER_ID:+--install-id "$VM_LEDGER_ID"} --data-reset "$ENV_FILE") || exit 1
+      if [ -n "${VM_LEDGER_ID:-}" ]; then
+        python3 -I "$KIT/vm/vm_capacity.py" assess-kit --install-id "$VM_LEDGER_ID" --data-reset "$ENV_FILE" \
+          >/dev/null || exit 1
       fi
       rm -f "$SEALED_DIR/data-on-new-build"
       mv -f "$SEALED_DIR/data.raw" "$SEALED_DIR/data.raw.prev"
@@ -232,12 +257,13 @@ if [ "$GOT" = "$EXPECTED" ]; then
   # Boot the guest again at the next host start (an unattended reboot left
   # sealed guests off until a manual start). Only a verified image is enabled.
   systemctl enable -q "$UNIT"
-  # VM host (AB#999): the new guest now runs at its new size, so this install's record in the host
-  # ledger, held at the larger of the old and new sizes since the assess step, goes. Another
-  # install's record of this kit stays.
+  # VM host (AB#999): the new guest runs from the current sealed.env, which no other install can
+  # have changed (this one holds the kit's install lock), so every open record of the kit goes:
+  # this install's and any a failed install left. A failed commit keeps them (the exit step logs it).
   if [ -n "${VM_LEDGER_ID:-}" ]; then
     python3 -I "$KIT/vm/vm_capacity.py" commit-kit --install-id "$VM_LEDGER_ID" "$SEALED_DIR/sealed.env" \
-      || log "VM host ledger: install $VM_LEDGER_ID of $SEALED_NAME keeps its larger record; remove it once this build is vouched for"
+      && VM_LEDGER_COMMITTED=1 \
+      || log "VM host ledger: the commit of install $VM_LEDGER_ID failed; the records of $SEALED_NAME stay"
   fi
 else
   # Do not serve a guest the operator cannot vouch for, and do not boot it
