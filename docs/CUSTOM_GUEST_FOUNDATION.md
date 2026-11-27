@@ -35,6 +35,44 @@ python3 room-kit/verify_custom_guest.py \
 
 The endpoint must match the owner-signed public host and first port mapping. The wrapper currently supports the strict Turin verifier; Genoa rehearsal evidence is a separate, partial qualification and must not be presented as Turin acceptance.
 
+## Static native helper and bootstrap library
+
+`room-kit/custom-guest` contains a dependency-free Go implementation for Linux
+amd64. Its `cathedral-attest CHALLENGE_HEX` command has the same response envelope
+as the Python reference command. It requires root, a root-only native SNP device
+and a root-owned SSH public key. There is no device override, network, proxy or
+emulated-report option. The ioctl buffers are explicitly pinned during the call.
+
+For the reference init, `cathedral-attest --boot-host-data EXPECTED_HEX` generates
+a fresh 32-byte nonce and uses the separate boot-check domain. It checks the
+returned nonce, HOST_DATA, exact launch policy, VMPL and unmasked VCEK selection.
+The expected hash must come from validated signed launch documents. This mode
+checks a local native response; it does not validate AMD certificates or publish
+an owner-side PASS. The SSH-bound verifier still performs those independent checks.
+
+The Go bootstrap library validates canonical launch bytes, every document field,
+the owner signature and HOST_DATA. Its key anchor is the exact measured
+`/proc/cmdline`, including the firmware's `initrd=initrd ` prefix. It shares the
+Python interoperability vector. A caller must still compare the validated values
+with guest-observed CPU, memory, disk, MAC and policy before using them. This
+library alone does not satisfy that boot gate.
+
+With the pinned Go 1.26.11 compiler installed:
+
+```sh
+python3 scripts/build_custom_guest_helper.py \
+  --go /PATH/TO/go1.26.11/bin/go --output cathedral-attest
+```
+
+The builder disables cgo and network dependency resolution, rebuilds in two
+separate directories, requires identical bytes and validates the static ELF.
+Its JSON result records the candidate digest and source digests. CI tests the Go
+code with the race detector and runs the double build. This is a candidate helper,
+not the published reference initrd or a boot-tested guest image.
+
+ABI references: [Linux SNP guest UAPI](https://github.com/torvalds/linux/blob/master/include/uapi/linux/sev-guest.h),
+[Go runtime pinning](https://pkg.go.dev/runtime#Pinner).
+
 ## Reference initrd packaging
 
 `custom_guest_initrd.py` builds and validates the archive from a separately reviewed
