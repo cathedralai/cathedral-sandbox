@@ -19,6 +19,8 @@ required (AB#999)") and the broker refuses a VM create (409
 | `vm-net.sh up\|down\|check vm.env` | Tap /30, NAT out, SSH port forward, isolation. |
 | `images.lock`, `fetch-image.sh` | Pinned Ubuntu 24.04 cloud image and its sha256. |
 | `vm.env.example` | What `create` writes per VM. |
+| `vm_measure.py` | Sealed VM (v2) launch values: identity document, measured cmdline, HOST_DATA, expected measurement; bundle manifest. Not wired into `create` yet. |
+| `build-bundle.sh`, `bundle.env.example` | Recipe for one sealed VM bundle: base root, kernel and modules, manifest. |
 
 ## Use
 
@@ -126,6 +128,40 @@ command="/opt/cathedral/room-kit/vm/vm-ctl.sh --from-broker",restrict ssh-ed2551
 it is split on spaces, never passed to a shell, and only the public
 subcommands are allowed. `create` takes the customer key on stdin and always
 uses the pinned image (no `--ssh-key-file`, no `--image`).
+
+## Sealed VM bundle and launch values (AB#999, PR VM1a)
+
+Nothing below is used by `create` or the launcher yet (VM3 wires it in).
+
+- **Bundle:** one directory addressed by `sha256(manifest.json)`: `OVMF.amdsev.fd`,
+  `vmlinuz`, `initrd.cpio.zst` (the VM initrd, PR VM1b), `base-root.raw` (ext4 plus its
+  dm-verity tree after the data), the two `packages.lock` files and `manifest.json`
+  (schema `cathedral.vm.bundle/v1`, canonical JSON, every file's sha256 and size, the
+  cmdline template, CPU family and model, policy `0x30000`, QEMU, kernel and initrd
+  versions, snapshot, verity root hash). `build-bundle.sh` builds the base root and the
+  kernel from one pinned snapshot, then writes the manifest.
+- **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random
+  salt, the first-boot SSH key and the bundle's base root hash. Written once at create.
+- **Cmdline:** the bundle template with `cathedral.vm=<sha256 of vm-identity.json>`, so
+  every VM has its own launch measurement. It masks every getty, the emergency, rescue
+  and debug shells, and the guest agent.
+- **HOST_DATA:** `sha256(b"cathedral-vm-v1\0" || sha256(vm-identity.json))`: 64 hex in a
+  report, base64 for QEMU `host-data=`.
+- **Measurement:** `sev-snp-measure 0.0.12 --mode snp` (requirements/vm-measure.txt) over
+  digest-checked private copies. Every VM runs QEMU `-cpu EPYC-v4`, on Genoa and Turin
+  alike (Toby, 27 Nov 12:19Z: until the tool supports Turin); a manifest naming another
+  model is refused. Only the model's CPUID signature (family, model, stepping) is
+  measured, not its feature set: EPYC-v1 and EPYC-v4 give one digest. The guest checks
+  its features itself (VM1b).
+
+```
+vm_measure.py identity --bundle B --vm-id vm-0123456789ab --ssh-key-file key.pub --out vm-identity.json
+vm_measure.py launch --bundle B --identity vm-identity.json --vcpus 2 --cpu-family genoa
+vm_measure.py check-bundle B
+```
+
+Shared vectors: `tests/fixtures/vm_measure_v1.json` (identity, cmdline, HOST_DATA, five
+measurements) for the VM init (VM1b) and the verifier (VM2).
 
 ## Not in v1
 
