@@ -504,6 +504,39 @@ def test_both_roots_take_all_three_pockets_of_one_snapshot():
     assert "MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT" in text
 
 
+def _host_leaks(tmp_path, files):
+    text = BUILD.read_text()
+    block = text[text.index("host_leaks() {"):text.index("# ---------------------------------------------------------------- base root")]
+    root = tmp_path / "root"
+    for rel, data in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+    (root / "var").mkdir(exist_ok=True)
+    script = 'die() { echo "$*" >&2; exit 1; }\n' + block + f'\nhost_leaks {root} && echo clean'
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def test_host_leaks_passes_a_root_without_host_files(tmp_path):
+    r = _host_leaks(tmp_path, {"etc/hostname": b"cathedral-vm\n", "etc/os-release": b"NAME=Ubuntu\n"})
+    assert r.returncode == 0 and "clean" in r.stdout, r.stderr
+
+
+def test_host_leaks_refuses_a_copy_of_the_host_resolv_conf(tmp_path):
+    host = Path("/etc/resolv.conf")
+    if not host.is_file() or host.stat().st_size == 0:
+        pytest.skip("this host has no resolv.conf")
+    r = _host_leaks(tmp_path, {"etc/.resolv.conf.systemd-resolved.bak": host.read_bytes()})
+    assert r.returncode != 0
+    assert "copy of a build host file: etc/.resolv.conf.systemd-resolved.bak" in r.stderr
+
+
+def test_base_root_removes_the_resolved_backup_before_the_image():
+    text = BUILD.read_text()
+    base = text[text.index("build_base_root() {"):text.index("# ---------------------------------------------------------------- kernel")]
+    assert 'rm -f "$R/etc/.resolv.conf.systemd-resolved.bak"' in base
+    assert base.index("host_leaks") < base.index('"$MKE2FS" -t ext4')
+
+
 def test_kernel_step_takes_the_extra_modules_of_the_named_release():
     assert _assignment("KERNEL_EXTRA_PKG") == "linux-modules-extra"
     text = BUILD.read_text()

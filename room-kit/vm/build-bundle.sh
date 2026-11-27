@@ -145,6 +145,30 @@ pinned_root() {
   fi
 }
 
+# host_leaks ROOT: stop if ROOT's etc or var holds a copy of the build host's resolv.conf,
+# hostname, hosts or machine-id, or names its hostname or DNS search domain. mmdebstrap copies
+# the host's resolv.conf and hostname in, and package scripts can keep copies of them (the
+# systemd-resolved backup); such a file differs per build host and is not the customer's.
+host_leaks() {
+  local root=$1 f s found=0 sums=() marks=()
+  for f in /etc/resolv.conf /etc/hostname /etc/hosts /etc/machine-id; do
+    [ -s "$f" ] && sums+=("$(sha256sum < "$f" | cut -d' ' -f1)")
+  done
+  s=$(hostname 2>/dev/null || true)
+  [ ${#s} -ge 8 ] && marks+=("$s")
+  for s in $(awk '$1 == "search" || $1 == "domain" { for (i = 2; i <= NF; i++) print $i }' /etc/resolv.conf 2>/dev/null); do
+    [ ${#s} -ge 8 ] && [[ "$s" = *.* ]] && marks+=("$s")
+  done
+  while IFS= read -r -d '' f; do
+    s=$(sha256sum < "$f" | cut -d' ' -f1)
+    if [[ " ${sums[*]} " = *" $s "* ]]; then echo "[vm-bundle] copy of a build host file: ${f#"$root"/}" >&2; found=1; fi
+  done < <(find "$root/etc" "$root/var" -type f -print0)
+  for s in "${marks[@]}"; do
+    if grep -rlF --no-messages -- "$s" "$root/etc" "$root/var" >&2; then found=1; fi
+  done
+  [ "$found" = 0 ] || die "the base root holds files from this build host (listed above)"
+}
+
 # ---------------------------------------------------------------- base root (7.3)
 build_base_root() {
   e2fsprogs_floor
@@ -173,6 +197,8 @@ PermitRootLogin no
 EOF
   # The network file comes from the init at every boot (/run/systemd/network, from the link).
   ln -sfn ../run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
+  # systemd-resolved's postinst keeps the build host's resolv.conf here.
+  rm -f "$R/etc/.resolv.conf.systemd-resolved.bak"
   in_root systemctl enable -q ssh.service systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
   in_root systemctl mask -q ssh.socket
   in_root passwd -l root >/dev/null
@@ -209,6 +235,7 @@ EOF
   rm -rf "${R:?}"/var/cache/apt/archives/*.deb "${R:?}"/var/lib/apt/lists/* "${R:?}"/tmp/* "${R:?}"/var/tmp/*
   rm -f "$R/var/cache/ldconfig/aux-cache"   # holds inode numbers and times of this build
   find "$R/var/log" -type f -delete
+  host_leaks "$R"
   clamp "$R"
 
   # ext4 image of the root. The init copies it into the file system area of the LUKS
