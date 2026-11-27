@@ -7,7 +7,15 @@ cvm-<slot> and one systemd unit cathedral-vm-<name>.service that runs the SEV-SN
 guest as that user (launch-vm.py; VM runtime spec r2 6.3, 7.1, 8.1, 8.2).
 Every command prints one JSON line on stdout; a refusal prints {"error": ...} and exits nonzero:
   2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or exists, or
-  {"error": "host_capacity", "resource": ...} from create and start (vm_capacity.py), 1 anything else.
+  {"error": "host_capacity", "resource": ...} from create and start (vm_capacity.py),
+  10 to 18 a pre-launch gate (start; vm_gates.EXIT), 19 stale bundle selection, 20 bundle
+  incompatible and 21 selection committed but not synced (rebundle), 1 anything else. A refusal may add fields, such as "reason", a token
+  naming the check.
+
+Re-wrap (spec r3 7.5): rebundle moves a stopped VM to another bundle, fenced by its closed
+generation and its bundle_selection_revision, idempotent by op_id; rewrap writes the customer's
+answer, read from stdin only, to the answer slot of the VM's mailbox (vm_mailbox.py) for the
+offer its guest left there.
 
 Credit cutoff (polariscomputer#2290 rules 3, 5, 6) is enforced here, on the host,
 so it holds with the API and the broker down:
@@ -50,6 +58,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parent
 # -I keeps the script's directory off sys.path; vm_measure.py beside this file is the kit's.
 sys.path.insert(0, str(KIT))
+import vm_mailbox  # noqa: E402
 import vm_measure  # noqa: E402
 
 
@@ -81,9 +90,22 @@ KEY_TYPES = (
 NET = ipaddress.IPv4Network("10.216.0.0/16")
 SLOTS = NET.num_addresses // 4
 COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce",
-            "cancel", "history")
+            "cancel", "history", "rebundle", "rewrap")
 STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
-MAILBOX_BYTES = 1 << 20
+MAILBOX_BYTES = vm_mailbox.MAILBOX_BYTES
+# rewrap reads a torn offer (spec r3 7.5 Read) again this many times, this far apart, under that
+# VM's lock only. status and list read each slot once: a guest that keeps its slot torn must not
+# slow every list on the host.
+MAILBOX_RETRIES = 5
+MAILBOX_RETRY_WAIT = float(os.environ.get("VM_MAILBOX_RETRY_WAIT", "0.2"))
+# Rebundle (spec r3 7.5 step 1): the applied op_ids a VM remembers, with their results.
+SELECTION_OPS_MAX = 64
+BUNDLE_ID_RE = re.compile(r"[0-9a-f]{64}")
+EXIT_STALE_SELECTION, EXIT_BUNDLE_INCOMPATIBLE = 19, 20  # 17 and 18 are the gates' (vm_gates.EXIT)
+# The selection is committed (launch.json) but vm.env, the unit or daemon-reload failed after it:
+# the same op_id again finishes it (the retry re-runs sync_selection), and so does start.
+EXIT_SELECTION_SYNC_FAILED = 21
+OP_ID_RE = re.compile(r"[0-9a-f]{32}")  # 128 random bits from the caller
 # MemoryMax headroom over guest memory: the dedicated unit's figure (D 5.8) until rehearsal A2
 # measures the SNP QEMU overhead. A cap, not a reservation: admission (VM4) counts its own.
 MEM_OVERHEAD_GIB = 16
@@ -388,6 +410,82 @@ def cmd_qmp_as_vm_user(args: list[str]) -> dict:
     if not qmp_exchange("qmp.sock", args[0], float(args[1])):
         raise Refusal("qmp_failed", "QEMU did not take the command", 1)
     return {"sent": args[0]}
+
+
+# ---- the mailbox disk (spec r3 7.5 Mailbox, vm_mailbox.py) --------------------------------
+
+def mailbox_open(d: Path, user: str, write: bool = False) -> int:
+    """mailbox.raw by openat from the VM directory, never through a link, checked on the open file:
+    a regular file of 1 MiB with one link, owned by the VM user. The user owns the file's bytes,
+    not its entry: the directory is root's, mode 0700, so the user cannot replace or link it, and
+    the checks run on the descriptor that is then used, so nothing changes between check and use."""
+    import pwd
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        raise Refusal("mailbox_invalid", f"no VM user {user}", 3) from None
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Refusal("mailbox_invalid", f"{d}: {e.strerror}", 3) from None
+    try:
+        # Never O_CREAT or O_TRUNC. O_NONBLOCK: a FIFO in its place fails the checks, not hangs here.
+        fd = os.open("mailbox.raw", (os.O_RDWR if write else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC
+                     | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dfd)
+    except OSError as e:
+        raise Refusal("mailbox_invalid", f"mailbox.raw: {e.strerror}", 3) from None
+    finally:
+        os.close(dfd)
+    st = os.fstat(fd)
+    if not (stat.S_ISREG(st.st_mode) and st.st_uid == uid and st.st_nlink == 1 and st.st_size == MAILBOX_BYTES):
+        os.close(fd)
+        raise Refusal("mailbox_invalid", "mailbox.raw is not the VM user's 1 MiB regular file with one link", 3)
+    return fd
+
+
+def mailbox_slot(fd: int, offset: int, retries: int = 0) -> bytes | None:
+    """The record body in the slot at offset, or None when the slot is empty. A torn record is read
+    again up to retries times, MAILBOX_RETRY_WAIT apart; one that never checks is empty."""
+    kind = vm_mailbox.SLOT_KIND[offset]
+    for attempt in range(retries + 1):
+        try:
+            return vm_mailbox.decode_slot(os.pread(fd, vm_mailbox.SLOT_BYTES, offset), kind)
+        except vm_mailbox.Torn:
+            if attempt < retries:
+                time.sleep(MAILBOX_RETRY_WAIT)
+    return None
+
+
+def guest_record(fd: int, offset: int, retries: int = 0) -> tuple[dict, bytes] | None:
+    """A guest slot's (document, body bytes), or None. The bytes are the guest's: any failure, of any
+    exception type (a recursion or memory error too), is an empty slot."""
+    try:
+        body = mailbox_slot(fd, offset, retries)
+        return None if body is None else (vm_mailbox.parse_body(body, vm_mailbox.SLOT_KIND[offset]), body)
+    except Exception:
+        return None
+
+
+def mailbox_view(d: Path, env: dict, running: bool) -> dict:
+    """What status shows of the mailbox (spec r3 7.2, 7.5 step 3): the guest's status record and,
+    while the VM runs, the offer its guest waits with. Guest data, passed on and trusted by nothing
+    here; any problem is an empty slot, so it never fails status, list or another VM. Each slot is
+    read once (no torn-read retry here)."""
+    view: dict = {"vm_state": None, "guest_status": None, "rewrap_offer": None}
+    try:
+        fd = mailbox_open(d, env["VM_USER"])
+    except Exception:
+        return view
+    try:
+        status = guest_record(fd, vm_mailbox.STATUS_OFFSET)
+        if status:
+            view.update(vm_state=status[0]["state"], guest_status=status[0])
+        offer = guest_record(fd, vm_mailbox.OFFER_OFFSET) if running else None
+        if offer:
+            view["rewrap_offer"] = {**offer[0], "offer_sha256": vm_mailbox.body_sha256(offer[1])}
+    finally:
+        os.close(fd)
+    return view
 
 
 # ---- authorization -------------------------------------------------------------
@@ -839,9 +937,28 @@ def status_of(name: str) -> dict:
         # Sealed VM launch values (spec r2 6.3): the customer recomputes expected_measurement from
         # the published bundle and their identity document; the broker passes these through.
         **{k: launch[k] for k in LAUNCH_STATUS if k in launch},
-        **({"disks": {"root": (d / "root.raw").is_file(), "mailbox": (d / "mailbox.raw").is_file()}}
+        **({"identity_document": identity_text(d, launch),
+            "disks": {"root": (d / "root.raw").is_file(), "mailbox": (d / "mailbox.raw").is_file()},
+            # The caller passes it back as rebundle --expect-revision (spec r3 7.5 step 1).
+            "bundle_selection_revision": launch.get("bundle_selection_revision", 0),
+            **mailbox_view(d, env, state == "running")}
            if launch else {}),
     }
+
+
+def identity_text(d: Path, launch: dict) -> str | None:
+    """vm-identity.json exactly as create wrote it (spec r2 6.3): verify_vm.py needs it, salt
+    included, to recompute the measurement. Not secret: the salt and the public key are the
+    customer's own. None unless its sha256 is launch.json's identity_sha256, so a caller never gets
+    a document other than the one the measurement was computed from."""
+    try:
+        with open(d / "vm-identity.json", "rb") as f:
+            raw = f.read(vm_measure.DOC_MAX + 1)
+        if hashlib.sha256(raw).hexdigest() == launch.get("identity_sha256"):
+            return raw.decode("ascii")
+    except (OSError, UnicodeDecodeError):
+        pass
+    return None
 
 
 # ---- create ---------------------------------------------------------------------
@@ -1011,6 +1128,56 @@ def write_unit(name: str, d: Path, env: dict) -> None:
     write_atomic(unit_dir() / unit_name(name), unit_text(name, d, env), 0o644)
 
 
+def write_env(d: Path, env: dict) -> None:
+    write_atomic(d / "vm.env", "".join(f"{k}='{v}'\n" for k, v in env.items()), 0o644)
+
+
+def unit_binds_bundle(name: str, bundle: str) -> bool:
+    try:
+        text = (unit_dir() / unit_name(name)).read_text()
+    except FileNotFoundError:
+        return False
+    want = str(bundle_dir(bundle))
+    return any(line.startswith("BindReadOnlyPaths=") and want in line.split("=", 1)[1].split()
+               for line in text.splitlines())
+
+
+def synced_revision(d: Path) -> int:
+    """The bundle_selection_revision whose vm.env, unit file and daemon-reload are all done.
+    No file: revision 0, which needs nothing (create writes all three)."""
+    return read_json(d / "selection-synced.json", {"revision": 0})["revision"]
+
+
+def selection_synced(name: str, d: Path) -> bool:
+    launch = read_json(d / "launch.json", {})
+    bundle = launch.get("bundle")
+    if not bundle:
+        return True  # a VM from before AB#999 VM3: no sealed bundle
+    return (synced_revision(d) == launch.get("bundle_selection_revision", 0)
+            and read_env(d / "vm.env").get("VM_BUNDLE") == bundle and unit_binds_bundle(name, bundle))
+
+
+def sync_selection(name: str, d: Path) -> None:
+    """launch.json is the commit point of the VM's bundle: rebundle changes it in one rename.
+    vm.env's VM_BUNDLE (read by launch-vm.py and the start gates), the unit's bundle bind and
+    systemd's copy of the unit follow it, in that order, and selection-synced.json records the
+    revision once all three are done. A rebundle cut anywhere after its commit leaves them
+    behind; this finishes them. Under the VM lock: on every rebundle, and in start before any
+    gate or launch reads VM_BUNDLE. The marker, not the unit file, says whether systemd reloaded:
+    a cut between the unit write and daemon-reload leaves a right file and a stale systemd."""
+    if selection_synced(name, d):
+        return
+    launch = read_json(d / "launch.json", {})
+    env = read_env(d / "vm.env")
+    if env.get("VM_BUNDLE") != launch["bundle"]:
+        env["VM_BUNDLE"] = launch["bundle"]
+        write_env(d, env)
+    write_unit(name, d, env)
+    systemctl("daemon-reload")
+    write_atomic(d / "selection-synced.json",
+                 json.dumps({"revision": launch.get("bundle_selection_revision", 0)}) + "\n")
+
+
 def ensure_enforce_timer() -> None:
     svc, timer = unit_dir() / "cathedral-vm-enforce.service", unit_dir() / "cathedral-vm-enforce.timer"
     write_atomic(svc, f"""[Unit]
@@ -1169,6 +1336,9 @@ def cmd_check_paid(args: list[str]) -> dict:
     refusal = paid_refusal(a, int(time.time()))
     if refusal:
         raise refusal
+    if not selection_synced(name, d):
+        # A rebundle was cut after its commit: vm-ctl start (or the rebundle retry) syncs first.
+        raise Refusal("selection_unsynced", "vm.env names another bundle than launch.json: use vm-ctl start", 3)
     # H2: no launch of a tracked generation without a durable start line, and none after a durable
     # close line (it is authoritative even when authorization.json missed it), and none from a
     # corrupt journal. Read only. No journal at all is a VM from before the upgrade: not gated.
@@ -1203,6 +1373,7 @@ def cmd_start(args: list[str]) -> dict:
     d = vm_dir(name)
     with Lock(d / ".lock"), contextlib.ExitStack() as admission:
         begin(name, d)
+        sync_selection(name, d)  # before any gate or launch reads VM_BUNDLE (rebundle cut)
         check_generation(opts, auth_of(d))
         refusal = paid_refusal(auth_of(d), int(time.time())) or gate_refusal(name)
         if refusal:
@@ -1374,6 +1545,185 @@ def cmd_reboot(args: list[str]) -> dict:
         pending.unlink(missing_ok=True)
     return {"name": name, "rebooted_at": int(time.time()), "state": "running", "generation": g,
             "graceful": graceful, "resumed": resume and not running}
+
+
+# ---- rebundle (spec r3 7.5 step 1) ----------------------------------------------------------
+
+def incompatible(reason: str, detail: str) -> Refusal:
+    return Refusal("bundle_incompatible", detail, EXIT_BUNDLE_INCOMPATIBLE, reason=reason)
+
+
+def selection_values(name: str, d: Path, launch: dict, bundle: str) -> dict:
+    """Check 4 of spec r3 7.5 step 1, then the launch values of this VM's identity on B2. B2 must
+    pass what create checks (enabled, its manifest is its id) and what start's gates check (a
+    verified build of B2 for this host and the VM's vCPUs, or the VM is a canary: the vm_gates
+    helpers themselves), be built for this host's CPU family and carry the identity's base root,
+    which never changes. Any failure is bundle_incompatible (exit 20) with the check as its reason;
+    nothing is written."""
+    import vm_gates
+    try:
+        cfg = host_config()
+        gates_cfg = vm_gates.host_config()  # the stricter read start's gate makes of the same file
+    except (Refusal, vm_gates.GateRefusal) as e:
+        raise incompatible("host_config_invalid", f"{e.error}: {e.detail}") from None
+    if bundle not in cfg["bundles"]:
+        raise incompatible("bundle_not_enabled", f"bundle {bundle} is not enabled on this host")
+    try:
+        manifest, raw = vm_measure.read_manifest(bundle_dir(bundle))
+    except vm_measure.Refusal as e:
+        raise incompatible("no_bundle", f"bundle {bundle}: {e}") from None
+    if hashlib.sha256(raw).hexdigest() != bundle:
+        raise incompatible("no_bundle", f"bundle {bundle}: the manifest is not the one its directory names")
+    if manifest["cpu_family"] != cfg["cpu_family"]:
+        raise incompatible("cpu_family_differs",
+                           f"bundle {bundle} is built for {manifest['cpu_family']}, this host is {cfg['cpu_family']}")
+    env = read_env(d / "vm.env")
+    vcpus = int(env["VM_VCPUS"])
+    try:
+        vm_gates.host_build_gate(gates_cfg, {"name": name, "bundle": bundle, "vcpus": vcpus})
+    except vm_gates.GateRefusal as e:
+        raise incompatible("no_verified_build", f"{e.error}: {e.detail}") from None
+    try:
+        with open(d / "vm-identity.json", "rb") as f:
+            identity_raw = f.read(vm_measure.DOC_MAX + 1)
+        identity = vm_measure.parse_identity(identity_raw)
+    except (OSError, vm_measure.Refusal) as e:
+        raise Refusal("launch_values", f"vm-identity.json: {e}", 1) from None
+    if (identity["base_root_verity"], identity["base_root_data_bytes"]) != \
+            (manifest["base_root_verity"], manifest["base_root_data_bytes"]):
+        raise incompatible("base_root_differs", f"bundle {bundle} has another base root than this VM's identity")
+    try:
+        values = vm_measure.launch_values(bundle_dir(bundle), identity_raw, vcpus,
+                                          cfg["cpu_family"], cfg.get("sev_snp_measure"))
+    except vm_measure.Refusal as e:
+        raise Refusal("launch_values", str(e), 1) from None
+    values["vm_id"] = launch.get("vm_id", identity["vm_id"])
+    return values
+
+
+def cmd_rebundle(args: list[str]) -> dict:
+    """Spec r3 7.5 step 1: select bundle B2 for a stopped VM (a restore is the same command back).
+
+    Under the VM lock, in this order: (1) an op_id in selection_ops with the same generation,
+    expect_revision and to returns its stored result and writes nothing; the same op_id with any
+    other field is stale_selection (reason op_id_reused). (2) G must be the current generation,
+    closed (or 0 for a VM never authorized), with the unit stopped: else stale_generation, exit 3.
+    (3) expect_revision must equal bundle_selection_revision: else stale_selection, exit 19.
+    (4) selection_values: else bundle_incompatible, exit 20. Then launch.json is written once (the
+    commit point) with B2, its measurement, the revision + 1 and the op; vm.env and the unit
+    follow (sync_selection), as start does again before its gates."""
+    # No admission check (vm_capacity.py): a rebundle keeps the VM's vCPUs, memory and disks.
+    want = ("--generation", "--expect-revision", "--op-id", "--to")
+    opts = parse_opts(args, set(want), 1)
+    name = check_name(opts["_"][0])
+    for req in want:
+        if req not in opts:
+            raise Refusal("missing_option", f"rebundle needs {req}")
+    gen = check_int(opts["--generation"], "generation", 0, 2**53)
+    expect = check_int(opts["--expect-revision"], "expect_revision", 0, 2**53)
+    dst, op_id = opts["--to"], opts["--op-id"]
+    if not BUNDLE_ID_RE.fullmatch(dst):
+        raise Refusal("invalid_bundle", "--to is a bundle id (64 lowercase hex)")
+    if not OP_ID_RE.fullmatch(op_id):
+        raise Refusal("invalid_op_id", "--op-id is 32 lowercase hex (128 random bits)")
+    d = vm_dir(name)
+    with Lock(d / ".lock"):
+        begin(name, d)
+        launch = read_json(d / "launch.json", {})
+        if not launch.get("bundle"):
+            raise Refusal("not_sealed", f"VM {name} has no sealed launch record", 1)
+        for op in launch.get("selection_ops", []):
+            if op["op_id"] == op_id:
+                if (op["generation"], op["expect_revision"], op["to"]) != (gen, expect, dst):
+                    raise Refusal("stale_selection", "this op_id was applied to another request",
+                                  EXIT_STALE_SELECTION, reason="op_id_reused")
+                synced_or_refuse(name, d)  # derived files only: a retry after a cut finishes them
+                return {"name": name, "op_id": op_id, **op["result"]}
+        a = auth_of(d)
+        if gen != a["generation"]:
+            raise Refusal("stale_generation", f"generation {gen} is not the current one ({a['generation']})", 3,
+                          reason="not_current")
+        if gen > a.get("closed_generation", 0):
+            raise Refusal("stale_generation", f"generation {gen} is open: stop or cancel it first", 3,
+                          reason="generation_open")
+        if unit_active(name):
+            raise Refusal("stale_generation", f"{unit_name(name)} is active", 3, reason="unit_active")
+        revision = launch.get("bundle_selection_revision", 0)
+        if expect != revision:
+            raise Refusal("stale_selection", f"expect_revision {expect} is not the revision ({revision})",
+                          EXIT_STALE_SELECTION, reason="revision_changed")
+        values = selection_values(name, d, launch, dst)
+        result = {"bundle": dst, "expected_measurement": values["expected_measurement"],
+                  "bundle_selection_revision": revision + 1}
+        ops = launch.get("selection_ops", []) + [
+            {"op_id": op_id, "generation": gen, "expect_revision": expect, "to": dst, "result": result}]
+        committed = {**launch, **values, "bundle_selection_revision": revision + 1,
+                     "selection_ops": ops[-SELECTION_OPS_MAX:]}
+        write_atomic(d / "launch.json", json.dumps(committed, sort_keys=True) + "\n", 0o644)
+        synced_or_refuse(name, d)
+    return {"name": name, "op_id": op_id, **result}
+
+
+def synced_or_refuse(name: str, d: Path) -> None:
+    """sync_selection after the commit point: a failure here is not "rebundle failed" (exit 1).
+    The new selection is committed and recorded; only its derived files are behind, which the
+    same op_id again finishes (and start too, before its gates)."""
+    try:
+        sync_selection(name, d)
+    except Exception as e:
+        raise Refusal("selection_committed_sync_failed",
+                      f"the selection is committed; vm.env or the unit did not follow"
+                      f" ({getattr(e, 'error', type(e).__name__)}):"
+                      " repeat the same op_id to finish it", EXIT_SELECTION_SYNC_FAILED) from None
+
+
+# ---- rewrap (spec r3 7.5 step 4) ------------------------------------------------------------
+
+def cmd_rewrap(args: list[str], answer: bytes | None) -> dict:
+    """Write the customer's answer to the answer slot for the offer the running guest waits with.
+    The answer comes on stdin only (from the broker: at most vm_mailbox.ANSWER_MAX bytes), never
+    on argv: the answer envelope, canonical, whose offer_sha256 names the offer now in the offer
+    slot. Only for the current, open generation G with the unit active. The same answer again is
+    not written again."""
+    opts = parse_opts(args, {"--generation"}, 1)
+    name = check_name(opts["_"][0])
+    if "--generation" not in opts:
+        raise Refusal("missing_option", "rewrap needs --generation")
+    gen = check_int(opts["--generation"], "generation", 1, 2**53)
+    if answer is None:
+        answer = sys.stdin.buffer.read(vm_mailbox.ANSWER_MAX + 1)
+    try:
+        doc = vm_mailbox.parse_answer(answer)
+    except vm_mailbox.Refusal as e:
+        raise Refusal("invalid_rewrap_answer", str(e)) from None
+    slot = vm_mailbox.encode_slot(vm_mailbox.KIND_ANSWER, answer)
+    d = vm_dir(name)
+    with Lock(d / ".lock"):
+        begin(name, d)
+        a = auth_of(d)
+        if gen != a["generation"]:
+            raise Refusal("stale_generation", f"generation {gen} is not the current one ({a['generation']})", 3)
+        if gen <= a.get("closed_generation", 0):
+            raise Refusal("generation_closed", f"generation {gen} was stopped: no guest waits", 3)
+        user = read_env(d / "vm.env").get("VM_USER")
+        if not user or not unit_active(name):
+            raise Refusal("no_rewrap_offer", f"VM {name} is not running: no guest waits for an answer", 3)
+        fd = mailbox_open(d, user, write=True)
+        try:
+            offer = guest_record(fd, vm_mailbox.OFFER_OFFSET, MAILBOX_RETRIES)
+            if offer is None:
+                raise Refusal("no_rewrap_offer", "the offer slot holds no valid offer", 3)
+            if vm_mailbox.body_sha256(offer[1]) != doc["offer_sha256"]:
+                raise Refusal("rewrap_offer_changed", "the answer is for another offer than the one waiting", 3)
+            written = os.pread(fd, vm_mailbox.SLOT_BYTES, vm_mailbox.ANSWER_OFFSET) != slot
+            if written:
+                view = memoryview(slot)
+                while view:  # one pwrite of the answer slot; the loop only finishes a short write
+                    view = view[os.pwrite(fd, view, vm_mailbox.ANSWER_OFFSET + len(slot) - len(view)):]
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+    return {"name": name, "generation": gen, "offer_sha256": doc["offer_sha256"], "written": written}
 
 
 # ---- delete, status, list, enforce ---------------------------------------------
@@ -1648,8 +1998,12 @@ def parse_opts(args: list[str], allowed: set[str], positional: int) -> dict:
 BROKER_SAFE = re.compile(r"[A-Za-z0-9 ._-]{1,512}")
 
 
-def from_broker() -> tuple[list[str], str | None]:
-    """authorized_keys forced command: SSH_ORIGINAL_COMMAND split on spaces, never a shell."""
+def from_broker() -> tuple[list[str], str | bytes | None]:
+    """authorized_keys forced command: SSH_ORIGINAL_COMMAND split on spaces, never a shell.
+
+    stdin is read only for the two commands that take a document: create (the customer key) and
+    rewrap (the answer: one byte more than vm_mailbox.ANSWER_MAX, so a longer one is refused,
+    never cut)."""
     raw = os.environ.get("SSH_ORIGINAL_COMMAND")
     if raw is None:
         raise Refusal("usage", "--from-broker needs SSH_ORIGINAL_COMMAND")
@@ -1664,6 +2018,8 @@ def from_broker() -> tuple[list[str], str | None]:
         if "--ssh-key-file" in args or "--image" in args:
             raise Refusal("invalid_option", "from the broker the key comes on stdin and the image is the pinned one")
         return args, sys.stdin.read(16385)
+    if args[0] == "rewrap":
+        return args, sys.stdin.buffer.read(vm_mailbox.ANSWER_MAX + 1)
     return args, None
 
 
@@ -1681,10 +2037,12 @@ def main(argv: list[str]) -> int:
             "authorize": cmd_authorize, "start": cmd_start, "stop": cmd_stop, "reboot": cmd_reboot,
             "delete": cmd_delete, "status": cmd_status, "list": cmd_list, "enforce": cmd_enforce,
             "check-paid": cmd_check_paid, "powerdown": cmd_powerdown, "cancel": cmd_cancel,
-            "history": cmd_history, "qmp-as-vm-user": cmd_qmp_as_vm_user,
+            "history": cmd_history, "qmp-as-vm-user": cmd_qmp_as_vm_user, "rebundle": cmd_rebundle,
         }
         if cmd == "create":
             out(cmd_create(rest, key_text))
+        elif cmd == "rewrap":
+            out(cmd_rewrap(rest, key_text))
         elif cmd == "capacity":
             doc = cmd_capacity(rest)
             out(doc)

@@ -24,6 +24,7 @@ and lists the VM's bundle.
 | `vm-gates.sh` (`vm_gates.py`) | Pre-launch gates and the host change gate (spec 8.3): `check <name>` before every start and launch, `enforce` on the enforce tick. Exit codes in `vm_gates.py`. |
 | `vm-net.sh up\|down\|check vm.env` | Tap /30 owned by the VM user, NAT out, SSH port forward, isolation. |
 | `vm.env.example` | What `create` writes per VM. |
+| `vm_mailbox.py` | The mailbox disk: slots, records, the body pre-scan and strict parsers (re-wrap). |
 | `vm_measure.py` | Sealed VM launch values: identity document, measured cmdline, HOST_DATA, expected measurement; bundle manifest. |
 | `build-bundle.sh`, `bundle.env.example` | Recipe for one sealed VM bundle: base root, kernel and modules, manifest. |
 | `verify_vm.py` | The customer's verifier, run on their own machine: one SSH connection, a fresh challenge, the SNP report checked against their bundle and identity. `pin` also keeps the recovery key, chip and host key locally. |
@@ -41,6 +42,8 @@ sudo ./vm-ctl.sh reboot|stop|status vm1
 sudo ./vm-ctl.sh list | enforce
 sudo ./vm-ctl.sh cancel vm1 <generation>    # close a run in any state (see Execution history)
 ./vm-ctl.sh history vm1 <generation>         # read only, works after delete
+sudo ./vm-ctl.sh rebundle vm1 --generation G --expect-revision N --op-id <32 hex> --to <B2>
+sudo ./vm-ctl.sh rewrap vm1 --generation G < answer.json   # the answer on stdin only
 sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the disk
 sudo ./vm-ctl.sh capacity [--broker-max-vcpus N --broker-max-mem-gib N --broker-max-disk-gib N]
 ```
@@ -48,7 +51,10 @@ sudo ./vm-ctl.sh capacity [--broker-max-vcpus N --broker-max-mem-gib N --broker-
 `VM_ROOT` (default `/srv/cathedral-vms`) and `SYSTEMD_UNIT_DIR` (default
 `/etc/systemd/system`) can be set in the environment. Exit codes: 0 ok,
 2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or conflict, or no room on
-the host (`{"error": "host_capacity", "resource": ...}`, see Host admission), 1 other.
+the host (`{"error": "host_capacity", "resource": ...}`, see Host admission), 10 to 18 a
+pre-launch gate (`start`, `vm_gates.EXIT`), 19 stale bundle selection, 20 bundle
+incompatible and 21 selection committed but not synced (`rebundle`), 1 other. A refusal may carry a `reason` token. Callers map a
+refusal by its exit code and `error` token together, per command.
 
 ## What a VM is
 
@@ -247,6 +253,10 @@ cmdline and HOST_DATA from the identity on every launch.
   kernel from one pinned snapshot, then writes the manifest.
 - **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random
   salt, the first-boot SSH key and the bundle's base root hash. Written once at create.
+  `create`'s answer, `status` and `list` carry it as `identity_document`, the file's exact
+  text (the customer's input to `verify_vm.py`; its sha256 is `identity_sha256`), or `null`
+  when the file is not the one `launch.json` names. It is not secret: the salt and the key
+  are the customer's own.
 - **Cmdline:** the bundle template with `cathedral.vm=<sha256 of vm-identity.json>`, so
   every VM has its own launch measurement. It masks every getty, the emergency, rescue
   and debug shells, and the guest agent.
@@ -333,6 +343,82 @@ yours, or open to others refuses (`pin_store_invalid`). R is never printed. Pinn
 with the same values is a no-op (`unchanged`); other values refuse `pin_exists` and leave
 the pin as it was. VM6 re-wrap reads R with `load_pin`.
 
+## Rebundle (AB#999, PR VM6 host side; spec r3 7.5 step 1)
+
+A VM moves to another bundle (a kernel fix) only with its customer: the new measurement
+derives a new disk key, the guest finds its root `locked`, and the customer's tool wraps
+their pinned recovery key to the guest's offer (`rewrap`, below). A restore is the
+same command with `--to` the old bundle.
+
+**`rebundle <name> --generation G --expect-revision N --op-id X --to B2`**, all four
+required. `launch.json` holds `bundle_selection_revision` (0 when absent; `status` returns
+it) and `selection_ops`, the last 64 applied requests with their results. Every accepted
+rebundle adds exactly 1 to the revision, also one whose `--to` is the current bundle.
+
+Under the VM lock, in this order:
+
+1. **Retry:** `X` in `selection_ops` with the same G, N and B2 returns its stored result
+   (the state right after it) and changes nothing in `launch.json`. The same `X` with any
+   other field: `stale_selection`, exit 19, reason `op_id_reused`.
+2. **Generation fence:** G is the current generation, closed (or 0 for a VM never
+   authorized), and the unit is stopped; else `stale_generation`, exit 3, reason
+   `not_current`, `generation_open` (an authorized run that never started is cancelled
+   first) or `unit_active`.
+3. **Revision fence:** N is `bundle_selection_revision`; else `stale_selection`, exit 19.
+4. **B2 can start here:** the host file reads (as create and start's gate read it), B2 is
+   enabled in it, its manifest is its id, it is built for this host's CPU family, it has a
+   verified build for this host's QEMU and kernel and the VM's vCPUs (or the VM is a canary;
+   the `vm_gates.py` helpers start uses), and it carries the identity's base root. Else
+   `bundle_incompatible`, exit 20, reason `host_config_invalid`, `bundle_not_enabled`,
+   `no_bundle`, `cpu_family_differs`, `no_verified_build` or `base_root_differs`. Start runs
+   its gates again.
+5. **Apply:** B2's launch values (the expected measurement; the identity and HOST_DATA do
+   not change), the revision + 1 and the request are written in one rename of
+   `launch.json`, the commit point. Then `vm.env` `VM_BUNDLE`, the unit's bundle bind and
+   `daemon-reload` follow, and `selection-synced.json` records the revision.
+
+Refused requests are not recorded. A retry whose `X` has left the last 64 is evaluated as
+new and refused by the revision fence. A cut before the commit changes nothing; a cut after
+it is finished by the retry or by the next `start`, which derives `vm.env` and the unit from
+`launch.json` before its gates read `VM_BUNDLE`. A sync step that fails after the commit
+(for example `daemon-reload`) exits 21, `selection_committed_sync_failed`, not 1: the change is
+committed, and the same `X` again finishes it. Until then `check-paid` refuses every launch
+(`selection_unsynced`, exit 3). The marker exists because a cut between the unit write and
+`daemon-reload` leaves a right file and a stale systemd. **A caller retries any failure it
+cannot read as a refusal (a lost answer, exit 21, any broker 5xx) with the same `X`.**
+
+## Re-wrap: rewrap and the mailbox (AB#999, PR VM6 host side; spec r3 7.5)
+
+**The mailbox** (`mailbox.raw`, 1 MiB, owned by the VM user; `vm_mailbox.py`, vectors in
+`tests/fixtures/vm_mailbox_v1.json`): the status record at 0 and the offer at 64 KiB, written by
+the guest; the answer at 128 KiB, written by the host. A record is `CVMMBX1\0`, a kind byte, a
+4-byte big-endian body length, the body's sha256 and a canonical JSON body (at most 64 KiB minus
+the 45-byte header; 4096 bytes for the answer).
+
+- **Read:** magic, kind, length bound and sha256; a mismatch is a torn read. `status` and `list`
+  read each slot once (a torn slot is empty there); only `rewrap`, under that VM's lock, reads
+  the offer again, 5 times 200 ms apart. Then a bounded pre-scan refuses any nesting before the parser runs, and the keys
+  must be exactly the schema's, each with its type and length. Any failure, of any exception
+  type, is an empty slot: it never fails `status`, `list` or another VM.
+- **Host access:** the VM directory (root's, 0700) opened with `O_DIRECTORY|O_NOFOLLOW`, then
+  `openat(dirfd, "mailbox.raw", O_NOFOLLOW)` (`O_RDONLY` to read, `O_RDWR` to write, never
+  `O_CREAT`), then `fstat` on the open file: a regular file of 1 MiB, one link, owned by the VM
+  user, else `mailbox_invalid` (exit 3) and nothing is touched. The VM user owns the bytes, not
+  the entry, and the checks run on the descriptor that is used.
+- **`status`** (only for a sealed VM) shows `vm_state` and `guest_status` from the status
+  record and, while the unit runs, `rewrap_offer` (the offer and its `offer_sha256`, the sha256 of
+  its body). All of it is guest data: the broker and the API pass it on, the customer's tool
+  verifies it.
+
+**`rewrap <name> --generation G`**, the answer on stdin (step 4), never an argument: the
+broker's argument check allows 64 characters. The envelope is canonical JSON of at most 4096
+bytes with exactly `schema`, `offer_sha256`, `epk`, `nonce`, `ct` (`invalid_rewrap_answer`,
+exit 2). It is written only while G is the current, open generation (`stale_generation`,
+`generation_closed`) and the unit is active, and only for the offer now in the offer slot:
+`no_rewrap_offer` or `rewrap_offer_changed`, exit 3. One `pwrite` of the answer slot, then
+`fsync`; the same answer again is not written again (`"written": false`).
+
 ## Not here yet
 
-Admission across VMs and kits (VM4), re-wrap (VM6), resize, snapshots.
+Admission across VMs and kits (VM4), the guest side of re-wrap (VM1b, VM2), the status
+record's measurement check (`vm_measurement_differs`, spec 7.2), resize, snapshots.
