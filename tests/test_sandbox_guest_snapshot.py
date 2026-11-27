@@ -900,7 +900,11 @@ def test_a_tar_changed_in_place_during_the_read_never_starts_a_room(fake, provid
     def flip() -> None:
         with open(path, "r+b") as fh:
             fh.seek(300)
-            fh.write(b"\xff")
+            original = fh.read(1)
+            assert len(original) == 1
+            fh.seek(300)
+            # A fixed 0xff sometimes leaves this random archive byte unchanged.
+            fh.write(bytes([original[0] ^ 1]))
 
     monkeypatch.setattr(sandbox_provider, "_open_snapshot_archive", lambda p: _SlowReader(p, flip))
     runs = len(fake.calls_of("run"))

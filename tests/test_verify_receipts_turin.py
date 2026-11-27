@@ -133,6 +133,6 @@ def test_the_chi_ur_2_attestation_from_engaging_loon_verifies() -> None:
     out = vr.verify_attestation(att, measurement, None, "/nonexistent", TURIN_PIN, False, certs)
     assert out["amd"] == {"product": "Turin", "ark_sha256": TURIN_PIN,
                           "tcb": {"fmc": 1, "bootloader": 3, "tee": 3, "snp": 8, "microcode": 118}}
-    # No Turin floor is defined: a Genoa floor refuses the report instead of skipping it.
+    # The legacy Genoa-only flag still refuses Turin instead of silently skipping it.
     with pytest.raises(vr.Fail, match="Genoa SNP floor requires a verified AMD processor generation"):
         vr.verify_attestation(att, measurement, None, "/nonexistent", TURIN_PIN, False, certs, min_genoa_snp_spl=0x1E)
