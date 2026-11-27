@@ -1,0 +1,275 @@
+name: VM bundle build
+
+# The sealed customer VM bundle (AB#999, VM runtime spec r2 6.1 and 7.3) from pinned inputs:
+# the four static tools, the base root (ext4 and its dm-verity tree) and the stock Ubuntu
+# kernel with its module tree, both roots from one snapshot.ubuntu.com id, then the VM
+# initrd closure. Each lane runs on its own fresh hosted runner, and the summary job
+# requires byte-identical output from both lanes before it prints the digests; on any
+# difference it names the file (and the line or tar member inside it) and fails, never
+# picking a lane. While room-kit/vm/vm_initrd_closure.json is unpinned the lanes print the
+# closure this build resolves (build-vm-initrd.py pin) and stop there; once it is pinned they
+# also build the initrd, the manifest and the measurement of the fixture identity. Every
+# download is checked against a sha256 in scripts/vm_bundle_build_inputs.json,
+# scripts/vm_initrd_tools_inputs.json or requirements/vm-measure.txt, and both package sets
+# against the snapshot's signed indexes. GitHub-hosted only: never a hotel or Contabo.
+# This builds; it does not boot a VM.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "room-kit/vm/**"
+      - "room-kit/custom-guest/**"
+      - "room-kit/custom_guest_initrd.py"
+      - "room-kit/sealed/packages_lock.py"
+      - "scripts/build_vm_initrd_tools.py"
+      - "scripts/vm_initrd_tools_inputs.json"
+      - "scripts/vm_bundle_build_inputs.json"
+      - "scripts/fetch_vm_bundle_inputs.py"
+      - "scripts/vm_bundle_build_summary.py"
+      - "requirements/vm-measure.txt"
+      - ".github/workflows/vm-bundle-build.yml"
+  pull_request:
+    paths:
+      - "room-kit/vm/**"
+      - "room-kit/custom-guest/**"
+      - "room-kit/custom_guest_initrd.py"
+      - "room-kit/sealed/packages_lock.py"
+      - "scripts/build_vm_initrd_tools.py"
+      - "scripts/vm_initrd_tools_inputs.json"
+      - "scripts/vm_bundle_build_inputs.json"
+      - "scripts/fetch_vm_bundle_inputs.py"
+      - "scripts/vm_bundle_build_summary.py"
+      - "requirements/vm-measure.txt"
+      - ".github/workflows/vm-bundle-build.yml"
+
+concurrency:
+  group: vm-bundle-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # An explicit bash shell runs with -eo pipefail; the default on Linux has no pipefail.
+    shell: bash
+
+env:
+  # Both roots and the firmware come from this one snapshot (release, -updates, -security).
+  VM_BUNDLE_SNAPSHOT: 20261126T000000Z
+  VM_BUNDLE_SUITE: noble
+  VM_BUNDLE_LABEL: vm-v1-genoa
+  VM_BUNDLE_CPU_FAMILY: genoa
+  VM_BUNDLE_QEMU_VERSION: 10.2.1
+  VM_BUNDLE_INITRD_VERSION: vm1-0
+  VM_BUNDLE_OVMF_SOURCE: ovmf=2024.02-2ubuntu0.10
+  # No committed packages.lock yet: the lanes write both and the summary requires them equal.
+  VM_BUNDLE_LOCK_UPDATE: "1"
+
+jobs:
+  tools:
+    name: Static tools (${{ matrix.lane }})
+    runs-on: ubuntu-24.04
+    # As vm-guest.yml: gcc 15 from the digest-pinned ubuntu:26.04 image; the build prints its version.
+    container: ubuntu@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second]
+    steps:
+      - name: Toolchain
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends gcc libc6-dev make pkg-config python3 xz-utils binutils bzip2 patch ca-certificates
+          mkdir "$RUNNER_TEMP/record"
+          { gcc --version | head -n 1; make --version | head -n 1; python3 --version; } | tee "$RUNNER_TEMP/record/toolchain.txt"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Lock shape
+        run: python3 scripts/build_vm_initrd_tools.py lock-check
+      - name: Fetch the pinned inputs (each digest is checked)
+        run: python3 scripts/build_vm_initrd_tools.py fetch --inputs "$RUNNER_TEMP/inputs"
+      - name: Build twice and require identical static tools
+        run: |
+          python3 scripts/build_vm_initrd_tools.py build --inputs "$RUNNER_TEMP/inputs" --output "$RUNNER_TEMP/tools" --log "$RUNNER_TEMP/tools-build.log"
+          cp "$RUNNER_TEMP/record/toolchain.txt" "$RUNNER_TEMP/tools/toolchain.txt"
+          sha256sum "$RUNNER_TEMP"/tools/*
+      - name: Build log on failure
+        if: failure()
+        run: tail -n 120 "$RUNNER_TEMP/tools-build.log" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tools-${{ matrix.lane }}
+          path: ${{ runner.temp }}/tools/
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle:
+    name: Bundle (${{ matrix.lane }})
+    needs: tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Hosted Ubuntu 26.04 only (the host debs are pinned for it)
+        run: |
+          . /etc/os-release
+          [ "$VERSION_CODENAME" = resolute ] || { echo "runner is $PRETTY_NAME; the pinned mmdebstrap is for resolute" >&2; exit 1; }
+      - name: Fetch the pinned inputs (each sha256 is checked)
+        run: python3 -I scripts/fetch_vm_bundle_inputs.py --out "$RUNNER_TEMP/inputs" --group host --group ovmf --group go --group python
+      - name: Install mmdebstrap, Go, python-zstandard, the firmware and sev-snp-measure
+        run: |
+          sudo -n dpkg -i "$RUNNER_TEMP"/inputs/host/mmdebstrap_1.5.7-3_all.deb
+          mkdir "$RUNNER_TEMP/go-root" "$RUNNER_TEMP/pylib" "$RUNNER_TEMP/lane"
+          tar -xzf "$RUNNER_TEMP/inputs/go/go1.26.11.linux-amd64.tar.gz" -C "$RUNNER_TEMP/go-root"
+          echo "$RUNNER_TEMP/go-root/go/bin" >> "$GITHUB_PATH"
+          /usr/bin/python3 -I -m zipfile -e "$RUNNER_TEMP"/inputs/python/zstandard-0.25.0-*.whl "$RUNNER_TEMP/pylib"
+          dpkg-deb -x "$RUNNER_TEMP/inputs/ovmf/ovmf_2024.02-2ubuntu0.10_all.deb" "$RUNNER_TEMP/ovmf"
+          test -f "$RUNNER_TEMP/ovmf/usr/share/ovmf/OVMF.amdsev.fd"
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/vm-measure"
+          "$RUNNER_TEMP/vm-measure/bin/pip" install -q --no-deps --require-hashes -r requirements/vm-measure.txt
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tools-${{ matrix.lane }}
+          path: ${{ runner.temp }}/tools
+      - name: Toolchain record
+        run: |
+          # Artifacts do not keep the executable bit.
+          chmod 0755 "$RUNNER_TEMP"/tools/cryptsetup "$RUNNER_TEMP"/tools/veritysetup "$RUNNER_TEMP"/tools/mke2fs "$RUNNER_TEMP"/tools/resize2fs
+          {
+            echo "image: $ImageOS $ImageVersion"
+            mmdebstrap --version
+            apt-get --version | head -n 1
+            dpkg --version | head -n 1
+            /usr/bin/python3 --version
+            go version
+            PYTHONPATH="$RUNNER_TEMP/pylib" /usr/bin/python3 -c 'import zstandard; print("python-zstandard", zstandard.__version__, "libzstd", zstandard.ZSTD_VERSION)'
+            "$RUNNER_TEMP/tools/mke2fs" -V 2>&1 | head -n 1
+            "$RUNNER_TEMP/tools/veritysetup" --version
+            "$RUNNER_TEMP/vm-measure/bin/pip" freeze
+          } | tee "$RUNNER_TEMP/lane/toolchain.txt"
+      - name: bundle.env
+        run: |
+          # The checked-out commit's time, the same in both lanes; sudo would not see git's safe directory.
+          epoch=$(git log -1 --format=%ct)
+          cat > "$RUNNER_TEMP/bundle.env" <<EOF
+          VM_BUNDLE_OUT=$RUNNER_TEMP/bundle
+          VM_BUNDLE_SNAPSHOT=$VM_BUNDLE_SNAPSHOT
+          VM_BUNDLE_SUITE=$VM_BUNDLE_SUITE
+          VM_BUNDLE_LOCK_UPDATE=$VM_BUNDLE_LOCK_UPDATE
+          VM_BUNDLE_TOOLS=$RUNNER_TEMP/tools
+          SOURCE_DATE_EPOCH=$epoch
+          VM_BUNDLE_OVMF=$RUNNER_TEMP/ovmf/usr/share/ovmf/OVMF.amdsev.fd
+          VM_BUNDLE_OVMF_SOURCE=$VM_BUNDLE_OVMF_SOURCE
+          VM_BUNDLE_INITRD=$RUNNER_TEMP/initrd.cpio.zst
+          VM_BUNDLE_INITRD_VERSION=$VM_BUNDLE_INITRD_VERSION
+          VM_BUNDLE_LABEL=$VM_BUNDLE_LABEL
+          VM_BUNDLE_CPU_FAMILY=$VM_BUNDLE_CPU_FAMILY
+          VM_BUNDLE_QEMU_VERSION=$VM_BUNDLE_QEMU_VERSION
+          EOF
+          cat "$RUNNER_TEMP/bundle.env"
+      - name: Base root (mmdebstrap, ext4, dm-verity)
+        run: |
+          sudo -n bash room-kit/vm/build-bundle.sh base-root "$RUNNER_TEMP/bundle.env"
+          # File by file, so the summary can say which file differs if the images do.
+          sudo -n /usr/bin/python3 -I scripts/vm_bundle_build_summary.py tree "$RUNNER_TEMP/bundle/build/base-root" > "$RUNNER_TEMP/lane/base-root.tree.txt"
+      - name: Kernel and module tree
+        run: |
+          sudo -n bash room-kit/vm/build-bundle.sh kernel "$RUNNER_TEMP/bundle.env"
+          cat "$RUNNER_TEMP/bundle/build/kernel-release" "$RUNNER_TEMP/bundle/build/boot-modules.txt"
+      - name: VM initrd closure (pin while unpinned, else build and check)
+        run: |
+          kver=$(cat "$RUNNER_TEMP/bundle/build/kernel-release")
+          mkdir "$RUNNER_TEMP/modtree"
+          tar -xf "$RUNNER_TEMP/bundle/build/modules-$kver.tar" -C "$RUNNER_TEMP/modtree"
+          # An unpinned closure names no kernel yet: give it the one this build resolved. A
+          # closure that names another kernel is refused.
+          status=$(/usr/bin/python3 -I - "$kver" room-kit/vm/vm_initrd_closure.json "$RUNNER_TEMP/closure.json" <<'EOF'
+          import json, sys
+          kver, src, dst = sys.argv[1:]
+          closure = json.load(open(src))
+          if closure["kernel_release"] not in ("", kver):
+              sys.exit(f"the closure names kernel {closure['kernel_release']}; this build resolved {kver}")
+          closure["kernel_release"] = kver
+          with open(dst, "x") as out:
+              json.dump(closure, out, indent=2, sort_keys=True)
+          print(closure["status"])
+          EOF
+          )
+          echo "closure status: $status"
+          recipe=(env PYTHONPATH="$RUNNER_TEMP/pylib" /usr/bin/python3 room-kit/vm/build-vm-initrd.py)
+          inputs=(--module-dir room-kit/custom-guest --tools "$RUNNER_TEMP/tools" --modules "$RUNNER_TEMP/modtree/$kver")
+          if [ "$status" = pinned ]; then
+            "${recipe[@]}" build --closure room-kit/vm/vm_initrd_closure.json "${inputs[@]}" --archive "$RUNNER_TEMP/initrd.cpio.zst"
+            "${recipe[@]}" check --closure room-kit/vm/vm_initrd_closure.json --archive "$RUNNER_TEMP/initrd.cpio.zst"
+          else
+            "${recipe[@]}" pin --closure "$RUNNER_TEMP/closure.json" "${inputs[@]}" > "$RUNNER_TEMP/lane/pinned-closure.json"
+            /usr/bin/python3 -I -c 'import json, sys; c = json.load(open(sys.argv[1])); print(json.dumps({"kernel_release": c["kernel_release"], "executables": c["executables"], "module_files": len(c["modules"])}, indent=1))' "$RUNNER_TEMP/lane/pinned-closure.json"
+          fi
+      - name: Manifest and the fixture identity's measurement (pinned closure only)
+        run: |
+          [ -f "$RUNNER_TEMP/initrd.cpio.zst" ] || { echo "closure unpinned: no initrd, manifest or measurement in this run"; exit 0; }
+          sudo -n bash room-kit/vm/build-bundle.sh manifest "$RUNNER_TEMP/bundle.env"
+          # Identity "a" of tests/fixtures/vm_measure_v1.json, over this bundle; 2 vCPU, genoa.
+          /usr/bin/python3 -I -c 'import json, sys; a = json.load(open(sys.argv[1]))["identities"]["a"]; open(sys.argv[2], "x").write(a["ssh_key_line"] + "\n"); print(a["vm_id"], a["salt_hex"])' \
+            tests/fixtures/vm_measure_v1.json "$RUNNER_TEMP/fixture-key.pub" > "$RUNNER_TEMP/fixture-id.txt"
+          read -r vm_id salt < "$RUNNER_TEMP/fixture-id.txt"
+          /usr/bin/python3 -I room-kit/vm/vm_measure.py identity --bundle "$RUNNER_TEMP/bundle" --vm-id "$vm_id" \
+            --ssh-key-file "$RUNNER_TEMP/fixture-key.pub" --salt-hex "$salt" --out "$RUNNER_TEMP/lane/identity.json"
+          /usr/bin/python3 -I room-kit/vm/vm_measure.py launch --bundle "$RUNNER_TEMP/bundle" --identity "$RUNNER_TEMP/lane/identity.json" \
+            --vcpus 2 --cpu-family genoa --tool "$RUNNER_TEMP/vm-measure/bin/sev-snp-measure" > "$RUNNER_TEMP/lane/measurement.json"
+          cat "$RUNNER_TEMP/lane/measurement.json"
+      - name: Collect the lane's files
+        run: |
+          out=$RUNNER_TEMP/bundle
+          kver=$(cat "$out/build/kernel-release")
+          take() { sudo -n install -m 0644 -o "$(id -u)" -g "$(id -g)" "$1" "$RUNNER_TEMP/lane/$2"; }
+          take "$out/base-root.raw" base-root.raw
+          take "$out/base-root.packages.lock" base-root.packages.lock
+          take "$out/build/base-root.verity" base-root.verity
+          take "$out/build/base-root.data-bytes" base-root.data-bytes
+          take "$out/vmlinuz" vmlinuz
+          take "$out/kernel.packages.lock" kernel.packages.lock
+          take "$out/build/kernel-release" kernel-release
+          take "$out/build/boot-modules.txt" boot-modules.txt
+          take "$out/build/config-$kver" kernel.config
+          take "$out/build/modules-$kver.tar" modules.tar
+          for f in OVMF.amdsev.fd initrd.cpio.zst manifest.json; do
+            if [ -f "$out/$f" ]; then take "$out/$f" "$f"; fi
+          done
+          ls -la "$RUNNER_TEMP/lane"
+          sha256sum "$RUNNER_TEMP"/lane/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-${{ matrix.lane }}
+          path: ${{ runner.temp }}/lane/
+          if-no-files-found: error
+          retention-days: 14
+
+  summary:
+    name: Both lanes identical, digest summary
+    needs: [tools, bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/lanes
+      - name: Compare the lanes and write the published set
+        run: |
+          /usr/bin/python3 -I scripts/vm_bundle_build_summary.py compare --lanes "$RUNNER_TEMP/lanes" --out "$RUNNER_TEMP/vm-bundle"
+          cat "$RUNNER_TEMP/vm-bundle/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/vm-bundle/SHA256SUMS"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vm-bundle
+          path: ${{ runner.temp }}/vm-bundle/
+          if-no-files-found: error
+          retention-days: 30

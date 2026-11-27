@@ -1,7 +1,9 @@
 #!/bin/bash
 # Build the files of one sealed customer VM bundle (AB#999, VM runtime spec r2 6.1 and 7.3).
-# Run as root on a build host with mmdebstrap, e2fsprogs 1.47.1 or later, veritysetup
-# (cryptsetup-bin) and kmod.
+# Run as root on an Ubuntu build host with mmdebstrap, e2fsprogs 1.47.1 or later, veritysetup
+# (cryptsetup-bin) and kmod. VM_BUNDLE_TOOLS names a directory with the pinned static mke2fs
+# and veritysetup (scripts/build_vm_initrd_tools.py); the reference build
+# (.github/workflows/vm-bundle-build.yml) uses it so the image bytes do not follow the host.
 #
 #   build-bundle.sh base-root bundle.env [--verify-reproducible]
 #       the customer's base root: ext4 image + dm-verity tree
@@ -15,7 +17,7 @@
 #
 # The VM initrd (PR VM1b) is built between kernel and manifest: it packs the module
 # tree from $VM_BUNDLE_OUT/build/modules-<release>.tar. Both package sets come from one
-# pinned snapshot.ubuntu.com id and must equal their packages.lock (packages_lock.py, as
+# pinned snapshot.ubuntu.com id (its release, -updates and -security pockets) and must equal their packages.lock (packages_lock.py, as
 # build-guest.sh's pinned base). Output in $VM_BUNDLE_OUT, all digested by the manifest:
 #   OVMF.amdsev.fd vmlinuz initrd.cpio.zst base-root.raw base-root.packages.lock
 #   kernel.packages.lock manifest.json
@@ -62,10 +64,17 @@ SNAPSHOT_EPOCH=$(python3 "$LOCK_TOOL" snapshot-epoch "$SNAPSHOT") \
 SUITE=${VM_BUNDLE_SUITE:-noble}
 [[ "$SUITE" =~ ^[a-z]{2,20}$ ]] || die "VM_BUNDLE_SUITE must be an Ubuntu suite name"
 MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT
+KEYRING=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 OUT=${VM_BUNDLE_OUT:-}
 [[ "$OUT" = /* ]] || die "VM_BUNDLE_OUT must be an absolute directory"
 B=$OUT/build
 LOCK_UPDATE=${VM_BUNDLE_LOCK_UPDATE:-0}
+TOOLS=${VM_BUNDLE_TOOLS:-}
+if [ -n "$TOOLS" ] && ! { [ -x "$TOOLS/mke2fs" ] && [ -x "$TOOLS/veritysetup" ]; }; then
+  die "VM_BUNDLE_TOOLS must hold executable mke2fs and veritysetup"
+fi
+MKE2FS=${TOOLS:+$TOOLS/}mke2fs
+VERITYSETUP=${TOOLS:+$TOOLS/}veritysetup
 case "$LOCK_UPDATE" in 0|1) ;; *) die "VM_BUNDLE_LOCK_UPDATE must be 0 or 1" ;; esac
 # The kit commit time, so the same kit gives the same bytes on any build host.
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$KIT" log -1 --format=%ct 2>/dev/null || echo 0)}
@@ -89,7 +98,7 @@ clamp() { find "$1" -mindepth 1 -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +; }
 E2FSPROGS_MIN=1.47.1
 e2fsprogs_floor() {
   local have
-  have=$(mke2fs -V 2>&1 | awk 'NR == 1 && $1 == "mke2fs" { print $2 }')
+  have=$("${MKE2FS:-mke2fs}" -V 2>&1 | awk 'NR == 1 && $1 == "mke2fs" { print $2 }')
   python3 -c 'import re, sys
 have, want = sys.argv[1], sys.argv[2]
 m = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", have)
@@ -100,18 +109,24 @@ sys.exit(0 if m and tuple(int(x or 0) for x in m.groups()) >= tuple(map(int, wan
 
 # pinned_root NAME PACKAGES EXPECTED_LOCK: mmdebstrap NAME from the snapshot into $B/NAME and
 # write $OUT/NAME.packages.lock; stop unless it equals EXPECTED_LOCK (or LOCK_UPDATE=1).
+# The release, -updates and -security pockets all come from the one snapshot id, so the
+# kernel and every security fix are what that snapshot resolves, on any day it is built.
 pinned_root() {
-  local name=$1 pkgs=$2 want=$3 root=$B/$1
+  local name=$1 pkgs=$2 want=$3 root=$B/$1 pocket sources=()
   [ "$LOCK_UPDATE" = 1 ] || [ -f "$want" ] \
     || die "$name: set its expected packages.lock in bundle.env, or VM_BUNDLE_LOCK_UPDATE=1 to make one"
+  [ -f "$KEYRING" ] || die "no Ubuntu archive keyring at $KEYRING"
+  for pocket in "$SUITE" "$SUITE-updates" "$SUITE-security"; do
+    sources+=("deb [signed-by=$KEYRING] $MIRROR $pocket main universe")
+  done
   rm -rf "${root:?}" "$root.packages.lock.tmp"
-  log "mmdebstrap $SUITE $name from snapshot $SNAPSHOT"
+  log "mmdebstrap $SUITE $name from snapshot $SNAPSHOT ($SUITE, $SUITE-updates, $SUITE-security)"
   # The hook runs on the build host before mmdebstrap removes the apt lists, which hold
   # the sha256 of every .deb (packages_lock.py emit).
   ( export SOURCE_DATE_EPOCH=$SNAPSHOT_EPOCH
-    mmdebstrap --variant=minbase --aptopt='APT::Install-Recommends "false"' --components=main,universe \
+    mmdebstrap --variant=minbase --aptopt='APT::Install-Recommends "false"' \
       --customize-hook="python3 $(printf '%q' "$LOCK_TOOL") emit \"\$1\" > $(printf '%q' "$root.packages.lock.tmp")" \
-      --include="$pkgs" "$SUITE" "$root" "$MIRROR" )
+      --include="$pkgs" "$SUITE" "$root" "${sources[@]}" )
   mv "$root.packages.lock.tmp" "$OUT/$name.packages.lock"
   python3 "$LOCK_TOOL" check "$root" "$OUT/$name.packages.lock" || die "$name does not match its packages.lock"
   if [ "$LOCK_UPDATE" = 1 ]; then
@@ -198,8 +213,9 @@ EOF
   size_mib=$(( (size_mib + 3) / 4 * 4 ))
   rm -f "$B/base-root.ext4"
   # SOURCE_DATE_EPOCH (not E2FSPROGS_FAKE_TIME) is what turns on the clamping; LC_ALL=C
-  # fixes the name order mke2fs -d adds files in (scandir with alphasort).
-  LC_ALL=C SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH mkfs.ext4 -q -F -b 4096 -L cathedral-root \
+  # fixes the name order mke2fs -d adds files in (scandir with alphasort). MKE2FS_CONFIG
+  # names no file, so mke2fs takes its compiled-in defaults, not the host's /etc/mke2fs.conf.
+  LC_ALL=C SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH MKE2FS_CONFIG=$B/no-mke2fs.conf "$MKE2FS" -t ext4 -q -F -b 4096 -L cathedral-root \
     -U "$(uuid_of "cathedral-vm-base-root-fs $lock_sha")" \
     -E "hash_seed=$(uuid_of "cathedral-vm-base-root-hash $lock_sha"),root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0,nodiscard" \
     -d "$R" "$B/base-root.ext4" "${size_mib}M"
@@ -211,12 +227,12 @@ EOF
   [ $(( data_bytes % 4096 )) = 0 ] || die "the base root image is not 4 KiB aligned"
   salt=$(sha256sum < "$B/base-root.ext4" | cut -d' ' -f1)
   cp "$B/base-root.ext4" "$B/base-root.raw.tmp"
-  veritysetup format "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" --data-block-size=4096 --hash-block-size=4096 \
+  "$VERITYSETUP" format "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" --data-block-size=4096 --hash-block-size=4096 \
     --data-blocks=$(( data_bytes / 4096 )) --hash-offset="$data_bytes" --salt="$salt" \
     --uuid="$(uuid_of "cathedral-vm-base-root-verity $salt")" > "$B/base-root.verity.txt"
   root_hash=$(awk -F: '/^Root hash:/ { gsub(/[ \t]/, "", $2); print $2 }' "$B/base-root.verity.txt")
   [[ "$root_hash" =~ ^[0-9a-f]{64}$ ]] || die "veritysetup gave no root hash"
-  veritysetup verify "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" "$root_hash" --hash-offset="$data_bytes" \
+  "$VERITYSETUP" verify "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" "$root_hash" --hash-offset="$data_bytes" \
     || die "the base root fails its own verity check"
   mv "$B/base-root.raw.tmp" "$OUT/base-root.raw"
   echo "$root_hash" > "$B/base-root.verity"
@@ -239,8 +255,25 @@ build_kernel() {
   done
   # A built-in cmdline would add kernel parameters outside the measured template.
   ! grep -qx 'CONFIG_CMDLINE_BOOL=y' "$K/boot/config-$kver" || die "kernel $kver: CONFIG_CMDLINE_BOOL must be off"
+  # Each boot module is a module file or built in. A built-in one must be listed in the
+  # package's modules.builtin; the VM initrd recipe then ships no file for it and the init
+  # loads none (build-vm-initrd.py load_order). build/boot-modules.txt records which is which.
+  local file key tree
+  tree=$(readlink -f "$K/lib/modules/$kver")
+  : > "$B/boot-modules.txt"
   for m in $KERNEL_MODULES; do
-    modinfo -b "$K" -k "$kver" -F name "$m" >/dev/null 2>&1 || die "kernel $kver: module $m is missing"
+    file=$(modinfo -b "$K" -k "$kver" -F filename "$m" 2>/dev/null) || die "kernel $kver: module $m is missing"
+    key=${m//-/_}
+    if [ "$file" = "(builtin)" ]; then
+      awk -v k="$key" '{ n = $0; sub(/.*\//, "", n); sub(/\.ko$/, "", n); gsub(/-/, "_", n); if (n == k) found = 1 }
+        END { exit !found }' "$K/lib/modules/$kver/modules.builtin" \
+        || die "kernel $kver: modinfo says $m is built in, but modules.builtin does not list it"
+      echo "$m built-in" >> "$B/boot-modules.txt"
+    else
+      file=$(readlink -f "$file")
+      [[ "$file" = "$tree/"* ]] && [ -f "$file" ] || die "kernel $kver: module $m is outside its module tree"
+      echo "$m module ${file#"$tree/"}" >> "$B/boot-modules.txt"
+    fi
   done
   install -m 0644 "$K/boot/vmlinuz-$kver" "$OUT/vmlinuz"
   install -m 0644 "$K/boot/config-$kver" "$B/config-$kver"
@@ -282,7 +315,7 @@ build_manifest() {
 step_outputs() {
   case "$CMD" in
     base-root) echo base-root.raw base-root.packages.lock build/base-root.verity build/base-root.data-bytes ;;
-    kernel) echo vmlinuz kernel.packages.lock build/kernel-release "build/config-$(cat "$B/kernel-release")" \
+    kernel) echo vmlinuz kernel.packages.lock build/kernel-release build/boot-modules.txt "build/config-$(cat "$B/kernel-release")" \
                  "build/modules-$(cat "$B/kernel-release").tar" ;;
   esac
 }

@@ -488,6 +488,24 @@ def test_mkfs_runs_with_source_date_epoch_after_the_floor():
     text = BUILD.read_text()
     base = text[text.index("build_base_root() {"):text.index("# ---------------------------------------------------------------- kernel")]
     assert base.index("e2fsprogs_floor") < base.index("pinned_root base-root")
-    mkfs = next(line for line in base.splitlines() if "mkfs.ext4" in line)
+    mkfs = next(line for line in base.splitlines() if '"$MKE2FS" -t ext4' in line)
     assert "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" in mkfs and "LC_ALL=C" in mkfs
+    # No host /etc/mke2fs.conf: the compiled-in defaults of the pinned mke2fs.
+    assert "MKE2FS_CONFIG=$B/no-mke2fs.conf" in mkfs
     assert "E2FSPROGS_FAKE_TIME=" not in base
+
+
+def test_both_roots_take_all_three_pockets_of_one_snapshot():
+    text = BUILD.read_text()
+    root = text[text.index("pinned_root() {"):text.index("# ---------------------------------------------------------------- base root")]
+    assert 'for pocket in "$SUITE" "$SUITE-updates" "$SUITE-security"; do' in root
+    assert 'sources+=("deb [signed-by=$KEYRING] $MIRROR $pocket main universe")' in root
+    assert '"${sources[@]}"' in root and "--components" not in root
+    assert "MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT" in text
+
+
+def test_kernel_step_records_built_in_boot_modules():
+    text = BUILD.read_text()
+    kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]
+    assert "modules.builtin" in kernel and '"$B/boot-modules.txt"' in kernel
+    assert "build/boot-modules.txt" in text[text.index("step_outputs() {"):]
