@@ -34,8 +34,12 @@ LOCK_TOOL=$KIT/sealed/packages_lock.py
 # the link; sshd takes the host keys the init makes at first boot.
 BASE_PKGS=systemd,systemd-sysv,systemd-resolved,systemd-timesyncd,udev,kmod,dbus,iproute2,iputils-ping,netbase,openssh-server,sudo,ca-certificates,curl,gnupg,less,vim-tiny,procps,psmisc,util-linux,passwd,e2fsprogs,tzdata,locales,bash-completion,apt-utils,lsb-release
 # Stock Ubuntu kernel, the package the kit boots (build-guest.sh PKGS). Only its vmlinuz
-# and module tree leave this root.
+# and the boot modules leave this root.
 KERNEL_PKGS=linux-image-virtual
+# sev-guest (with tsm, which it needs) and qemu_fw_cfg are only in linux-modules-extra, which
+# is versioned: bundle.env names the release (VM_BUNDLE_KERNEL_RELEASE) and the build stops
+# unless linux-image-virtual resolves to the same one in the snapshot.
+KERNEL_EXTRA_PKG=linux-modules-extra
 # Loaded or built in; the VM init (7.2) needs each one before it can open the disks.
 KERNEL_MODULES="sev-guest dm-verity dm-crypt qemu_fw_cfg virtio_blk virtio_net"
 KERNEL_CONFIG_Y="AMD_MEM_ENCRYPT EFI_STUB BLK_DEV_INITRD RD_ZSTD"
@@ -62,6 +66,10 @@ SNAPSHOT=${VM_BUNDLE_SNAPSHOT:-}
 SNAPSHOT_EPOCH=$(python3 "$LOCK_TOOL" snapshot-epoch "$SNAPSHOT") \
   || die "VM_BUNDLE_SNAPSHOT must be a snapshot.ubuntu.com id such as 20261101T000000Z: a bundle builds only from a pinned snapshot"
 SUITE=${VM_BUNDLE_SUITE:-noble}
+KERNEL_RELEASE=${VM_BUNDLE_KERNEL_RELEASE:-}
+if [ "$CMD" = kernel ] && ! [[ "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9]+$ ]]; then
+  die "VM_BUNDLE_KERNEL_RELEASE must name the kernel release the snapshot resolves, such as 6.8.0-151-generic"
+fi
 [[ "$SUITE" =~ ^[a-z]{2,20}$ ]] || die "VM_BUNDLE_SUITE must be an Ubuntu suite name"
 MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT
 KEYRING=/usr/share/keyrings/ubuntu-archive-keyring.gpg
@@ -242,9 +250,11 @@ EOF
 
 # ---------------------------------------------------------------- kernel and modules (6.1)
 build_kernel() {
-  pinned_root kernel "$KERNEL_PKGS" "${VM_BUNDLE_KERNEL_LOCK:-}"
+  pinned_root kernel "$KERNEL_PKGS,$KERNEL_EXTRA_PKG-$KERNEL_RELEASE" "${VM_BUNDLE_KERNEL_LOCK:-}"
   local K=$B/kernel kver opt m
   kver=$(python3 "$LOCK_TOOL" kernel "$OUT/kernel.packages.lock")
+  [ "$kver" = "$KERNEL_RELEASE" ] \
+    || die "linux-image-virtual resolves to $kver in snapshot $SNAPSHOT, but VM_BUNDLE_KERNEL_RELEASE is $KERNEL_RELEASE"
   [ -f "$K/boot/vmlinuz-$kver" ] && [ -f "$K/boot/config-$kver" ] && [ -d "$K/lib/modules/$kver" ] \
     || die "kernel $kver: vmlinuz, config or module tree missing"
   for opt in $KERNEL_CONFIG_Y; do
@@ -278,7 +288,43 @@ build_kernel() {
   install -m 0644 "$K/boot/vmlinuz-$kver" "$OUT/vmlinuz"
   install -m 0644 "$K/boot/config-$kver" "$B/config-$kver"
   # The module tree for the VM initrd (VM1b), which bind-mounts it read-only at
-  # /lib/modules/<release> in the customer root (6.1).
+  # /lib/modules/<release> in the customer root (6.1). It holds the boot module files and
+  # what modules.dep says they need, nothing else of the two packages: every other module,
+  # the vdso and its .build-id links go, modules.order is cut to the kept files, and the
+  # depmod of this root (its pinned kmod) rebuilds the indexes for that set.
+  python3 -I - "$tree" "$B/boot-modules.txt" <<'EOF' || die "kernel $kver: cannot cut the module tree to the boot modules"
+import sys
+from pathlib import Path
+tree, listing = Path(sys.argv[1]), Path(sys.argv[2])
+dep = {}
+for line in (tree / "modules.dep").read_text().splitlines():
+    name, _, needs = line.partition(":")
+    dep[name] = needs.split()
+keep = set()
+for line in listing.read_text().splitlines():
+    fields = line.split()
+    if fields[1] == "module":
+        if fields[2] not in dep:
+            sys.exit(f"modules.dep has no entry for {fields[2]}")
+        keep.add(fields[2])
+        keep.update(dep[fields[2]])
+indexes = {"modules.builtin", "modules.builtin.modinfo", "modules.order"}
+for path in sorted(tree.rglob("*"), reverse=True):
+    rel = path.relative_to(tree).as_posix()
+    if path.is_symlink() or not path.is_dir():
+        if rel not in keep and rel not in indexes:
+            path.unlink()
+    elif not any(path.iterdir()):
+        path.rmdir()
+order = tree / "modules.order"
+kept = [line for line in order.read_text().splitlines() if line in keep or line + ".zst" in keep]
+order.write_text("".join(line + "\n" for line in kept))
+print("kept module files:", " ".join(sorted(keep)))
+EOF
+  chroot "$K" depmod -a "$kver"
+  for m in $KERNEL_MODULES; do
+    modinfo -b "$K" -k "$kver" -F filename "$m" >/dev/null 2>&1 || die "kernel $kver: module $m is missing after the cut"
+  done
   clamp "$K/lib/modules/$kver"
   tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
     -C "$K/lib/modules" -cf "$B/modules-$kver.tar" "$kver"

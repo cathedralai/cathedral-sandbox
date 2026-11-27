@@ -60,6 +60,8 @@ env:
   # Both roots and the firmware come from this one snapshot (release, -updates, -security).
   VM_BUNDLE_SNAPSHOT: 20261126T000000Z
   VM_BUNDLE_SUITE: noble
+  # What linux-image-virtual resolves to in the snapshot; the build checks it.
+  VM_BUNDLE_KERNEL_RELEASE: 6.8.0-151-generic
   VM_BUNDLE_LABEL: vm-v1-genoa
   VM_BUNDLE_CPU_FAMILY: genoa
   VM_BUNDLE_QEMU_VERSION: 10.2.1
@@ -162,6 +164,7 @@ jobs:
           VM_BUNDLE_OUT=$RUNNER_TEMP/bundle
           VM_BUNDLE_SNAPSHOT=$VM_BUNDLE_SNAPSHOT
           VM_BUNDLE_SUITE=$VM_BUNDLE_SUITE
+          VM_BUNDLE_KERNEL_RELEASE=$VM_BUNDLE_KERNEL_RELEASE
           VM_BUNDLE_LOCK_UPDATE=$VM_BUNDLE_LOCK_UPDATE
           VM_BUNDLE_TOOLS=$RUNNER_TEMP/tools
           SOURCE_DATE_EPOCH=$epoch

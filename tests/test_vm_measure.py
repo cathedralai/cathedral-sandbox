@@ -504,6 +504,71 @@ def test_both_roots_take_all_three_pockets_of_one_snapshot():
     assert "MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT" in text
 
 
+def test_kernel_step_takes_the_extra_modules_of_the_named_release():
+    assert _assignment("KERNEL_EXTRA_PKG") == "linux-modules-extra"
+    text = BUILD.read_text()
+    kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]
+    assert 'pinned_root kernel "$KERNEL_PKGS,$KERNEL_EXTRA_PKG-$KERNEL_RELEASE"' in kernel
+    assert '[ "$kver" = "$KERNEL_RELEASE" ]' in kernel
+
+
+def _module_cut_script() -> str:
+    text = BUILD.read_text()
+    start = text.index("\n", text.index('python3 -I - "$tree" "$B/boot-modules.txt" <<\'EOF\'')) + 1
+    return text[start:text.index("\nEOF\n", start) + 1]
+
+
+def test_module_cut_keeps_the_boot_modules_and_their_dependencies_only(tmp_path):
+    tree = tmp_path / "6.8.0-151-generic"
+    files = {
+        "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst": "kernel/drivers/virt/coco/tsm.ko.zst",
+        "kernel/drivers/virt/coco/tsm.ko.zst": "",
+        "kernel/drivers/md/dm-verity.ko.zst": "kernel/drivers/md/dm-bufio.ko.zst",
+        "kernel/drivers/md/dm-bufio.ko.zst": "",
+        "kernel/drivers/md/dm-crypt.ko.zst": "",
+        "kernel/drivers/firmware/qemu_fw_cfg.ko.zst": "",
+        "kernel/sound/core/snd.ko.zst": "",
+        "kernel/drivers/net/wireless/foo.ko.zst": "kernel/sound/core/snd.ko.zst",
+    }
+    for rel in files:
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_bytes(b"ko")
+    (tree / "modules.dep").write_text("".join(f"{rel}: {needs}".rstrip() + "\n" for rel, needs in files.items()))
+    (tree / "modules.order").write_text("".join(rel.removesuffix(".zst") + "\n" for rel in files))
+    for index in ("modules.builtin", "modules.builtin.modinfo", "modules.alias", "modules.dep.bin"):
+        (tree / index).write_text("x\n")
+    (tree / "vdso" / ".build-id" / "3e").mkdir(parents=True)
+    (tree / "vdso" / "vdso64.so").write_bytes(b"elf")
+    os.symlink("../../vdso64.so", tree / "vdso" / ".build-id" / "3e" / "e2.debug")
+    listing = tmp_path / "boot-modules.txt"
+    listing.write_text("sev-guest module kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst\n"
+                       "dm-verity module kernel/drivers/md/dm-verity.ko.zst\n"
+                       "dm-crypt module kernel/drivers/md/dm-crypt.ko.zst\n"
+                       "qemu_fw_cfg module kernel/drivers/firmware/qemu_fw_cfg.ko.zst\n"
+                       "virtio_blk built-in\nvirtio_net built-in\n")
+    r = subprocess.run([sys.executable, "-I", "-", str(tree), str(listing)], input=_module_cut_script(),
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    left = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file() or p.is_symlink())
+    kept = sorted(rel for rel in files if "snd" not in rel and "wireless" not in rel)
+    # modules.dep and the other depmod outputs go too; depmod rebuilds them for the kept set.
+    assert left == sorted(kept + ["modules.builtin", "modules.builtin.modinfo", "modules.order"])
+    assert not (tree / "vdso").exists() and not (tree / "kernel/sound").exists()
+    assert (tree / "modules.order").read_text().splitlines() == [rel.removesuffix(".zst") for rel in files if rel in kept]
+
+
+def test_module_cut_refuses_a_boot_module_modules_dep_does_not_know(tmp_path):
+    tree = tmp_path / "t"
+    tree.mkdir()
+    (tree / "modules.dep").write_text("kernel/a.ko.zst:\n")
+    (tree / "modules.order").write_text("kernel/a.ko\n")
+    listing = tmp_path / "boot-modules.txt"
+    listing.write_text("sev-guest module kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst\n")
+    r = subprocess.run([sys.executable, "-I", "-", str(tree), str(listing)], input=_module_cut_script(),
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "modules.dep has no entry" in r.stderr
+
+
 def test_kernel_step_records_built_in_boot_modules():
     text = BUILD.read_text()
     kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]

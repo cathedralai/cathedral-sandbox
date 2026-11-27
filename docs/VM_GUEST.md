@@ -110,7 +110,8 @@ merges them after PRs A, B and C land.
 mode fixed per artifact. It reuses `custom_guest_initrd.py` read-only.
 
 - Contents: `/init` and two more Go mains (built twice, identical, with an empty `-tags`), four static
-  C tools, the kernel module tree under `usr/lib/modules/<release>/` (each file pinned), and two
+  C tools, the kernel module tree under `usr/lib/modules/<release>/` (each file pinned; only the boot
+  modules and their `modules.dep` dependencies, with the indexes depmod rebuilds for them), and two
   generated files for the init: `usr/lib/cathedral/vm-closure.json` and `usr/lib/cathedral/vm-modules.list`
   (boot modules in load order from `modules.dep`, dependencies first; built-in modules need no file).
   `build-bundle.sh` takes the archive through its existing `VM_BUNDLE_INITRD` hook.

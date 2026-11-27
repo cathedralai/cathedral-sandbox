@@ -125,13 +125,10 @@ def read(directory, name):
 
 
 def closure_rows(pinned):
-    """The digests a reviewer pins: the executables, then the module tree's index files."""
+    """The digests a reviewer pins: the executables, then every module tree file (the boot
+    modules, their dependencies and the indexes)."""
     rows = dict(sorted(pinned.get("executables", {}).items()))
-    release = pinned.get("kernel_release", "")
-    for index in ("modules.builtin", "modules.dep", "modules.order"):
-        key = f"usr/lib/modules/{release}/{index}"
-        if key in pinned.get("modules", {}):
-            rows[key] = pinned["modules"][key]
+    rows.update(sorted(pinned.get("modules", {}).items()))
     return rows
 
 
