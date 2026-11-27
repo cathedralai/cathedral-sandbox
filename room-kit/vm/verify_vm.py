@@ -29,11 +29,15 @@ import argparse
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import selectors
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from cryptography import x509
@@ -41,27 +45,22 @@ from cryptography.exceptions import InvalidSignature
 
 VM_KIT = Path(__file__).resolve().parent
 sys.path[:0] = [str(VM_KIT), str(VM_KIT.parent)]
-import custom_guest_protocol as protocol
-import verify_custom_guest as vcg
 import verify_receipts as vr
 import vm_measure
 
 SCHEMA = "cathedral.vm.verify/v1"
 
 # ---- guest contract ---------------------------------------------------------------
-# What the VM's measured initrd provides, in one place.
-# - Spec r3 6.4 fixes the attest path (cathedral-attest from the measured initrd, bind-mounted
-#   at /run/cathedral/bin) and the REPORT_DATA tag: the VM's own, so a VM report never reads
-#   as a custom guest one (custom_guest_protocol.REPORT_DOMAIN).
-# - The answer member is report_b64, as snp_guest_report.collect prints it (#774, #776).
-# - Chaser confirms in PR VM1b: the login user and running the attest command with sudo -n.
+# What the VM's measured initrd provides (spec r3 6.4: cathedral-attest from the initrd,
+# bind-mounted at /run/cathedral/bin). The guest side is PR VM1b: Chaser confirms every
+# value in this block there. Until then they are the values agreed with team-lead, 27 Nov.
 GUEST_USER = "cathedral"  # the login user (README: ssh -p <port> cathedral@<host>)
 GUEST_ATTEST = "/run/cathedral/bin/cathedral-attest"
 GUEST_ATTEST_COMMAND = "sudo -n " + GUEST_ATTEST + " {challenge_hex}"
-# REPORT_DATA = sha512(REPORT_DATA_DOMAIN || challenge[32] || sha256(host_key_blob)): the
-# custom guest formula (D 10.1, 10.2, custom_guest_protocol.report_data) under the VM's tag.
+# REPORT_DATA = sha512(REPORT_DATA_DOMAIN || challenge[32] || sha256(host_key_blob)), the
+# custom guest pattern (D 10.1, 10.2) under the VM's own tag.
 REPORT_DATA_DOMAIN = b"cathedral-vm-report/v1\0"
-ANSWER_REPORT_KEY = "report_b64"
+ANSWER_REPORT_KEY = "report_b64"  # the guest prints one JSON object with this member
 
 # ---- report rules -----------------------------------------------------------------
 # 3 and 4 carry the CPUID fields; Turin firmware writes 5 (AMD SEV-SNP ABI 1.58, table 23).
@@ -91,11 +90,14 @@ DOES_NOT_PROVE = [
     "that the VM stays on one chip across reports: the chip pin (verify_vm.py pin, spec 7.5) is not in this version",
 ]
 
-SSH_BIN = "/usr/bin/ssh"  # what verify_custom_guest.ssh_command runs; tests point it at a fake
+SSH_BIN = "/usr/bin/ssh"
 SSH_TIMEOUT = 45
+SSH_EXIT_ERROR = 255  # ssh's own failure (connection, host key, auth), not the remote command's
 ANSWER_MAX = 65536
 REPORT_B64_MAX = 2048
 CRL_MAX = 1024 * 1024
+ED25519_BLOB_PREFIX = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -165,23 +167,97 @@ def floor_for(cpu_family: str, specs: list[str] | None) -> dict[str, int]:
 
 
 # ---- SSH channel binding ------------------------------------------------------------
-# The connection, its bounded run and the known_hosts read are verify_custom_guest.py's (#776),
-# used unchanged. The VM differs in two places, kept here: the remote command (spec r3 6.4)
-# and the REPORT_DATA tag.
+# The four helpers below copy the pattern of verify_custom_guest.py. Consolidate with
+# verify_custom_guest.py (#776, merged): a follow-up imports its helpers instead.
+
+def endpoint(host: str, port: int) -> str:
+    """The known_hosts name of host:port."""
+    need(type(port) is int and 1 <= port <= 65535, "ssh_target", "--port must be 1 to 65535", CannotCheck)
+    need(type(host) is str and 0 < len(host) <= 253, "ssh_target", "--host is invalid", CannotCheck)
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        need(all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part) for part in host.split(".")),
+             "ssh_target", "--host must be an IP address or a DNS name", CannotCheck)
+    return host if port == 22 else f"[{host}]:{port}"
+
 
 def ssh_argv(host: str, port: int, user: str, ssh_key: str, known_hosts: Path, challenge: bytes) -> list[str]:
-    """#776's argv (one connection; no user or system config, agent, mux or proxy; ed25519 host
-    keys only; accept-new on an empty known_hosts, so OpenSSH records the key only after it
-    checked the KEX signature), with the VM's attest command as the remote command."""
+    """One connection, no user or system config, no agent, mux or proxy, ed25519 host keys only.
+    accept-new on an empty file records the key only after OpenSSH verified the KEX signature."""
+    endpoint(host, port)
+    need(type(user) is str and USER_RE.fullmatch(user) is not None, "ssh_target", "--user is invalid", CannotCheck)
+    need(type(challenge) is bytes and len(challenge) == 32, "challenge", "the challenge must be 32 bytes", CannotCheck)
+    options = {
+        "UserKnownHostsFile": str(known_hosts), "GlobalKnownHostsFile": "/dev/null",
+        "StrictHostKeyChecking": "accept-new", "HostKeyAlgorithms": "ssh-ed25519",
+        "HashKnownHosts": "no", "CheckHostIP": "no", "VerifyHostKeyDNS": "no", "UpdateHostKeys": "no",
+        "BatchMode": "yes", "PasswordAuthentication": "no", "KbdInteractiveAuthentication": "no",
+        "IdentitiesOnly": "yes", "IdentityAgent": "none", "ForwardAgent": "no", "ForwardX11": "no",
+        "ClearAllForwardings": "yes", "PermitLocalCommand": "no", "ControlMaster": "no",
+        "ControlPath": "none", "ProxyCommand": "none", "ProxyJump": "none",
+        "ConnectTimeout": "15", "ConnectionAttempts": "1", "LogLevel": "ERROR",
+    }
+    argv = [SSH_BIN, "-F", "/dev/null", "-T"]
+    for key, value in options.items():
+        argv += ["-o", f"{key}={value}"]
+    return argv + ["-i", str(Path(ssh_key).resolve()), "-p", str(port), "-l", user, host,
+                   GUEST_ATTEST_COMMAND.format(challenge_hex=challenge.hex())]
+
+
+def run_bounded(argv: list[str], timeout: float = SSH_TIMEOUT, limit: int = ANSWER_MAX) -> tuple[int, bytes, bytes]:
+    """Run our own child, drain both pipes within byte and time bounds, and always reap it."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = {"out": bytearray(), "err": bytearray()}
     try:
-        argv = vcg.ssh_command(host, port, user, ssh_key, known_hosts, challenge)
-    except protocol.ProtocolError as exc:
-        raise CannotCheck("ssh_target", str(exc)) from None
-    # #776 ends its argv with the host and the custom guest's command. Refuse a layout this
-    # wrapper was not written for rather than send the wrong command.
-    need(argv[0] == "/usr/bin/ssh" and argv[-2] == host and argv[-1] == "/usr/bin/cathedral-attest " + challenge.hex(),
-         "ssh_target", "verify_custom_guest.ssh_command changed its argv layout", CannotCheck)
-    return [SSH_BIN, *argv[1:-1], GUEST_ATTEST_COMMAND.format(challenge_hex=challenge.hex())]
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ, "out")
+            selector.register(proc.stderr, selectors.EVENT_READ, "err")
+            deadline = time.monotonic() + timeout
+            while selector.get_map():
+                left = deadline - time.monotonic()
+                need(left > 0, "ssh_failed", f"no answer within {timeout:g} s", CannotCheck)
+                for key, _ in selector.select(min(left, 0.1)):
+                    chunk = os.read(key.fd, 4096)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    output[key.data].extend(chunk)
+                    need(len(output["out"]) <= limit, "answer_invalid", f"the answer exceeds {limit} bytes")
+                    need(len(output["err"]) <= limit, "ssh_failed", f"ssh wrote more than {limit} bytes of errors",
+                         CannotCheck)
+            try:
+                code = proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                raise CannotCheck("ssh_failed", f"no answer within {timeout:g} s") from None
+        return code, bytes(output["out"]), bytes(output["err"])
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def connection_key(raw: bytes, host: str, port: int) -> bytes:
+    """The SSH wire blob of the one ed25519 host key this connection recorded."""
+    need(type(raw) is bytes and len(raw) <= 4096, "host_key_invalid", "known_hosts is too large")
+    lines = raw.splitlines()
+    need(len(lines) == 1, "host_key_invalid", "expected exactly one host key for this connection")
+    parts = lines[0].split()
+    need(len(parts) == 3 and parts[0] == endpoint(host, port).encode() and parts[1] == b"ssh-ed25519",
+         "host_key_invalid", "the recorded host key is not one ssh-ed25519 key for this host and port")
+    try:
+        blob = base64.b64decode(parts[2], validate=True)
+    except (binascii.Error, ValueError):
+        raise Refused("host_key_invalid", "the recorded host key is not base64") from None
+    need(len(blob) == len(ED25519_BLOB_PREFIX) + 32 and blob.startswith(ED25519_BLOB_PREFIX)
+         and base64.b64encode(blob) == parts[2], "host_key_invalid", "the recorded host key is not an ed25519 key")
+    return blob
+
+
+def _printable(raw: bytes, limit: int = 200) -> str:
+    return "".join(c for c in raw[:limit].decode("ascii", "replace") if 0x20 <= ord(c) <= 0x7E)
 
 
 def exchange(host: str, port: int, user: str, ssh_key: str, challenge: bytes) -> tuple[bytes, bytes]:
@@ -191,28 +267,22 @@ def exchange(host: str, port: int, user: str, ssh_key: str, challenge: bytes) ->
     with tempfile.TemporaryDirectory(prefix="cathedral-vm-verify-") as temp:
         known = Path(temp) / "known_hosts"
         known.touch(mode=0o600)
-        argv = ssh_argv(host, port, user, ssh_key, known, challenge)
         try:
-            out = vcg.bounded_command(argv, timeout=SSH_TIMEOUT, limit=ANSWER_MAX)
-        except protocol.ProtocolError as exc:
-            raise CannotCheck("ssh_failed", f"{exc}; run the same ssh by hand to see why") from None
+            code, out, err = run_bounded(ssh_argv(host, port, user, ssh_key, known, challenge))
         except OSError as exc:
-            raise CannotCheck("ssh_failed", f"cannot run {argv[0]}: {exc.strerror or type(exc).__name__}") from None
+            raise CannotCheck("ssh_failed", f"cannot run {SSH_BIN}: {exc.strerror or type(exc).__name__}") from None
+        need(code != SSH_EXIT_ERROR, "ssh_failed", f"ssh failed: {_printable(err)}", CannotCheck)
+        need(code == 0, "attest_failed", f"the VM's attest command exited {code}: {_printable(out or err)}")
         with open(known, "rb") as f:
-            raw = f.read(4097)
-    try:
-        return out, vcg.connection_key(raw, host, port)
-    except ValueError as exc:  # protocol.ProtocolError, or binascii.Error from the base64 field
-        raise Refused("host_key_invalid", str(exc) or "the recorded host key is not base64") from None
+            host_blob = connection_key(f.read(4097), host, port)
+    return out, host_blob
 
 
 def report_data(challenge: bytes, host_blob: bytes) -> bytes:
     """The 64 bytes the VM must put in REPORT_DATA for this challenge on this connection."""
     need(type(challenge) is bytes and len(challenge) == 32, "challenge", "the challenge must be 32 bytes", CannotCheck)
-    try:
-        protocol.host_key_blob(host_blob)
-    except protocol.ProtocolError as exc:
-        raise Refused("host_key_invalid", str(exc)) from None
+    need(type(host_blob) is bytes and len(host_blob) == len(ED25519_BLOB_PREFIX) + 32
+         and host_blob.startswith(ED25519_BLOB_PREFIX), "host_key_invalid", "the host key is not an ed25519 blob")
     return hashlib.sha512(REPORT_DATA_DOMAIN + challenge + hashlib.sha256(host_blob).digest()).digest()
 
 
