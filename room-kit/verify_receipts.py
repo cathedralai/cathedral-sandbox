@@ -25,9 +25,9 @@ Sealed (schema cathedral_sealed_hotel_binding_v1). Checks, in order:
      Optional --min-genoa-snp-spl checks the current, reported, committed and
      launch SNP TCB components after the AMD chain; it cannot prove the OEM
      PI, mitigation bit or full microcode patch in AMD-SB-3059/3061. It is
-     not applied to Milan and refuses Turin (no Turin floor is defined).
+     not applied to Milan and refuses Turin (use --min-tcb turin:... instead).
      Optional --min-tcb GEN:bl=N,tee=N,snp=N,ucode=N (AB#968, repeat per
-     generation; today only genoa, CPUID family 0x19 models 0x10 to 0x1F)
+     generation; genoa, or turin with an additional required fmc=N component)
      checks every component of the current, reported, committed and launch
      TCB; a newer SNP byte does not make up for an older microcode byte, and
      a processor the floor does not name fails. Under a floor the report must
@@ -437,14 +437,18 @@ def product(rep: dict, override: str | None) -> str:
     return shown
 
 
-# --min-tcb (AB#968). A generation is a CPUID family and a published model range, not product()'s "model >= 0x10":
-# Genoa is family 0x19 models 0x10 to 0x1F (every live hotel is 0x11). Bergamo, Siena, Milan and Turin are not
-# named, so a floor fails on them instead of passing unchecked.
-TCB_GENERATIONS = {"genoa": (0x19, range(0x10, 0x20))}
-TCB_COMPONENTS = {"bl": 0, "tee": 1, "snp": 6, "ucode": 7}  # byte offsets in one Milan/Genoa TCB_VERSION
-TCB_COMPONENT_NAMES = {"bl": "boot loader", "tee": "TEE", "snp": "SNP firmware", "ucode": "microcode"}
+# --min-tcb (AB#968, AB#1004). Keep the existing Genoa range and Turin product() map; do not infer layouts
+# from the family alone. Unsupported processors fail rather than passing unchecked.
+TCB_GENERATIONS = {"genoa": (0x19, range(0x10, 0x20)), "turin": (0x1A, range(0x00, 0x12))}
+# Byte offsets in TCB_VERSION, AMD 56860 rev 1.59 section 2.3 tables 4/5. Turin includes FMC and moves
+# bootloader/TEE/SNP. These match verify_amd()'s VCEK SPL checks, including the archived chi-ur-2 report.
+TCB_COMPONENTS = {
+    "genoa": {"bl": 0, "tee": 1, "snp": 6, "ucode": 7},
+    "turin": {"fmc": 0, "bl": 1, "tee": 2, "snp": 3, "ucode": 7},
+}
+TCB_COMPONENT_NAMES = {"fmc": "FMC", "bl": "boot loader", "tee": "TEE", "snp": "SNP firmware", "ucode": "microcode"}
 TCB_OFFSETS = (("current", 0x38), ("reported", 0x180), ("committed", 0x1E0), ("launch", 0x1F0))
-MIN_TCB_HELP = "GEN:bl=N,tee=N,snp=N,ucode=N, for example genoa:bl=12,tee=0,snp=30,ucode=88"
+MIN_TCB_HELP = "genoa:bl=N,tee=N,snp=N,ucode=N or turin:fmc=N,bl=N,tee=N,snp=N,ucode=N"
 MIGRATION_AGENT_BIT = 1 << 18
 CHIP_ID_RE = re.compile(r"[0-9a-f]{128}")
 
@@ -464,15 +468,16 @@ def parse_min_tcb(specs: list[str]) -> dict[str, dict[str, int]]:
                              f"(known: {', '.join(sorted(TCB_GENERATIONS))})")
         if generation in floors:
             raise ValueError(f"--min-tcb names {generation} twice")
+        components = TCB_COMPONENTS[generation]
         floor: dict[str, int] = {}
         for part in body.split(","):
             name, eq, value = (x.strip() for x in part.partition("="))
-            if not eq or name not in TCB_COMPONENTS or name in floor or not re.fullmatch(r"[0-9]{1,3}", value):
+            if not eq or name not in components or name in floor or not re.fullmatch(r"[0-9]{1,3}", value):
                 raise ValueError(f"--min-tcb {spec!r}: expected {MIN_TCB_HELP}")
             if int(value) > 255:
                 raise ValueError(f"--min-tcb {spec!r}: {name} must be from 0 to 255")
             floor[name] = int(value)
-        missing = [name for name in TCB_COMPONENTS if name not in floor]
+        missing = [name for name in components if name not in floor]
         if missing:
             raise ValueError(f"--min-tcb {spec!r}: name every component ({', '.join(missing)} missing)")
         floors[generation] = floor
@@ -500,11 +505,12 @@ def check_tcb_floor(report: bytes, rep: dict, floors: dict[str, dict[str, int]])
     need(generation is not None and generation in floors,
          f"TCB floor: the processor (CPUID {cpuid}) is not a generation --min-tcb names")
     floor = floors[generation]
+    components = TCB_COMPONENTS[generation]
     tcbs = {}
     for tcb_name, offset in TCB_OFFSETS:
         tcb = report[offset:offset + 8]
-        tcbs[tcb_name] = {name: tcb[index] for name, index in TCB_COMPONENTS.items()}
-        for name, index in TCB_COMPONENTS.items():
+        tcbs[tcb_name] = {name: tcb[index] for name, index in components.items()}
+        for name, index in components.items():
             need(tcb[index] >= floor[name], f"TCB floor: {tcb_name} TCB {TCB_COMPONENT_NAMES[name]} {tcb[index]} "
                                             f"is below {floor[name]} ({generation})")
     return {"generation": generation, "cpuid": cpuid, "floor": floor, "vmpl": vmpl,
@@ -2849,8 +2855,8 @@ def main() -> int:
     ap.add_argument("--min-genoa-snp-spl", type=int, metavar="N",
                     help="require Genoa current/reported/committed/launch SNP TCB components >= N (e.g. 30 for AMD-SB-3059); requires AMD chain")
     ap.add_argument("--min-tcb", action="append", default=[], metavar="SPEC",
-                    help="TCB floor per generation, for example genoa:bl=12,tee=0,snp=30,ucode=88 (repeat per "
-                         "generation): every component of the current, reported, committed and launch TCB must "
+                    help="TCB floor per generation: " + MIN_TCB_HELP + " (repeat per generation). "
+                         "Every component of the current, reported, committed and launch TCB must "
                          "reach it, and a processor the floor does not name fails; needs --ark-sha256 (AB#968)")
     ap.add_argument("--expected-chip-id", metavar="HEX",
                     help="the report's chip id (128 hex) must equal it; needs --ark-sha256 (AB#968)")

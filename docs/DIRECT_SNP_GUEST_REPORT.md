@@ -100,8 +100,19 @@ HOST_DATA, VMPL 0, and debug and migration-agent policies disabled. Invalid
 input, a missing expectation, or a failed check exits nonzero.
 
 Use `--expected-chip-id` when the contract pins a physical chip. Use repeated
-`--min-tcb GEN:bl=N,tee=N,snp=N,ucode=N` arguments for a supported TCB floor, as documented
-by `verify_receipts.py`. With no floor supplied, `tcb_floor` is `not checked`;
+`--min-tcb` arguments for independently selected firmware floors:
+
+- Genoa: `genoa:bl=N,tee=N,snp=N,ucode=N`
+- Turin: `turin:fmc=N,bl=N,tee=N,snp=N,ucode=N`
+
+Replace every `N` with the approved decimal minimum (0 through 255), including
+Turin's FMC component. The layouts differ: a Genoa floor cannot cover Turin.
+Every component is checked on the current, reported, committed and launch TCB.
+Do not choose the floor by copying the values from the guest's report; archived
+test-fixture values are not a security policy. The Turin layout follows
+[AMD's SNP ABI, section 2.3](https://docs.amd.com/v/u/en-US/56860_PUB_SEV_SNP).
+
+With no floor supplied, `tcb_floor` is `not checked`;
 a PASS does not assert firmware meets an unstated minimum. The existing
 verifier's product/version and TCB-floor support limits still apply.
 
@@ -140,8 +151,9 @@ device/driver evidence, collection exit status, and verifier output. Negative
 checks must reject a changed nonce, measurement and HOST_DATA. Preserve customer
 rooms, workspaces, volumes and snapshots throughout the rollout.
 
-Unit tests use an injected ioctl response and synthetic AMD certificates. They
-prove parsing and refusal behavior, not hardware support or a live release.
+Tests use injected ioctl responses, synthetic certificates, and an archived
+Turin report with its AMD certificate chain. They prove parsing and refusal
+behavior, not fresh hardware acceptance or a live release.
 
 The collector follows the [Linux SEV guest UAPI](https://docs.kernel.org/virt/coco/sev-guest.html)
 and `include/uapi/linux/sev-guest.h`: a 96-byte report request, 32-byte ioctl
