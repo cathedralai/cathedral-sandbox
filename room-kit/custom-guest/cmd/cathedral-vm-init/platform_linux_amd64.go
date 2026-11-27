@@ -371,22 +371,9 @@ func (p *linuxPlatform) Disk(ctx context.Context, cfg vmdisk.Config) (vmdisk.Out
 	return vmdisk.Run(ctx, cfg)
 }
 
-func (p *linuxPlatform) Root() Root       { return unwired{} }
-func (p *linuxPlatform) Mailbox() Mailbox { return unwired{} }
+func (p *linuxPlatform) Root() Root       { return newRootAdapter(p.manifest) }
+func (p *linuxPlatform) Mailbox() Mailbox { return mailboxAdapter{} }
 func (p *linuxPlatform) Log(s string)     { fmt.Fprintln(os.Stderr, s) }
-
-// unwired stands where vmroot and vmmailbox (PR C) go in the wiring commit.
-// It refuses at the first call, so this build never touches a disk.
-type unwired struct{}
-
-var errUnwired = errors.New("the VM root setup (PR C) is not wired into this build")
-
-func (unwired) CheckLink([]byte) error { return errUnwired }
-func (unwired) FirstBoot(context.Context, *os.File, Base, vmidentity.Identity, func(string) error) ([32]byte, error) {
-	return [32]byte{}, errUnwired
-}
-func (unwired) Start(context.Context, *os.File, []byte, func() error) error { return errUnwired }
-func (unwired) WriteStatus(*os.File, int64, string, string, []byte) error   { return errUnwired }
 
 func powerOff() {
 	syscall.Sync()

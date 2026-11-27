@@ -80,6 +80,15 @@ func (m *Mounted) Unmount() error {
 	return err
 }
 
+// UnmountStrict unmounts without detaching and removes the mount point. A busy root fails loudly:
+// the init hands the file-system area to the disk package next, which must not see a lazy mount.
+func (m *Mounted) UnmountStrict() error {
+	if err := syscall.Unmount(m.path, 0); err != nil {
+		return err
+	}
+	return os.Remove(m.path)
+}
+
 // Resize grows the file system to its device, online (resize2fs refuses an unmounted file system
 // that was not checked, and the tools carry no e2fsck).
 func (m *Mounted) Resize(t Tool) error {

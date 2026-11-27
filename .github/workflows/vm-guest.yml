@@ -42,7 +42,7 @@ jobs:
       - name: Packages and kernel modules
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q cryptsetup-bin e2fsprogs
+          sudo apt-get install -y -q cryptsetup-bin dmsetup e2fsprogs
           sudo modprobe loop dm-mod dm-verity || true
           lsmod | grep -E 'dm_verity|loop' || true
           veritysetup --version
@@ -56,9 +56,17 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: go test -c -o "$RUNNER_TEMP/vmmailbox.test" ./internal/vmmailbox
+      - name: Build the wired init test as the runner user
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: go test -c -o "$RUNNER_TEMP/vminit.test" ./cmd/cathedral-vm-init
       - name: Run it as root
         working-directory: room-kit/custom-guest/internal/vmroot
         run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmroot.test" -test.v -test.count=1
+      - name: Run the wired init test as root (real vmdisk and vmroot on loop devices)
+        working-directory: room-kit/custom-guest/cmd/cathedral-vm-init
+        run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 GOGC=1 "$RUNNER_TEMP/vminit.test" -test.v -test.count=2 -test.run 'RootWired'
       - name: Run the mailbox device test as root (O_DIRECT on a loop device)
         working-directory: room-kit/custom-guest/internal/vmmailbox
         run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmmailbox.test" -test.v -test.count=1 -test.run RootOpenDevice
