@@ -66,7 +66,7 @@ jobs:
         run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmroot.test" -test.v -test.count=1
       - name: Run the wired init test as root (real vmdisk and vmroot on loop devices)
         working-directory: room-kit/custom-guest/cmd/cathedral-vm-init
-        run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vminit.test" -test.v -test.count=1 -test.run 'RootWired'
+        run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 GOGC=1 "$RUNNER_TEMP/vminit.test" -test.v -test.count=2 -test.run 'RootWired'
       - name: Run the mailbox device test as root (O_DIRECT on a loop device)
         working-directory: room-kit/custom-guest/internal/vmmailbox
         run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmmailbox.test" -test.v -test.count=1 -test.run RootOpenDevice

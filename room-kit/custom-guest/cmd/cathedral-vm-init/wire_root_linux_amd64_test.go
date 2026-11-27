@@ -21,9 +21,26 @@ import (
 	"testing"
 
 	"github.com/cathedralai/cathedral-sandbox/custom-guest/internal/vmdisk"
+	"github.com/cathedralai/cathedral-sandbox/custom-guest/internal/vmkey"
 	"github.com/cathedralai/cathedral-sandbox/custom-guest/internal/vmmailbox"
 	"github.com/cathedralai/cathedral-sandbox/custom-guest/internal/vmroot"
 )
+
+// newFakeNoFD is newFake without its fake disk. newFake wraps fd 0 in an os.File (os.NewFile(0, ...)),
+// and that object's finalizer closes fd 0 whenever the garbage collector runs. In a run that opens
+// loop devices and mappings, fd 0 is then a live descriptor of something else, and the close shows up
+// as EBADF on a write or EOF on a read. This test uses the real disk, so it never creates one.
+func newFakeNoFD(t *testing.T) *fake {
+	t.Helper()
+	doc := identityDoc("vm-0123456789ab")
+	f := &fake{t: t, identity: doc, link: []byte("10.0.0.1 10.0.0.2"), cmdline: cmdlineFor(t, doc),
+		key: vmkey.Material{KeyID: "0123456789abcdef"}}
+	for i := range f.key.Passphrase {
+		f.key.Passphrase[i] = byte(i + 1)
+	}
+	f.measurement[0], f.measurement[47] = 0xaa, 0xbb
+	return f
+}
 
 var errStopped = errors.New("stopped before switch_root (test)")
 
@@ -216,10 +233,7 @@ func (r hybridRoot) Start(ctx context.Context, fsArea *os.File, link []byte, rea
 
 func (im *image) boot(t *testing.T, dropPin string) (*hybrid, error) {
 	t.Helper()
-	f := newFake(t)
-	// newFake wraps fd 0 in an os.File for its fake disk; its finalizer would close fd 0 under a later
-	// open. This test uses the real disk, so drop it.
-	f.outcome = vmdisk.Outcome{}
+	f := newFakeNoFD(t)
 	f.identity, f.cmdline, f.link = im.identity, im.cmdline, []byte("10.216.0.5 10.216.0.6")
 	rootFile, rootSize := attachLoop(t, im.root, os.O_RDWR)
 	baseFile, baseSize := attachLoop(t, im.base, os.O_RDONLY)
@@ -378,8 +392,7 @@ func TestRootWiredRefusals(t *testing.T) {
 	t.Run("a bad link is refused before any disk", func(t *testing.T) {
 		im := newImage(t)
 		before := sha256File(t, im.root)
-		f := newFake(t)
-		f.outcome = vmdisk.Outcome{}
+		f := newFakeNoFD(t)
 		f.identity, f.cmdline, f.link = im.identity, im.cmdline, []byte("192.0.2.1 192.0.2.2")
 		h := &hybrid{fake: f, im: im}
 		err := boot(context.Background(), h)
