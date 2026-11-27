@@ -260,3 +260,22 @@ The device tests use synthetic sysfs trees with swapped disk enumeration and
 negative controls, not a booted SNP guest. The sysfs interfaces are defined by
 [Linux CPU topology](https://www.kernel.org/doc/html/latest/admin-guide/cputopology.html)
 and the [virtio block driver](https://github.com/torvalds/linux/blob/master/drivers/block/virtio_blk.c).
+
+### Verified-root contract check
+
+`internal/bootstate.CheckRoot` implements the reference init's root inspection
+step. The caller must already have mounted the dm-verity root read-only, without
+submounts. It compares `/usr/bin/cathedral-attest` with a digest pinned in the
+measured init build, refuses installed cloud-init without the disable marker,
+and reads `/sbin/init` and `/usr/sbin/sshd` in full before returning their hashes.
+It refuses non-regular, non-executable, writable or oversized program files.
+No inspected program is executed. The cloud-init check covers the supported
+root recipes' standard installation paths; it is not an audit of arbitrary
+owner software.
+
+Absolute symlinks such as `/sbin/init -> /lib/systemd/systemd` resolve inside the
+guest root, never against the build or host filesystem. Traversal above that
+root, symlink loops and special files fail. Go's `os.Root` confines file access;
+the module now requires Go 1.26, matching the existing pinned 1.26.11 build and
+CI compiler. Tests include a real extracted reference root, but do not exercise
+a kernel dm-verity mapping or replace the pending PID1/hardware qualification.
