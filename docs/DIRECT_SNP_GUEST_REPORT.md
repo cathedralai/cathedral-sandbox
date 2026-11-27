@@ -35,10 +35,14 @@ not load modules, change permissions, or fall back to a proxy if the device or
 ioctl is absent. It needs only Python 3's standard library.
 
 Run verification on a trusted machine outside the guest, using Python 3.11+,
-`cryptography`, and both `verify_guest_report.py` and `verify_receipts.py` from
+`cryptography>=42`, and both `verify_guest_report.py` and `verify_receipts.py` from
 the same reviewed repository revision. The existing verifier retrieves AMD
-certificates from KDS or its local cache. A cache must have been populated for
-this chip and TCB before an offline check. Never adopt a root fingerprint from
+certificates from KDS or its local cache. For offline verification, populate the certificate cache and supply a current
+AMD KDS DER CRL with `--ark-crl`. The verifier checks all three certificate
+validity periods against its own UTC clock, and requires an ARK-signed, current,
+full CRL that does not revoke the ASK. It fetches that CRL from KDS on every
+on-offline check; a fetch failure, future or expired CRL fails closed.
+VCEK firmware acceptability is checked through the required TCB floor. Never adopt a root fingerprint from
 the guest's answer.
 
 Before launch, independently obtain:
@@ -49,8 +53,10 @@ Before launch, independently obtain:
   contract and customer-owned inputs, including the owner public key and
   bootstrap digest. Use that contract's exact manifest encoding and version;
   do not hash an arbitrary JSON serialization or copy HOST_DATA from the report.
-- A trusted AMD ARK SHA-256 fingerprint, and any required chip identity or
-  minimum TCB policy.
+- A trusted AMD ARK SHA-256 fingerprint and the expected physical chip identity.
+- An approved CPU family/model/stepping and its complete minimum TCB policy.
+  This entry point supports Turin report versions 3, 4 and 5 only. It refuses
+  version 2 and Genoa. The legacy receipt verifier keeps its broader support.
 
 The verifier compares the expected HOST_DATA bytes. It does not construct the
 R3 bootstrap or decide which image and bootstrap the customer intended.
@@ -101,7 +107,7 @@ python3 room-kit/snp_guest_report.py --report-data-hex "$NONCE_HEX" > guest-repo
 ```
 
 Copy `guest-report.json` back to the verifier machine. Keep the original nonce
-there; do not replace it with a nonce claimed by the guest. Set the three
+there; do not replace it with a nonce claimed by the guest. Set all
 expectation variables below from the independent inputs above, then run:
 
 ```sh
@@ -109,31 +115,40 @@ python3 room-kit/verify_guest_report.py guest-report.json \
   --report-data-hex "$NONCE_HEX" \
   --expected-measurement "$EXPECTED_MEASUREMENT_HEX" \
   --expected-host-data "$EXPECTED_HOST_DATA_HEX" \
-  --ark-sha256 "$TRUSTED_ARK_SHA256"
+  --ark-sha256 "$TRUSTED_ARK_SHA256" \
+  --expected-chip-id "$EXPECTED_CHIP_ID_HEX" \
+  --expected-cpuid "$APPROVED_CPUID_HEX" \
+  --min-tcb "$APPROVED_TURIN_FLOOR"
 ```
 
-The collector returns `verification: not_checked`. Only the verifier can return
-`verdict: PASS`, with exit status 0. It requires a valid AMD certificate chain
-and report signature, the original challenge, the expected measurement and
-HOST_DATA, VMPL 0, and debug and migration-agent policies disabled. Invalid
-input, a missing expectation, or a failed check exits nonzero.
+The collector requests VCEK explicitly (`KEY_SEL=1`) and returns
+`verification: not_checked`. The verifier returns `verdict: report_verified`
+with exit status 0 only after checking the current AMD chain and revocation
+status, report signature, original REPORT_DATA, expected measurement and
+HOST_DATA, chip pin, CPU-specific floor, VMPL 0, VCEK signing with an unmasked
+chip key, and exact launch policy `0x30000`. It also rejects platform SMT without
+guest permission. Invalid input or any missing expectation exits nonzero.
 
-Use `--expected-chip-id` when the contract pins a physical chip. Use repeated
-`--min-tcb` arguments for independently selected firmware floors:
+`--expected-cpuid` is three hexadecimal bytes, `family:model:stepping`.
+`--min-tcb` must be one complete
+`turin:fmc=N,bl=N,tee=N,snp=N,ucode=N` policy. These two inputs form one approved
+profile: that floor applies only to that exact CPU tuple. Unknown or different
+steppings fail; they cannot inherit another stepping's floor. Replace every `N`
+with an independently approved decimal minimum (0 through 255). Every component
+is checked on the current, reported, committed and launch TCB. No production
+floor is selected by this tool. Never copy a floor, chip pin or CPU tuple from
+the untrusted guest report; fixture values are not an approved security policy.
 
-- Genoa: `genoa:bl=N,tee=N,snp=N,ucode=N`
-- Turin: `turin:fmc=N,bl=N,tee=N,snp=N,ucode=N`
+This primitive deliberately never returns a final `PASS`. Its output includes
+`ssh_channel_binding: not_checked`. The launch's SSH wrapper must derive the
+64-byte REPORT_DATA from the fresh 32-byte challenge, purpose tag and the host
+key of the actual SSH connection, using the reviewed launch protocol, and
+verify that binding before returning the final PASS. The random 64-byte example
+above exercises only this report primitive; it is not that channel protocol.
 
-Replace every `N` with the approved decimal minimum (0 through 255), including
-Turin's FMC component. The layouts differ: a Genoa floor cannot cover Turin.
-Every component is checked on the current, reported, committed and launch TCB.
-Do not choose the floor by copying the values from the guest's report; archived
-test-fixture values are not a security policy. The Turin layout follows
-[AMD's SNP ABI, section 2.3](https://docs.amd.com/v/u/en-US/56860_PUB_SEV_SNP).
-
-With no floor supplied, `tcb_floor` is `not checked`;
-a PASS does not assert firmware meets an unstated minimum. The existing
-verifier's product/version and TCB-floor support limits still apply.
+Policy and field layouts follow [AMD's SNP ABI, tables 9 and 22–24](https://www.amd.com/content/dam/amd/en/documents/developer/56860.pdf).
+The CRL is the product's `/vcek/v1/Turin/crl` resource in
+[AMD's KDS specification](https://docs.amd.com/v/u/en-US/57230).
 
 ## What the result establishes
 
@@ -171,8 +186,9 @@ device/driver evidence, collection exit status, and verifier output. Negative
 checks must reject a changed nonce, measurement and HOST_DATA. Preserve customer
 rooms, workspaces, volumes and snapshots throughout the rollout.
 
-Tests use injected ioctl responses, synthetic certificates, and an archived
-Turin report with its AMD certificate chain. They prove parsing and refusal
+Tests use injected ioctl responses and synthetic, signed Turin chains and CRLs.
+The shared legacy verifier also checks an archived Turin report with its AMD
+chain; that archive is not a current admission or revocation proof. They prove parsing and refusal
 behavior, not fresh hardware acceptance or a live release.
 
 The collector follows the [Linux SEV guest UAPI](https://docs.kernel.org/virt/coco/sev-guest.html)

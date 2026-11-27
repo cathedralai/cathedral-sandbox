@@ -1,4 +1,7 @@
-"""AB#1004: offline Turin floor coverage; archived reports are not live proof."""
+"""AB#1004: shared Turin floor primitives; archived reports are not live admission.
+
+The strict direct entry point is exercised with current synthetic chains/CRLs in
+test_direct_snp_report.py. This archived AMD chain tests legacy compatibility."""
 from __future__ import annotations
 
 import base64
@@ -34,16 +37,14 @@ def run_verifier(tmp_path: Path, *extra: str):
     answer = tmp_path / "answer.json"
     answer.write_text(json.dumps({"report_b64": base64.b64encode(REPORT).decode()}))
     proc = subprocess.run([
-        sys.executable, str(fixture.ROOT / "room-kit" / "verify_guest_report.py"), str(answer),
+        sys.executable, str(fixture.ROOT / "room-kit" / "verify_receipts.py"), "--fresh-report", str(answer),
         "--report-data-hex", REPORT[0x50:0x90].hex(),
-        "--expected-measurement", REPORT[0x90:0xC0].hex(),
-        "--expected-host-data", REPORT[0xC0:0xE0].hex(),
         "--ark-sha256", fixture.TURIN_PIN, "--kds-cache", str(cache), *extra,
     ], capture_output=True, text=True, timeout=10)
     return proc.returncode, json.loads(proc.stdout)
 
 
-def test_archived_turin_report_passes_direct_cli_with_complete_floor(tmp_path):
+def test_archived_turin_report_passes_legacy_cli_with_complete_floor(tmp_path):
     code, out = run_verifier(tmp_path, "--min-tcb", FLOOR)
     assert (code, out["verdict"]) == (0, "PASS"), out
     assert out["attestation"]["amd"]["product"] == "Turin"
@@ -106,6 +107,6 @@ def test_turin_floor_does_not_expand_the_existing_product_map(family, model):
         vr.check_tcb_floor(REPORT, rep, vr.parse_min_tcb([FLOOR]))
 
 
-def test_no_floor_remains_explicitly_unchecked(tmp_path):
+def test_legacy_no_floor_remains_explicitly_unchecked(tmp_path):
     code, out = run_verifier(tmp_path)
     assert code == 0 and out["tcb_floor"] == "not checked"

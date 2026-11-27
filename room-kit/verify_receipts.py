@@ -403,6 +403,7 @@ def parse_report(r: bytes) -> dict:
         "reported_tcb": r[0x180:0x188],
         "cpuid_fam": r[0x188] if version >= 3 else None,
         "cpuid_mod": r[0x189] if version >= 3 else None,
+        "cpuid_step": r[0x18A] if version >= 3 else None,
         "chip_id": r[0x1A0:0x1E0],
         "sig_r": int.from_bytes(r[0x2A0:0x2A0 + 72], "little"),
         "sig_s": int.from_bytes(r[0x2E8:0x2E8 + 72], "little"),
@@ -620,8 +621,41 @@ def load_bundle_certs(certs: dict) -> tuple[x509.Certificate, x509.Certificate, 
         raise Fail("the AMD certificates are not base64 DER certificates (vcek, ask, ark)") from exc
 
 
+def verify_certificate_status(ark, ask, vcek, crl_der: bytes) -> dict:
+    """Current-time checks for a live admission, not retrospective receipt verification.
+
+    AMD KDS publishes the ARK-signed CRL for ASK revocation. VCEK TCB
+    acceptability is enforced separately by the caller's approved firmware floor.
+    The clock belongs to the trusted verifier, never the report or guest.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    for name, cert in (("ARK", ark), ("ASK", ask), ("VCEK", vcek)):
+        need(cert.not_valid_before_utc <= now < cert.not_valid_after_utc,
+             f"{name} certificate is not currently valid")
+    need(ark.issuer == ark.subject and ask.issuer == ark.subject and vcek.issuer == ask.subject,
+         "AMD certificate issuer names do not form ARK -> ASK -> VCEK")
+    need(len(crl_der) <= 1024 * 1024, "AMD CRL exceeds 1 MiB")
+    crl = x509.load_der_x509_crl(crl_der)
+    need(crl.issuer == ark.subject, "AMD CRL issuer is not the pinned ARK")
+    need(crl.is_signature_valid(ark.public_key()), "AMD CRL signature is not valid under the pinned ARK")
+    # A partial or delta CRL cannot establish absence from the full revocation list.
+    for extension in crl.extensions:
+        need(not extension.critical and not isinstance(extension.value, (
+            x509.DeltaCRLIndicator, x509.IssuingDistributionPoint)),
+             "AMD CRL has unsupported critical, delta or scoped extensions")
+    need(crl.next_update_utc is not None and crl.last_update_utc <= now < crl.next_update_utc,
+         "AMD CRL is not current (thisUpdate/nextUpdate)")
+    need(crl.get_revoked_certificate_by_serial_number(ask.serial_number) is None,
+         "ASK certificate is revoked by the AMD ARK")
+    return {"checked_at": now.isoformat(), "crl_next_update": crl.next_update_utc.isoformat(),
+            "ask_revocation": "not revoked", "certificates": "currently valid"}
+
+
 def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str | list[str] | None,
-               certs: dict | None = None) -> dict:
+               certs: dict | None = None, *, current_certificates: bool = False,
+               ark_crl: bytes | None = None) -> dict:
     """The AMD chain. certs (base64 DER vcek, ask, ark) replace the KDS fetch; every other check is the same."""
     tcb = rep["reported_tcb"]
     need(prod in ("Genoa", "Milan", "Turin"), "only Milan, Genoa and Turin TCB layouts are handled")
@@ -661,6 +695,15 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
         vcek_url = f"{KDS}/{prod}/{kds_id}?{spl_query}"
         vcek = x509.load_der_x509_certificate(fetch(vcek_url, cache, f"vcek-{chip[:16]}-{tcb.hex()}.der"))
     pss_verify(ask, vcek)
+    status = None
+    if current_certificates:
+        need(bool(ark_sha256), "current certificate checks require a pinned ARK")
+        if ark_crl is None:
+            # Unlike the certificate cache, revocation data must not be cached forever.
+            # Offline callers can supply a signed CRL; the same time checks still apply.
+            with urllib.request.urlopen(f"{KDS}/{prod}/crl", timeout=30) as response:
+                ark_crl = response.read(1024 * 1024 + 1)
+        status = verify_certificate_status(ark, ask, vcek, ark_crl)
     hwid = vcek.extensions.get_extension_for_oid(x509.ObjectIdentifier("1.3.6.1.4.1.3704.1.4")).value.value
     # A Turin hwID is the raw 8 bytes, or those behind an OCTET STRING header (04 08).
     need(hwid[-len(hwid_want):] == hwid_want and (not turin or len(hwid) in (8, 10)),
@@ -680,13 +723,17 @@ def verify_amd(report: bytes, rep: dict, prod: str, cache: str, ark_sha256: str 
     out_tcb = {"bootloader": bl, "tee": tee, "snp": snp, "microcode": ucode}
     if turin:
         out_tcb = {"fmc": fmc, **out_tcb}
-    return {"product": prod, "ark_sha256": ark_fp, "tcb": out_tcb}
+    result = {"product": prod, "ark_sha256": ark_fp, "tcb": out_tcb}
+    if status is not None:
+        result["certificate_status"] = status
+    return result
 
 
 def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: str,
                         ark_sha256: str | list[str] | None, min_tcb: dict | None = None,
                         expected_chip_id: str | None = None, approved_list: dict | None = None,
-                        certs: dict | None = None) -> dict:
+                        certs: dict | None = None, *, current_certificates: bool = False,
+                        ark_crl: bytes | None = None) -> dict:
     """One POST /room/attest answer: REPORT_DATA is the caller's, debug is off, the AMD chain signs the report.
 
     Only the signed report is read. The answer's other members (binding_sha256, measurement) are the hotel's
@@ -705,7 +752,8 @@ def verify_fresh_report(answer, report_data_hex: str, prod: str | None, cache: s
     need(not rep["policy"] & (1 << 19), "guest policy allows debug")
     need(not rep["policy"] & MIGRATION_AGENT_BIT, "guest policy allows a migration agent (bit 18)")
     need(bool(ark_sha256), "a fresh report needs --ark-sha256: an unpinned chain proves nothing")
-    amd = verify_amd(report, rep, product(rep, prod), cache, ark_sha256, certs)
+    amd = verify_amd(report, rep, product(rep, prod), cache, ark_sha256, certs,
+                     current_certificates=current_certificates, ark_crl=ark_crl)
     pins = check_report_pins(report, rep, min_tcb, expected_chip_id)
     listed = check_approved_list(approved_list, report, rep, None) if approved_list else "not checked"
     return {"fresh_report": {"report_data_hex": rep["report_data"].hex(), "measurement": rep["measurement"],

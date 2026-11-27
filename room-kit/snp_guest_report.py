@@ -33,7 +33,7 @@ class GuestRequest(ctypes.Structure):
 
 class ReportRequest(ctypes.Structure):
     _fields_ = [("user_data", ctypes.c_uint8 * 64), ("vmpl", ctypes.c_uint32),
-                ("reserved", ctypes.c_uint8 * 28)]
+                ("key_sel", ctypes.c_uint32), ("reserved", ctypes.c_uint8 * 24)]
 
 
 SNP_GET_REPORT = (3 << 30) | (ctypes.sizeof(GuestRequest) << 16) | (ord("S") << 8)
@@ -48,6 +48,7 @@ def collect(report_data: bytes, device: str = DEVICE, *, ioctl=None) -> dict:
     request = ReportRequest()
     request.user_data[:] = report_data
     request.vmpl = 0
+    request.key_sel = 1  # AMD MSG_REPORT_REQ: require VCEK, never prefer a loaded VLEK.
     response = ctypes.create_string_buffer(RESPONSE_BYTES)
     command = GuestRequest(msg_version=1, req_data=ctypes.addressof(request),
                            resp_data=ctypes.addressof(response))

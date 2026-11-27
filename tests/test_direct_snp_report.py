@@ -12,6 +12,7 @@ import sys
 import pytest
 
 from tests import test_verify_receipts_room_report as fixture
+from tests import direct_snp_support as trust
 
 KIT = Path(__file__).resolve().parents[1] / "room-kit"
 sys.path.insert(0, str(KIT))
@@ -37,7 +38,9 @@ def fake_ioctl(*, status=0, size=1184, exitinfo2=0, vmpl=0, wrong_nonce=False):
         assert command.msg_version == 1
         req = collector.ReportRequest.from_address(command.req_data)
         assert bytes(req.user_data) == NONCE and req.vmpl == 0
-        assert bytes(req.reserved) == bytes(28)
+        assert req.key_sel == 1
+        assert collector.ReportRequest.key_sel.offset == 0x44
+        assert bytes(req.reserved) == bytes(24)
         assert ctypes.sizeof(req) == 96
         command.exitinfo2 = exitinfo2
         report = bytearray(1184)
@@ -105,20 +108,25 @@ def test_caller_length_is_exact(size):
         collector.collect(bytes(size), "/dev/null")
 
 
-def signed_report(tmp_path, *, vmpl=0, debug=False, migration=False):
-    raw = bytearray(fixture.snp.make_report(report_data=NONCE))
+def signed_report(tmp_path, *, vmpl=0, debug=False, migration=False, mutate=None, **trust_options):
+    raw = bytearray(fixture.snp.make_report(report_data=NONCE, family=0x1a, model=2, chip_id=trust.CHIP,
+                                                   tcbs=dict.fromkeys(fixture.snp.TCB_OFFSETS, trust.TCB)))
     raw[0xc0:0xe0] = bytes.fromhex(HOST_DATA)
     raw[0x30:0x34] = vmpl.to_bytes(4, "little")
     policy = int.from_bytes(raw[8:16], "little") | (debug << 19) | (migration << 18)
     raw[8:16] = policy.to_bytes(8, "little")
     cache = tmp_path / "kds"
-    report = fixture._sign_with_one_vcek([bytes(raw)], cache)[0]
+    if mutate:
+        mutate(raw)
+    report = trust.sign(bytes(raw), cache, **trust_options)
     return {"report_b64": base64.b64encode(report).decode()}, cache
 
 
 def verify(answer, cache, **over):
     expected = dict(report_data_hex=NONCE.hex(), expected_measurement=fixture.snp.MEASUREMENT,
-                    expected_host_data=HOST_DATA, ark_sha256=fixture.snp.ark_pin(), cache=str(cache))
+                    expected_host_data=HOST_DATA, ark_sha256=trust.cache_pin(cache), cache=str(cache),
+                    expected_chip_id=trust.CHIP, expected_cpuid=trust.CPU,
+                    min_tcb=verifier.vr.parse_min_tcb([trust.FLOOR]), ark_crl=(cache / "ark.crl").read_bytes())
     expected.update(over)
     return verifier.verify(answer, **expected)
 
@@ -127,7 +135,8 @@ def test_signed_report_passes_with_all_expected_fields(tmp_path):
     answer, cache = signed_report(tmp_path)
     answer.update(host_data="00" * 32, measurement="ff" * 48, verification="PASS")
     result = verify(answer, cache)
-    assert result["verdict"] == "PASS"
+    assert result["verdict"] == "report_verified"
+    assert result["ssh_channel_binding"] == "not_checked"
     assert result["fresh_report"]["host_data"] == HOST_DATA
     assert result["fresh_report"]["report_data_hex"] == NONCE.hex()
     assert result["fresh_report"]["vmpl"] == 0
@@ -173,11 +182,12 @@ def test_verifier_cli_and_missing_pin_fail_closed(tmp_path):
     path.write_text(json.dumps(answer))
     command = [sys.executable, str(KIT / "verify_guest_report.py"), str(path),
                "--report-data-hex", NONCE.hex(), "--expected-measurement", fixture.snp.MEASUREMENT,
-               "--expected-host-data", HOST_DATA, "--ark-sha256", fixture.snp.ark_pin(),
-               "--kds-cache", str(cache)]
+               "--expected-host-data", HOST_DATA, "--ark-sha256", trust.cache_pin(cache),
+               "--kds-cache", str(cache), "--expected-chip-id", trust.CHIP,
+               "--expected-cpuid", trust.CPU, "--min-tcb", trust.FLOOR, "--ark-crl", str(cache / "ark.crl")]
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert json.loads(result.stdout)["verdict"] == "PASS"
+    assert json.loads(result.stdout)["verdict"] == "report_verified"
     index = command.index("--expected-host-data")
     del command[index:index + 2]
     result = subprocess.run(command, capture_output=True, text=True)
@@ -191,3 +201,107 @@ def test_collector_cli_failure_never_prints_pass(tmp_path):
     assert result.returncode == 1
     assert json.loads(result.stdout)["error"] == "report_collection_failed"
     assert "PASS" not in result.stdout
+
+
+@pytest.mark.parametrize('field,value,reason', [
+    ('expected_chip_id', None, 'expected-chip-id'),
+    ('min_tcb', None, 'complete --min-tcb'),
+    ('min_tcb', {}, 'complete --min-tcb'),
+    ('min_tcb', {'turin': {'snp': 8}}, 'complete uint8'),
+    ('expected_cpuid', None, 'expected CPUID'),
+    ('expected_cpuid', '1a:02:01', 'family/model/stepping'),
+])
+def test_missing_policy_inputs_are_refused(tmp_path, field, value, reason):
+    answer, cache = signed_report(tmp_path)
+    with pytest.raises((verifier.vr.Fail, ValueError), match=reason):
+        verify(answer, cache, **{field: value})
+
+
+@pytest.mark.parametrize('certificate', ['ARK', 'ASK', 'VCEK'])
+@pytest.mark.parametrize('period', ['expired', 'future'])
+def test_correctly_signed_but_out_of_date_certificates_fail(tmp_path, certificate, period):
+    from datetime import timedelta
+    if period == 'expired':
+        dates = (trust.NOW - timedelta(days=2), trust.NOW - timedelta(days=1))
+    else:
+        dates = (trust.NOW + timedelta(days=1), trust.NOW + timedelta(days=2))
+    answer, cache = signed_report(tmp_path, validity={certificate: dates})
+    with pytest.raises(verifier.vr.Fail, match=f'{certificate} certificate is not currently valid'):
+        verify(answer, cache)
+
+
+@pytest.mark.parametrize('option,reason', [
+    ('revoked', 'ASK certificate is revoked'),
+    ('stale', 'CRL is not current'), ('future', 'CRL is not current'),
+    ('bad_signature', 'CRL signature'), ('wrong_issuer', 'CRL issuer'),
+    ('scoped', 'scoped extensions'), ('delta', 'delta'),
+])
+def test_signed_report_is_refused_without_current_unrevoked_ask(tmp_path, option, reason):
+    answer, cache = signed_report(tmp_path, crl_options={option: True})
+    with pytest.raises(verifier.vr.Fail, match=reason):
+        verify(answer, cache)
+
+
+def test_live_crl_is_required_and_network_failure_is_closed(tmp_path, monkeypatch):
+    import io
+    from urllib.error import URLError
+    answer, cache = signed_report(tmp_path)
+    requested = []
+
+    def get(url, timeout):
+        requested.append((url, timeout))
+        return io.BytesIO((cache / 'ark.crl').read_bytes())
+
+    monkeypatch.setattr(verifier.vr.urllib.request, 'urlopen', get)
+    result = verify(answer, cache, ark_crl=None)
+    assert result['attestation']['amd']['certificate_status']['ask_revocation'] == 'not revoked'
+    assert requested == [(verifier.vr.KDS + '/Turin/crl', 30)]
+
+    def unavailable(*args, **kwargs):
+        raise URLError('KDS unavailable')
+
+    monkeypatch.setattr(verifier.vr.urllib.request, 'urlopen', unavailable)
+    with pytest.raises(URLError):
+        verify(answer, cache, ark_crl=None)
+
+
+@pytest.mark.parametrize('crl', [b'', b'not DER', bytes(1024 * 1024 + 1)])
+def test_invalid_revocation_data_cannot_verify(tmp_path, crl):
+    answer, cache = signed_report(tmp_path)
+    with pytest.raises((verifier.vr.Fail, ValueError)):
+        verify(answer, cache, ark_crl=crl)
+
+
+def set_bytes(offset, data):
+    def mutate(raw):
+        raw[offset:offset + len(data)] = data
+    return mutate
+
+
+@pytest.mark.parametrize('offset,data,reason', [
+    (0, (2).to_bytes(4, 'little'), 'version 3, 4 or 5'),
+    (0, (6).to_bytes(4, 'little'), 'report version'),
+    (0x188, bytes([0x19, 0x11, 0]), 'requires Turin'),
+    (0x18a, b'\x01', 'family/model/stepping'),
+    (8, (0x130000).to_bytes(8, 'little'), 'exact policy'),
+    (0x48, b'\x04', 'signed by VCEK'),
+    (0x48, b'\x1c', 'signed by VCEK'),
+    (0x48, b'\x02', 'mask the chip key'),
+    (0x48, b'\x20', 'reserved signer'),
+    (0x1f3, b'\x07', 'launch TCB SNP firmware 7 is below'),
+])
+def test_signed_contract_counterexamples_fail(tmp_path, offset, data, reason):
+    answer, cache = signed_report(tmp_path, mutate=set_bytes(offset, data))
+    with pytest.raises(verifier.vr.Fail, match=reason):
+        verify(answer, cache)
+
+
+def test_smt_needs_policy_permission(tmp_path):
+    def forbidden(raw):
+        raw[8:16] = (0x20000).to_bytes(8, 'little')
+        raw[0x40] = 1
+    answer, cache = signed_report(tmp_path, mutate=forbidden)
+    with pytest.raises(verifier.vr.Fail, match='SMT is enabled without guest permission'):
+        verify(answer, cache)
+    answer, cache = signed_report(tmp_path, mutate=set_bytes(0x40, b'\x01'))
+    assert verify(answer, cache)['verdict'] == 'report_verified'
