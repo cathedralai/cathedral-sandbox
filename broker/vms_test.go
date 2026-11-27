@@ -1050,6 +1050,27 @@ func TestVMsCreateIdempotentReplayHoldsCapacityOnce(t *testing.T) {
 	}
 }
 
+func TestVMsCreateReplayDuringOtherOperationReturnsTheVM(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	hdr := map[string]string{"Idempotency-Key": "req-busy"}
+	st, first := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	if st != 201 {
+		t.Fatalf("first create: %d %v", st, first)
+	}
+	id := first["id"].(string)
+	// Another operation (a start, stop or reboot) holds the VM's busy flag.
+	tb.b.vms.mu.Lock()
+	tb.b.vms.busy[id] = true
+	tb.b.vms.mu.Unlock()
+	st, again := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	if st != 200 || again["id"] != id {
+		t.Fatalf("replay while another operation runs: %d %v want 200 and %s", st, again, id)
+	}
+	if n := countHostCalls(tb, "create"); n != 1 {
+		t.Fatalf("host create calls: %d", n)
+	}
+}
+
 func TestVMsCreateIdempotencyConflicts(t *testing.T) {
 	tb := newVMTestBroker(t, true)
 	hdr := map[string]string{"Idempotency-Key": "req-2"}

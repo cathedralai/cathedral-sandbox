@@ -768,7 +768,10 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 409, "idempotency_key_reused", "this request id was used for a different create")
 				return
 			}
-			if s.busy[old.ID] {
+			// busy is shared with start, stop, authorize, reboot and delete, so
+			// only a VM still in creating means this create is in flight; any
+			// other busy VM was already created and the replay returns it.
+			if old.DesiredState == vmStateCreating && s.busy[old.ID] {
 				writeErr(w, 409, "vm_busy", "the create for this request id is still in flight")
 				return
 			}
