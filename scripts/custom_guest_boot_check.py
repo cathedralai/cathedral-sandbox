@@ -69,19 +69,21 @@ def manifest_cmdline(path: Path) -> str:
 
 
 def qemu_argv(qemu: str, kernel: Path, initrd: Path, cmdline: str, memory_mib: int) -> list[str]:
-    # -no-reboot turns the guest's poweroff (and any reboot) into QEMU exiting.
-    return [qemu, "-nographic", "-no-reboot", "-nodefaults", "-serial", "stdio", "-m", str(memory_mib),
+    # -no-reboot turns the guest's poweroff (and any reboot) into QEMU exiting. -cpu max: TCG's
+    # default qemu64 lacks features an EPYC-built kernel may need before it reaches PID1.
+    return [qemu, "-nographic", "-no-reboot", "-nodefaults", "-cpu", "max", "-serial", "stdio", "-m", str(memory_mib),
             "-kernel", str(kernel), "-initrd", str(initrd), "-append", cmdline]
 
 
-def boot(argv: list[str], timeout: float, runner=subprocess.run) -> tuple[str, bool, bool]:
+def boot(argv: list[str], timeout: float, runner=subprocess.run) -> tuple[str, bool, bool, int | None]:
+    """Console text, whether QEMU exited, whether it hit the time limit, and its return code."""
     try:
         done = runner(argv, capture_output=True, timeout=timeout, check=False)
         out = (done.stdout or b"")[:LOG_LIMIT] + (done.stderr or b"")[:LOG_LIMIT]
-        return out.decode("utf-8", "replace"), True, False
+        return out.decode("utf-8", "replace"), True, False, done.returncode
     except subprocess.TimeoutExpired as exc:
         out = (exc.stdout or b"")[:LOG_LIMIT] + (exc.stderr or b"")[:LOG_LIMIT]
-        return out.decode("utf-8", "replace"), False, True
+        return out.decode("utf-8", "replace"), False, True, None
 
 
 def main(argv: list[str] | None = None, runner=subprocess.run) -> int:
@@ -102,15 +104,20 @@ def main(argv: list[str] | None = None, runner=subprocess.run) -> int:
         if shutil.which(args.qemu) is None and not Path(args.qemu).is_file():
             raise ValueError(f"{args.qemu} not found")
         cmdline = manifest_cmdline(args.manifest)
+        # Only the serial port is read: without a ttyS0 console every boot would read as a FAIL.
+        if not any(t == "console=ttyS0" or t.startswith("console=ttyS0,") for t in cmdline.split()):
+            raise ValueError("manifest cmdline sends no console to ttyS0, so this check cannot read the boot")
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"verdict": "ERROR", "reason": str(exc)}))
         return 2
-    console, exited, timed_out = boot(qemu_argv(args.qemu, args.kernel, args.initrd, cmdline, args.memory_mib),
+    console, exited, timed_out, qemu_rc = boot(qemu_argv(args.qemu, args.kernel, args.initrd, cmdline, args.memory_mib),
                                       args.timeout, runner)
     if args.console_out:
         args.console_out.write_text(console)
     result = evaluate(console, exited, timed_out, args.expect_stage)
-    result.update(schema="cathedral.custom_guest_boot_check/v1", expect_stage=args.expect_stage, snp=False)
+    # A QEMU argument or startup error otherwise reads as "never showed cathedral-init".
+    result.update(schema="cathedral.custom_guest_boot_check/v1", expect_stage=args.expect_stage, snp=False,
+                  qemu_returncode=qemu_rc)
     print(json.dumps(result))
     return 0 if result["verdict"] == "PASS" else 1
 

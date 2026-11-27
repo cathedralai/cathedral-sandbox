@@ -57,16 +57,25 @@ def test_main_boots_with_the_manifest_cmdline_exactly(tmp_path, capsys):
     assert bc.main(files(tmp_path), runner=fake) == 0
     argv = seen[0]
     assert argv[argv.index("-append") + 1] == "console=ttyS0 cathedral.owner=x systemd.import_credentials=no"
-    assert "-no-reboot" in argv
+    assert "-no-reboot" in argv and argv[argv.index("-cpu") + 1] == "max"
     out = json.loads(capsys.readouterr().out)
-    assert out["verdict"] == "PASS" and out["snp"] is False
+    assert out["verdict"] == "PASS" and out["snp"] is False and out["qemu_returncode"] == 0
+
+
+def test_a_qemu_startup_error_shows_its_return_code(tmp_path, capsys):
+    def broken(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"qemu: unsupported machine")
+    assert bc.main(files(tmp_path), runner=broken) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "FAIL" and out["qemu_returncode"] == 1
 
 
 def test_main_reports_a_hang_as_fail(tmp_path, capsys):
     def hang(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, kwargs["timeout"], output=BOOT.encode())
     assert bc.main(files(tmp_path), runner=hang) == 1
-    assert "time limit" in json.loads(capsys.readouterr().out)["reason"]
+    out = json.loads(capsys.readouterr().out)
+    assert "time limit" in out["reason"] and out["qemu_returncode"] is None
 
 
 def test_missing_inputs_are_an_error_not_a_fail(tmp_path, capsys):
@@ -74,3 +83,8 @@ def test_missing_inputs_are_an_error_not_a_fail(tmp_path, capsys):
     (tmp_path / "initrd").unlink()
     assert bc.main(args) == 2
     assert json.loads(capsys.readouterr().out)["verdict"] == "ERROR"
+
+
+def test_a_cmdline_without_a_serial_console_is_an_error(tmp_path, capsys):
+    assert bc.main(files(tmp_path, cmdline="quiet cathedral.owner=x")) == 2
+    assert "ttyS0" in json.loads(capsys.readouterr().out)["reason"]
