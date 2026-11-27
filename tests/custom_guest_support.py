@@ -39,6 +39,7 @@ if "-p" in args:
 verb, units = args[0], args[1:]
 root = os.environ.get("CG_ROOT", "")
 proc = os.environ.get("CG_PROC", "/proc")
+HOST_NS = "/usr/bin/nsenter --mount=/proc/1/ns/mnt --"  # the + hooks enter the host mount namespace (custom_guest_host.HOST_NS)
 def u(name):
     return state.setdefault(name, {"active": False, "enabled": False, "invocation": "", "enter": 0})
 def unit_text(name):
@@ -87,7 +88,7 @@ elif verb == "start":
                 if subprocess.run(["/bin/sh", "-c", cmd.split("-c ", 1)[1].strip("'")]).returncode != 0:
                     rc = 1
             if line.startswith("ExecStartPre=+") and "check-start" in line:
-                if subprocess.run(line.split("=", 1)[1][1:].split()).returncode != 0:
+                if subprocess.run(line.split("=", 1)[1][1:].replace(HOST_NS + " ", "", 1).split()).returncode != 0:
                     rc = 1
         if rc:
             s["result"] = "failed"; continue
@@ -110,7 +111,7 @@ elif verb in ("stop", "enable", "disable"):
             s["active"] = False; kill_qemu(name)
             for line in unit_text(name).splitlines():
                 if line.startswith("ExecStopPost=+") and "exited" in line:
-                    subprocess.run(line.split("=", 1)[1][1:].split(), env={**os.environ, "SERVICE_RESULT": "success", "EXIT_STATUS": "0"})
+                    subprocess.run(line.split("=", 1)[1][1:].replace(HOST_NS + " ", "", 1).split(), env={**os.environ, "SERVICE_RESULT": "success", "EXIT_STATUS": "0"})
         if "--now" in flags and verb == "enable" and not s["active"]:
             s["active"] = True; s["invocation"] = uuid.uuid4().hex; s["enter"] = int(time.time())
 json.dump(state, open(path, "w"))

@@ -68,6 +68,18 @@ HOST_DEADLINE = {"intake": 7200, "hold-baseline": 5400, "verify-disks": 5400, "r
 NOTICE_SECONDS = 72 * 3600
 
 
+DETAIL_MAX = 300
+
+
+def one_line(text: object, limit: int = DETAIL_MAX) -> str:
+    """A detail for the API: one line of printable ASCII, whitespace collapsed, at most `limit` characters.
+    A serial tail has newlines and control bytes, and the API refuses those with a 422 (rehearsal B, run 3: a
+    boot failure could not be recorded). Anything outside 0x20 to 0x7e becomes a space; an empty result says so."""
+    flat = "".join(c if " " <= c <= "~" else " " for c in str(text))
+    flat = " ".join(flat.split())[:limit].rstrip()
+    return flat or "no detail given"
+
+
 class Blocked(Exception):
     """A step stops here; the record keeps the error for the operator or Toby."""
 
@@ -1055,7 +1067,7 @@ class Op:
                     raise Blocked("custom_guest_stop_failed",
                                   f"boot failed ({e.code}) and the guest unit did not stop; the record stays booting")
                 self.patch(seq, "booting", "stopped", {"stop_reason": "boot_failed", "error_code": e.code,
-                                                       "error_detail": e.detail[:300]})
+                                                       "error_detail": one_line(e.detail)})
                 self.j.write(self.launch, gen, step, "boot_failed", "done")
             self.end(step, gen)
             raise

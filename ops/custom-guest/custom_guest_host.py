@@ -545,6 +545,10 @@ def chown(owner: str, *paths: str, recursive: bool = False) -> None:
 
 
 def install_tools() -> None:
+    # The unit's + hooks run through nsenter (HOST_NS). Without it every start would fail in ExecStartPre, after a
+    # boot intent and a token were written: refuse before any of that, on a real host (a test root has no /usr/bin).
+    if not ROOT and not os.access(NSENTER, os.X_OK):
+        raise Halt("custom_guest_hold_failed", f"{NSENTER} is missing: the guest unit's host hooks need it (util-linux)")
     os.makedirs(LIBDIR, mode=0o755, exist_ok=True)
     for name in TOOLS:
         src, dst = os.path.join(HERE, name), os.path.join(LIBDIR, name)
@@ -749,6 +753,21 @@ def verify_isolation(ctx: Ctx) -> None:
 
 # ---------------------------------------------------------------- unit text (5.8)
 
+# Every `+` hook of the custom unit runs in the host's mount namespace. systemd runs a `+` command with
+# full privileges, but on systemd 259 still inside the unit's own mount namespace, and this unit's namespace
+# has TemporaryFileSystem=/srv:ro (so the guest user sees no other hotel or launch). Seen from there, check-start
+# finds an empty /srv and no host journal, and exited cannot append to it (EROFS). Those two are the real
+# breakage (rehearsal B, run 3, 27 Nov). A plain `+` hook can still write /run/lock and use netlink on 259
+# (probed with the full lockdown), so custom-net.sh and the /dev/kvm wait, modprobe and rm lines are wrapped for
+# consistency, one rule for every host hook, not because they failed.
+# `nsenter --mount=/proc/1/ns/mnt` puts only the hook, never the guest process, in PID 1's mount namespace
+# (probed on systemd 259 with the unit's sandbox: the wrapped hook saw /srv, the main process did not).
+# Chosen over binding the hooks' files into the unit (they would then be visible to the guest user, and the list
+# would grow with every hook) and over separate helper units (more moving parts for the same effect). The
+# guest's ExecStart is unchanged: it still sees images (ro), disks and run.
+NSENTER = "/usr/bin/nsenter"
+HOST_NS = f"{NSENTER} --mount=/proc/1/ns/mnt --"
+
 def unit_text(ctx: Ctx, mem_gib: int) -> str:
     d, lib, h, l = ctx.d, LIBDIR, ctx.hotel, ctx.launch
     return f"""[Unit]
@@ -759,13 +778,13 @@ Type=simple
 User=cg-{h}
 Group=cg-{h}
 SupplementaryGroups=kvm cg-sev
-ExecStartPre=+{lib}/custom-guest-host.sh check-start --hotel {h} --launch-id {l}
-ExecStartPre=+-/sbin/modprobe -q kvm_amd
-ExecStartPre=+/bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
-ExecStartPre=+{lib}/custom-net.sh up {h} {l}
-ExecStartPre=+/bin/rm -f {d}/run/qmp.sock
+ExecStartPre=+{HOST_NS} {lib}/custom-guest-host.sh check-start --hotel {h} --launch-id {l}
+ExecStartPre=+-{HOST_NS} /sbin/modprobe -q kvm_amd
+ExecStartPre=+{HOST_NS} /bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
+ExecStartPre=+{HOST_NS} {lib}/custom-net.sh up {h} {l}
+ExecStartPre=+{HOST_NS} /bin/rm -f {d}/run/qmp.sock
 ExecStart=/usr/bin/python3 -I {lib}/launch-custom-guest.py {d}
-ExecStopPost=+{lib}/custom-guest-host.sh exited --hotel {h} --launch-id {l}
+ExecStopPost=+{HOST_NS} {lib}/custom-guest-host.sh exited --hotel {h} --launch-id {l}
 Restart=no
 KillSignal=SIGTERM
 TimeoutStartSec=180

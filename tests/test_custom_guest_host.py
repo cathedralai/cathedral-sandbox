@@ -159,11 +159,31 @@ def test_unit_confinement(host):
         assert want in lines, want
     assert "[Install]" not in text, "the unit is never enabled"
     pre = [ln for ln in text.splitlines() if ln.startswith("ExecStartPre=")]
-    assert pre[0] == f"ExecStartPre=+{mod.LIBDIR}/custom-guest-host.sh check-start --hotel {HOTEL} --launch-id {LAUNCH}"
+    assert pre[0] == f"ExecStartPre=+{mod.HOST_NS} {mod.LIBDIR}/custom-guest-host.sh check-start --hotel {HOTEL} --launch-id {LAUNCH}"
     assert all(ln.startswith("ExecStartPre=+") for ln in pre), "root steps are + prefixed only"
     assert [ln for ln in text.splitlines() if ln.startswith("ExecStart=")] == [
         f"ExecStart=/usr/bin/python3 -I {mod.LIBDIR}/launch-custom-guest.py {ctx.d}"]
-    assert f"ExecStopPost=+{mod.LIBDIR}/custom-guest-host.sh exited --hotel {HOTEL} --launch-id {LAUNCH}" in lines
+    assert f"ExecStopPost=+{mod.HOST_NS} {mod.LIBDIR}/custom-guest-host.sh exited --hotel {HOTEL} --launch-id {LAUNCH}" in lines
+    # Every + hook enters the host mount namespace: the unit's own (TemporaryFileSystem=/srv:ro, ProtectSystem=strict)
+    # hides the host journal and makes /run and /var read-only, from systemd 259 on, even for + commands.
+    assert mod.HOST_NS == "/usr/bin/nsenter --mount=/proc/1/ns/mnt --"
+    privileged = [ln for ln in text.splitlines() if ln.startswith(("ExecStartPre=+", "ExecStopPost=+"))]
+    assert len(privileged) == 6
+    assert all(f"+{mod.HOST_NS} " in ln or f"+-{mod.HOST_NS} " in ln for ln in privileged), privileged
+    # The guest process is not wrapped: it keeps the unit's namespace, the one that hides /srv.
+    assert not [ln for ln in text.splitlines() if ln.startswith("ExecStart=") and "nsenter" in ln]
+
+
+def test_a_host_without_nsenter_is_refused_before_anything_is_written(host, tmp_path, monkeypatch):
+    mod = load_host_module(host.env)
+    assert mod.HOST_NS.startswith(mod.NSENTER + " ")
+    monkeypatch.setattr(mod, "ROOT", "")
+    monkeypatch.setattr(mod, "LIBDIR", str(tmp_path / "lib"))
+    monkeypatch.setattr(mod, "NSENTER", str(tmp_path / "no-nsenter"))
+    with pytest.raises(mod.Halt) as refused:
+        mod.install_tools()
+    assert "nsenter" in refused.value.detail
+    assert not (tmp_path / "lib").exists(), "nothing was installed"
 
 
 def test_validator_line_is_the_spec_line(host):
