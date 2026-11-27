@@ -280,3 +280,117 @@ def test_phase_runs_under_its_deadline(host):
     assert host.phase("inbox")[0] == 0
     line = open(str(host.state) + ".timeout").read().split()
     assert line[:2] == ["--kill-after=30s", "300s"]
+
+
+# ---------------------------------------------------------------- Astra review of #780 (findings 1, 4, 9)
+
+def test_serial_tail_never_follows_a_link_qemu_planted(host, monkeypatch):
+    """Finding 1: D/run is QEMU-writable; root writes the serial tail only into the root-only D/log."""
+    import stat
+    mod = load_host_module(host.env)
+    ctx = mod.Ctx("stop", HOTEL, LAUNCH, {}, {})
+    run_dir = os.path.join(ctx.d, "run")
+    os.makedirs(run_dir)
+    victim = host.sealed / "data.raw"
+    before = victim.read_bytes()
+    os.symlink(victim, os.path.join(run_dir, "serial-tail.txt"))
+    monkeypatch.setattr(mod, "qmp", lambda c, *a, **k: [{"return": "guest console tail"}])
+    path = mod.save_ring(ctx)
+    assert victim.read_bytes() == before, "the kit disk was written through the link"
+    assert path == os.path.join(ctx.d, "log", "serial-tail.txt")
+    assert open(path).read() == "guest console tail"
+    assert stat.S_IMODE(os.stat(os.path.join(ctx.d, "log")).st_mode) == 0o700
+
+
+def test_serial_tail_refuses_a_linked_log_folder(host, monkeypatch):
+    mod = load_host_module(host.env)
+    ctx = mod.Ctx("stop", HOTEL, LAUNCH, {}, {})
+    os.makedirs(ctx.d)
+    os.symlink(host.sealed, os.path.join(ctx.d, "log"))
+    monkeypatch.setattr(mod, "qmp", lambda c, *a, **k: [{"return": "x"}])
+    assert mod.save_ring(ctx) is None
+    assert not (host.sealed / "serial-tail.txt").exists()
+
+
+def test_qmp_runs_as_the_guest_user(host, monkeypatch):
+    """Finding 1: a root connect to D/run/qmp.sock could follow a planted link to another socket."""
+    mod = load_host_module(host.env)
+    ctx = mod.Ctx("stop", HOTEL, LAUNCH, {}, {})
+    seen = []
+
+    def fake_run(argv, timeout=120, **kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout='[{"return": {}}]', stderr="")
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    assert mod.qmp(ctx, {"execute": "query-block"}) == [{"return": {}}]
+    assert seen[0][:4] == ["runuser", "-u", f"cg-{HOTEL}", "--"]
+    assert seen[0][-3] == f"{ctx.d}/run/qmp.sock"
+
+
+def test_qmp_client_speaks_qmp(host):
+    import socket
+    import tempfile
+    import threading
+    mod = load_host_module(host.env)
+    d = tempfile.mkdtemp(dir="/tmp")
+    sock_path = os.path.join(d, "q.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(1)
+    got = []
+
+    def serve():
+        c, _ = srv.accept()
+        f = c.makefile("rwb")
+        f.write(b'{"QMP": {"version": {}}}\n')
+        f.flush()
+        for _ in range(2):
+            got.append(json.loads(f.readline()))
+            f.write(b'{"event": "X"}\n{"return": {"ok": 1}}\n')
+            f.flush()
+        c.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    p = subprocess.run([sys.executable, "-I", "-c", mod.QMP_CLIENT, sock_path, "5",
+                        json.dumps([{"execute": "query-block"}])], capture_output=True, text=True, timeout=20)
+    t.join(5)
+    srv.close()
+    os.remove(sock_path)
+    os.rmdir(d)
+    assert p.returncode == 0, p.stderr
+    assert json.loads(p.stdout) == [{"return": {"ok": 1}}]
+    assert got == [{"execute": "qmp_capabilities"}, {"execute": "query-block"}]
+
+
+def test_boot_retry_after_a_crash_between_start_and_booted_finishes_the_checks(host):
+    """Finding 4: the unit runs for this generation but "booted" never landed: the checks run, not skipped."""
+    held(host)
+    mod = load_host_module(host.env)
+    ctx = mod.Ctx("boot", HOTEL, LAUNCH, {}, {})
+    ctx.log("baselined", fingerprint_sha256="f" * 64)
+    ctx.log("boot", state="intent", generation=1, token="t1")
+    ctx.log("token_used", token="t1", generation=1)
+    os.makedirs(ctx.images)
+    with open(os.path.join(ctx.images, "bootstrap.json"), "w") as f:
+        f.write(json.dumps({"network": {"guest_ip": "10.217.0.2"}}, sort_keys=True, separators=(",", ":")))
+    unit = f"custom-guest-{LAUNCH}.service"
+    st = host.systemd()
+    st[unit] = {"active": True, "enabled": False, "invocation": "i1", "enter": 1}
+    host.state.write_text(json.dumps(st))
+    rc, r = host.phase("boot", {"generation": 1}, extra={"CG_PROBE_TIMEOUT": "1", "CG_PROBE_ADDR": "127.0.0.1:9"})
+    assert rc == 1 and r["error_code"] == "custom_guest_boot_failed", r
+    assert not host.systemd()[unit]["active"], "a failed check stops the unit"
+    assert not [e for e in host.journal() if e["event"] == "booted"]
+
+
+def test_facts_show_inbox_and_staging_and_discard_clears_them(host):
+    """Finding 9: cancel must see the inbox and staging folders, and discard removes them."""
+    assert host.phase("inbox")[0] == 0
+    (host.root / f"srv/custom-guest/{HOTEL}/staging/{LAUNCH}").mkdir(parents=True)
+    f = host.phase("facts")[1]
+    assert f["inbox_dir"] and f["staging_dir"] and not f["launch_dir"]
+    assert host.phase("discard")[0] == 0
+    f = host.phase("facts")[1]
+    assert not (f["inbox_dir"] or f["staging_dir"] or f["launch_dir"])

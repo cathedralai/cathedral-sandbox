@@ -621,44 +621,77 @@ def load_doc(path: str) -> tuple[dict, bytes]:
 
 # ---------------------------------------------------------------- QMP and probes
 
+QMP_CLIENT = """
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(float(sys.argv[2]))
+s.connect(sys.argv[1])
+f = s.makefile("rwb")
+def reply():
+    while True:
+        line = f.readline()
+        if not line:
+            raise OSError("QMP closed")
+        msg = json.loads(line)
+        if "return" in msg or "error" in msg:
+            return msg
+json.loads(f.readline())
+out = []
+for cmd in [{"execute": "qmp_capabilities"}] + json.loads(sys.argv[3]):
+    f.write(json.dumps(cmd).encode() + b"\\n")
+    f.flush()
+    out.append(reply())
+print(json.dumps(out[1:]))
+"""
+
+
 def qmp(ctx: Ctx, *commands: dict, timeout: float = 10) -> list[dict]:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    s.connect(f"{ctx.d}/run/qmp.sock")
-    f = s.makefile("rwb")
-
-    def reply() -> dict:
-        while True:
-            line = f.readline()
-            if not line:
-                raise OSError("QMP closed")
-            msg = json.loads(line)
-            if "return" in msg or "error" in msg:
-                return msg
-
+    """QMP as the guest's own user. D/run is writable by QEMU, so a root connect could follow a planted
+    symlink to another socket (the kit's QMP, systemd's); as cg-<hotel> it reaches only what QEMU could."""
+    r = run(["runuser", "-u", ctx.user, "--", sys.executable, "-I", "-c", QMP_CLIENT, f"{ctx.d}/run/qmp.sock",
+             str(timeout), json.dumps(list(commands))], timeout=timeout + 10)
+    if r.returncode != 0:
+        raise OSError(f"QMP: {r.stderr.strip()[-200:]}")
     try:
-        json.loads(f.readline())  # greeting
-        out = []
-        for cmd in ({"execute": "qmp_capabilities"}, *commands):
-            f.write(json.dumps(cmd).encode() + b"\n")
-            f.flush()
-            out.append(reply())
-        return out[1:]
+        out = json.loads(r.stdout)
+    except ValueError as e:
+        raise OSError(f"QMP answer: {e}")
+    if not isinstance(out, list):
+        raise OSError("QMP answer is not a list")
+    return out
+
+
+def root_write(directory: str, name: str, data: bytes) -> str:
+    """Write a file as root only inside a folder this process owns, never through a link (5.8)."""
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(directory)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        raise OSError(f"{directory} is not a private folder of this user")
+    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
     finally:
-        s.close()
+        os.close(dfd)
+    return os.path.join(directory, name)
 
 
 def save_ring(ctx: Ctx) -> str | None:
+    """The serial tail, kept in D/log (root-only; the unit binds only D/images, D/disks and D/run)."""
     try:
         r = qmp(ctx, {"execute": "ringbuf-read", "arguments": {"device": "serial0", "size": 1 << 20,
                                                                 "format": "utf8"}})[0]
         text = r.get("return", "")
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
-    path = f"{ctx.d}/run/serial-tail.txt"
-    with open(path, "w") as f:
-        f.write(text if isinstance(text, str) else "")
-    return path
+    try:
+        return root_write(f"{ctx.d}/log", "serial-tail.txt", (text if isinstance(text, str) else "").encode())
+    except OSError:
+        return None
 
 
 def probe_banner(ctx: Ctx, addr: str, port: int) -> bool:
@@ -806,6 +839,8 @@ def ph_facts(ctx: Ctx) -> dict:
             "kit_absent": kit_absent(ctx), "kit_net_timer": {"active": active(ctx.kit_net_timer),
                                                              "enabled": enabled(ctx.kit_net_timer)},
             "custom_unit": custom, "marker": marker_doc(ctx), "launch_dir": os.path.isdir(ctx.d),
+            "inbox_dir": os.path.isdir(f"{ctx.base}/inbox/{ctx.launch}"),
+            "staging_dir": os.path.isdir(f"{ctx.base}/staging/{ctx.launch}"),
             "journal": [e for e in ctx.entries() if e.get("event") != "sub"], "boot_id": boot_id(),
             "allowed": allowed(ctx.hotel)}
 
@@ -1209,7 +1244,10 @@ def ph_boot(ctx: Ctx) -> dict:
     used = ctx.last("token_used")
     if active(ctx.unit):
         if used and used.get("generation") == gen:
-            return {"ok": True, "already": True, "generation": gen}
+            if any(e.get("generation") == gen for e in ctx.entries("booted")):
+                return {"ok": True, "already": True, "generation": gen}
+            # A run that died between the start and "booted": finish the checks, never skip them.
+            return finish_boot(ctx, gen)
         raise Halt("custom_guest_host_not_exclusive", "the custom guest runs another generation")
     if any(e.get("generation") == gen for e in ctx.entries("token_used")):
         # Nothing restarts a guest (11.4): a new start is an owner relaunch with a new generation.
@@ -1286,6 +1324,12 @@ def ph_boot(ctx: Ctx) -> dict:
     r = run(["systemctl", "start", ctx.unit], timeout=240)
     if r.returncode != 0 or not active(ctx.unit):
         raise Halt("custom_guest_boot_failed", f"the unit did not start: {r.stderr.strip()[:200]}")
+    fault("host:boot:started")
+    return finish_boot(ctx, gen)
+
+
+def finish_boot(ctx: Ctx, gen: int) -> dict:
+    """After the start: the SSH banner, the isolation checks, then "booted". Any failure stops the unit."""
     net = guest_net(ctx)
     addr = os.environ.get("CG_PROBE_ADDR", f"{net['guest_ip']}:22")
     host, port = addr.rsplit(":", 1)
