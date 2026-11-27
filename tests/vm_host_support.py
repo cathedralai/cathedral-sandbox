@@ -12,6 +12,11 @@ KIT = Path(__file__).resolve().parents[1] / "room-kit" / "vm"
 MEASUREMENT = "ab" * 48
 FAKE_LOG = '#!/bin/sh\necho "$(basename "$0") $*" >> "$FAKE_STATE.tools"\n'
 # getent finds nothing, so create runs useradd and groupadd (logged, not run).
+# vm-gates.sh check: passes unless $FAKE_STATE.gates holds an exit code (line 1) and the JSON
+# line to print (line 2). Every call is logged with the other tools.
+FAKE_GATES = ('#!/bin/sh\necho "vm-gates $*" >> "$FAKE_STATE.tools"\n'
+              '[ -f "$FAKE_STATE.gates" ] || { echo \'{"ok": true}\'; exit 0; }\n'
+              'sed -n 2p "$FAKE_STATE.gates"; exit "$(sed -n 1p "$FAKE_STATE.gates")"\n')
 FAKE_USER_TOOLS = {"useradd": FAKE_LOG, "userdel": FAKE_LOG, "groupadd": FAKE_LOG, "chown": FAKE_LOG,
                    "udevadm": FAKE_LOG, "getent": FAKE_LOG + "exit 2\n"}
 
@@ -36,11 +41,12 @@ def install_bundle(vm_root: Path, family: str = "genoa") -> str:
 
 def sealed_host(tmp_path: Path, fake_bin: Path, family: str = "genoa") -> dict:
     """Write a bundle, the host config and the fake tools; return the env vm_ctl needs."""
-    for name, text in FAKE_USER_TOOLS.items():
+    for name, text in {**FAKE_USER_TOOLS, "vm-gates": FAKE_GATES}.items():
         (fake_bin / name).write_text(text)
         (fake_bin / name).chmod(0o755)
     bundle = install_bundle(tmp_path / "vms", family)
     config = tmp_path / "snp-vm-host.json"
     config.write_text(json.dumps({"version": 1, "cpu_family": family, "bundles": [bundle],
                                   "default_bundle": bundle, "sev_snp_measure": str(fake_measure_tool(fake_bin))}))
-    return {"VM_HOST_CONFIG": str(config), "VM_UDEV_RULES_DIR": str(tmp_path / "udev"), "VM_TEST_BUNDLE": bundle}
+    return {"VM_HOST_CONFIG": str(config), "VM_UDEV_RULES_DIR": str(tmp_path / "udev"), "VM_TEST_BUNDLE": bundle,
+            "VM_GATES": str(fake_bin / "vm-gates")}
