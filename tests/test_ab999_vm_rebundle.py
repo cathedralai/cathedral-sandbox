@@ -222,6 +222,13 @@ def test_a_retried_op_id_returns_its_stored_result_unchanged(site):
         code, res = site.rebundle(gen, dst, expect, op(1))
         assert (code, res["error"], res["reason"]) == (19, "stale_selection", "op_id_reused")
     assert site.files() == files
+    # Also after a later run: the same answer byte for byte, and nothing written.
+    site.ran_once()
+    files = site.files()
+    p = subprocess.run([str(CTL), *argv(0, site.b2, 0, op(1))], capture_output=True, text=True, timeout=60,
+                       env=site.h.environ)
+    assert p.returncode == 0 and p.stdout == json.dumps(first, sort_keys=True) + "\n"  # out() writes sorted keys
+    assert site.files() == files and site.launch()["bundle"] == site.b1
 
 
 def test_the_op_log_keeps_the_last_64_and_an_evicted_retry_changes_nothing(site):
@@ -247,7 +254,8 @@ def test_the_op_log_keeps_the_last_64_and_an_evicted_retry_changes_nothing(site)
 @pytest.mark.parametrize("case", [
     ("stale_generation", "not_current"), ("stale_generation", "generation_open"),
     ("stale_generation", "unit_active"), ("bundle_incompatible", "bundle_not_enabled"),
-    ("bundle_incompatible", "no_bundle"), ("bundle_incompatible", "no_verified_build"),
+    ("bundle_incompatible", "no_bundle"), ("bundle_incompatible", "no_bundle/manifest"),
+    ("bundle_incompatible", "no_verified_build"),
     ("bundle_incompatible", "no_verified_build/vcpus"), ("bundle_incompatible", "no_verified_build/qemu"),
     ("bundle_incompatible", "base_root_differs")])
 def test_fences_refuse_and_write_nothing(site, case):
@@ -270,6 +278,9 @@ def test_fences_refuse_and_write_nothing(site, case):
         dst = site.b4
     elif why == "no_bundle":
         shutil.rmtree(site.h.root / "bundles" / site.b2)  # enabled in the host file, directory gone
+    elif why == "no_bundle/manifest":
+        manifest = site.h.root / "bundles" / site.b2 / "manifest.json"
+        manifest.write_bytes(manifest.read_bytes().replace(b"kernel-fix", b"kernel-fyx"))  # sha256 != its id
     elif why == "no_verified_build":
         dst = site.b5
     elif why == "no_verified_build/vcpus":
