@@ -124,6 +124,8 @@ func TestCutAtEveryPointEndsReady(t *testing.T) {
 		{"4.4", StateOpen},
 		{"4.5-torn", StateOpen},
 		{"4.5", StateOpen},
+		{"4.5-other-torn", StateOpen},
+		{"4.5-other", StateOpen},
 	} {
 		t.Run(c.point, func(t *testing.T) {
 			h := rootHarness(t)
@@ -174,6 +176,9 @@ func TestCutTwiceEndsReady(t *testing.T) {
 		{"4.4", "4.4", StateOpen},
 		{"4.4", "4.1", StateOpen}, // the stray recovery slot removed, then cut
 		{"4.5-torn", "4.5-torn", StateOpen},
+		// Ready on one copy only: the next boot makes the other ready.
+		{"4.5", "ready-copy-torn", StateOpen},
+		{"4.5-other-torn", "ready-copy", StateOpen},
 	} {
 		t.Run(c.first+" then "+c.second, func(t *testing.T) {
 			h := rootHarness(t)

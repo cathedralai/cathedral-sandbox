@@ -3,8 +3,11 @@ package vmdisk
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -70,16 +73,17 @@ func TestRootNewThenOpen(t *testing.T) {
 	id, k := testID(t, "vm-0123456789ab"), newKey(1)
 	d := h.newDisk(testDisk)
 	out := h.mustReady(d, id, k, StateNew)
-	if out.Meta.State != StateReady || out.Meta.Seq != 2 {
+	if out.Meta.State != StateReady || out.Meta.Seq != 3 {
 		t.Fatalf("first boot meta %+v", out.Meta)
 	}
 	rep := h.checkReady(d, id, k)
-	if rep.meta.Copy != 1 {
-		t.Fatalf("ready went to copy %d, want 1 (F4 wrote copy 0)", rep.meta.Copy)
+	// F4 wrote copy 0 (seq 1), 4.5 copy 1 (seq 2), then copy 0 again (seq 3).
+	if rep.meta.Copy != 0 || rep.copies[1].Seq != 2 {
+		t.Fatalf("ready is copy %d, copy 1 seq %d; want copy 0 over copy 1 seq 2", rep.meta.Copy, rep.copies[1].Seq)
 	}
 	before := d.sha()
 	out = h.mustReady(d, id, k, StateOpen)
-	if out.Meta.Seq != 2 || d.sha() != before {
+	if out.Meta.Seq != 3 || d.sha() != before {
 		t.Fatal("a second boot of a ready disk wrote it")
 	}
 }
@@ -139,7 +143,7 @@ func TestRootOpensWithSlotZeroRemoved(t *testing.T) {
 		"--new-keyfile-size", "32", "DEV", secretPath(1))
 	// The re-wrap cut before its meta write: the next boot adds the slot (step 5).
 	out := h.mustReady(d, id, k2, StateOpen)
-	if out.Meta.Seq != 3 || len(out.Meta.Slots) != 3 {
+	if out.Meta.Seq != 4 || len(out.Meta.Slots) != 3 {
 		t.Fatalf("step 5 did not add the slot: %+v", out.Meta)
 	}
 	var m1 int
@@ -163,6 +167,60 @@ func TestRootOpensWithSlotZeroRemoved(t *testing.T) {
 		t.Fatalf("pruned meta not read: %+v", out.Meta)
 	}
 	h.mustRefuse(d, id, k1, StateLocked)
+}
+
+// One unreadable meta copy after ready (P2 1): both copies are ready, so
+// the boot opens with the same table, runs no first-boot step, the first
+// boot's R still opens the recovery slot, and the lost copy is ready again.
+func TestRootOneBadMetaCopyStaysReady(t *testing.T) {
+	for copyIndex := range MetaOffsets() {
+		t.Run(fmt.Sprintf("copy %d", copyIndex), func(t *testing.T) {
+			h := rootHarness(t)
+			id, k := testID(t, "vm-0123456789ab"), newKey(1)
+			d := h.newDisk(testDisk)
+			h.mustReady(d, id, k, StateNew)
+			rep := h.checkReady(d, id, k)
+			r := append([]byte(nil), rep.fs[2*MiB:2*MiB+32]...)
+			// One 4 KiB sector of ciphertext: the copy decrypts to noise.
+			d.writeAt(LUKSDataOffset+MetaOffsets()[copyIndex], bytes.Repeat([]byte{0xa5}, RecordBytes))
+			if h.inspect(d, k).valid[copyIndex] {
+				t.Fatal("the overwritten copy still parses")
+			}
+			out, err, lines := h.boot(d, id, k)
+			log := strings.Join(lines, "\n")
+			if err != nil || !out.Ready || out.State != StateOpen || out.Meta.State != StateReady ||
+				!reflect.DeepEqual(out.Meta.Slots, rep.meta.Meta.Slots) || strings.Contains(log, "vm-disk: 4.1") {
+				t.Fatalf("state %s ready %v meta %+v err %v\n%s", out.State, out.Ready, out.Meta, err, log)
+			}
+			after := h.checkReady(d, id, k)
+			for slot, role := range after.meta.Meta.Slots {
+				if role == RoleRecovery && !h.opensSlot(d, r, slot) {
+					t.Fatal("the first boot's R no longer opens the recovery slot")
+				}
+			}
+		})
+	}
+}
+
+// A LUKS2 header whose two copies fail their checksums keeps its magics:
+// broken, with or without this VM's intent (P2 3). Read as "no header",
+// the intent would resume and format over the volume.
+func TestRootUnreadableHeaderIsBroken(t *testing.T) {
+	h := rootHarness(t)
+	id, k := testID(t, "vm-0123456789ab"), newKey(1)
+	d := h.newDisk(testDisk)
+	h.mustReady(d, id, k, StateNew)
+	// One byte of each JSON area (F3's 16 KiB header: copies at 0 and 16 KiB).
+	for _, off := range []int64{4096 + 1, 16<<10 + 4096 + 1} {
+		d.writeAt(off, []byte{'X'})
+	}
+	h.mustRefuse(d, id, k, StateBroken)
+	rec, err := EncodeIntent(id, testDisk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.writeAt(testDisk-IntentAreaBytes, rec[:])
+	h.mustRefuse(d, id, k, StateBroken)
 }
 
 func TestRootIntentCases(t *testing.T) {
@@ -213,7 +271,7 @@ func TestRootIntentCases(t *testing.T) {
 		volume := d.readAt(0, int(intentOff))
 		d.writeAt(intentOff, intentFor(idA, testDisk))
 		out := h.mustReady(d, idA, k1, StateOpen)
-		if out.Meta.Seq != 2 || !bytes.Equal(d.readAt(0, int(intentOff)), volume) {
+		if out.Meta.Seq != 3 || !bytes.Equal(d.readAt(0, int(intentOff)), volume) {
 			t.Fatal("the volume changed")
 		}
 		if !bytes.Equal(d.intentArea(), make([]byte, IntentAreaBytes)) {

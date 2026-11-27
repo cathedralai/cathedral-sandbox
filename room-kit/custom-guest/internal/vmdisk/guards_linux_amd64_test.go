@@ -1,6 +1,7 @@
 package vmdisk
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"os"
@@ -22,13 +23,32 @@ import (
 // init runs it as it runs the pinned binary (by descriptor, secrets on
 // fds 4 and 5), so a lie that needs a secret twice copies it to a file in
 // the test's temporary directory first.
-func (h *harness) lyingTool(lie string) Tool {
+func (h *harness) lyingTool(lie string) Tool { return h.lyingToolOn(lie, "") }
+
+// lyingToolOn is lyingTool with the path of the disk file a lie writes.
+func (h *harness) lyingToolOn(lie, disk string) Tool {
 	h.t.Helper()
 	keys := filepath.Join(h.dir, "lie-"+randomHex(4))
 	script := `#!/bin/sh
 real='` + h.tool.Path + `'
 keys='` + keys + `'
 lie='` + lie + `'
+disk='` + disk + `'
+test=0
+for a in "$@"; do
+	if [ "$a" = --test-passphrase ]; then test=1; fi
+done
+case "$1:$lie:$test" in
+open:test-exit-1:1)
+	exit 1
+	;;
+open:wipe-header:1)
+	if [ ! -e "$keys.wiped" ]; then
+		: > "$keys.wiped"
+		dd if=/dev/zero of="$disk" bs=1M count=16 conv=notrunc status=none || exit 9
+	fi
+	;;
+esac
 case "$1:$lie" in
 luksFormat:format-512)
 	first=1
@@ -196,5 +216,39 @@ func TestRootCraftedTablesAreRefused(t *testing.T) {
 				t.Fatal("the refused boot wrote the disk")
 			}
 		})
+	}
+}
+
+// A cryptsetup key test that fails in any way but "wrong passphrase" (exit
+// 2) is an error, never locked (P2 4): the boot powers off and writes
+// nothing, and the real tool then opens the disk.
+func TestRootKeyTestFailureIsNotLocked(t *testing.T) {
+	h := rootHarness(t)
+	id, k := testID(t, "vm-0123456789ab"), newKey(1)
+	d := h.newDisk(testDisk)
+	h.mustReady(d, id, k, StateNew)
+	before := d.sha()
+	h.mustFail(d, id, k, h.lyingTool("test-exit-1"), fakeSetup{}, "--test-passphrase exit 1")
+	if d.sha() != before {
+		t.Fatal("the failed boot wrote the disk")
+	}
+	h.mustReady(d, id, k, StateOpen)
+}
+
+// The header on the disk is zeroed after the classifier read it and before
+// the first key test (P2 2). Every key test and open of the boot reads the
+// header snapshot, so the boot still ends ready with the volume the
+// classifier saw; read from the disk again, the key test would fail.
+func TestRootHeaderSwapAfterTheCheckIsNotSeen(t *testing.T) {
+	h := rootHarness(t)
+	id, k := testID(t, "vm-0123456789ab"), newKey(1)
+	d := h.newDisk(testDisk)
+	h.mustReady(d, id, k, StateNew)
+	out, err, lines := h.bootWith(d, id, k, h.lyingToolOn("wipe-header", d.path), fakeSetup{})
+	if err != nil || !out.Ready || out.State != StateOpen || out.Meta.State != StateReady {
+		t.Fatalf("state %s ready %v err %v\n%s", out.State, out.Ready, err, strings.Join(lines, "\n"))
+	}
+	if !bytes.Equal(d.readAt(0, 16*MiB), make([]byte, 16*MiB)) {
+		t.Fatal("the header was not zeroed: the swap did not run")
 	}
 }

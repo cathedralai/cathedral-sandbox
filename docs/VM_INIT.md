@@ -40,6 +40,21 @@ The LUKS device is mapped read-only while the disk is classified, so cryptsetup
 cannot repair or rewrite a header the init then refuses. Only `new`, `resume`
 and `open` reload it read-write.
 
+Header snapshot: before the classifier, the init copies the header and keyslot
+area (the 16 MiB before the volume) into a memfd. Every header read of the boot
+(`luksDump`, each `--test-passphrase`, the probe and volume opens) passes that
+copy as `--header`, so each sees the header the rules were checked on, not one
+the host swapped on the disk in between. The header writes (`luksFormat`,
+`luksKillSlot`, `luksAddKey`) go to the disk, and the init copies the header
+again after each before it reads it.
+
+A key test (`open --test-passphrase`) reads only exit 2 (no key available with
+this passphrase) as "does not open". Any other nonzero exit is an error and
+powers off, so a tool failure never classifies a disk as `locked`.
+
+The mailbox disk is opened `O_RDWR|O_DIRECT`, as `internal/vmmailbox` (PR C)
+requires, so a poll reads what the host wrote and not a cached page.
+
 ## States
 
 Order of the probes: intent, header, (blank), opens, meta.
@@ -51,13 +66,18 @@ Order of the probes: intent, header, (blank), opens, meta.
 | `new` | no valid intent, not LUKS, every byte of the LUKS device zero | format from F1 |
 | `locked` | no valid intent, header rules hold, no slot opens | status, power off; never written |
 | `tampered` | no valid intent, a LUKS2 header that fails the rules | status, power off; never written |
-| `broken` | anything else: LUKS1; not blank and not LUKS with no intent; a valid intent with a keyslot this key cannot open; meta of another identity; a slot opens with no meta and no intent; a valid meta behind a header that fails the rules | status, power off; never written |
+| `broken` | anything else: LUKS1; a LUKS magic (primary, or a LUKS2 secondary at any offset LUKS2 allows) that cryptsetup cannot read, with or without an intent; not blank and not LUKS with no intent; a valid intent with a keyslot this key cannot open; meta of another identity; a slot opens with no meta and no intent; a valid meta behind a header that fails the rules | status, power off; never written |
 
 The host's `vm_state` shows `resume` as `new`.
 
 The last `broken` row is stricter than r3's text (D4 on PR #798): a header that
 fails the rules, a slot this key opens and a valid meta would read as `resume`,
-which would re-format a volume holding a valid meta.
+which would re-format a volume holding a valid meta. The same holds for a LUKS
+magic cryptsetup cannot read: read as "no header", a valid intent would resume
+and format over the volume. Its cost: a power cut inside F3's own header write
+(cryptsetup writes the header without its checksum, then the JSON, then the
+checksum) leaves a disk `broken` instead of `resume`. F3 runs before any
+customer data exists, so that cost is a new VM, never lost data.
 
 Header rules (sealed-data.sh:84-104 without the slot-0 test): one crypt segment
 `aes-xts-plain64`, 4 KiB sectors, offset 16 MiB, size dynamic, no integrity or
@@ -76,7 +96,12 @@ kernel's crypt table must be the same cipher, sector size and device.
 - 4.1: remove every keyslot the table does not list.
 - 4.2, 4.3: root setup on the file system area; it returns the recovery key R.
 - 4.4: add R as a keyslot; exactly one slot is new and R opens it.
-- 4.5: meta `ready` with both slots, to the other copy. Last.
+- 4.5: meta `ready` with both slots, to the other copy (the commit), then again
+  with `seq + 1` over the `initializing` copy. Last. With one copy ready and the
+  other still `initializing`, one unreadable sector of the ready copy would
+  bring back `initializing`, and that boot's 4.1 would remove the recovery slot.
+  A boot of a ready disk whose other copy is not ready (a cut between the two
+  writes, or a copy lost since) writes it ready the same way.
 
 ## Tests
 
@@ -88,7 +113,7 @@ kernel's crypt table must be the same cipher, sector size and device.
 | Hook | `cmd/cathedral-vm-init` | the init built as the initrd builds it has no `vmcuttest` or `CATHEDRAL_VMCUT` bytes; the tagged build has both |
 | Classifier | `internal/vmdisk` | every branch, with the exact probe sequence |
 | T3 | `.github/workflows/vm-init.yml`, root | init states on loop files with the kernel device-mapper and cryptsetup; refused disks keep their sha256 |
-| T5 | `.github/workflows/vm-init.yml`, root, `-tags vmcuttest` | a SIGKILL at every F step and step-4 point, inside luksFormat and luksAddKey, and twice, then a clean boot: ready, one M slot, one recovery slot, zero intent |
+| T5 | `.github/workflows/vm-init.yml`, root, `-tags vmcuttest` | a SIGKILL at every F step and step-4 point (both 4.5 writes and the ready-boot repair), inside luksFormat and luksAddKey, and twice, then a clean boot: ready, one M slot, one recovery slot, both meta copies ready, zero intent |
 
 Run as a user (any linux/amd64 host; `go test -c` elsewhere):
 

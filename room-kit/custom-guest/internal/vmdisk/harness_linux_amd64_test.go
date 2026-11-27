@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -269,7 +270,9 @@ func (h *harness) mustRefuse(d *disk, id vmidentity.Identity, k key, want State)
 type report struct {
 	keyslots []int
 	meta     Current
-	fs       []byte // the first 3 MiB of the file system area
+	copies   [2]Meta // each meta copy as parsed
+	valid    [2]bool // whether each copy parsed
+	fs       []byte  // the first 3 MiB of the file system area
 }
 
 func (h *harness) inspect(d *disk, k key) report {
@@ -315,6 +318,13 @@ func (h *harness) inspect(d *disk, k key) report {
 	if rep.meta, err = readMeta(vol); err != nil {
 		h.t.Fatal(err)
 	}
+	for i, off := range MetaOffsets() {
+		rec, err := readDirect(vol, off, RecordBytes)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		rep.copies[i], rep.valid[i] = ParseMeta(rec)
+	}
 	if rep.fs, err = readDirect(vol, MetaAreaBytes, 3*MiB); err != nil {
 		h.t.Fatal(err)
 	}
@@ -336,7 +346,8 @@ func (h *harness) opensSlot(d *disk, pass []byte, slot int) bool {
 }
 
 // checkReady is the T5 end state: ready, exactly one measurement slot for
-// k and one recovery slot, R opens its slot, and an all-zero intent area.
+// k and one recovery slot, both meta copies ready with that table, R opens
+// its slot, and an all-zero intent area.
 func (h *harness) checkReady(d *disk, id vmidentity.Identity, k key) report {
 	h.t.Helper()
 	rep := h.inspect(d, k)
@@ -355,6 +366,12 @@ func (h *harness) checkReady(d *disk, id vmidentity.Identity, k key) report {
 	}
 	if measured < 0 || recovery < 0 || !sameSlots(rep.keyslots, m.Meta.Slots) {
 		h.t.Fatalf("table %v keyslots %v", m.Meta.Slots, rep.keyslots)
+	}
+	for i := range rep.copies {
+		c := rep.copies[i]
+		if !rep.valid[i] || c.State != StateReady || !c.Names(id) || !reflect.DeepEqual(c.Slots, m.Meta.Slots) {
+			h.t.Fatalf("meta copy %d is not a ready copy of the table: valid %v %+v", i, rep.valid[i], c)
+		}
 	}
 	if !h.opensSlot(d, k.pass, measured) || h.opensSlot(d, k.pass, recovery) {
 		h.t.Fatal("the measurement slot does not open with the key, or the recovery slot does")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 )
@@ -11,9 +12,28 @@ import (
 // cryptsetup runs the pinned cryptsetup on one LUKS device path. Keys reach
 // it only through pipes (Tool.run); it never sees a key in argv or env, and
 // its output is never logged beyond one stderr line.
+//
+// hdr, when set, is this boot's in-memory copy of the header and keyslot
+// area (run.snapshot). Every read (dump, key test, open) passes it as
+// --header, so each reads the header the classifier checked, not the disk
+// again: the host cannot swap the header between a check and an open. The
+// writes (luksFormat, luksAddKey, luksKillSlot) change the header on the
+// device and take no --header; the caller snapshots again after each.
 type cryptsetup struct {
 	tool Tool
 	dev  string
+	hdr  *os.File
+}
+
+// read runs a header read with the snapshot, when there is one, as the
+// file after the secret pipes.
+func (c cryptsetup) read(ctx context.Context, point string, secrets [][]byte, args ...string) (toolResult, error) {
+	if c.hdr == nil {
+		return c.tool.run(ctx, point, quick, secrets, args...)
+	}
+	// The verb stays first; --header goes right after it.
+	with := append([]string{args[0], "--header", secretPath(len(secrets))}, args[1:]...)
+	return c.tool.runFiles(ctx, point, quick, secrets, []*os.File{c.hdr}, with...)
 }
 
 const (
@@ -29,22 +49,34 @@ func keyArgs(n int) []string {
 }
 
 func (c cryptsetup) dump(ctx context.Context) (toolResult, error) {
-	return c.tool.run(ctx, "dump", quick, nil, "luksDump", "--dump-json-metadata", c.dev)
+	return c.read(ctx, "dump", nil, "luksDump", "--dump-json-metadata", c.dev)
 }
 
-// opens reports whether key opens slot (any slot when slot < 0). Any
-// normal nonzero exit is "does not open": that never leads to a write.
+// passphraseRefused is cryptsetup's exit code for "no key available with
+// this passphrase" (EPERM).
+const passphraseRefused = 2
+
+// opens reports whether key opens slot (any slot when slot < 0). Only exit 2
+// means "does not open". Any other nonzero exit (a header it cannot load, a
+// device it cannot read, a bad argument) is an error, so a failure of the
+// tool never classifies a disk as locked.
 func (c cryptsetup) opens(ctx context.Context, key []byte, slot int) (bool, error) {
 	args := []string{"open", "--test-passphrase", "--type", "luks2", "--disable-external-tokens"}
 	if slot >= 0 {
 		args = append(args, "--key-slot", strconv.Itoa(slot))
 	}
 	args = append(append(args, keyArgs(0)...), c.dev)
-	r, err := c.tool.run(ctx, "test", quick, [][]byte{key}, args...)
+	r, err := c.read(ctx, "test", [][]byte{key}, args...)
 	if err != nil {
 		return false, err
 	}
-	return r.Exit == 0, nil
+	switch r.Exit {
+	case 0:
+		return true, nil
+	case passphraseRefused:
+		return false, nil
+	}
+	return false, fmt.Errorf("cryptsetup open --test-passphrase exit %d: %s", r.Exit, r.Stderr)
 }
 
 // open maps the volume as name, read-only or read-write, with one slot.
@@ -57,7 +89,7 @@ func (c cryptsetup) open(ctx context.Context, key []byte, slot int, name string,
 		args = append(args, "--key-slot", strconv.Itoa(slot))
 	}
 	args = append(append(args, keyArgs(0)...), c.dev, name)
-	r, err := c.tool.run(ctx, "open", quick, [][]byte{key}, args...)
+	r, err := c.read(ctx, "open", [][]byte{key}, args...)
 	if err != nil {
 		return err
 	}

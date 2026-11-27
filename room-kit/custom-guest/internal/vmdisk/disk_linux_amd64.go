@@ -3,12 +3,12 @@ package vmdisk
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"syscall"
+	"unsafe"
 )
 
 type run struct {
@@ -71,6 +71,9 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 	}
 	r.cs = cryptsetup{tool: cfg.Cryptsetup, dev: luks.Name()}
 	luks.Close()
+	if err := r.snapshot(); err != nil {
+		return Outcome{}, err
+	}
 
 	res, err := Classify(&linuxFacts{r: r}, cfg.Identity)
 	if err != nil {
@@ -101,6 +104,8 @@ func Run(ctx context.Context, cfg Config) (Outcome, error) {
 	// would keep the crypt mapping busy.
 	r.crypt.Close()
 	r.crypt = nil
+	r.cs.hdr.Close()
+	r.cs.hdr = nil
 	out.Ready, out.Meta, out.FSArea = true, meta, r.fs
 	ready = true
 	return out, nil
@@ -121,6 +126,44 @@ func (r *run) teardown() {
 		}
 	}
 	r.dm.remove(r.cfg.Names.LUKS)
+	if r.cs.hdr != nil {
+		r.cs.hdr.Close()
+		r.cs.hdr = nil
+	}
+}
+
+// sysMemfdCreate is memfd_create(2) on x86_64; mfdCloexec its MFD_CLOEXEC.
+const (
+	sysMemfdCreate = 319
+	mfdCloexec     = 1
+)
+
+// snapshot copies the header and keyslot area (the LUKSDataOffset bytes
+// before the volume) from the disk into memory, and every later read of
+// this boot's cryptsetup uses that copy (cryptsetup.hdr). The classifier's
+// header checks, each key test and each open then see the same header, not
+// one the host swapped on the disk in between. Taken once before the
+// classifier and again after each write to the on-disk header.
+func (r *run) snapshot() error {
+	head, err := readDirect(r.cfg.Disk, 0, LUKSDataOffset)
+	if err != nil {
+		return fmt.Errorf("LUKS header: %w", err)
+	}
+	name := []byte("cathedral-vm-luks-header\x00")
+	fd, _, errno := syscall.Syscall(sysMemfdCreate, uintptr(unsafe.Pointer(&name[0])), mfdCloexec, 0)
+	if errno != 0 {
+		return fmt.Errorf("header copy: %w", errno)
+	}
+	f := os.NewFile(fd, "luks-header")
+	if n, err := f.WriteAt(head, 0); err != nil || n != len(head) {
+		f.Close()
+		return errors.New("header copy: short write")
+	}
+	if r.cs.hdr != nil {
+		r.cs.hdr.Close()
+	}
+	r.cs.hdr = f
+	return nil
 }
 
 // linuxFacts are the classifier's probes on the read-only LUKS mapping.
@@ -144,14 +187,12 @@ func (f *linuxFacts) Header() (HeaderKind, Header, error) {
 		clear(res.Stdout)
 		return LUKS2, f.r.header, nil
 	}
-	head, err := readDirect(f.r.cfg.Disk, 0, 4096)
-	if err != nil {
-		return 0, Header{}, fmt.Errorf("LUKS device: %w", err)
+	// The magics of the same copy cryptsetup could not read.
+	head := make([]byte, MagicScanBytes)
+	if n, err := f.r.cs.hdr.ReadAt(head, 0); err != nil || n != len(head) {
+		return 0, Header{}, errors.New("LUKS header copy unreadable")
 	}
-	if string(head[:6]) == "LUKS\xba\xbe" && binary.BigEndian.Uint16(head[6:8]) == 1 {
-		return LUKS1, Header{}, nil
-	}
-	return NoLUKS2, Header{}, nil
+	return MagicKind(head), Header{}, nil
 }
 
 func (f *linuxFacts) Opens(slots []int) (int, bool, error) {
@@ -356,6 +397,9 @@ func (r *run) format() (Meta, error) {
 	}
 	r.log("vm-disk: F3 luksFormat done")
 	cutAfter("f3-format")
+	if err := r.snapshot(); err != nil {
+		return Meta{}, err
+	}
 	h, err := r.cs.header(r.ctx)
 	if err != nil {
 		return Meta{}, err
@@ -435,7 +479,33 @@ func (r *run) open(res Result) (Meta, error) {
 		cutAfter("table")
 		return next, nil
 	}
-	return cur.Meta, nil
+	return r.mirror(cur, "ready-copy")
+}
+
+// mirror makes the other meta copy a ready copy when it is not one: the
+// second write of 4.5, and on a ready boot after a cut between the two
+// writes (or a copy lost since). While the other copy still holds the
+// initializing seq 1, one unreadable sector of the ready copy would make
+// ChooseMeta pick it, and that boot's 4.1 would remove the recovery slot.
+// With both copies ready, losing either leaves a ready copy.
+func (r *run) mirror(cur Current, point string) (Meta, error) {
+	other := cur.NextCopy()
+	rec, err := readDirect(r.crypt, MetaOffsets()[other], RecordBytes)
+	if err != nil {
+		return Meta{}, err
+	}
+	if m, ok := ParseMeta(rec); ok && m.State == StateReady && m.Names(r.cfg.Identity) {
+		return cur.Meta, nil
+	}
+	next := cur.Meta
+	next.Seq++
+	next.Slots = copySlots(cur.Meta.Slots)
+	if err := r.writeMeta(point, other, next); err != nil {
+		return Meta{}, err
+	}
+	r.log("vm-disk: meta copy %d made ready", other)
+	cutAfter(point)
+	return next, nil
 }
 
 func copySlots(in map[int]string) map[int]string {
@@ -464,6 +534,9 @@ func (r *run) firstBoot(cur Current) (Meta, error) {
 			}
 			r.log("vm-disk: 4.1 removed stray slot %d", slot)
 		}
+	}
+	if err := r.snapshot(); err != nil {
+		return Meta{}, err
 	}
 	if h, err = r.cs.header(r.ctx); err != nil {
 		return Meta{}, err
@@ -499,6 +572,9 @@ func (r *run) firstBoot(cur Current) (Meta, error) {
 	if err := r.cs.addKey(r.ctx, r.cfg.Passphrase, recovery); err != nil {
 		return Meta{}, err
 	}
+	if err := r.snapshot(); err != nil {
+		return Meta{}, err
+	}
 	if h, err = r.cs.header(r.ctx); err != nil {
 		return Meta{}, err
 	}
@@ -512,7 +588,8 @@ func (r *run) firstBoot(cur Current) (Meta, error) {
 	r.log("vm-disk: 4.4 recovery slot %d added", added[0])
 	cutAfter("4.4")
 
-	// 4.5: meta ready with both slots. Last.
+	// 4.5: meta ready with both slots, to the next copy (the commit), then
+	// to the other copy over the initializing one (mirror). Last.
 	next := cur.Meta
 	next.Seq++
 	next.State = StateReady
@@ -523,7 +600,7 @@ func (r *run) firstBoot(cur Current) (Meta, error) {
 	}
 	r.log("vm-disk: 4.5 meta ready")
 	cutAfter("4.5")
-	return next, nil
+	return r.mirror(Current{Meta: next, Copy: cur.NextCopy(), Valid: true}, "4.5-other")
 }
 
 func sameSlots(slots []int, table map[int]string) bool {

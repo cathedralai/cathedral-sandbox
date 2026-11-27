@@ -44,9 +44,10 @@ func (s State) HostState() string {
 type HeaderKind int
 
 const (
-	NoLUKS2 HeaderKind = iota // no header cryptsetup reads as LUKS2: not LUKS, or one it cannot read
-	LUKS1                     // a LUKS1 header: never made by this init
-	LUKS2                     // a LUKS2 header cryptsetup reads
+	NoLUKS2    HeaderKind = iota // no LUKS magic and no header cryptsetup reads
+	LUKS1                        // a LUKS1 header: never made by this init
+	LUKS2                        // a LUKS2 header cryptsetup reads
+	Unreadable                   // a LUKS magic (primary or secondary) cryptsetup cannot read
 )
 
 // Facts are the read-only probes the classifier asks for, in its order. The
@@ -101,6 +102,11 @@ func Classify(f Facts, id vmidentity.Identity) (Result, error) {
 	switch kind {
 	case LUKS1:
 		return done(StateBroken, "a LUKS1 header, which this init never makes")
+	case Unreadable:
+		// Not "no header": with an intent that would resume and format over
+		// whatever volume the header held. A cut inside F3's header write can
+		// leave this too; F3 runs only before any customer data exists.
+		return done(StateBroken, "a LUKS header magic that cryptsetup cannot read")
 	case NoLUKS2:
 		if intent {
 			return done(StateResume, "this VM's intent and no LUKS2 header: resume at F3")

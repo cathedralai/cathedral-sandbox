@@ -59,6 +59,12 @@ type toolResult struct {
 // /proc/self/fd/4, /proc/self/fd/5, ... in order, never argv or env; the
 // args may name those paths. point names the run for the cut hook.
 func (t Tool) run(ctx context.Context, point string, timeout time.Duration, secrets [][]byte, args ...string) (toolResult, error) {
+	return t.runFiles(ctx, point, timeout, secrets, nil, args...)
+}
+
+// runFiles is run with open files passed after the secret pipes: the first
+// at /proc/self/fd/(4+len(secrets)), then in order.
+func (t Tool) runFiles(ctx context.Context, point string, timeout time.Duration, secrets [][]byte, extra []*os.File, args ...string) (toolResult, error) {
 	helper, err := openPinned(t.Path, t.SHA256)
 	if err != nil {
 		return toolResult{}, fmt.Errorf("%s: %w", t.Name, err)
@@ -79,6 +85,7 @@ func (t Tool) run(ctx context.Context, point string, timeout time.Duration, secr
 		}
 		files = append(files, r)
 	}
+	files = append(files, extra...)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/fd/3", args...)

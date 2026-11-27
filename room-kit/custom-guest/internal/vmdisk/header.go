@@ -264,3 +264,30 @@ func CheckCryptsetupVersion(out string) error {
 	}
 	return nil
 }
+
+// MagicScanBytes is how much of the LUKS device MagicKind reads: up to the
+// last place LUKS2 allows a secondary header, plus its magic.
+const MagicScanBytes = 4*MiB + 4096
+
+// luks2SecondaryOffsets are where a LUKS2 secondary header may start: after
+// a primary header of each size LUKS2 allows (16 KiB to 4 MiB).
+var luks2SecondaryOffsets = []int{16 << 10, 32 << 10, 64 << 10, 128 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20, 4 << 20}
+
+// MagicKind reads the magics of a LUKS device that cryptsetup could not
+// dump: LUKS1 for a primary LUKS magic of version 1, Unreadable for any
+// other primary LUKS magic or a LUKS2 secondary magic at any of its
+// offsets, and NoLUKS2 when no magic is there.
+func MagicKind(head []byte) HeaderKind {
+	if len(head) >= 8 && string(head[:6]) == "LUKS\xba\xbe" {
+		if head[6] == 0 && head[7] == 1 {
+			return LUKS1
+		}
+		return Unreadable
+	}
+	for _, off := range luks2SecondaryOffsets {
+		if len(head) >= off+6 && string(head[off:off+6]) == "SKUL\xba\xbe" {
+			return Unreadable
+		}
+	}
+	return NoLUKS2
+}

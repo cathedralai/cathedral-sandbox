@@ -135,3 +135,29 @@ func TestCryptsetupFloor(t *testing.T) {
 		}
 	}
 }
+
+func TestMagicKind(t *testing.T) {
+	put := func(off int, magic string, version byte) []byte {
+		b := make([]byte, MagicScanBytes)
+		copy(b[off:], magic)
+		b[off+7] = version
+		return b
+	}
+	for name, c := range map[string]struct {
+		head []byte
+		want HeaderKind
+	}{
+		"zero":                     {make([]byte, MagicScanBytes), NoLUKS2},
+		"LUKS1":                    {put(0, "LUKS\xba\xbe", 1), LUKS1},
+		"LUKS2 primary":            {put(0, "LUKS\xba\xbe", 2), Unreadable},
+		"another version":          {put(0, "LUKS\xba\xbe", 9), Unreadable},
+		"secondary at 16 KiB":      {put(16<<10, "SKUL\xba\xbe", 2), Unreadable},
+		"secondary at 4 MiB":       {put(4<<20, "SKUL\xba\xbe", 2), Unreadable},
+		"secondary off its places": {put(20<<10, "SKUL\xba\xbe", 2), NoLUKS2},
+		"short read":               {[]byte("LUKS"), NoLUKS2},
+	} {
+		if got := MagicKind(c.head); got != c.want {
+			t.Errorf("%s: %d, want %d", name, got, c.want)
+		}
+	}
+}

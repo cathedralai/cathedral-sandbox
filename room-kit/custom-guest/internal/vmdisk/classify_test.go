@@ -83,6 +83,8 @@ func TestClassifyEveryBranch(t *testing.T) {
 		{"no LUKS2, intent", fakeFacts{intent: IntentValid, kind: NoLUKS2}, StateResume, []string{"intent", "header"}},
 		{"LUKS1, no intent", fakeFacts{kind: LUKS1, blank: true}, StateBroken, []string{"intent", "header"}},
 		{"LUKS1, intent", fakeFacts{intent: IntentValid, kind: LUKS1}, StateBroken, []string{"intent", "header"}},
+		{"unreadable LUKS magic, no intent", fakeFacts{kind: Unreadable, blank: true}, StateBroken, []string{"intent", "header"}},
+		{"unreadable LUKS magic, intent", fakeFacts{intent: IntentValid, kind: Unreadable}, StateBroken, []string{"intent", "header"}},
 		{"rules fail, no intent", fakeFacts{kind: LUKS2, header: failing, opens: true, meta: ours}, StateTampered, []string{"intent", "header"}},
 		{"rules fail, foreign intent", fakeFacts{intent: IntentForeign, kind: LUKS2, header: failing, opens: true}, StateTampered, []string{"intent", "header"}},
 		{"unparsed, no intent", fakeFacts{kind: LUKS2, header: unparsed, opens: true}, StateTampered, []string{"intent", "header"}},
