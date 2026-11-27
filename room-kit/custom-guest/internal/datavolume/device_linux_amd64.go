@@ -20,6 +20,8 @@ type HeldDevice struct {
 	size       int64
 	number     uint64
 	name       string
+	dev        string // "major:minor" of the held disk, as the kernel reports it
+	tools      *tools // set by OpenData; nil in descriptor-only tests
 }
 
 func (d *HeldDevice) Size() int64 { return d.size }
@@ -212,11 +214,23 @@ func inspectData(f *os.File, want diskIdentity) error {
 // /run/cathedral must be the measured boot's private runtime directory.
 // The lock serializes this helper; it does not restrict an owner with root from
 // deliberately accessing their disk through other programs.
-func OpenData(expectedGiB int64) (*HeldDevice, error) {
+//
+// cryptsetupSHA256 pins the static helper at /usr/lib/cathedral/cryptsetup; it
+// must be linked into the calling command, never read from the root or host.
+// The result implements LockedCandidate.
+func OpenData(expectedGiB int64, cryptsetupSHA256 [32]byte) (*HeldDevice, error) {
 	if os.Geteuid() != 0 {
 		return nil, errors.New("root required")
 	}
-	return openData(expectedGiB, "/sys", "/dev", "/run/cathedral", "/proc/self/mountinfo", inspectData)
+	if cryptsetupSHA256 == [32]byte{} {
+		return nil, errors.New("cryptsetup pin missing")
+	}
+	d, err := openData(expectedGiB, "/sys", "/dev", "/run/cathedral", "/proc/self/mountinfo", inspectData)
+	if err != nil {
+		return nil, err
+	}
+	d.tools = productionTools(cryptsetupSHA256)
+	return d, nil
 }
 func openData(gib int64, sys, dev, run, mounts string, inspect func(*os.File, diskIdentity) error) (*HeldDevice, error) {
 	if gib < 1 || gib > 400 {
@@ -269,5 +283,6 @@ func openData(gib int64, sys, dev, run, mounts string, inspect func(*os.File, di
 	}
 	d.name = before.name
 	d.number = before.number
+	d.dev = before.dev
 	return d, nil
 }
