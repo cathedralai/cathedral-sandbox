@@ -1,0 +1,25 @@
+{
+  "cases": [
+    {
+      "challenge_hex": "8e1c16d08fe708f5a483c16c91c4ba5e36b8d28e27f136834848e10a7798cab2",
+      "host_key_blob_hex": "0000000b7373682d65643235353139000000205d3b7b7ba8c3a9fe6dac2052f47d6e95b94fda51fb221daf57d415f235b47d04",
+      "host_key_line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF07e3uow6n+bawgUvR9bpW5T9pR+yIdr1fUFfI1tH0E root@vm-one",
+      "report_data_hex": "be695d479be17a0baf1609a1383ee44efac797bcf53a4bd64b39503f25170bce440c11d555e2a500242a12cb22412d135d36a944707ff4681a1b5b57601b5d34"
+    },
+    {
+      "challenge_hex": "c1c31101e22cc43814bdc9b4203853905b4a3f867b4aefe1c1de92caaf70c8fa",
+      "host_key_blob_hex": "0000000b7373682d65643235353139000000202c3439155521cffcd054638cde455494c35de6e557cd50c058343e79b005918b",
+      "host_key_line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICw0ORVVIc/80FRjjN5FVJTDXeblV81QwFg0PnmwBZGL root@vm-two",
+      "report_data_hex": "54e5fe27345c68f84cbff28d49081efce9c6a7a5f76ee2baeac9fab1bf5c43d08a7739a696c693986f52a52d44585317db0b6ea12a36fa4b70a610c6b8111443"
+    },
+    {
+      "challenge_hex": "72fc99f7a18e1d99d39e1a94e8874688f6e305018c801d99dd37391aee2ec29a",
+      "host_key_blob_hex": "0000000b7373682d65643235353139000000205dd115eded38dce6af5b0c23354632061b58368984e57f7b9e6da1dbe33507f2",
+      "host_key_line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF3RFe3tONzmr1sMIzVGMgYbWDaJhOV/e55todvjNQfy root@vm-three",
+      "report_data_hex": "d4803ad651dd17d13f74c9be9fa07a36436d3f0f3e395ff41a58e42aeba10d2172a86c07cf9b23e2999ed099c5f501c6634e81e8e94643975b1c041330b3f5eb"
+    }
+  ],
+  "domain": "cathedral-vm-report/v1\\0",
+  "formula": "sha512(domain || challenge[32] || sha256(host_key_blob))",
+  "spec": "VM runtime spec r3 6.4"
+}
