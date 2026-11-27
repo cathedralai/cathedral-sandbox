@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -116,6 +117,49 @@ func canonicalValue(value any) error {
 	return nil
 }
 
+// encoding/json accepts case-insensitive aliases for struct fields even with
+// DisallowUnknownFields. The signed protocol permits only exact JSON names.
+// Missing fields retain the existing semantic validation (data_disk_gib is
+// optional); string-keyed maps have their own exact key checks below.
+func exactFieldNames(value any, typ reflect.Type) error {
+	switch typ.Kind() {
+	case reflect.Struct:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("expected protocol object")
+		}
+		fields := make(map[string]reflect.Type, typ.NumField())
+		for i := range typ.NumField() {
+			field := typ.Field(i)
+			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if name == "" || name == "-" || field.Anonymous {
+				return errors.New("protocol fields require explicit JSON names")
+			}
+			fields[name] = field.Type
+		}
+		for name, child := range object {
+			field, ok := fields[name]
+			if !ok {
+				return errors.New("unknown protocol field")
+			}
+			if err := exactFieldNames(child, field); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice:
+		array, ok := value.([]any)
+		if !ok {
+			return errors.New("expected protocol array")
+		}
+		for _, child := range array {
+			if err := exactFieldNames(child, typ.Elem()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func decode(raw []byte, dst any) error {
 	if len(raw) == 0 || len(raw) > documentLimit {
 		return errors.New("document size invalid")
@@ -141,6 +185,9 @@ func decode(raw []byte, dst any) error {
 	canonical := bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))
 	if !bytes.Equal(raw, canonical) {
 		return errors.New("document is not canonical JSON")
+	}
+	if err := exactFieldNames(value, reflect.TypeOf(dst).Elem()); err != nil {
+		return err
 	}
 	decoder = json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()

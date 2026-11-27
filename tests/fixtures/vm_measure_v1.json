@@ -1,0 +1,112 @@
+{
+ "about": "Shared vectors for vm_measure.py (AB#999, VM runtime spec r2 6.3) and any other implementation (the VM init of PR VM1b, the verifier of PR VM2). Files come from recipes in tests/vm_measure_support.py; they are not bootable and base_root_verity is a placeholder. Measurements are sev-snp-measure 0.0.12 --mode snp over those files.",
+ "bundles": {
+  "genoa": {
+   "bundle_id": "f56a1359b5efef9cdc93389cce2582df68caa2701bed4531730aaa7eb55e2e30",
+   "manifest_utf8": "{\"base_root_data_bytes\":8192,\"base_root_verity\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"bytes\":{\"OVMF.amdsev.fd\":65536,\"base-root.packages.lock\":93,\"base-root.raw\":12288,\"initrd.cpio.zst\":20000,\"kernel.packages.lock\":109,\"vmlinuz\":12288},\"cmdline_template\":\"console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no systemd.getty_auto=0 systemd.mask=getty@.service systemd.mask=serial-getty@.service systemd.mask=autovt@.service systemd.mask=console-getty.service systemd.mask=emergency.service systemd.mask=rescue.service systemd.mask=debug-shell.service systemd.mask=qemu-guest-agent.service cathedral.vm={identity_sha256}\",\"cpu_family\":\"genoa\",\"cpu_model\":\"EPYC-v4\",\"initrd_version\":\"vm1-test\",\"kernel_release\":\"6.8.0-1-generic\",\"label\":\"test-genoa\",\"ovmf_source\":\"test:synthetic-ovmf-v1\",\"policy\":\"0x30000\",\"qemu_version\":\"10.2.1\",\"schema\":\"cathedral.vm.bundle/v1\",\"sev_snp_measure\":\"0.0.12\",\"sha256\":{\"OVMF.amdsev.fd\":\"91ef139c788da83cfea35fdf698a413746410706a6a67b0cb509c9b9f2b6136c\",\"base-root.packages.lock\":\"12089d58e53256b9d8aebe288da6db563566614ed71db1f3cda9d729b027d11a\",\"base-root.raw\":\"4b7faaeab7f95d2f006deb05875c61da082601899cbd5d53cc7f5285a30d249a\",\"initrd.cpio.zst\":\"0794f564e1717815f753c917132492b774218cfe74748e7608dd71fa7a711d12\",\"kernel.packages.lock\":\"79e9da806c4c163e40d8ca0684ef33db92d914648df20194ad735fbbe1c805b3\",\"vmlinuz\":\"3a493a21b0cbe5a36a1787b097c6d0b080a13ef3aadbc05bc8fdf163bfb3ad0f\"},\"snapshot\":\"20261101T000000Z\",\"version\":1}"
+  },
+  "turin": {
+   "bundle_id": "0c65b84f56ed91c519ba8c9dcb50d5bbdd1f4027a3ae5351e32ce0db87ba7e3d",
+   "manifest_utf8": "{\"base_root_data_bytes\":8192,\"base_root_verity\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"bytes\":{\"OVMF.amdsev.fd\":65536,\"base-root.packages.lock\":93,\"base-root.raw\":12288,\"initrd.cpio.zst\":20000,\"kernel.packages.lock\":109,\"vmlinuz\":12288},\"cmdline_template\":\"console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no systemd.getty_auto=0 systemd.mask=getty@.service systemd.mask=serial-getty@.service systemd.mask=autovt@.service systemd.mask=console-getty.service systemd.mask=emergency.service systemd.mask=rescue.service systemd.mask=debug-shell.service systemd.mask=qemu-guest-agent.service cathedral.vm={identity_sha256}\",\"cpu_family\":\"turin\",\"cpu_model\":\"EPYC-v4\",\"initrd_version\":\"vm1-test\",\"kernel_release\":\"6.8.0-1-generic\",\"label\":\"test-turin\",\"ovmf_source\":\"test:synthetic-ovmf-v1\",\"policy\":\"0x30000\",\"qemu_version\":\"10.2.1\",\"schema\":\"cathedral.vm.bundle/v1\",\"sev_snp_measure\":\"0.0.12\",\"sha256\":{\"OVMF.amdsev.fd\":\"91ef139c788da83cfea35fdf698a413746410706a6a67b0cb509c9b9f2b6136c\",\"base-root.packages.lock\":\"12089d58e53256b9d8aebe288da6db563566614ed71db1f3cda9d729b027d11a\",\"base-root.raw\":\"4b7faaeab7f95d2f006deb05875c61da082601899cbd5d53cc7f5285a30d249a\",\"initrd.cpio.zst\":\"0794f564e1717815f753c917132492b774218cfe74748e7608dd71fa7a711d12\",\"kernel.packages.lock\":\"79e9da806c4c163e40d8ca0684ef33db92d914648df20194ad735fbbe1c805b3\",\"vmlinuz\":\"3a493a21b0cbe5a36a1787b097c6d0b080a13ef3aadbc05bc8fdf163bfb3ad0f\"},\"snapshot\":\"20261101T000000Z\",\"version\":1}"
+  }
+ },
+ "cmdline_template": "console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no systemd.getty_auto=0 systemd.mask=getty@.service systemd.mask=serial-getty@.service systemd.mask=autovt@.service systemd.mask=console-getty.service systemd.mask=emergency.service systemd.mask=rescue.service systemd.mask=debug-shell.service systemd.mask=qemu-guest-agent.service cathedral.vm={identity_sha256}",
+ "files": {
+  "OVMF.amdsev.fd": {
+   "bytes": 65536,
+   "recipe": "synthetic-ovmf-v1",
+   "sha256": "91ef139c788da83cfea35fdf698a413746410706a6a67b0cb509c9b9f2b6136c"
+  },
+  "base-root.packages.lock": {
+   "bytes": 93,
+   "recipe": "text",
+   "sha256": "12089d58e53256b9d8aebe288da6db563566614ed71db1f3cda9d729b027d11a",
+   "text": "base-files 13ubuntu10 amd64 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+  },
+  "base-root.raw": {
+   "bytes": 12288,
+   "label": "cathedral-vm-test-base-root",
+   "recipe": "fill",
+   "sha256": "4b7faaeab7f95d2f006deb05875c61da082601899cbd5d53cc7f5285a30d249a"
+  },
+  "initrd.cpio.zst": {
+   "bytes": 20000,
+   "label": "cathedral-vm-test-initrd",
+   "recipe": "fill",
+   "sha256": "0794f564e1717815f753c917132492b774218cfe74748e7608dd71fa7a711d12"
+  },
+  "kernel.packages.lock": {
+   "bytes": 109,
+   "recipe": "text",
+   "sha256": "79e9da806c4c163e40d8ca0684ef33db92d914648df20194ad735fbbe1c805b3",
+   "text": "linux-image-6.8.0-1-generic 6.8.0-1.1 amd64 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+  },
+  "vmlinuz": {
+   "bytes": 12288,
+   "label": "cathedral-vm-test-vmlinuz",
+   "recipe": "fill",
+   "sha256": "3a493a21b0cbe5a36a1787b097c6d0b080a13ef3aadbc05bc8fdf163bfb3ad0f"
+  }
+ },
+ "host_data_domain_hex": "63617468656472616c2d766d2d763100",
+ "identities": {
+  "a": {
+   "cmdline": "console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no systemd.getty_auto=0 systemd.mask=getty@.service systemd.mask=serial-getty@.service systemd.mask=autovt@.service systemd.mask=console-getty.service systemd.mask=emergency.service systemd.mask=rescue.service systemd.mask=debug-shell.service systemd.mask=qemu-guest-agent.service cathedral.vm=29fe58f423679971829b26e7c9d939fa676d36b3e862e97065d3c46692ff6b2f",
+   "host_data_b64": "NXnrlmmVa5btk19YbvD5TNQyuOG6lJVC88gWaU3Ubtw=",
+   "host_data_hex": "3579eb9669956b96ed935f586ef0f94cd432b8e1ba949542f3c816694dd46edc",
+   "identity_sha256": "29fe58f423679971829b26e7c9d939fa676d36b3e862e97065d3c46692ff6b2f",
+   "identity_utf8": "{\"base_root_data_bytes\":8192,\"base_root_verity\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"salt_hex\":\"000102030405060708090a0b0c0d0e0f\",\"schema\":\"cathedral.vm.identity/v1\",\"ssh_public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/\",\"version\":1,\"vm_id\":\"vm-0123456789ab\"}",
+   "salt_hex": "000102030405060708090a0b0c0d0e0f",
+   "ssh_key_line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/ test@example",
+   "vm_id": "vm-0123456789ab"
+  },
+  "b": {
+   "cmdline": "console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no systemd.getty_auto=0 systemd.mask=getty@.service systemd.mask=serial-getty@.service systemd.mask=autovt@.service systemd.mask=console-getty.service systemd.mask=emergency.service systemd.mask=rescue.service systemd.mask=debug-shell.service systemd.mask=qemu-guest-agent.service cathedral.vm=c7bfa1d627bac7256fa32a5ef0dbe56cb8ee67c624dbdfcaf09fc3fb7f985e31",
+   "host_data_b64": "DSB9M11kUlZ3rK3QuItg1F9hTll2f8xPgqLFGWNatyw=",
+   "host_data_hex": "0d207d335d64525677acadd0b88b60d45f614e59767fcc4f82a2c519635ab72c",
+   "identity_sha256": "c7bfa1d627bac7256fa32a5ef0dbe56cb8ee67c624dbdfcaf09fc3fb7f985e31",
+   "identity_utf8": "{\"base_root_data_bytes\":8192,\"base_root_verity\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"salt_hex\":\"f0e0d0c0b0a090807060504030201000\",\"schema\":\"cathedral.vm.identity/v1\",\"ssh_public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f\",\"version\":1,\"vm_id\":\"vm-ba9876543210\"}",
+   "salt_hex": "f0e0d0c0b0a090807060504030201000",
+   "ssh_key_line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEBBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f test@example",
+   "vm_id": "vm-ba9876543210"
+  }
+ },
+ "measurements": [
+  {
+   "cpu_family": "genoa",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "6507d3bb72b9acbd3d5087fd3cdf0db7b322d1e85fc2cba9f85fa2f522874d1bd83af7b5ee6035635739970169e260e8",
+   "identity": "a",
+   "vcpus": 4
+  },
+  {
+   "cpu_family": "turin",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "6507d3bb72b9acbd3d5087fd3cdf0db7b322d1e85fc2cba9f85fa2f522874d1bd83af7b5ee6035635739970169e260e8",
+   "identity": "a",
+   "vcpus": 4
+  },
+  {
+   "cpu_family": "genoa",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "f7a0530c20a111b1bb2fabfacf4ed07e05706a1aaed5fd8bd1ccdcec9ce09e3843247072d184e56f7e1f1eb351cfa17d",
+   "identity": "a",
+   "vcpus": 2
+  },
+  {
+   "cpu_family": "genoa",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "f00bff34fd417d1da9fa6e51032d99be767e0c5bbeddd87a43d70eefd48509a9ff4111109df14b086dcd9bd9b719a07c",
+   "identity": "b",
+   "vcpus": 4
+  },
+  {
+   "cpu_family": "turin",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "8b80c89065d10e9d71341f28973d9bb4fb544e2210b3695f6cefe80908194f05208b1480893d1b3c41b4a6d497e6a1a1",
+   "identity": "b",
+   "vcpus": 64
+  }
+ ],
+ "schema": "cathedral.vm.test-vectors/v1"
+}

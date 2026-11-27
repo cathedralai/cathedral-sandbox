@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,65 @@ import (
 
 	"github.com/cathedralai/cathedral-sandbox/custom-guest/internal/bootstrap"
 )
+
+// Opt-in: the runner must give this test a scratch directory inside a private
+// mount namespace. It mounts only newly created test directories, never /run.
+func TestRuntimeMountCapacity(t *testing.T) {
+	parent := os.Getenv("GUEST_RUNTIME_MOUNT_TEST_DIR")
+	if parent == "" || os.Geteuid() != 0 {
+		t.Skip("requires the private mount-namespace test runner")
+	}
+	path, err := os.MkdirTemp(parent, "runtime-mount-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(path) })
+	target, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := mountRuntime(target); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := syscall.Unmount(path, 0); err != nil {
+			t.Error(err)
+		}
+	})
+	run, err := os.OpenRoot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer run.Close()
+	if err := writeRuntime(run, runtimeLaunch(t), "eth0", rand.Reader); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise capacity beyond the old 256-inode cap using zero-byte entries.
+	// This models runtime state, not a full systemd boot.
+	for i := range 512 {
+		f, err := run.OpenFile(fmt.Sprintf("unit-%d", i), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatalf("runtime inode %d: %v", i, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// systemd's PID1 re-execution alone needs 16 MiB free. Verify that it fits
+	// after other runtime contents rather than only checking statfs capacity.
+	f, err := run.OpenFile("reexec-state", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	block := make([]byte, 1<<20)
+	for range 17 {
+		if n, err := f.Write(block); err != nil || n != len(block) {
+			t.Fatalf("runtime space: wrote %d: %v", n, err)
+		}
+	}
+}
 
 func runtimeLaunch(t *testing.T) bootstrap.Launch {
 	t.Helper()

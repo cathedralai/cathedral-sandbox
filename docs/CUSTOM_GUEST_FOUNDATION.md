@@ -386,7 +386,88 @@ or configfs and never change the host SNP device. A mount namespace alone is
 not isolation for these kernel-global objects: do not run this setup component
 in a host/container rehearsal.
 
-This component is not yet wired into a complete PID1. The inherited `/run`
-capacity also needs validation with the reference systemd boot; the current
-16 MiB/256-inode cap has a review concern and is not a qualified runtime limit.
-These additions do not establish a bootable image or hardware acceptance.
+This component is not yet wired into a complete PID1. These additions do not
+establish a bootable image or hardware acceptance.
+
+### Runtime capacity and exact document fields
+
+The inherited `/run` now uses systemd 252's bounded capacity: 20% of guest RAM
+and 800k inodes, retaining `nosuid,nodev,noexec`. Systemd leaves an existing
+`/run` mount in place, so sizing it only for the four Cathedral files was too
+small. The source contracts are
+[the mount table](https://github.com/systemd/systemd/blob/v252/src/shared/mount-setup.c)
+and [the runtime limits](https://github.com/systemd/systemd/blob/v252/src/shared/mount-util.h).
+
+`scripts/test_custom_guest_runtime.sh` mounts only scratch tmpfs in a private
+mount namespace. It writes the runtime files, 512 zero-byte unit-state files
+and 17 MiB of simulated re-execution state. Restoring either old limit causes
+ENOSPC; the new limits pass. This validates capacity, not a complete systemd
+or SNP boot. That acceptance test remains required.
+
+Signed JSON field names must now match their declared spelling exactly,
+including nested network and port objects. Case aliases and simultaneous
+case variants are refused before decoding into Go structs. The optional
+`data_disk_gib` field remains optional; fixture signatures and HOST_DATA are
+unchanged. Eight signed regression cases failed before the fix.
+
+### Data-volume preservation checks (not yet wired)
+
+`internal/datavolume` adds two read-only guards for the planned owner unlock
+command. `CheckBlank` reads every byte of the bounded candidate and refuses
+nonzero data, incomplete reads or cancellation. A blank header is insufficient:
+data behind a lost header can remain recoverable with its backup.
+
+`CheckHeaderPolicy` checks the encryption fields of cryptsetup JSON metadata:
+one AES-XTS segment, 4096-byte sectors, HMAC-SHA256 integrity, encrypted keyslots,
+and no persistent bypass or reencryption flags. It rejects duplicate JSON keys,
+excessive nesting and oversized metadata. The policy uses the cryptsetup 2.8.4
+layout: 64-byte XTS plus 32-byte HMAC volume keys and 64-byte keyslot wrapping.
+Tests use synthetic metadata, not a complete checksummed LUKS header.
+
+Neither result authorizes a write. The command still needs held device identity,
+exclusive use, bounded passphrase intake, cryptsetup validation, active mapping
+verification and restricted filesystem handling. Existing filesystems must never
+be reformatted; first-use formatting must follow the full blank check under the
+same device hold. Nothing opens the data disk at boot. The owner unlock command,
+complete PID1/initrd integration and hardware acceptance remain unfinished.
+
+The unlock coordinator now enforces operation ordering against an explicit
+adapter contract. Existing headers must pass policy checks before any open;
+only an explicit non-LUKS probe followed by a full zero scan permits first-use
+formatting. Filesystem creation is permitted only in that same invocation.
+Interrupted initialization is preserved for recovery on a later retry, never
+silently reformatted. The coordinator checks the active mapping before filesystem
+work and again before mounting, and accepts only ext4 from the filesystem probe.
+
+Failed opens that allocated a mapping, failed checks and cancelled operations
+close only that invocation's mapping using a fresh bounded cleanup context.
+Cleanup failures remain visible. Passphrases are bounded to 4096 raw bytes,
+never normalized or placed in error text, and the consumed buffer is cleared.
+The future CLI must supply a bounded non-TTY input stream; it must never echo a
+passphrase or pass it through arguments, environment variables or disk files.
+
+These are tests with an injected disk/mapping adapter, including partial failures
+and relaunch retries. No Linux adapter, unlock CLI, real LUKS format/mount or
+hardware proof is supplied by this component. Adapter identity, serialization,
+cryptsetup behavior and mount restrictions still require independent validation.
+
+
+The first Linux adapter component now holds the data device by descriptor.
+`OpenData` is an owner-command operation, never a boot operation. It selects
+`custom-data` by serial, checks the signed size and writable virtio identity,
+refuses partitions, existing holders and mounts, and repeats inventory checks
+after opening. Kernel device type, major/minor, size and read-only state are
+checked on the held descriptor. Later cryptsetup calls must inherit that
+same descriptor; they must not reopen a user-supplied pathname.
+
+A root-owned private runtime lock serializes this helper. Failed opens release
+both descriptors; closing the holder never closes a device-mapper mapping.
+This cooperative lock does not prevent the owner from deliberately accessing
+the disk through another root program. The complete adapter must recheck
+identity/use before writes and verify its own active mapping before filesystem
+work. It must retain ownership records for cleanup of partial opens.
+
+The new tests use private sysfs/dev/mount fixtures, with descriptor ioctl checks
+substituted by a test callback. The real inspector is tested to reject ordinary
+files. Root-owned lock tests require uid 0 and skip otherwise. No real block
+device, LUKS formatting, mounting, runtime CLI or hardware acceptance is claimed.

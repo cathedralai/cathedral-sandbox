@@ -37,12 +37,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
 
+      # The measurement tool of tests/test_vm_measure.py, by artifact hash and in its own
+      # venv, as a VM host installs it. Not in the dev extra, which pins by version only.
+      - name: Install sev-snp-measure by hash
+        run: |
+          python -m venv "$RUNNER_TEMP/vm-measure"
+          "$RUNNER_TEMP/vm-measure/bin/pip" install -q --no-deps --require-hashes -r requirements/vm-measure.txt
+
       - name: Create trusted path test root
         run: sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 -- /var/lib/cathedral-test-tmp
 
       - name: Test
         env:
           CATHEDRAL_TEST_TMPDIR: /var/lib/cathedral-test-tmp
+          CATHEDRAL_SEV_SNP_MEASURE: ${{ runner.temp }}/vm-measure/bin/sev-snp-measure
         run: python -m pytest -q $(python scripts/ci_shard.py ${{ matrix.shard }} 4)
 
   cross-repository-receipt-contract:

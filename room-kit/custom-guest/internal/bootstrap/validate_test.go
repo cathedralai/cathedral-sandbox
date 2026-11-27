@@ -106,6 +106,35 @@ func TestCanonicalDocumentRejections(t *testing.T) {
 	}
 }
 
+func TestSignedFieldNamesAreCaseSensitive(t *testing.T) {
+	for _, object := range []string{"manifest", "bootstrap", "network", "port"} {
+		for _, duplicate := range []bool{false, true} {
+			t.Run(object+map[bool]string{false: "-renamed", true: "-duplicate"}[duplicate], func(t *testing.T) {
+				m, b := documents(t)
+				var target map[string]any
+				var key string
+				switch object {
+				case "manifest":
+					target, key = m, "version"
+				case "bootstrap":
+					target, key = b, "hotel"
+				case "network":
+					target, key = b["network"].(map[string]any), "prefix"
+				case "port":
+					target, key = b["ports"].([]any)[0].(map[string]any), "guest"
+				}
+				target[strings.ToUpper(key)] = target[key]
+				if !duplicate {
+					delete(target, key)
+				}
+				if _, err := Validate(signed(t, m, b)); err == nil {
+					t.Fatal("signed case-variant field accepted")
+				}
+			})
+		}
+	}
+}
+
 func TestSignedInvalidManifestRejectedBeforeUse(t *testing.T) {
 	for _, name := range []string{"version", "unknown", "missing", "file_digest", "file_size", "extra_file", "vcpus", "memory", "disk", "cpu", "policy", "qemu", "measure", "initrd", "root_hash", "root_offset", "cmdline_digest"} {
 		t.Run(name, func(t *testing.T) {

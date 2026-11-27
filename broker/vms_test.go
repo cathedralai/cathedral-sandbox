@@ -106,7 +106,7 @@ func vmConfig(t *testing.T, enabled bool, stateDir string) config {
 	}
 	host := func(id string, pmin, pmax, cpus int) vmHostConfig {
 		return vmHostConfig{ID: id, SSHTarget: "vmctl@" + id + ".example", SSHKeyFile: key, KnownHostsFile: kh, PublicIP: "203.0.113.9",
-			PortMin: pmin, PortMax: pmax, MaxVCPUs: cpus, MaxMemGiB: 32, MaxDiskGiB: 200}
+			PortMin: pmin, PortMax: pmax, MaxVCPUs: cpus, MaxMemGiB: 32, MaxDiskGiB: 200, Sealed: true, SNPVMRuntime: true}
 	}
 	return config{
 		Listen: "127.0.0.1:0", StateDir: stateDir, OperatorKeySHA256: sha("operator-key"),
@@ -1187,5 +1187,71 @@ func TestVMsCreateIdempotentRetryAfterLostHostReply(t *testing.T) {
 	}
 	if n := countHostCalls(tb, "create"); n != 1 {
 		t.Fatalf("host create calls: %d", n)
+	}
+}
+
+// AB#999: no unsealed VMs. A create needs a sealed host with the SNP VM runtime.
+func TestVMsCreateRefusedWithoutSealedSNPHost(t *testing.T) {
+	cases := map[string]func(h *vmHostConfig){
+		"not sealed":         func(h *vmHostConfig) { h.Sealed = false },
+		"sealed, no SNP VMs": func(h *vmHostConfig) { h.SNPVMRuntime = false },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := vmConfig(t, true, t.TempDir())
+			for i := range c.VMHosts {
+				mutate(&c.VMHosts[i])
+			}
+			tb := loadVMTestBroker(t, writeConfig(t, c))
+			code, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms", map[string]any{
+				"account": "acct1", "vcpus": 2, "mem_gib": 4, "disk_gib": 20, "ssh_public_key": testED25519Key()})
+			if code != 409 || vmErrCode(doc) != "vm_runtime_not_sealed" {
+				t.Fatalf("want 409 vm_runtime_not_sealed, got %d %v", code, doc)
+			}
+		})
+	}
+}
+
+func TestVMsCreateSkipsHostWithoutSNPAndRefusesNamedOne(t *testing.T) {
+	c := vmConfig(t, true, t.TempDir())
+	c.VMHosts[0].SNPVMRuntime = false // vmh-a is out, vmh-b stays eligible
+	tb := loadVMTestBroker(t, writeConfig(t, c))
+	if v := tb.create(t, nil); v["host"] != "vmh-b" {
+		t.Fatalf("create must skip the host without SNP: %v", v)
+	}
+	code, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms", map[string]any{
+		"account": "acct1", "vcpus": 1, "mem_gib": 1, "disk_gib": 20, "ssh_public_key": testED25519Key(), "host": "vmh-a"})
+	if code != 409 || vmErrCode(doc) != "vm_runtime_not_sealed" {
+		t.Fatalf("named non-SNP host: %d %v", code, doc)
+	}
+}
+
+// Spec r2 8.3 (#788 gates, wired in vm_ctl start): a gate refusal is the gate's exit code,
+// 17 sev_platform_changed or 18 sev_state_unavailable. The broker answers 502 vm_host_refused,
+// keeps the VM stopped and the authorization, and a later start can still run.
+func TestVMsGateRefusedStartIsHostRefusedAndStaysStopped(t *testing.T) {
+	for _, gate := range []struct {
+		code  int
+		error string
+	}{{17, "sev_platform_changed"}, {18, "sev_state_unavailable"}} {
+		tb := newVMTestBroker(t, true)
+		id := tb.create(t, nil)["id"].(string)
+		base := "/v1/broker/vms/" + id
+		tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
+		tb.host.answer = func([]string) ([]byte, int, error) {
+			return []byte(`{"error":"` + gate.error + `","detail":"x"}` + "\n"), gate.code, nil
+		}
+		st, doc := tb.call(t, "operator-key", "POST", base+"/start", nil)
+		if st != 502 || vmErrCode(doc) != "vm_host_refused" {
+			t.Fatalf("gate %d on start: %d %v", gate.code, st, doc)
+		}
+		tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("down") }
+		if _, one := tb.call(t, "operator-key", "GET", base, nil); one["desired_state"] == "running" || one["desired_state"] == "starting" {
+			t.Fatalf("after gate %d refusal: %v", gate.code, one)
+		}
+		tb.host.answer = nil
+		if st, doc := tb.call(t, "operator-key", "POST", base+"/start", map[string]any{"generation": 1}); st != 200 || doc["desired_state"] != "running" {
+			t.Fatalf("start after the gate passes: %d %v", st, doc)
+		}
 	}
 }

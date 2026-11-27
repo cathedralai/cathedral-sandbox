@@ -16,6 +16,16 @@ import (
 
 const tmpfsMagic = 0x01021994
 
+// The reference root uses systemd 252, which keeps an inherited /run mount.
+// Match its bounded runtime capacity instead of sizing /run for our four files.
+// https://github.com/systemd/systemd/blob/v252/src/shared/mount-util.h
+const runtimeMountOptions = "mode=0755,size=20%,nr_inodes=800k"
+
+func mountRuntime(run *os.File) error {
+	return syscall.Mount("tmpfs", descriptorPath(run), "tmpfs",
+		syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, runtimeMountOptions)
+}
+
 // ReadyRoot is produced only after the verity root and runtime files pass.
 // Its zero value cannot hand off to owner code.
 type ReadyRoot struct{ ready bool }
@@ -145,7 +155,7 @@ func PrepareVerifiedRuntime(launch bootstrap.Launch, veritySHA, reportSHA [32]by
 	if err != nil {
 		return nil, err
 	}
-	err = syscall.Mount("tmpfs", descriptorPath(run), "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, "mode=0755,size=16m,nr_inodes=256")
+	err = mountRuntime(run)
 	run.Close()
 	if err != nil {
 		return nil, err
