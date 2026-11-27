@@ -36,6 +36,35 @@ Before launch, independently obtain:
 The verifier compares the expected HOST_DATA bytes. It does not construct the
 R3 bootstrap or decide which image and bootstrap the customer intended.
 
+### Approved HOST_DATA domain
+
+The dedicated launch uses the existing `cathedral-dedicated-v2` domain:
+
+```text
+HOST_DATA = SHA256(
+    b"cathedral-dedicated-v2\0"
+    || SHA256(exact_manifest_file_bytes)
+    || owner_ed25519_public_key_raw_32_bytes
+    || bootstrap_sha256_raw_32_bytes
+)
+```
+
+`||` means byte concatenation; the domain ends with one zero byte. Both digests
+and the owner key contribute raw bytes, not their hexadecimal or base64 text.
+The result is 32 bytes; pass its 64 hexadecimal digits to `--expected-host-data`.
+QEMU's base64 `host-data` representation encodes those same result bytes.
+
+Hash the exact approved manifest file without parsing or reserializing JSON.
+Use the owner's public key, never its private key. Obtain the bootstrap digest
+from the reviewed launch contract: retaining the v2 domain does not define the
+custom-guest manifest schema or bootstrap canonicalization. Do not substitute
+an old hotel-create recipe unless that contract explicitly uses it. A missing
+bootstrap digest must not silently select the older v1 formula for this release.
+
+This encoding matches `room-kit/sealed/launch-guest.sh` and the v2 checks in
+`room-kit/verify_receipts.py`. It does not prove the custom launcher is deployed
+or that the measured guest enforced the bootstrap.
+
 ## Collect and verify
 
 On the trusted verifier machine, generate a new challenge for this attempt and
