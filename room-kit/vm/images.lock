@@ -1,7 +1,0 @@
-# Pinned base image for customer VMs (AB#991). fetch-image.sh downloads IMAGE_URL
-# to $VM_ROOT/images/IMAGE_FILE and refuses it unless its sha256 is IMAGE_SHA256.
-# vm-ctl.sh create checks the same digest before it makes a disk on top of it.
-# Source of the digest: the release's SHA256SUMS on cloud-images.ubuntu.com.
-IMAGE_URL=https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img
-IMAGE_SHA256=04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
-IMAGE_FILE=ubuntu-24.04-server-cloudimg-amd64-20261017.img

@@ -24,10 +24,15 @@ import os
 import re
 import sys
 
-QEMU = "/usr/bin/qemu-system-x86_64"
-POLICY = "0x30000"
+# -I keeps the script's directory off sys.path. snp_qemu.py is installed beside this file
+# (TOOLS in custom_guest_host.py); in the repository it is a link to room-kit/vm/snp_qemu.py.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import snp_qemu  # noqa: E402
+
+QEMU = snp_qemu.QEMU
+POLICY = snp_qemu.POLICY
 HOST_DATA_DOMAIN = b"cathedral-dedicated-v2\0"
-CPU_MODELS = {"EPYC-Genoa-v1", "EPYC-v4"}
+CPU_MODELS = snp_qemu.CPU_MODELS
 FW_CFG_NAMES = ("opt/cathedral/manifest.json", "opt/cathedral/bootstrap.json", "opt/cathedral/bootstrap.sig")
 
 
@@ -90,45 +95,35 @@ def build_argv(d: str) -> list[str]:
     owner = base64.b64decode(str(bootstrap.get("owner_ed25519_b64", "")), validate=True)
     hd = base64.b64encode(host_data(manifest_raw, owner, bootstrap_raw)).decode()
 
-    argv = [QEMU, "-no-user-config", "-nodefaults", "-no-reboot", "-name", f"custom-guest-{bootstrap['launch_id']}",
-            "-enable-kvm", "-cpu", model, "-smp", str(vcpus), "-m", f"{mem}G",
-            "-machine", "q35,confidential-guest-support=sev0,memory-backend=ram1",
-            "-object", f"memory-backend-memfd,id=ram1,size={mem}G,share=true,prealloc=false",
-            "-object", f"sev-snp-guest,id=sev0,policy={POLICY},cbitpos=51,reduced-phys-bits=1,"
-                       f"kernel-hashes=on,host-data={hd}",
-            "-bios", os.path.join(img, "OVMF.amdsev.fd"), "-kernel", os.path.join(img, "vmlinuz"),
-            "-initrd", os.path.join(img, "initrd"), "-append", cmdline.decode("ascii"),
-            "-drive", f"if=none,id=root,format=raw,readonly=on,file={os.path.join(img, 'root.raw')},"
-                      "cache=none,aio=io_uring",
-            "-device", "virtio-blk-pci,drive=root,serial=custom-root,disable-legacy=on,iommu_platform=true"]
+    devices = ["-drive", f"if=none,id=root,format=raw,readonly=on,file={os.path.join(img, 'root.raw')},"
+                         "cache=none,aio=io_uring",
+               "-device", "virtio-blk-pci,drive=root,serial=custom-root,disable-legacy=on,iommu_platform=true"]
     if data_gib:
-        argv += ["-drive", f"if=none,id=data,format=raw,file={os.path.join(d, 'disks', 'data.raw')},"
-                           "cache=none,aio=io_uring",
-                 "-device", "virtio-blk-pci,drive=data,serial=custom-data,disable-legacy=on,iommu_platform=true"]
-    argv += ["-netdev", f"tap,id=net0,ifname={tap},script=no,downscript=no,vhost=on",
-             "-device", f"virtio-net-pci,netdev=net0,mac={mac},disable-legacy=on,iommu_platform=true,romfile="]
+        devices += ["-drive", f"if=none,id=data,format=raw,file={os.path.join(d, 'disks', 'data.raw')},"
+                              "cache=none,aio=io_uring",
+                    "-device", "virtio-blk-pci,drive=data,serial=custom-data,disable-legacy=on,iommu_platform=true"]
+    devices += ["-netdev", f"tap,id=net0,ifname={tap},script=no,downscript=no,vhost=on",
+                "-device", f"virtio-net-pci,netdev=net0,mac={mac},disable-legacy=on,iommu_platform=true,romfile="]
     for name in FW_CFG_NAMES:
-        argv += ["-fw_cfg", f"name={name},file={os.path.join(img, os.path.basename(name))}"]
-    argv += ["-qmp", f"unix:{os.path.join(d, 'run', 'qmp.sock')},server=on,wait=off",
-             "-display", "none", "-vga", "none", "-monitor", "none",
-             "-chardev", "ringbuf,id=serial0,size=1M", "-serial", "chardev:serial0",
-             "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]
+        devices += ["-fw_cfg", f"name={name},file={os.path.join(img, os.path.basename(name))}"]
+    try:
+        argv = snp_qemu.snp_argv(
+            name=f"custom-guest-{bootstrap['launch_id']}", cpu_model=model, vcpus=vcpus, mem_gib=mem,
+            host_data_b64=hd, ovmf=os.path.join(img, "OVMF.amdsev.fd"), kernel=os.path.join(img, "vmlinuz"),
+            initrd=os.path.join(img, "initrd"), cmdline=cmdline.decode("ascii"), devices=devices,
+            qmp_sockets=[os.path.join(d, "run", "qmp.sock")])
+    except snp_qemu.SnpArgvError as e:
+        raise LaunchError(str(e)) from None
     check_argv(argv, d)
     return argv
 
 
 def check_argv(argv: list[str], d: str) -> None:
-    """Property checks every launch must pass: no argv without the SNP object, and nothing extra."""
-    objs = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-object"]
-    snp = [o for o in objs if o.startswith("sev-snp-guest,")]
-    if len(snp) != 1 or f"policy={POLICY}," not in snp[0] or "kernel-hashes=on" not in snp[0] \
-            or ",host-data=" not in snp[0]:
-        raise LaunchError("the argv has no SEV-SNP guest object with policy 0x30000 and kernel hashes")
-    machine = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-machine"]
-    if machine != ["q35,confidential-guest-support=sev0,memory-backend=ram1"]:
-        raise LaunchError("the machine must use the SNP object")
-    if "-smbios" in argv or "-hda" in argv or "-cdrom" in argv:
-        raise LaunchError("no -smbios and no extra drive")
+    """Property checks every launch must pass: the shared SNP property, and nothing extra."""
+    try:
+        snp_qemu.check_snp_argv(argv)
+    except snp_qemu.SnpArgvError as e:
+        raise LaunchError(str(e)) from None
     fw = [argv[i + 1].split(",", 1)[0] for i, a in enumerate(argv[:-1]) if a == "-fw_cfg"]
     if fw != [f"name={n}" for n in FW_CFG_NAMES]:
         raise LaunchError("exactly the three fw_cfg names")

@@ -57,8 +57,10 @@ STOP_WAIT = float(os.environ.get("CG_STOP_WAIT", "60"))
 KIT_ATTEST_WAIT = float(os.environ.get("CG_KIT_ATTEST_WAIT", "900"))
 POLL = float(os.environ.get("CG_POLL", "5"))
 SNP_MEASURE_VERSION = "0.0.12"
+# snp_qemu.py is a link to room-kit/vm/snp_qemu.py, the SNP argv shared with the VM launcher;
+# install_tools copies its content, so LIBDIR holds a plain file.
 TOOLS = ("custom-guest-host.sh", "custom_guest_host.py", "custom-net.sh", "launch-custom-guest.py",
-         "sev_status.py", "custom_guest_stage.py")
+         "sev_status.py", "custom_guest_stage.py", "snp_qemu.py")
 KIT_DISKS = ("data.raw", "data.raw.prev", "scratch.raw")
 GUARD_TEXT = "custom-guest.hold"  # the 5.10 guard line write-units.sh writes (PR 2)
 GIB = 1 << 30

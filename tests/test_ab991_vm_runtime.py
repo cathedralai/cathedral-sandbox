@@ -1,7 +1,9 @@
-"""AB#991: host runtime for long-lived customer VMs (room-kit/vm). No KVM, no root:
-fake systemctl, qemu-img, cloud-localds, ip and iptables on PATH, VM_ROOT in tmp."""
+"""AB#991, AB#999: host runtime for sealed customer VMs (room-kit/vm). No KVM, no root:
+fake systemctl, ip, iptables, user tools and sev-snp-measure on PATH, VM_ROOT in tmp,
+a vector bundle and the host switch file (tests/vm_host_support.py)."""
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -9,6 +11,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+import vm_host_support
 
 KIT = Path(__file__).resolve().parents[1] / "room-kit" / "vm"
 CTL = KIT / "vm-ctl.sh"
@@ -54,18 +58,20 @@ def host(tmp_path, monkeypatch):
                        "flock": FAKE_LOG, "ss": FAKE_LOG}.items():
         (fake / name).write_text(text)
         (fake / name).chmod(0o755)
-    image = tmp_path / "base.img"
-    image.write_bytes(b"not really an image")
+    sealed = vm_host_support.sealed_host(tmp_path, fake)
     (tmp_path / "id.pub").write_text(KEY + "\n")
     env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", VM_ROOT=str(tmp_path / "vms"),
                SYSTEMD_UNIT_DIR=str(tmp_path / "units"), FAKE_STATE=str(tmp_path / "systemd.json"),
                VM_STOP_WAIT="1", VM_LOCK_DIR=str(tmp_path / "lock"),
-               VM_IPV6_CONF_DIR=str(tmp_path / "ipv6conf"))
+               VM_IPV6_CONF_DIR=str(tmp_path / "ipv6conf"), **sealed)
     env.pop("SSH_ORIGINAL_COMMAND", None)
 
     class Host:
         root = tmp_path / "vms"
         units = tmp_path / "units"
+        bundle = sealed["VM_TEST_BUNDLE"]
+        config = Path(sealed["VM_HOST_CONFIG"])
+        environ = env
 
         def ctl(self, *args, stdin="", extra=None):
             p = subprocess.run([str(CTL), *args], capture_output=True, text=True, input=stdin,
@@ -76,7 +82,7 @@ def host(tmp_path, monkeypatch):
 
         def create(self, name="vm1", port="22001", key=None, **opts):
             args = ["create", name, "--vcpus", "1", "--mem-gib", "1", "--disk-gib", "8",
-                    "--ssh-key-file", str(key or tmp_path / "id.pub"), "--ssh-port", port, "--image", str(image)]
+                    "--ssh-key-file", str(key or tmp_path / "id.pub"), "--ssh-port", port]
             return self.ctl(*args)
 
         def systemd(self):
@@ -93,33 +99,77 @@ def host(tmp_path, monkeypatch):
     return Host()
 
 
-def test_create_writes_disk_seed_env_unit_and_does_not_start(host):
+def test_create_writes_identity_disks_user_unit_and_does_not_start(host):
     code, vm = host.create()
     assert code == 0, vm
     assert vm["state"] == "created" and vm["ssh_port"] == 22001 and vm["guest_ip"] == "10.216.0.2"
     assert (vm["vcpus"], vm["mem_gib"], vm["disk_gib"], vm["generation"], vm["paid_through"]) == (1, 1, 8, 0, 0)
     d = host.root / "vm1"
-    for f in ("vm.env", "disk.qcow2", "seed.iso", "authorization.json"):
+    for f in ("vm.env", "vm-identity.json", "launch.json", "root.raw", "mailbox.raw", "authorization.json"):
         assert (d / f).exists(), f
-    user_data = (d / "seed" / "user-data").read_text()
-    cfg = json.loads(user_data.split("\n", 1)[1])
-    assert cfg["disable_root"] is True and cfg["ssh_pwauth"] is False
-    assert cfg["users"][0]["name"] == "cathedral" and cfg["users"][0]["sudo"] == "ALL=(ALL) NOPASSWD:ALL"
-    assert cfg["users"][0]["ssh_authorized_keys"] == [" ".join(KEY.split()[:2])]
-    net = json.loads((d / "seed" / "network-config").read_text())
-    assert net["ethernets"]["eth0"]["addresses"] == ["10.216.0.2/30"]
+    for gone in ("disk.qcow2", "seed.iso", "seed"):
+        assert not (d / gone).exists(), gone
+    # The identity (spec r2 6.3): canonical, immutable, the customer's key without its comment.
+    raw = (d / "vm-identity.json").read_bytes()
+    ident = json.loads(raw)
+    assert ident["ssh_public_key"] == " ".join(KEY.split()[:2]) and ident["schema"] == "cathedral.vm.identity/v1"
+    assert len(ident["salt_hex"]) == 32 and ident["vm_id"].startswith("vm-")
+    import hashlib
+    assert vm["identity_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert vm["bundle"] == host.bundle and vm["expected_measurement"] == vm_host_support.MEASUREMENT
+    assert len(vm["host_data"]) == 64 and vm["policy"] == "0x30000" and vm["vm_id"] == ident["vm_id"]
+    assert vm["disks"] == {"root": True, "mailbox": True}
+    # Sparse all-zero disks of the asked size: the guest formats only a disk that reads as zero.
+    root_raw = (d / "root.raw").stat()
+    assert root_raw.st_size == 8 << 30 and root_raw.st_blocks * 512 < 1 << 20
+    assert (d / "mailbox.raw").stat().st_size == 1 << 20
+    env = dict(line.split("=", 1) for line in (d / "vm.env").read_text().splitlines())
+    assert env["VM_USER"] == "'cvm-0'" and env["VM_BUNDLE"] == f"'{host.bundle}'"
+    tools = host.tools.read_text()
+    assert "useradd --system --user-group --no-create-home" in tools and tools.count("cvm-0") >= 2
+    assert f"chown --no-dereference cvm-0:cvm-0 {d}/root.raw {d}/mailbox.raw {d}/run" in tools
+    assert "groupadd --system cvm-sev" in tools
     unit = (host.units / "cathedral-vm-vm1.service").read_text()
     assert "check-paid vm1" in unit and "Restart=on-failure" in unit and "StartLimitBurst" in unit
     assert "vm-net.sh up" in unit and "ExecStopPost=" in unit and "WantedBy=multi-user.target" in unit
     assert "OnUnitActiveSec=30s" in (host.units / "cathedral-vm-enforce.timer").read_text()
-    assert "-b " in host.tools.read_text() and "8G" in host.tools.read_text()
     state = host.systemd()
     assert not state.get("cathedral-vm-vm1.service", {}).get("active")
-    # A second VM gets the next /30 and its own tap.
+    # A second VM gets the next /30, its own tap and its own user.
     code, vm2 = host.create("vm2", port="22002")
     assert code == 0 and vm2["guest_ip"] == "10.216.0.6"
+    assert "User=cvm-1" in (host.units / "cathedral-vm-vm2.service").read_text()
+    assert vm2["identity_sha256"] != vm["identity_sha256"]  # own salt, own measurement
     code, listed = host.ctl("list")
     assert [v["name"] for v in listed["vms"]] == ["vm1", "vm2"]
+
+
+def test_create_refuses_without_the_host_switch_or_an_enabled_bundle(host):
+    config = json.loads(host.config.read_text())
+    host.config.unlink()
+    code, out = host.create()
+    assert code == 1 and out["error"] == "snp_vm_host_disabled"
+    assert not (host.root / "vm1").exists()
+    host.config.write_text(json.dumps(config))
+    code, out = host.ctl("create", "vm1", "--vcpus", "1", "--mem-gib", "1", "--disk-gib", "8", "--ssh-port",
+                         "22001", "--ssh-key-file", str(host.root.parent / "id.pub"), "--bundle", "0" * 64)
+    assert code == 1 and out["error"] == "bundle_not_enabled"
+    host.config.write_text(json.dumps({**config, "cpu_family": "turin"}))
+    code, out = host.create()
+    assert code == 1 and out["error"] == "launch_values"  # the bundle is built for another family
+    assert not (host.root / "vm1").exists() and not (host.root / ".history" / "vm1.jsonl").exists()
+
+
+def test_a_broker_vm_id_is_the_identity_vm_id(host):
+    code, vm = host.create("vm-0123456789ab")
+    assert code == 0, vm
+    assert vm["vm_id"] == "vm-0123456789ab"
+    assert json.loads((host.root / "vm-0123456789ab" / "vm-identity.json").read_text())["vm_id"] == vm["vm_id"]
+
+
+def test_bundles_is_not_a_vm_name(host):
+    code, out = host.create("bundles")
+    assert code == 2 and out["error"] == "invalid_name"
 
 
 @pytest.mark.parametrize("name", ["", "-a", "A", "a_b", "a" * 42, "a;b", "../x"])
@@ -235,7 +285,7 @@ def test_stop_keeps_the_disk_closes_the_generation_and_is_idempotent(host):
     assert abs(out["stopped_at"] - time.time()) < 30
     u = host.systemd()["cathedral-vm-vm1.service"]
     assert not u["active"] and not u["enabled"]
-    assert (host.root / "vm1" / "disk.qcow2").exists()
+    assert (host.root / "vm1" / "root.raw").exists()
     again = host.ctl("stop", "vm1")[1]
     assert again["stopped_at"] == out["stopped_at"] and not again["was_running"]
     # A top-up of the stopped run cannot revive it; a fresh generation can.
@@ -263,7 +313,7 @@ def test_enforce_stops_expired_vms_and_keeps_their_disks(host):
     assert code == 0 and [s["name"] for s in out["stopped"]] == ["vm1"] and out["checked"] == 2
     assert host.ctl("status", "vm1")[1]["state"] == "stopped"
     assert host.ctl("status", "vm2")[1]["state"] == "running"
-    assert (host.root / "vm1" / "disk.qcow2").exists()
+    assert (host.root / "vm1" / "root.raw").exists()
     assert json.loads((host.root / "vm1" / "stop.json").read_text())["reason"] == "paid_through"
     assert not host.systemd()["cathedral-vm-vm1.service"]["enabled"]  # not back after a host reboot
     assert host.ctl("enforce")[1]["stopped"] == []
@@ -275,9 +325,10 @@ def test_delete_needs_confirm_with_the_name(host):
     assert code == 2 and out["error"] == "confirm_required"
     code, out = host.ctl("delete", "vm1", "--confirm", "vm2")
     assert code == 2 and out["error"] == "confirm_required"
-    assert (host.root / "vm1" / "disk.qcow2").exists()
+    assert (host.root / "vm1" / "root.raw").exists()
     code, out = host.ctl("delete", "vm1", "--confirm", "vm1")
     assert code == 0 and out == {"name": "vm1", "deleted": True}
+    assert "userdel cvm-0" in host.tools.read_text()  # the VM user goes with the VM
     assert not (host.root / "vm1").exists() and not (host.units / "cathedral-vm-vm1.service").exists()
     assert not (host.units / "cathedral-vm-enforce.timer").exists()  # last VM gone
     # A repeated delete (lost answer) or one for a create that never reached the host succeeds.
@@ -289,6 +340,30 @@ def test_reboot_needs_a_running_vm(host):
     host.create()
     code, out = host.ctl("reboot", "vm1")
     assert code == 5 and out["error"] == "not_running"
+
+
+def test_reboot_is_a_fenced_relaunch_in_the_same_generation(host):
+    """Spec r2 8.1: powerdown, wait, restart the unit; no new history line, no new generation."""
+    host.create()
+    now = int(time.time())
+    host.ctl("authorize", "vm1", str(now + 600), "1")
+    assert host.ctl("start", "vm1", "--generation", "1")[0] == 0
+    hist = (host.root / ".history" / "vm1.jsonl").read_text()
+    (host.root.parent / "systemd.json.log").write_text("")
+    code, out = host.ctl("reboot", "vm1", "--generation", "1")
+    assert code == 0 and out["state"] == "running" and out["generation"] == 1, out
+    log = (host.root.parent / "systemd.json.log").read_text().splitlines()
+    assert log[-1] == "restart cathedral-vm-vm1.service" and "disable -q cathedral-vm-vm1.service" not in log
+    assert (host.root / ".history" / "vm1.jsonl").read_text() == hist
+    assert not (host.root / "vm1" / "powerdown-sent").exists()
+    assert host.ctl("check-paid", "vm1")[0] == 0  # the relaunch passes the unit's gate
+    a = json.loads((host.root / "vm1" / "authorization.json").read_text())
+    assert (a["generation"], a["closed_generation"]) == (1, 0)
+    # Past paid_through a reboot is refused: enforce stops it instead.
+    a["paid_through"] = now - 1
+    (host.root / "vm1" / "authorization.json").write_text(json.dumps(a))
+    code, out = host.ctl("reboot", "vm1", "--generation", "1")
+    assert code == 4 and out["error"] == "unpaid"
 
 
 @pytest.mark.parametrize("command", [
@@ -303,6 +378,7 @@ def test_reboot_needs_a_running_vm(host):
     "powerdown vm1",
     "create vm2 --vcpus 1 --mem-gib 1 --disk-gib 8 --ssh-port 22002 --ssh-key-file /etc/passwd",
     "create vm2 --vcpus 1 --mem-gib 1 --disk-gib 8 --ssh-port 22002 --image /etc/shadow",
+    "create vm2 --vcpus 1 --mem-gib 1 --disk-gib 8 --ssh-port 22002 --bundle " + "0" * 64,
     "status ../vm1",
     "",
 ])
@@ -317,13 +393,12 @@ def test_from_broker_runs_known_commands_and_takes_the_key_on_stdin(host):
     code, out = host.ctl("--from-broker", extra={"SSH_ORIGINAL_COMMAND": "status vm1"})
     assert code == 0 and out["name"] == "vm1"
     cmd = "create vm2 --vcpus 1 --mem-gib 1 --disk-gib 8 --ssh-port 22002"
-    image = str(host.root.parent / "base.img")
-    code, out = host.ctl("--from-broker", stdin=KEY + "\n",
-                         extra={"SSH_ORIGINAL_COMMAND": cmd, "VM_BASE_IMAGE": image})
-    # The pinned digest is checked even when the image path comes from the host env.
-    assert code == 1 and out["error"] == "image_mismatch"
     code, out = host.ctl("--from-broker", stdin="", extra={"SSH_ORIGINAL_COMMAND": cmd})
     assert code == 2 and out["error"] == "invalid_ssh_key"
+    code, out = host.ctl("--from-broker", stdin=KEY + "\n", extra={"SSH_ORIGINAL_COMMAND": cmd})
+    assert code == 0 and out["name"] == "vm2" and out["bundle"] == host.bundle, out
+    ident = json.loads((host.root / "vm2" / "vm-identity.json").read_text())
+    assert ident["ssh_public_key"] == " ".join(KEY.split()[:2])
 
 
 def test_vm_net_up_blocks_private_ranges_and_forwards_only_ssh(host):
@@ -340,38 +415,30 @@ def test_vm_net_up_blocks_private_ranges_and_forwards_only_ssh(host):
     assert "-t nat -A OUTPUT" in log and "-t nat -A PREROUTING" in log and "MASQUERADE" in log
     assert "ctorigdstport 22001" in log  # only connections through this VM's own forward
     assert "-I INPUT 1 -i cvm0 -m comment --comment cathedral-vm:vm1 -j DROP" in log  # IPv6 backstop
+    assert "ip tuntap add dev cvm0 mode tap user cvm-0 group cvm-0" in log  # QEMU is not root
     assert "net.ipv6.conf.cvm0.disable_ipv6=1" in log
     assert host.run_net("down").returncode == 0
     assert "link del cvm0" in host.tools.read_text()
 
 
 def _launch_code() -> str:
-    """launch-vm.sh without comment lines."""
-    return "\n".join(l for l in (KIT / "launch-vm.sh").read_text().splitlines() if not l.lstrip().startswith("#"))
+    """The launcher and the shared SNP argv module without comments and docstrings."""
+    out = []
+    for name in ("launch-vm.py", "snp_qemu.py"):
+        tree = ast.parse((KIT / name).read_text())
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body and isinstance(body[0], ast.Expr) \
+                    and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                body[0] = ast.Pass()
+        out.append(ast.unparse(tree))
+    return "\n".join(out)
 
 
-def test_launch_refuses_every_vm_without_sev_snp(tmp_path):
-    vm_dir = tmp_path / "vm1"
-    vm_dir.mkdir()
-    marker = tmp_path / "qemu-ran"
-    fake_qemu = tmp_path / "qemu"
-    fake_qemu.write_text(f'#!/bin/sh\necho ran > "{marker}"\n')
-    fake_qemu.chmod(0o755)
-    env_file = tmp_path / "vm.env"
-    env_file.write_text("\n".join([
-        "VM_NAME='vm1'", f"VM_DIR='{vm_dir}'", "VM_VCPUS='2'", "VM_MEM_GIB='4'",
-        "VM_TAP='cvm0'", "VM_MAC='52:54:00:d8:00:00'", ""]))
-    p = subprocess.run(["bash", str(KIT / "launch-vm.sh"), str(env_file)], capture_output=True, text=True,
-                       env=dict(os.environ, QEMU=str(fake_qemu)), timeout=30)
-    assert p.returncode == 78, (p.returncode, p.stderr)
-    assert "SEV-SNP is required" in p.stderr
-    assert not marker.exists()  # even a QEMU override is never run
-
-
-def test_launch_script_never_invokes_qemu_system():
-    code = _launch_code()
-    assert "qemu-system" not in code
-    assert "exec " not in code
+def test_the_stub_launcher_is_gone():
+    """VM3 replaces the exit-78 stub of #775 with launch-vm.py (tests/test_vm_launcher.py)."""
+    assert not (KIT / "launch-vm.sh").exists()
+    assert not (KIT / "images.lock").exists() and not (KIT / "fetch-image.sh").exists()
 
 
 def test_launch_has_no_plain_mode_switch():
@@ -383,13 +450,6 @@ def test_launch_has_no_plain_mode_switch():
         if f.suffix in (".sh", ".py", ".example"):
             text = f.read_text().upper()
             assert "ALLOW_UNSEALED" not in text and "VM_PLAIN" not in text, f.name
-
-
-def test_image_is_pinned():
-    lock = (KIT / "images.lock").read_text()
-    assert "IMAGE_URL=https://cloud-images.ubuntu.com/releases/noble/release-" in lock
-    sha = [line.split("=", 1)[1] for line in lock.splitlines() if line.startswith("IMAGE_SHA256=")]
-    assert len(sha) == 1 and len(sha[0]) == 64
 
 
 def test_no_em_dashes_in_the_kit():
