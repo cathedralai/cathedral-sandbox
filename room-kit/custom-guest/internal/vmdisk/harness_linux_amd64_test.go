@@ -225,11 +225,16 @@ func (fakeSetup) FirstBoot(_ context.Context, fs *os.File, cut func(string) erro
 // boot runs one boot of d in this process and powers off after it.
 func (h *harness) boot(d *disk, id vmidentity.Identity, k key) (Outcome, error, []string) {
 	h.t.Helper()
+	return h.bootWith(d, id, k, h.tool, fakeSetup{})
+}
+
+func (h *harness) bootWith(d *disk, id vmidentity.Identity, k key, tool Tool, setup Setup) (Outcome, error, []string) {
+	h.t.Helper()
 	f := d.attach()
 	defer func() { f.Close(); h.powerOff(); d.detach() }()
 	var lines []string
 	out, err := Run(context.Background(), Config{Disk: f, DiskBytes: testDisk, Identity: id, Passphrase: k.pass,
-		Measurement: k.meas, Cryptsetup: h.tool, Names: h.names, Setup: fakeSetup{},
+		Measurement: k.meas, Cryptsetup: tool, Names: h.names, Setup: setup,
 		Log: func(s string) { lines = append(lines, s) }})
 	if out.FSArea != nil {
 		out.FSArea.Close()
