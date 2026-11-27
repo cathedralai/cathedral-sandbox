@@ -69,7 +69,11 @@ for option in CMDLINE_BOOL BOOT_CONFIG_EMBED BOOT_CONFIG_FORCE IPV6_SIT; do
     fi
 done
 grep -qx 'CONFIG_INITRAMFS_SOURCE=""' "$work/build/.config"
-make -C "$work/source" O="$work/build" -j6 bzImage
+# objtool builds its livepatch (klp) part whenever the host has libxxhash, and the
+# klp-checksum.c of this Ubuntu tree does not compile: it calls functions check.c
+# keeps static or lacks. Livepatch needs MODULES, so it is off here; pinning the
+# probe off also makes the objtool build independent of the host's libraries.
+make -C "$work/source" O="$work/build" -j6 HAVE_XXHASH=n bzImage
 mkdir "$output"
 install -m 0444 "$work/build/arch/x86/boot/bzImage" "$output/vmlinuz"
 install -m 0444 "$work/build/.config" "$output/kernel.config"

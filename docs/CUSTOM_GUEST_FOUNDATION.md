@@ -227,6 +227,9 @@ boot configuration, embedded initramfs and unused hardware drivers are disabled.
 `CONFIG_IPV6_SIT` is disabled too: `x86_64_defconfig` turns it on, the kernel
 then creates a device-less `sit0` at boot, and `bootstate` refuses every
 interface except the one virtio NIC. The build fails if any of these come back.
+`make` runs with `HAVE_XXHASH=n`: objtool otherwise builds its livepatch part on
+any host with libxxhash, and that part of this Ubuntu tree does not compile.
+Livepatch needs modules, so the kernel has none either way.
 
 The recipe contains one explicit source adjustment: x86 `COMMAND_LINE_SIZE`
 is increased from 2048 to 4096. Linux advertises one less in the boot header;
@@ -450,6 +453,29 @@ twice, requires identical bytes and verifies the archive with
 `custom_guest_initrd.py`. Build order: verity helper, then
 `build_custom_guest_helper.py --init-output ... --verity-sha256 <that digest>`, then
 this tool. The root carries the same `cathedral-attest` the init pinned.
+
+### Reference build in CI
+
+`.github/workflows/reference-build.yml` runs the kernel recipe and that initrd build
+order with real pins on GitHub-hosted `ubuntu-latest` (Ubuntu 26.04: GCC 15.2.0,
+Make 4.4.1), never on a hotel host. It runs on `workflow_dispatch` and on pull
+requests that touch the recipes, their locks or the custom guest source.
+
+- Every download is checked against a sha256 before use:
+  `scripts/fetch_reference_build_inputs.py` takes the verity inputs from
+  `custom_guest_verity_inputs.json` (URLs from `vm_initrd_tools_inputs.json`, matched
+  by sha256) and the rest from `scripts/reference_build_inputs.json`: the kernel
+  source, Go 1.26.11, python-zstandard 0.25.0 and the two kernel host tools the
+  image lacks (`bc`, `libelf-dev`, with its dependencies).
+- The kernel and the initrd are each built on two fresh runners (the kernel in work
+  directories of different lengths). Each builder also builds twice on its own runner.
+- The summary job requires byte-identical outputs across the two runners, checks the
+  closure against the files built beside it, checks the archive with
+  `custom_guest_initrd.py check`, and uploads the `reference-build` artifact:
+  `vmlinuz`, `kernel.config`, `cathedral-custom-initrd-<version>.cpio.zst`,
+  `closure-list.txt` (`<sha256>  <path>` per line), `closure.json`, the five static
+  binaries, `SHA256SUMS`, the toolchain record of each runner and `summary.json`.
+- It builds only. OVMF, the measurement and a boot come from the host rehearsal.
 
 ### Early kernel views and report permissions
 
