@@ -371,8 +371,15 @@ func TestRewrapReportData(t *testing.T) {
 	if got == again {
 		t.Fatal("the nonce must matter")
 	}
-	if hex.EncodeToString(got[:4]) == "" {
-		t.Fatal("unreachable")
+	// Computed independently: python3 -c 'import hashlib; print(hashlib.sha512(
+	// b"cathedral-vm-rewrap/v1\x00" + bytes([1]) + bytes(31) + bytes([2]) + bytes(31)).hexdigest())'
+	const want = "dbcfc5ecf8f407260a7f103d27517a0834f3daf13030761d903c2fdbb3979c48" +
+		"bb6f77e10707caf7f8d27d3e04a06602461f1330fc72cb3b3211c1632d8488f0"
+	if hex.EncodeToString(got[:]) != want {
+		t.Fatalf("REPORT_DATA %x, want %s", got, want)
+	}
+	if swapped := RewrapReportData([32]byte{2}, [32]byte{1}); swapped == got {
+		t.Fatal("pubkey and nonce must not commute")
 	}
 }
 
