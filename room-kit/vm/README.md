@@ -24,6 +24,7 @@ and lists the VM's bundle.
 | `vm-gates.sh` (`vm_gates.py`) | Pre-launch gates and the host change gate (spec 8.3): `check <name>` before every start and launch, `enforce` on the enforce tick. Exit codes in `vm_gates.py`. |
 | `vm-net.sh up\|down\|check vm.env` | Tap /30 owned by the VM user, NAT out, SSH port forward, isolation. |
 | `vm.env.example` | What `create` writes per VM. |
+| `vm_mailbox.py` | The mailbox disk: slots, records, the body pre-scan and strict parsers (re-wrap). |
 | `vm_measure.py` | Sealed VM launch values: identity document, measured cmdline, HOST_DATA, expected measurement; bundle manifest. |
 | `build-bundle.sh`, `bundle.env.example` | Recipe for one sealed VM bundle: base root, kernel and modules, manifest. |
 
@@ -41,6 +42,7 @@ sudo ./vm-ctl.sh list | enforce
 sudo ./vm-ctl.sh cancel vm1 <generation>    # close a run in any state (see Execution history)
 ./vm-ctl.sh history vm1 <generation>         # read only, works after delete
 sudo ./vm-ctl.sh rebundle vm1 --generation G --expect-revision N --op-id <32 hex> --to <B2>
+sudo ./vm-ctl.sh rewrap vm1 --generation G < answer.json   # the answer on stdin only
 sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the disk
 sudo ./vm-ctl.sh capacity [--broker-max-vcpus N --broker-max-mem-gib N --broker-max-disk-gib N]
 ```
@@ -275,7 +277,7 @@ measurements) for the VM init (VM1b) and the verifier (VM2).
 
 A VM moves to another bundle (a kernel fix) only with its customer: the new measurement
 derives a new disk key, the guest finds its root `locked`, and the customer's tool wraps
-their pinned recovery key to the guest's offer (re-wrap, the next PR). A restore is the
+their pinned recovery key to the guest's offer (`rewrap`, below). A restore is the
 same command with `--to` the old bundle.
 
 **`rebundle <name> --generation G --expect-revision N --op-id X --to B2`**, all four
@@ -310,7 +312,37 @@ it is finished by the retry or by the next `start`, which derives `vm.env` and t
 launch (`selection_unsynced`, exit 3). The marker exists because a cut between the unit
 write and `daemon-reload` leaves a right file and a stale systemd.
 
+## Re-wrap: rewrap and the mailbox (AB#999, PR VM6 host side; spec r3 7.5)
+
+**The mailbox** (`mailbox.raw`, 1 MiB, owned by the VM user; `vm_mailbox.py`, vectors in
+`tests/fixtures/vm_mailbox_v1.json`): the status record at 0 and the offer at 64 KiB, written by
+the guest; the answer at 128 KiB, written by the host. A record is `CVMMBX1\0`, a kind byte, a
+4-byte big-endian body length, the body's sha256 and a canonical JSON body (at most 64 KiB minus
+the 45-byte header; 4096 bytes for the answer).
+
+- **Read:** magic, kind, length bound and sha256; a mismatch is a torn read, read again 5 times
+  200 ms apart. Then a bounded pre-scan refuses any nesting before the parser runs, and the keys
+  must be exactly the schema's, each with its type and length. Any failure, of any exception
+  type, is an empty slot: it never fails `status`, `list` or another VM.
+- **Host access:** the VM directory (root's, 0700) opened with `O_DIRECTORY|O_NOFOLLOW`, then
+  `openat(dirfd, "mailbox.raw", O_NOFOLLOW)` (`O_RDONLY` to read, `O_RDWR` to write, never
+  `O_CREAT`), then `fstat` on the open file: a regular file of 1 MiB, one link, owned by the VM
+  user, else `mailbox_invalid` (exit 3) and nothing is touched. The VM user owns the bytes, not
+  the entry, and the checks run on the descriptor that is used.
+- **`status`** (only for a sealed VM) shows `vm_state` and `guest_status` from the status
+  record and, while the unit runs, `rewrap_offer` (the offer and its `offer_sha256`, the sha256 of
+  its body). All of it is guest data: the broker and the API pass it on, the customer's tool
+  verifies it.
+
+**`rewrap <name> --generation G`**, the answer on stdin (step 4), never an argument: the
+broker's argument check allows 64 characters. The envelope is canonical JSON of at most 4096
+bytes with exactly `schema`, `offer_sha256`, `epk`, `nonce`, `ct` (`invalid_rewrap_answer`,
+exit 2). It is written only while G is the current, open generation (`stale_generation`,
+`generation_closed`) and the unit is active, and only for the offer now in the offer slot:
+`no_rewrap_offer` or `rewrap_offer_changed`, exit 3. One `pwrite` of the answer slot, then
+`fsync`; the same answer again is not written again (`"written": false`).
+
 ## Not here yet
 
-Re-wrap (`rewrap` and the mailbox: VM6, the next PR; the guest side: VM1b, VM2), resize,
-snapshots.
+The guest side of re-wrap (VM1b, VM2), the status record's measurement check
+(`vm_measurement_differs`, spec 7.2), resize, snapshots.

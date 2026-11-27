@@ -12,8 +12,10 @@ Every command prints one JSON line on stdout; a refusal prints {"error": ...} an
   incompatible (rebundle), 1 anything else. A refusal may add fields, such as "reason", a token
   naming the check.
 
-Rebundle (spec r3 7.5 step 1) moves a stopped VM to another bundle, fenced by its closed
-generation and its bundle_selection_revision, idempotent by op_id.
+Re-wrap (spec r3 7.5): rebundle moves a stopped VM to another bundle, fenced by its closed
+generation and its bundle_selection_revision, idempotent by op_id; rewrap writes the customer's
+answer, read from stdin only, to the answer slot of the VM's mailbox (vm_mailbox.py) for the
+offer its guest left there.
 
 Credit cutoff (polariscomputer#2290 rules 3, 5, 6) is enforced here, on the host,
 so it holds with the API and the broker down:
@@ -56,6 +58,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parent
 # -I keeps the script's directory off sys.path; vm_measure.py beside this file is the kit's.
 sys.path.insert(0, str(KIT))
+import vm_mailbox  # noqa: E402
 import vm_measure  # noqa: E402
 
 
@@ -87,9 +90,12 @@ KEY_TYPES = (
 NET = ipaddress.IPv4Network("10.216.0.0/16")
 SLOTS = NET.num_addresses // 4
 COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce",
-            "cancel", "history", "rebundle")
+            "cancel", "history", "rebundle", "rewrap")
 STOP_WAIT = int(os.environ.get("VM_STOP_WAIT", "60"))
-MAILBOX_BYTES = 1 << 20
+MAILBOX_BYTES = vm_mailbox.MAILBOX_BYTES
+# A torn guest record (spec r3 7.5 Read) is read again this many times, this far apart.
+MAILBOX_RETRIES = 5
+MAILBOX_RETRY_WAIT = float(os.environ.get("VM_MAILBOX_RETRY_WAIT", "0.2"))
 # Rebundle (spec r3 7.5 step 1): the applied op_ids a VM remembers, with their results.
 SELECTION_OPS_MAX = 64
 BUNDLE_ID_RE = re.compile(r"[0-9a-f]{64}")
@@ -399,6 +405,81 @@ def cmd_qmp_as_vm_user(args: list[str]) -> dict:
     if not qmp_exchange("qmp.sock", args[0], float(args[1])):
         raise Refusal("qmp_failed", "QEMU did not take the command", 1)
     return {"sent": args[0]}
+
+
+# ---- the mailbox disk (spec r3 7.5 Mailbox, vm_mailbox.py) --------------------------------
+
+def mailbox_open(d: Path, user: str, write: bool = False) -> int:
+    """mailbox.raw by openat from the VM directory, never through a link, checked on the open file:
+    a regular file of 1 MiB with one link, owned by the VM user. The user owns the file's bytes,
+    not its entry: the directory is root's, mode 0700, so the user cannot replace or link it, and
+    the checks run on the descriptor that is then used, so nothing changes between check and use."""
+    import pwd
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        raise Refusal("mailbox_invalid", f"no VM user {user}", 3) from None
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Refusal("mailbox_invalid", f"{d}: {e.strerror}", 3) from None
+    try:
+        # Never O_CREAT or O_TRUNC. O_NONBLOCK: a FIFO in its place fails the checks, not hangs here.
+        fd = os.open("mailbox.raw", (os.O_RDWR if write else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC
+                     | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dfd)
+    except OSError as e:
+        raise Refusal("mailbox_invalid", f"mailbox.raw: {e.strerror}", 3) from None
+    finally:
+        os.close(dfd)
+    st = os.fstat(fd)
+    if not (stat.S_ISREG(st.st_mode) and st.st_uid == uid and st.st_nlink == 1 and st.st_size == MAILBOX_BYTES):
+        os.close(fd)
+        raise Refusal("mailbox_invalid", "mailbox.raw is not the VM user's 1 MiB regular file with one link", 3)
+    return fd
+
+
+def mailbox_slot(fd: int, offset: int) -> bytes | None:
+    """The record body in the slot at offset, or None when the slot is empty. A torn record is read
+    again MAILBOX_RETRIES times, MAILBOX_RETRY_WAIT apart; one that never checks is empty."""
+    kind = vm_mailbox.SLOT_KIND[offset]
+    for attempt in range(MAILBOX_RETRIES + 1):
+        try:
+            return vm_mailbox.decode_slot(os.pread(fd, vm_mailbox.SLOT_BYTES, offset), kind)
+        except vm_mailbox.Torn:
+            if attempt < MAILBOX_RETRIES:
+                time.sleep(MAILBOX_RETRY_WAIT)
+    return None
+
+
+def guest_record(fd: int, offset: int) -> tuple[dict, bytes] | None:
+    """A guest slot's (document, body bytes), or None. The bytes are the guest's: any failure, of any
+    exception type (a recursion or memory error too), is an empty slot."""
+    try:
+        body = mailbox_slot(fd, offset)
+        return None if body is None else (vm_mailbox.parse_body(body, vm_mailbox.SLOT_KIND[offset]), body)
+    except Exception:
+        return None
+
+
+def mailbox_view(d: Path, env: dict, running: bool) -> dict:
+    """What status shows of the mailbox (spec r3 7.2, 7.5 step 3): the guest's status record and,
+    while the VM runs, the offer its guest waits with. Guest data, passed on and trusted by nothing
+    here; any problem is an empty slot, so it never fails status, list or another VM."""
+    view: dict = {"vm_state": None, "guest_status": None, "rewrap_offer": None}
+    try:
+        fd = mailbox_open(d, env["VM_USER"])
+    except Exception:
+        return view
+    try:
+        status = guest_record(fd, vm_mailbox.STATUS_OFFSET)
+        if status:
+            view.update(vm_state=status[0]["state"], guest_status=status[0])
+        offer = guest_record(fd, vm_mailbox.OFFER_OFFSET) if running else None
+        if offer:
+            view["rewrap_offer"] = {**offer[0], "offer_sha256": vm_mailbox.body_sha256(offer[1])}
+    finally:
+        os.close(fd)
+    return view
 
 
 # ---- authorization -------------------------------------------------------------
@@ -842,7 +923,8 @@ def status_of(name: str) -> dict:
         **{k: launch[k] for k in LAUNCH_STATUS if k in launch},
         **({"disks": {"root": (d / "root.raw").is_file(), "mailbox": (d / "mailbox.raw").is_file()},
             # The caller passes it back as rebundle --expect-revision (spec r3 7.5 step 1).
-            "bundle_selection_revision": launch.get("bundle_selection_revision", 0)}
+            "bundle_selection_revision": launch.get("bundle_selection_revision", 0),
+            **mailbox_view(d, env, state == "running")}
            if launch else {}),
     }
 
@@ -1541,6 +1623,55 @@ def cmd_rebundle(args: list[str]) -> dict:
     return {"name": name, "op_id": op_id, **result}
 
 
+# ---- rewrap (spec r3 7.5 step 4) ------------------------------------------------------------
+
+def cmd_rewrap(args: list[str], answer: bytes | None) -> dict:
+    """Write the customer's answer to the answer slot for the offer the running guest waits with.
+    The answer comes on stdin only (from the broker: at most vm_mailbox.ANSWER_MAX bytes), never
+    on argv: the answer envelope, canonical, whose offer_sha256 names the offer now in the offer
+    slot. Only for the current, open generation G with the unit active. The same answer again is
+    not written again."""
+    opts = parse_opts(args, {"--generation"}, 1)
+    name = check_name(opts["_"][0])
+    if "--generation" not in opts:
+        raise Refusal("missing_option", "rewrap needs --generation")
+    gen = check_int(opts["--generation"], "generation", 1, 2**53)
+    if answer is None:
+        answer = sys.stdin.buffer.read(vm_mailbox.ANSWER_MAX + 1)
+    try:
+        doc = vm_mailbox.parse_answer(answer)
+    except vm_mailbox.Refusal as e:
+        raise Refusal("invalid_rewrap_answer", str(e)) from None
+    slot = vm_mailbox.encode_slot(vm_mailbox.KIND_ANSWER, answer)
+    d = vm_dir(name)
+    with Lock(d / ".lock"):
+        begin(name, d)
+        a = auth_of(d)
+        if gen != a["generation"]:
+            raise Refusal("stale_generation", f"generation {gen} is not the current one ({a['generation']})", 3)
+        if gen <= a.get("closed_generation", 0):
+            raise Refusal("generation_closed", f"generation {gen} was stopped: no guest waits", 3)
+        user = read_env(d / "vm.env").get("VM_USER")
+        if not user or not unit_active(name):
+            raise Refusal("no_rewrap_offer", f"VM {name} is not running: no guest waits for an answer", 3)
+        fd = mailbox_open(d, user, write=True)
+        try:
+            offer = guest_record(fd, vm_mailbox.OFFER_OFFSET)
+            if offer is None:
+                raise Refusal("no_rewrap_offer", "the offer slot holds no valid offer", 3)
+            if vm_mailbox.body_sha256(offer[1]) != doc["offer_sha256"]:
+                raise Refusal("rewrap_offer_changed", "the answer is for another offer than the one waiting", 3)
+            written = os.pread(fd, vm_mailbox.SLOT_BYTES, vm_mailbox.ANSWER_OFFSET) != slot
+            if written:
+                view = memoryview(slot)
+                while view:  # one pwrite of the answer slot; the loop only finishes a short write
+                    view = view[os.pwrite(fd, view, vm_mailbox.ANSWER_OFFSET + len(slot) - len(view)):]
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+    return {"name": name, "generation": gen, "offer_sha256": doc["offer_sha256"], "written": written}
+
+
 # ---- delete, status, list, enforce ---------------------------------------------
 
 def close_unreached_generation(name: str, d: Path) -> None:
@@ -1813,8 +1944,12 @@ def parse_opts(args: list[str], allowed: set[str], positional: int) -> dict:
 BROKER_SAFE = re.compile(r"[A-Za-z0-9 ._-]{1,512}")
 
 
-def from_broker() -> tuple[list[str], str | None]:
-    """authorized_keys forced command: SSH_ORIGINAL_COMMAND split on spaces, never a shell."""
+def from_broker() -> tuple[list[str], str | bytes | None]:
+    """authorized_keys forced command: SSH_ORIGINAL_COMMAND split on spaces, never a shell.
+
+    stdin is read only for the two commands that take a document: create (the customer key) and
+    rewrap (the answer: one byte more than vm_mailbox.ANSWER_MAX, so a longer one is refused,
+    never cut)."""
     raw = os.environ.get("SSH_ORIGINAL_COMMAND")
     if raw is None:
         raise Refusal("usage", "--from-broker needs SSH_ORIGINAL_COMMAND")
@@ -1829,6 +1964,8 @@ def from_broker() -> tuple[list[str], str | None]:
         if "--ssh-key-file" in args or "--image" in args:
             raise Refusal("invalid_option", "from the broker the key comes on stdin and the image is the pinned one")
         return args, sys.stdin.read(16385)
+    if args[0] == "rewrap":
+        return args, sys.stdin.buffer.read(vm_mailbox.ANSWER_MAX + 1)
     return args, None
 
 
@@ -1850,6 +1987,8 @@ def main(argv: list[str]) -> int:
         }
         if cmd == "create":
             out(cmd_create(rest, key_text))
+        elif cmd == "rewrap":
+            out(cmd_rewrap(rest, key_text))
         elif cmd == "capacity":
             doc = cmd_capacity(rest)
             out(doc)
