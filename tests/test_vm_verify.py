@@ -109,7 +109,7 @@ def tcb(family: str, **lower: int) -> bytes:
 
 def make_report(family: str, *, report_data: bytes, measurement_hex: str, host_data_hex: str, version: int = 5,
                 cpuid: tuple | None = None, policy: int = 0x30000, vmpl: int = 0, signer: int = 0,
-                tcbs: dict | None = None) -> bytes:
+                tcbs: dict | None = None, chip: bytes | None = None) -> bytes:
     r = bytearray(vv.REPORT_BYTES)
     r[0:4] = version.to_bytes(4, "little")
     r[0x08:0x10] = policy.to_bytes(8, "little")
@@ -124,7 +124,7 @@ def make_report(family: str, *, report_data: bytes, measurement_hex: str, host_d
         r[offset:offset + 8] = (tcbs or {}).get(offset, tcb(family))
     if version >= 3:
         r[0x188:0x18B] = bytes(cpuid or vv.APPROVED_CPUS[family]["cpuid"])
-    r[0x1A0:0x1E0] = CHIPS[family]
+    r[0x1A0:0x1E0] = chip or CHIPS[family]
     return bytes(r)
 
 
@@ -167,6 +167,13 @@ print(TABLE.get("%d/%s" % (vcpus, identity)) or hashlib.sha384(("%d|" % vcpus + 
 '''
 
 
+@pytest.fixture(autouse=True)
+def pin_home(tmp_path: Path, monkeypatch) -> Path:
+    """Every test's default pin store is its own, never the real one under the user's home."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    return tmp_path / "xdg" / "cathedral" / "vm-pins"
+
+
 @pytest.fixture
 def files(tmp_path: Path) -> dict:
     """Per family: the vector bundle directory. Also identity a, the customer's key pair files
@@ -188,26 +195,45 @@ def files(tmp_path: Path) -> dict:
             "create_key": create_key, "cache": tmp_path / "kds"}
 
 
+R = base64.b64encode(hashlib.sha256(b"vm2 recovery key").digest()).decode()
+OTHER_R = base64.b64encode(hashlib.sha256(b"vm2 other recovery key").digest()).decode()
+# The same 32 bytes as R, with the two unused low bits of the last character set: decodes, not canonical.
+_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+NONCANONICAL_R = R[:-2] + _B64[_B64.index(R[-2]) | 0x03] + "="
+
+
+def recovery_line(family: str, identity: str = "a", **change) -> bytes:
+    doc = {"recovery_key_b64": R, "vm_id": IDS[identity]["vm_id"],
+           "identity_sha256": IDS[identity]["identity_sha256"], "chip_id": CHIPS[family].hex(), **change}
+    return json.dumps({k: v for k, v in doc.items() if v is not None}).encode()
+
+
 class Guest:
     """Stands in for exchange(): answers the challenge as a VM would, with a report the
-    synthetic chain signs. bound is the key REPORT_DATA names, shown the key the connection recorded."""
+    synthetic chain signs. bound is the key REPORT_DATA names, shown the key the connection recorded.
+    For pin, the remote command also asks for the recovery record: recovery is that line."""
 
     def __init__(self, family: str, cache: Path, *, identity: str = "a", vcpus: int = 4, bound=HOST_KEY,
-                 shown=HOST_KEY, foreign_ask: bool = False, fixed_challenge: bytes | None = None, **knobs):
+                 shown=HOST_KEY, foreign_ask: bool = False, fixed_challenge: bytes | None = None,
+                 recovery: bytes | None = None, **knobs):
         self.family, self.cache, self.bound, self.shown = family, cache, bound, shown
         self.foreign_ask, self.fixed_challenge = foreign_ask, fixed_challenge
         self.measurement = knobs.pop("measurement_hex", measurement(identity, vcpus))
         self.host_data = knobs.pop("host_data_hex", IDS[identity]["host_data_hex"])
-        self.knobs, self.answers, self.seen = knobs, [], []
+        self.recovery = recovery if recovery is not None else recovery_line(family)
+        self.knobs, self.answers, self.seen, self.remotes = knobs, [], [], []
 
-    def __call__(self, host, port, user, ssh_key, challenge):
+    def __call__(self, host, port, user, ssh_key, challenge, remote=None):
         self.seen.append((host, port, user, ssh_key, challenge))
+        self.remotes.append(remote)
         data = vv.report_data(self.fixed_challenge or challenge, blob(self.bound))
         report = sign(make_report(self.family, report_data=data, measurement_hex=self.measurement,
                                   host_data_hex=self.host_data, **self.knobs),
                       self.family, self.cache, foreign_ask=self.foreign_ask)
         answer = json.dumps({"report_b64": base64.b64encode(report).decode()}).encode()
         self.answers.append(answer)
+        if remote and vv.GUEST_RECOVERY_COMMAND in remote:
+            answer += b"\n" + self.recovery + b"\n"
         return answer, blob(self.shown)
 
 
@@ -217,13 +243,21 @@ def run(files: dict, family: str, guest, **override) -> dict:
               "ark_sha256": ark_pin(family), "host": "203.0.113.10", "port": 22001, "user": "cathedral",
               "ssh_key": files["key"], "floor": vv.floor_for(family, None), "cache": str(files["cache"]),
               "ark_crl": crl(family), "tool": files["tool"], "exchange": guest}
-    return vv.verify(**{**kwargs, **override})
+    return (override.pop("call", None) or vv.verify)(**{**kwargs, **override})
 
 
 def refused(files: dict, family: str, guest, **override) -> vv.Refused:
     with pytest.raises(vv.Refused) as caught:
         run(files, family, guest, **override)
     return caught.value
+
+
+def pin(files: dict, family: str, guest, **override) -> dict:
+    return run(files, family, guest, call=vv.pin, **override)
+
+
+def pin_refused(files: dict, family: str, guest, **override) -> vv.Refused:
+    return refused(files, family, guest, call=vv.pin, **override)
 
 
 # ---- PASS ---------------------------------------------------------------------------
@@ -246,7 +280,8 @@ def test_pass_on_both_families_and_report_versions_3_to_5(files, family, version
                              "host_key": "ssh-ed25519 " + base64.b64encode(blob(HOST_KEY)).decode()}
     challenge = guest.seen[0][4]
     assert len(challenge) == 32 and result["challenge_hex"] == challenge.hex()
-    assert result["chip_id_pin"] == "not_checked"
+    assert result["pin"]["state"] == "none" and vv.NOT_PINNED in result["does_not_prove"]
+    assert guest.remotes == [f"sudo -n /run/cathedral/bin/cathedral-attest {challenge.hex()}"]
     key = " ".join(IDS["a"]["ssh_key_line"].split()[:2])
     assert result["identity_key"]["key"] == key == json.loads(files["identity"])["ssh_public_key"]
 
@@ -304,7 +339,7 @@ def test_replayed_answer_is_refused(files):
     assert run(files, "genoa", guest)["verdict"] == "PASS"
     recorded = guest.answers[0]
 
-    def replay(host, port, user, ssh_key, challenge):
+    def replay(host, port, user, ssh_key, challenge, remote=None):
         return recorded, blob(HOST_KEY)
 
     assert refused(files, "genoa", replay).code == "report_data_mismatch"
@@ -506,8 +541,8 @@ def cli(files, tmp_path, monkeypatch, capsys):
             "--ssh-key", files["key"], "--ark-crl", str(crl_path), "--kds-cache", str(files["cache"]),
             "--tool", files["tool"]]
 
-    def call(*extra: str) -> tuple[int, dict]:
-        code = vv.main(argv + list(extra))
+    def call(*extra: str, command: str = "verify") -> tuple[int, dict]:
+        code = vv.main([command] + argv[1:] + list(extra))
         out = capsys.readouterr().out.strip().splitlines()
         assert len(out) == 1
         return code, json.loads(out[0])
@@ -592,9 +627,262 @@ def test_cli_unexpected_exception_is_could_not_check(cli, monkeypatch):
     assert result["reason"].startswith("TypeError: ")
 
 
-def test_cli_pin_is_reserved(capsys):
-    assert vv.main(["pin", "--anything"]) == 2
-    assert json.loads(capsys.readouterr().out)["code"] == "not_available"
+def test_cli_rejects_unknown_arguments_for_both_commands(cli):
+    for command in ("verify", "pin"):
+        with pytest.raises(SystemExit) as caught:
+            cli("--anything", command=command)
+        assert caught.value.code == 2
+
+
+# ---- pin and its store (spec r3 7.5) ---------------------------------------------------
+
+def pin_file(pin_home: Path, identity: str = "a") -> Path:
+    return pin_home / (IDS[identity]["identity_sha256"] + ".json")
+
+
+@pytest.mark.parametrize("family", ["genoa", "turin"])
+def test_pin_keeps_r_chip_and_host_key_after_a_full_pass(files, pin_home, family):
+    guest = Guest(family, files["cache"])
+    result = pin(files, family, guest)
+    challenge = guest.seen[0][4]
+    assert guest.remotes == [(f"sudo -n /run/cathedral/bin/cathedral-attest {challenge.hex()}"
+                              " && sudo -n /run/cathedral/bin/cathedral-vm recovery show")]
+    path = pin_file(pin_home)
+    assert result["verdict"] == "PASS" and result["pin"] == {"state": "stored", "path": str(path)}
+    assert vv.NOT_PINNED not in result["does_not_prove"]
+    assert R not in json.dumps(result)  # R is kept, never printed
+    assert path.stat().st_mode & 0o777 == 0o600 and pin_home.stat().st_mode & 0o777 == 0o700
+    doc = vv.load_pin(IDS["a"]["identity_sha256"])
+    assert path.read_bytes() == vv.vm_measure.canonical(doc)
+    assert {k: doc[k] for k in vv.PIN_COMPARED} == {
+        "vm_id": IDS["a"]["vm_id"], "identity_sha256": IDS["a"]["identity_sha256"], "chip_id": CHIPS[family].hex(),
+        "ssh_host_key": "ssh-ed25519 " + base64.b64encode(blob(HOST_KEY)).decode(), "recovery_key_b64": R}
+    assert doc["schema"] == "cathedral.vm.pin/v1"
+    assert [p.name for p in pin_home.iterdir()] == [path.name]  # no temporary file left
+
+
+def test_pin_with_the_same_values_again_is_a_no_op(files, pin_home):
+    pin(files, "turin", Guest("turin", files["cache"]))
+    before, stat = pin_file(pin_home).read_bytes(), pin_file(pin_home).stat()
+    result = pin(files, "turin", Guest("turin", files["cache"]))
+    assert result["pin"]["state"] == "unchanged"
+    assert pin_file(pin_home).read_bytes() == before and pin_file(pin_home).stat().st_mtime_ns == stat.st_mtime_ns
+
+
+def test_pin_existing_with_another_r_is_left_unchanged(files, pin_home):
+    pin(files, "turin", Guest("turin", files["cache"]))
+    before = pin_file(pin_home).read_bytes()
+    err = pin_refused(files, "turin", Guest("turin", files["cache"],
+                                            recovery=recovery_line("turin", recovery_key_b64=OTHER_R)))
+    assert err.code == "pin_exists" and err.exit_code == 1 and "recovery_key_b64" in str(err)
+    assert R not in str(err) and OTHER_R not in str(err)
+    assert pin_file(pin_home).read_bytes() == before
+
+
+@pytest.mark.parametrize("change, code", [
+    ({"chip_id": CHIPS["genoa"].hex()}, "recovery_chip_mismatch"),
+    ({"vm_id": IDS["b"]["vm_id"]}, "recovery_identity_mismatch"),
+    ({"identity_sha256": IDS["b"]["identity_sha256"]}, "recovery_identity_mismatch"),
+    ({"recovery_key_b64": base64.b64encode(bytes(31)).decode()}, "recovery_invalid"),
+    ({"recovery_key_b64": R.rstrip("=")}, "recovery_invalid"),
+    ({"recovery_key_b64": NONCANONICAL_R}, "recovery_invalid"),
+    ({"recovery_key_b64": None}, "recovery_invalid"),
+    ({"extra": "x"}, "recovery_invalid"),
+])
+def test_pin_refuses_a_recovery_record_for_another_vm_or_chip_and_writes_nothing(files, pin_home, change, code):
+    err = pin_refused(files, "turin", Guest("turin", files["cache"], recovery=recovery_line("turin", **change)))
+    assert err.code == code and err.exit_code == 1
+    assert not pin_home.exists()
+
+
+@pytest.mark.parametrize("recovery", [b"", b"not json", recovery_line("turin") + b"\n" + recovery_line("turin")])
+def test_pin_needs_exactly_the_report_line_and_one_recovery_line(files, pin_home, recovery):
+    err = pin_refused(files, "turin", Guest("turin", files["cache"], recovery=recovery))
+    assert err.code in {"answer_invalid", "recovery_invalid"}
+    assert not pin_home.exists()
+
+
+@pytest.mark.parametrize("knobs, code", [
+    ({"measurement_hex": "00" * 48}, "measurement_mismatch"),
+    ({"bound": OTHER_HOST_KEY}, "report_data_mismatch"),
+    ({"foreign_ask": True}, "amd_chain"),
+    ({"vmpl": 1}, "vmpl"),
+])
+def test_pin_after_a_failed_attestation_writes_nothing(files, pin_home, knobs, code):
+    err = pin_refused(files, "turin", Guest("turin", files["cache"], **knobs))
+    assert err.code == code
+    assert not pin_home.exists()
+
+
+def test_verify_with_a_pin_says_matched(files, pin_home):
+    pin(files, "turin", Guest("turin", files["cache"]))
+    result = run(files, "turin", Guest("turin", files["cache"]))
+    assert result["pin"] == {"state": "matched", "path": str(pin_file(pin_home))}
+    assert vv.NOT_PINNED not in result["does_not_prove"]
+
+
+def test_verify_with_a_pin_refuses_another_host_key(files, pin_home):
+    pin(files, "turin", Guest("turin", files["cache"]))
+    err = refused(files, "turin", Guest("turin", files["cache"], bound=OTHER_HOST_KEY, shown=OTHER_HOST_KEY))
+    assert err.code == "host_key_changed" and err.exit_code == 1
+
+
+def test_verify_with_a_pin_refuses_another_chip(files, pin_home):
+    pin(files, "turin", Guest("turin", files["cache"]))
+    other_chip = hashlib.sha256(b"vm2 another turin chip").digest()[:8] + bytes(56)
+    err = refused(files, "turin", Guest("turin", files["cache"], chip=other_chip))
+    assert err.code == "chip_id_changed" and err.exit_code == 1
+
+
+def test_pin_again_on_another_chip_is_refused_and_the_pin_kept(files, pin_home):
+    pin(files, "turin", Guest("turin", files["cache"]))
+    before = pin_file(pin_home).read_bytes()
+    other_chip = hashlib.sha256(b"vm2 another turin chip").digest()[:8] + bytes(56)
+    err = pin_refused(files, "turin", Guest("turin", files["cache"], chip=other_chip,
+                                            recovery=recovery_line("turin", chip_id=other_chip.hex())))
+    assert err.code == "chip_id_changed"
+    assert pin_file(pin_home).read_bytes() == before
+
+
+def _pinned(files, pin_home) -> Path:
+    pin(files, "turin", Guest("turin", files["cache"]))
+    return pin_file(pin_home)
+
+
+def test_load_refuses_a_pin_open_to_others(files, pin_home):
+    _pinned(files, pin_home).chmod(0o644)
+    err = refused(files, "turin", Guest("turin", files["cache"]))
+    assert err.code == "pin_store_invalid" and err.exit_code == 2
+
+
+def test_load_refuses_a_pin_directory_open_to_others(files, pin_home):
+    _pinned(files, pin_home)
+    pin_home.chmod(0o755)
+    err = refused(files, "turin", Guest("turin", files["cache"]))
+    assert err.code == "pin_store_invalid" and err.exit_code == 2
+
+
+def test_load_refuses_a_pin_that_is_a_symlink(files, pin_home, tmp_path):
+    path = _pinned(files, pin_home)
+    target = tmp_path / "elsewhere.json"
+    target.write_bytes(path.read_bytes())
+    target.chmod(0o600)
+    path.unlink()
+    path.symlink_to(target)
+    err = refused(files, "turin", Guest("turin", files["cache"]))
+    assert err.code == "pin_store_invalid" and err.exit_code == 2
+    # pin neither follows nor replaces it
+    err = pin_refused(files, "turin", Guest("turin", files["cache"]))
+    assert err.code == "pin_store_invalid" and path.is_symlink()
+
+
+def test_load_refuses_a_pin_directory_that_is_a_symlink(files, pin_home, tmp_path):
+    real = tmp_path / "real-pins"
+    real.mkdir(mode=0o700)
+    pin_home.parent.mkdir(parents=True)
+    pin_home.symlink_to(real)
+    err = pin_refused(files, "turin", Guest("turin", files["cache"]))
+    assert err.code == "pin_store_invalid"
+    assert list(real.iterdir()) == []
+
+
+@pytest.mark.parametrize("edit", [
+    lambda d: {**d, "recovery_key_b64": "AAAA"},
+    lambda d: {**d, "recovery_key_b64": 5},
+    lambda d: {**d, "ssh_host_key": "ssh-ed25519"},
+    lambda d: {**d, "chip_id": "zz"},
+    lambda d: {**d, "identity_sha256": IDS["b"]["identity_sha256"]},
+    lambda d: {**d, "extra": "x"},
+    lambda d: {k: v for k, v in d.items() if k != "ssh_host_key"},
+])
+def test_load_refuses_a_malformed_pin(files, pin_home, edit):
+    path = _pinned(files, pin_home)
+    path.write_bytes(vv.vm_measure.canonical(edit(json.loads(path.read_bytes()))))
+    with pytest.raises(vv.CannotCheck) as caught:
+        vv.load_pin(IDS["a"]["identity_sha256"])
+    assert caught.value.code == "pin_store_invalid"
+
+
+def test_load_refuses_a_pin_that_is_not_canonical(files, pin_home):
+    path = _pinned(files, pin_home)
+    path.write_bytes(json.dumps(json.loads(path.read_bytes()), indent=1).encode())
+    with pytest.raises(vv.CannotCheck) as caught:
+        vv.load_pin(IDS["a"]["identity_sha256"])
+    assert caught.value.code == "pin_store_invalid"
+
+
+def test_load_without_a_pin_is_none(pin_home):
+    assert vv.load_pin(IDS["a"]["identity_sha256"]) is None
+    pin_home.mkdir(parents=True, mode=0o700)
+    assert vv.load_pin(IDS["a"]["identity_sha256"]) is None
+
+
+def test_store_never_replaces_a_pin_written_by_a_concurrent_run(files, pin_home, monkeypatch):
+    first = vv.load_pin  # the concurrent run's pin lands after this run looked
+    path = _pinned(files, pin_home)
+    before = path.read_bytes()
+    record = {**json.loads(before), "recovery_key_b64": OTHER_R}
+    calls = []
+    monkeypatch.setattr(vv, "load_pin", lambda *a: calls.append(a) or (None if len(calls) == 1 else first(*a)))
+    with pytest.raises(vv.Refused) as caught:
+        vv.store_pin(record)
+    assert caught.value.code == "pin_exists" and path.read_bytes() == before
+    assert [p.name for p in pin_home.iterdir()] == [path.name]
+
+
+def test_default_pin_dir_follows_xdg_data_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert vv.default_pin_dir() == tmp_path / "data" / "cathedral" / "vm-pins"
+    for unset in ("", "relative/data"):
+        monkeypatch.setenv("XDG_DATA_HOME", unset)
+        assert vv.default_pin_dir() == Path.home() / ".local" / "share" / "cathedral" / "vm-pins"
+
+
+def _pin_answer(cli, tmp_path, monkeypatch, recovery: bytes) -> str:
+    """Make the fake ssh print the report answer and then the recovery line. Returns the
+    report-only answer file, for a later verify."""
+    answer = os.environ["FAKE_SSH_ANSWER"]
+    both = tmp_path / "answer-pin.json"
+    both.write_bytes(Path(answer).read_bytes() + b"\n" + recovery + b"\n")
+    monkeypatch.setenv("FAKE_SSH_ANSWER", str(both))
+    return answer
+
+
+def test_cli_pin_runs_one_exec_and_keeps_r_out_of_stdout(cli, tmp_path, monkeypatch, pin_home):
+    report_only = _pin_answer(cli, tmp_path, monkeypatch, recovery_line("turin"))
+    code, result = cli(command="pin")
+    assert code == 0 and result["pin"]["state"] == "stored" and R not in json.dumps(result)
+    argv = json.loads(cli.argv_file.read_text())
+    assert argv[-1] == (f"sudo -n /run/cathedral/bin/cathedral-attest {cli.challenge.hex()}"
+                        " && sudo -n /run/cathedral/bin/cathedral-vm recovery show")
+    assert vv.load_pin(IDS["a"]["identity_sha256"])["recovery_key_b64"] == R
+    monkeypatch.setenv("FAKE_SSH_ANSWER", report_only)
+    code, result = cli()
+    assert code == 0 and result["pin"]["state"] == "matched"
+
+
+def test_cli_pin_dir_flag(cli, tmp_path, monkeypatch, pin_home):
+    _pin_answer(cli, tmp_path, monkeypatch, recovery_line("turin"))
+    store = tmp_path / "my-pins"
+    code, result = cli("--pin-dir", str(store), command="pin")
+    assert code == 0 and result["pin"]["path"] == str(store / (IDS["a"]["identity_sha256"] + ".json"))
+    assert not pin_home.exists()
+
+
+def test_cli_pin_keeps_nothing_from_a_run_that_did_not_exit_0(cli, tmp_path, monkeypatch, pin_home):
+    # OpenSSH writes an accept-new key before it checks the KEX signature: a run that exited
+    # nonzero leaves a key in known_hosts that proves nothing, and stdout that may carry R.
+    _pin_answer(cli, tmp_path, monkeypatch, recovery_line("turin"))
+    r_only = tmp_path / "r-only.json"
+    r_only.write_bytes(recovery_line("turin") + b"\n")
+    for answer in (os.environ["FAKE_SSH_ANSWER"], str(r_only)):
+        monkeypatch.setenv("FAKE_SSH_ANSWER", answer)
+        for exit_code, code in (("1", "attest_failed"), ("255", "ssh_failed")):
+            monkeypatch.setenv("FAKE_SSH_EXIT", exit_code)
+            rc, result = cli(command="pin")
+            assert result["code"] == code and rc == {"1": 1, "255": 2}[exit_code]
+            assert R not in json.dumps(result)
+            assert not pin_home.exists()
 
 
 # ---- pinned values and real reports ---------------------------------------------------
