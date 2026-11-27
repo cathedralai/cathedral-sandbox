@@ -1,13 +1,13 @@
 """The generated custom guest unit under a real systemd (rehearsal B, run 3, 27 Nov).
 
-The unit has TemporaryFileSystem=/srv:ro and ProtectSystem=strict. From systemd 259 a `+` hook runs with full
-privileges but still inside that mount namespace, so check-start found an empty /srv (no host journal), exited
-could not write the journal (EROFS) and custom-net.sh could not take its lock under /run/lock. The fake systemctl
+The unit has TemporaryFileSystem=/srv:ro and ProtectSystem=strict. A `+` hook runs with full
+privileges but still inside that mount namespace (on systemd 255 and 259 alike, shown by the control test below), so
+check-start found an empty /srv (no host journal) and exited could not write the journal (EROFS). The fake systemctl
 of the other tests never ran a unit, so none of that showed. This test installs the unit text the module
 generates, with stub scripts in place of QEMU and the real hooks, starts it with systemctl and checks what a
 hook can see and write. It needs root and a systemd: it runs in .github/workflows/custom-guest-unit.yml with
-CG_SYSTEMD_TESTS=1 and is skipped elsewhere. The runner's systemd version is printed; where it is older than
-259 the old behaviour does not reproduce, but the generated unit must pass on every version.
+CG_SYSTEMD_TESTS=1 and is skipped elsewhere. The runner's systemd version is printed; the job runs on 24.04
+(systemd 255) and 26.04 (systemd 259, the rehearsal host's version).
 """
 from __future__ import annotations
 
@@ -206,9 +206,9 @@ def test_every_plus_hook_of_the_unit_is_wrapped_and_the_guest_line_is_not(host):
     assert "nsenter" not in next(ln for ln in text.splitlines() if ln.startswith("ExecStart="))
 
 
-def test_report_whether_the_unwrapped_unit_fails_on_this_systemd(host):
-    """Not an assertion about the fix: on systemd 259 the old unit failed check-start, on older ones it
-    passed. Printed so a CI log shows which side of the change this runner is on."""
+def test_the_unwrapped_unit_fails_on_every_systemd_version(host):
+    """The control: the unit without the host-namespace wrapper must fail, on every systemd version, because the
+    hook cannot see the host journal. That proves the old unit breaks and that the passing test above can fail."""
     unwrapped = UNIT_PATH.read_text().replace(host["mod"].HOST_NS + " ", "")
     UNIT_PATH.write_text(unwrapped)
     sh("systemctl", "daemon-reload")
@@ -216,7 +216,6 @@ def test_report_whether_the_unwrapped_unit_fails_on_this_systemd(host):
     state = wait_inactive(UNIT)
     print(f"systemd {systemd_version()}: the unit WITHOUT the host namespace ended {state}; "
           f"a failure here is the bug this change fixes\n{log_of(UNIT)}")
-    # The control: if it fails, it fails for the reason this change removes (the hidden host journal or a read-only
-    # /run), so the test above is known to be able to fail.
-    if state == "failed":
-        assert re.search(r"hidden from this hook|Read-only file system|read-only|No such file", log_of(UNIT)), log_of(UNIT)
+    assert state == "failed", f"the unwrapped unit ended {state} on systemd {systemd_version()}"
+    # And for the reason this change removes: the hook sees no host journal.
+    assert "hidden from this hook" in log_of(UNIT), log_of(UNIT)

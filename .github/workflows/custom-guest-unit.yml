@@ -25,13 +25,19 @@ permissions:
 
 jobs:
   unit:
-    name: Generated unit under real systemd (root)
-    runs-on: ubuntu-24.04
+    name: Generated unit under real systemd (root, ${{ matrix.os }})
+    # 26.04 ships systemd 259, the version of the host where rehearsal B run 3 failed; 24.04 has 255. The unwrapped unit fails on both.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Versions
         run: |
-          systemctl --version | head -1
+          systemctl --version | head -2
+          cat /etc/os-release | head -3
           nsenter --version
           python3 --version
       - name: Test environment
