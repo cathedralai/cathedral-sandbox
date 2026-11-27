@@ -7,39 +7,39 @@ import (
 	"github.com/cathedralai/cathedral-sandbox/custom-guest/internal/vmidentity"
 )
 
-const disk = 64 * MiB
+const diskSize = 64 * MiB
 
 func TestIntentRoundTripAndBinding(t *testing.T) {
 	id := testIdentity(t, "vm-0123456789ab")
 	other := testIdentity(t, "vm-ba9876543210")
-	rec, err := EncodeIntent(id, disk)
+	rec, err := EncodeIntent(id, diskSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(string(rec[:]), "CVMINT01") {
 		t.Fatal("magic")
 	}
-	if got := ParseIntent(rec[:], id, disk); got != IntentValid {
+	if got := ParseIntent(rec[:], id, diskSize); got != IntentValid {
 		t.Fatalf("own intent reads %s", got)
 	}
-	if got := ParseIntent(rec[:], other, disk); got != IntentForeign {
+	if got := ParseIntent(rec[:], other, diskSize); got != IntentForeign {
 		t.Fatalf("another identity reads %s", got)
 	}
-	if got := ParseIntent(rec[:], id, disk+MiB); got != IntentForeign {
+	if got := ParseIntent(rec[:], id, diskSize+MiB); got != IntentForeign {
 		t.Fatalf("another disk size reads %s", got)
 	}
-	if got := ParseIntent(make([]byte, RecordBytes), id, disk); got != IntentNone {
+	if got := ParseIntent(make([]byte, RecordBytes), id, diskSize); got != IntentNone {
 		t.Fatalf("zero reads %s", got)
 	}
 }
 
 func TestIntentRefusesEveryFlippedByteAndATornWrite(t *testing.T) {
 	id := testIdentity(t, "vm-0123456789ab")
-	rec, _ := EncodeIntent(id, disk)
+	rec, _ := EncodeIntent(id, diskSize)
 	for i := 0; i < RecordBytes; i++ {
 		bad := rec
 		bad[i] ^= 0x01
-		if ParseIntent(bad[:], id, disk) != IntentNone {
+		if ParseIntent(bad[:], id, diskSize) != IntentNone {
 			t.Fatalf("byte %d flipped still reads as an intent", i)
 		}
 	}
@@ -47,11 +47,11 @@ func TestIntentRefusesEveryFlippedByteAndATornWrite(t *testing.T) {
 	for _, n := range []int{8, 12, 100, 200} {
 		var torn [RecordBytes]byte
 		copy(torn[:n], rec[:n])
-		if ParseIntent(torn[:], id, disk) != IntentNone {
+		if ParseIntent(torn[:], id, diskSize) != IntentNone {
 			t.Fatalf("a %d-byte prefix reads as an intent", n)
 		}
 	}
-	if ParseIntent(rec[:100], id, disk) != IntentNone {
+	if ParseIntent(rec[:100], id, diskSize) != IntentNone {
 		t.Fatal("a short buffer reads as an intent")
 	}
 }
@@ -69,8 +69,8 @@ func TestIntentRefusesAnotherBody(t *testing.T) {
 		}
 		return rec
 	}
-	good := vmidentity.Object{"schema": IntentSchema, "vm_id": id.VMID, "identity_sha256": id.SHA256Hex(), "disk_bytes": int64(disk)}
-	if rec := body(good); ParseIntent(rec[:], id, disk) != IntentValid {
+	good := vmidentity.Object{"schema": IntentSchema, "vm_id": id.VMID, "identity_sha256": id.SHA256Hex(), "disk_bytes": int64(diskSize)}
+	if rec := body(good); ParseIntent(rec[:], id, diskSize) != IntentValid {
 		t.Fatal("control")
 	}
 	for name, mutate := range map[string]func(vmidentity.Object){
@@ -93,7 +93,7 @@ func TestIntentRefusesAnotherBody(t *testing.T) {
 			mutate(o)
 			rec = body(o)
 		}
-		if ParseIntent(rec[:], id, disk) != IntentNone {
+		if ParseIntent(rec[:], id, diskSize) != IntentNone {
 			t.Errorf("%s: read as an intent", name)
 		}
 	}
@@ -195,14 +195,14 @@ func TestChooseMetaWriteOrder(t *testing.T) {
 }
 
 func TestLayout(t *testing.T) {
-	l, err := NewLayout(disk)
+	l, err := NewLayout(diskSize)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.LUKSBytes != disk-MiB || l.IntentOffset != disk-MiB || l.VolumeBytes() != disk-MiB-16*MiB || l.FSBytes() != disk-MiB-32*MiB {
+	if l.LUKSBytes != diskSize-MiB || l.IntentOffset != diskSize-MiB || l.VolumeBytes() != diskSize-MiB-16*MiB || l.FSBytes() != diskSize-MiB-32*MiB {
 		t.Fatalf("%+v", l)
 	}
-	for _, bad := range []int64{0, MinDiskBytes - MiB, disk + 4096, MaxDiskBytes + MiB} {
+	for _, bad := range []int64{0, MinDiskBytes - MiB, diskSize + 4096, MaxDiskBytes + MiB} {
 		if _, err := NewLayout(bad); err == nil {
 			t.Errorf("%d accepted", bad)
 		}

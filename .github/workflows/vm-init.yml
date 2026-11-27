@@ -1,0 +1,81 @@
+name: VM init disk
+
+# The sealed VM init's root disk logic (AB#999, spec r3 7.2) on real loop
+# devices, the kernel device-mapper and cryptsetup, as root: T3 (init
+# states) and T5 (first-boot cuts, a vmcuttest build). GitHub-hosted only;
+# no hotel host is used. go test -race ./... in ci.yml covers the portable
+# logic; these jobs need root, so they live here.
+
+on:
+  pull_request:
+    paths:
+      - "room-kit/custom-guest/**"
+      - "room-kit/sealed/sealed_data_key.py"
+      - "scripts/make_vm_root_key_vectors.py"
+      - "scripts/sealed_data_proof.py"
+      - "tests/fixtures/vm_root_key_v1.json"
+      - "tests/fixtures/vm_measure_v1.json"
+      - ".github/workflows/vm-init.yml"
+  push:
+    branches: [main]
+    paths:
+      - "room-kit/custom-guest/**"
+      - "room-kit/sealed/sealed_data_key.py"
+      - "scripts/make_vm_root_key_vectors.py"
+      - "scripts/sealed_data_proof.py"
+      - "tests/fixtures/vm_root_key_v1.json"
+      - "tests/fixtures/vm_measure_v1.json"
+      - ".github/workflows/vm-init.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  root:
+    name: VM init disk states on loop devices (T3, T5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.11"
+          cache: false
+
+      - name: Kernel device-mapper and the runner's cryptsetup
+        run: |
+          sudo -n modprobe dm_mod
+          sudo -n modprobe dm_crypt
+          sudo -n modprobe loop
+          cryptsetup --version
+          echo "VMDISK_CRYPTSETUP=$(command -v cryptsetup || echo /usr/sbin/cryptsetup)" >> "$GITHUB_ENV"
+
+      - name: Root key vectors equal the script
+        run: python3 scripts/make_vm_root_key_vectors.py --check
+
+      - name: Build the test binaries
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go vet ./... && go vet -tags vmcuttest ./...
+          go test -c -o "$RUNNER_TEMP/vmdisk.test" ./internal/vmdisk
+          go test -c -tags vmcuttest -o "$RUNNER_TEMP/vmdisk-cut.test" ./internal/vmdisk
+
+      - name: T3 init states (root, loop devices)
+        working-directory: room-kit/custom-guest/internal/vmdisk
+        run: |
+          sudo -n env VMDISK_ROOT_TESTS=1 VMDISK_CRYPTSETUP="$VMDISK_CRYPTSETUP" \
+            "$RUNNER_TEMP/vmdisk.test" -test.v -test.run '^TestRoot' -test.timeout 15m
+
+      - name: T5 first-boot cuts (root, vmcuttest build)
+        working-directory: room-kit/custom-guest/internal/vmdisk
+        run: |
+          sudo -n env VMDISK_ROOT_TESTS=1 VMDISK_CRYPTSETUP="$VMDISK_CRYPTSETUP" \
+            "$RUNNER_TEMP/vmdisk-cut.test" -test.v -test.run '^TestCut' -test.timeout 30m
+
+      - name: No mapping or loop device left behind
+        if: always()
+        run: |
+          sudo -n dmsetup ls 2>/dev/null | grep '^cvmt' && exit 1 || true
+          sudo -n losetup --list

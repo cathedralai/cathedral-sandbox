@@ -84,10 +84,10 @@ func TestCryptTable(t *testing.T) {
 	const dev, sectors = "253:4", uint64(63 * MiB / 512)
 	length := sectors - 32768
 	good := "aes-xts-plain64 :64:logon:cryptsetup:abc-d0 0 253:4 32768 2 sector_size:4096 iv_large_sectors"
-	if err := CheckCryptTable("crypt", 0, length, good, dev, sectors); err != nil {
+	if err := CheckCryptTable("crypt", 0, length, []byte(good), dev, sectors); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckCryptTable("crypt", 0, length, "aes-xts-plain64 0011 0 253:4 32768 1 sector_size:4096", dev, sectors); err != nil {
+	if err := CheckCryptTable("crypt", 0, length, []byte("aes-xts-plain64 0011 0 253:4 32768 1 sector_size:4096"), dev, sectors); err != nil {
 		t.Fatal(err)
 	}
 	for name, c := range map[string]struct {
@@ -111,7 +111,7 @@ func TestCryptTable(t *testing.T) {
 		"unknown option":  {"crypt", 0, length, strings.Replace(good, " 2 ", " 3 ", 1) + " future_option"},
 		"truncated table": {"crypt", 0, length, "aes-xts-plain64"},
 	} {
-		if err := CheckCryptTable(c.kind, c.start, c.length, c.params, dev, sectors); err == nil {
+		if err := CheckCryptTable(c.kind, c.start, c.length, []byte(c.params), dev, sectors); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

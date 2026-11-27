@@ -192,30 +192,29 @@ var cryptOptions = map[string]bool{
 // CheckCryptTable checks the active table of the opened volume, the second
 // read sealed-data.sh's verify_header makes (dmsetup table there, the DM
 // ioctl here): one crypt target over exactly the LUKS device from the 16 MiB
-// offset, the data volume cipher, 4 KiB sectors. params holds the key field;
-// the caller clears it and never prints it.
-func CheckCryptTable(targetType string, start, length uint64, params string, luksDev string, luksSectors uint64) error {
+// offset, the data volume cipher, 4 KiB sectors. Field 1 of params is the
+// key (hex, or a keyring reference): it is never turned into a string, and
+// the caller clears params.
+func CheckCryptTable(targetType string, start, length uint64, params []byte, luksDev string, luksSectors uint64) error {
 	bad := errors.New("the opened volume is not the VM layout")
-	f := strings.Fields(params)
-	if targetType != "crypt" || start != 0 || length != luksSectors-LUKSDataOffset/sectorBytes || len(f) < 5 {
+	f := bytes.Fields(params)
+	if targetType != "crypt" || start != 0 || length != luksSectors-LUKSDataOffset/sectorBytes || len(f) < 6 {
 		return bad
 	}
-	if f[0] != cipher || f[2] != "0" || f[3] != luksDev || f[4] != strconv.Itoa(LUKSDataOffset/sectorBytes) {
+	if string(f[0]) != cipher || string(f[2]) != "0" || string(f[3]) != luksDev ||
+		string(f[4]) != strconv.Itoa(LUKSDataOffset/sectorBytes) {
 		return bad
 	}
-	if len(f) == 5 {
-		return bad // no sector_size:4096
-	}
-	n, err := strconv.Atoi(f[5])
+	n, err := strconv.Atoi(string(f[5]))
 	if err != nil || n != len(f)-6 {
 		return bad
 	}
 	sector := false
 	for _, opt := range f[6:] {
-		if !cryptOptions[opt] {
+		if !cryptOptions[string(opt)] {
 			return bad
 		}
-		sector = sector || opt == "sector_size:4096"
+		sector = sector || string(opt) == "sector_size:4096"
 	}
 	if !sector {
 		return bad
