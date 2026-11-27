@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -82,8 +83,15 @@ def fetch(target: Path) -> None:
         raise SystemExit("--inputs must be a new or empty directory")
     target.mkdir(parents=True, exist_ok=True)
     for name, item in files.items():
-        with urllib.request.urlopen(item["url"], timeout=120) as response:  # nosec: the digest decides
-            data = response.read(512 * 1024 * 1024)
+        for attempt in range(4):  # a reset connection is not a reason to fail; the digest decides
+            try:
+                with urllib.request.urlopen(item["url"], timeout=120) as response:
+                    data = response.read(512 * 1024 * 1024)
+                break
+            except OSError as exc:
+                if attempt == 3:
+                    raise SystemExit(f"cannot download {name}: {exc}")
+                time.sleep(5 * (attempt + 1))
         if hashlib.sha256(data).hexdigest() != item["sha256"]:
             raise SystemExit(f"digest mismatch after download: {name} from {item['url']}")
         (target / name).write_bytes(data)

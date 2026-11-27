@@ -196,9 +196,13 @@ func plainDirectory(root *os.Root, name string) (*os.File, error) {
 func bindReadOnly(src string, dst *os.File, extra uintptr) error {
 	target := descriptorPath(dst)
 	if err := syscall.Mount(src, target, "", syscall.MS_BIND, ""); err != nil {
-		return err
+		return fmt.Errorf("bind %s: %w", src, err)
 	}
-	return syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|extra, "")
+	// A bind mount takes its flags from the source; read-only and the rest need a second call.
+	if err := syscall.Mount("", target, "", syscall.MS_REMOUNT|syscall.MS_BIND|syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV|extra, ""); err != nil {
+		return fmt.Errorf("remount %s read-only: %w", src, err)
+	}
+	return nil
 }
 
 // Finish is what every boot does after the disk is ready (7.2 step 5), except the status record:
