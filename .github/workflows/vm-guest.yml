@@ -51,9 +51,17 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: go test -c -o "$RUNNER_TEMP/vmroot.test" ./internal/vmroot
+      - name: Build the mailbox device test as the runner user
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: go test -c -o "$RUNNER_TEMP/vmmailbox.test" ./internal/vmmailbox
       - name: Run it as root
         working-directory: room-kit/custom-guest/internal/vmroot
         run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmroot.test" -test.v -test.count=1
+      - name: Run the mailbox device test as root (O_DIRECT on a loop device)
+        working-directory: room-kit/custom-guest/internal/vmmailbox
+        run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmmailbox.test" -test.v -test.count=1 -test.run RootOpenDevice
 
   tools:
     name: Static tools (cryptsetup, veritysetup, mke2fs, resize2fs)

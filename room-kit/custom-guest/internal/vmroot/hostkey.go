@@ -49,7 +49,6 @@ func openSSHEd25519(random io.Reader, comment string) (private, public []byte, b
 
 	defer clear(section)
 	file := []byte("openssh-key-v1\x00")
-	defer clear(file)
 	file = append(file, str([]byte("none"))...)
 	file = append(file, str([]byte("none"))...)
 	file = append(file, str(nil)...)
@@ -57,14 +56,18 @@ func openSSHEd25519(random io.Reader, comment string) (private, public []byte, b
 	file = append(file, str(blob)...)
 	file = append(file, str(section)...)
 
-	encoded := base64.StdEncoding.EncodeToString(file)
+	encoded := []byte(base64.StdEncoding.EncodeToString(file))
+	clear(file)
+	defer clear(encoded)
 	var pem bytes.Buffer
 	pem.WriteString("-----BEGIN OPENSSH " + "PRIVATE KEY-----\n") // split: the leak guard flags the literal header
-	for len(encoded) > 70 {
-		pem.WriteString(encoded[:70] + "\n")
-		encoded = encoded[70:]
+	for rest := encoded; len(rest) > 0; {
+		n := min(70, len(rest))
+		pem.Write(rest[:n])
+		pem.WriteByte('\n')
+		rest = rest[n:]
 	}
-	pem.WriteString(encoded + "\n-----END OPENSSH " + "PRIVATE KEY-----\n")
+	pem.WriteString("-----END OPENSSH " + "PRIVATE KEY-----\n")
 	line := "ssh-ed25519 " + base64.StdEncoding.EncodeToString(blob) + " " + comment + "\n"
 	return pem.Bytes(), []byte(line), blob, nil
 }

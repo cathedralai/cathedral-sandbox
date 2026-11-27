@@ -22,6 +22,7 @@ func hkdfSHA256(ikm, salt, info []byte, length int) []byte {
 	prk := hmac.New(sha256.New, salt)
 	prk.Write(ikm)
 	key := prk.Sum(nil)
+	defer clear(key)
 	var out, block []byte
 	for counter := byte(1); len(out) < length; counter++ {
 		mac := hmac.New(sha256.New, key)

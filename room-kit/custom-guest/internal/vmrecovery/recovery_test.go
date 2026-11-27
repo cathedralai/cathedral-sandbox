@@ -3,6 +3,7 @@ package vmrecovery
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -83,8 +84,8 @@ func TestShowPrintsKeyIdentityAndChip(t *testing.T) {
 	if err := json.Unmarshal(out, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc["schema"] != ShowSchema || doc["vm_id"] != id || doc["identity_sha256"] != sha || len(doc["chip_id"]) != 128 ||
-		doc["recovery_key"] == "" || !strings.HasSuffix(string(out), "\n") || bytes.Count(out, []byte("\n")) != 1 {
+	if len(doc) != 4 || doc["vm_id"] != id || doc["identity_sha256"] != sha || len(doc["chip_id"]) != 128 ||
+		doc["recovery_key_b64"] == "" || !strings.HasSuffix(string(out), "\n") || bytes.Count(out, []byte("\n")) != 1 {
 		t.Fatalf("show: %s", out)
 	}
 	if _, err := Show(rec, [ChipBytes]byte{}); err == nil {
@@ -92,5 +93,26 @@ func TestShowPrintsKeyIdentityAndChip(t *testing.T) {
 	}
 	if !rec.IdentityMatches(id, sha) || rec.IdentityMatches(id, strings.Repeat("0", 64)) || rec.IdentityMatches("vm-ffffffffffff", sha) {
 		t.Error("IdentityMatches")
+	}
+}
+
+// The line is what verify_vm.py parse_recovery reads. tests/fixtures/vm_recovery_show_v1.txt is that
+// line for fixed inputs; tests/test_vm_attest_vectors.py feeds it to parse_recovery.
+func TestShowEqualsTheFixtureVerifyVMParses(t *testing.T) {
+	rec := sample(t)
+	var chip [ChipBytes]byte
+	for i := range chip {
+		chip[i] = byte(i + 1)
+	}
+	out, err := Show(rec, chip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile("../../../../tests/fixtures/vm_recovery_show_v1.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, want) {
+		t.Fatalf("Show differs from the fixture:\n%s\n%s", out, want)
 	}
 }

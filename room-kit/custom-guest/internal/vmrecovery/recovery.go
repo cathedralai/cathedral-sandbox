@@ -20,8 +20,6 @@ const (
 	KeyBytes   = 32
 	ChipBytes  = 64
 	fileSchema = "cathedral.vm.recovery-key/v1"
-	// ShowSchema labels the line `recovery show` prints. verify_vm.py pin reads it.
-	ShowSchema = "cathedral.vm.recovery/v1"
 	maxFile    = 1024
 )
 
@@ -102,7 +100,8 @@ func Parse(raw []byte) (Record, error) {
 }
 
 // Show is the one line `cathedral-vm recovery show` prints: R, vm_id, identity_sha256 and CHIP_ID,
-// as canonical JSON. chipID is the 64 bytes of the report's CHIP_ID field.
+// as canonical JSON with exactly the members verify_vm.py RECOVERY_FIELDS names
+// (recovery_key_b64, vm_id, identity_sha256, chip_id), no others. chipID is the 64 bytes of the report's CHIP_ID field.
 func Show(rec Record, chipID [ChipBytes]byte) ([]byte, error) {
 	if _, err := rec.Encode(); err != nil {
 		return nil, err
@@ -111,7 +110,7 @@ func Show(rec Record, chipID [ChipBytes]byte) ([]byte, error) {
 		return nil, errors.New("recovery show: CHIP_ID is all zero")
 	}
 	return []byte(`{"chip_id":"` + hex.EncodeToString(chipID[:]) + `","identity_sha256":"` + rec.IdentitySHA256 +
-		`","recovery_key":"` + base64.StdEncoding.EncodeToString(rec.Key[:]) + `","schema":"` + ShowSchema +
+		`","recovery_key_b64":"` + base64.StdEncoding.EncodeToString(rec.Key[:]) +
 		`","vm_id":"` + rec.VMID + "\"}\n"), nil
 }
 

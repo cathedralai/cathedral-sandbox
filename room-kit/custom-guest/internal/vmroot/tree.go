@@ -243,6 +243,7 @@ func WriteRecovery(root *os.Root, o TreeOptions) (vmrecovery.Record, error) {
 	if err != nil {
 		return vmrecovery.Record{}, err
 	}
+	defer clear(raw)
 	if err := root.MkdirAll("var/lib/cathedral-vm", 0o700); err != nil {
 		return vmrecovery.Record{}, err
 	}

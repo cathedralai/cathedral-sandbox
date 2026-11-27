@@ -66,12 +66,14 @@ not the dedicated guest's path or domain.
 ## Recovery (7.5)
 
 First boot writes `/var/lib/cathedral-vm/recovery.key` (root only, canonical JSON with `vm_id`,
-`identity_sha256` and the 32 byte key). `sudo cathedral-vm recovery show` prints one JSON line:
+`identity_sha256` and the 32 byte key). `sudo cathedral-vm recovery show` prints one JSON line with exactly the members of
+`verify_vm.py` `RECOVERY_FIELDS` and no others:
 
-    {"chip_id":"<128 hex>","identity_sha256":"<64 hex>","recovery_key":"<base64>","schema":"cathedral.vm.recovery/v1","vm_id":"vm-..."}
+    {"chip_id":"<128 hex>","identity_sha256":"<64 hex>","recovery_key_b64":"<base64 of 32 bytes>","vm_id":"vm-..."}
 
-The VM2 pin builder has no constants block for this output on main yet. If it expects another
-shape, change `vmrecovery.Show` and its test together.
+`tests/fixtures/vm_recovery_show_v1.txt` is that line for fixed inputs. The Go test requires `Show`
+to produce it byte for byte, and `tests/test_vm_attest_vectors.py` feeds it to
+`verify_vm.parse_recovery`.
 
 ## Root setup (`vmroot`)
 
@@ -124,7 +126,7 @@ mode fixed per artifact. It reuses `custom_guest_initrd.py` read-only.
 `mke2fs` and `resize2fs` (e2fsprogs 1.47.3). `vm_initrd_tools_inputs.json` pins every source and
 development package by URL and sha256. The cryptsetup, LVM2 and Ubuntu package pins are those of
 `custom_guest_verity_inputs.json`; the e2fsprogs source is new, and its sha256 equals the `.tar.xz` line
-of upstream's PGP-signed `sha256sums.asc`. `fetch` downloads and checks, `build` takes exactly the
+of `sha256sums.asc` in the same upstream directory (signed by the kernel.org autosigner; Ts'o's own signature is on the `.tar.sign` file, which this build does not check). `fetch` downloads and checks, `build` takes exactly the
 pinned files and downloads nothing, builds twice and requires identical static ELFs.
 
 ## Tests and CI

@@ -1,6 +1,6 @@
 {
   "schema": "cathedral.vm.initrd-tools-inputs/v1",
-  "note": "Same pins as scripts/custom_guest_verity_inputs.json (cryptsetup 2.8.4, LVM2 2.03.31, the Ubuntu development packages), plus e2fsprogs 1.47.3, which is new. The e2fsprogs sha256 equals the line for the .tar.xz in upstream sha256sums.asc (PGP-signed by Theodore Ts'o) at the same directory.",
+  "note": "Same pins as scripts/custom_guest_verity_inputs.json (cryptsetup 2.8.4, LVM2 2.03.31, the Ubuntu development packages), plus e2fsprogs 1.47.3, which is new. The e2fsprogs sha256 equals the line for the .tar.xz in sha256sums.asc in the same upstream directory (signed by the kernel.org autosigner; the release tarball itself is signed by Theodore Ts'o in the .tar.sign file, which this build does not check).",
   "files": {
     "LVM2.2.03.31.tgz": {
       "sha256": "5db2956a00fbf87d92274cccc92436387ec0c3faadece7413ece1ba1c10c98ff",

@@ -23,3 +23,13 @@ def test_every_case_equals_verify_vm_report_data():
         blob = bytes.fromhex(case["host_key_blob_hex"])
         assert verify_vm.report_data(bytes.fromhex(case["challenge_hex"]), blob).hex() == case["report_data_hex"]
         assert verify_vm.GUEST_ATTEST == "/run/cathedral/bin/cathedral-attest"
+
+
+def test_the_go_recovery_show_line_parses_in_verify_vm():
+    raw = (REPO / "tests" / "fixtures" / "vm_recovery_show_v1.txt").read_bytes()
+    doc = json.loads(raw)
+    expected = {"vm_id": doc["vm_id"], "identity_sha256": doc["identity_sha256"]}
+    assert verify_vm.parse_recovery(raw.rstrip(b"\n"), expected, doc["chip_id"]) == doc["recovery_key_b64"]
+    assert set(doc) == verify_vm.RECOVERY_FIELDS
+    # The run of the Go tool prints exactly this line, newline included; the verifier gets it stripped or not.
+    assert verify_vm.parse_recovery(raw, expected, doc["chip_id"]) == doc["recovery_key_b64"]
