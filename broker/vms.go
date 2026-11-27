@@ -95,7 +95,15 @@ type vmHostConfig struct {
 	MaxVCPUs       int    `json:"max_vcpus"`
 	MaxMemGiB      int    `json:"max_mem_gib"`
 	MaxDiskGiB     int    `json:"max_disk_gib"`
+	// Sealed is the host's class: only a sealed host may hold a VM. SNPVMRuntime
+	// says the host runs VMs as SEV-SNP guests. Both default to false, so a host
+	// entry that does not state them takes no VM (AB#999, no unsealed VMs).
+	Sealed       bool `json:"sealed"`
+	SNPVMRuntime bool `json:"snp_vm_runtime"`
 }
+
+// takesVMs is the one gate for a new VM: sealed class and an SNP VM runtime.
+func (h vmHostConfig) takesVMs() bool { return h.Sealed && h.SNPVMRuntime }
 
 var (
 	vmHostIDRE     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
@@ -750,6 +758,19 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// No unsealed VMs, ever (AB#999): refuse unless some candidate host is
+	// sealed and has the SNP VM runtime. placeLocked skips the others.
+	eligible := false
+	for _, id := range s.order {
+		if (req.Host == "" || id == req.Host) && s.hosts[id].takesVMs() {
+			eligible = true
+		}
+	}
+	if !eligible {
+		writeErr(w, 409, "vm_runtime_not_sealed", "VM create refused: the host is not sealed or has no SEV-SNP VM runtime (AB#999)")
+		return
+	}
+
 	reqHash := ""
 	if reqID != "" {
 		sum := sha256.Sum256([]byte(strings.Join([]string{req.Account, strconv.Itoa(req.VCPUs), strconv.Itoa(req.MemGiB),
@@ -842,6 +863,9 @@ func (s *vmStore) placeLocked(want string, vcpus, mem, disk int) (vmHostConfig, 
 			continue
 		}
 		h := s.hosts[id]
+		if !h.takesVMs() {
+			continue
+		}
 		usedC, usedM, usedD := 0, 0, 0
 		ports := map[int]bool{}
 		for _, r := range s.recs {
