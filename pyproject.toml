@@ -31,8 +31,6 @@ dev = [
   "hypothesis>=6.100",
   "substrate-interface>=1.7.0,<2",
   "bittensor-wallet>=4.0.1,<5",
-  # Expected SNP launch measurement in tests/test_vm_measure.py (requirements/vm-measure.txt).
-  "sev-snp-measure==0.0.12",
 ]
 
 [project.scripts]

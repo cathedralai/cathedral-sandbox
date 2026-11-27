@@ -2,8 +2,8 @@
 
 The vectors (tests/fixtures/vm_measure_v1.json) were made without vm_measure.py: identity,
 cmdline and HOST_DATA by hand, measurements by a literal sev-snp-measure 0.0.12 argv. The
-measurement tests need that tool (requirements/vm-measure.txt, in the dev extra); they skip
-without it locally and fail without it in CI.
+measurement tests need that tool, installed by hash (requirements/vm-measure.txt). CI passes
+its path as CATHEDRAL_SEV_SNP_MEASURE; without it they skip locally and fail in CI.
 """
 from __future__ import annotations
 
@@ -44,13 +44,16 @@ def identity_raw(name: str) -> bytes:
 
 @pytest.fixture
 def tool() -> str:
-    path = vm.default_tool()
+    path = os.environ.get("CATHEDRAL_SEV_SNP_MEASURE")
+    if os.environ.get("CI") and not path:
+        pytest.fail("CI must pass the hash-installed sev-snp-measure as CATHEDRAL_SEV_SNP_MEASURE")
+    path = path or vm.default_tool()
     try:
         vm.check_tool(path)
     except vm.Refusal:
         if os.environ.get("CI"):
-            pytest.fail("sev-snp-measure 0.0.12 must be installed in CI (dev extra)")
-        pytest.skip("sev-snp-measure 0.0.12 is not installed")
+            pytest.fail(f"sev-snp-measure 0.0.12 is not at {path}")
+        pytest.skip("sev-snp-measure 0.0.12 is not installed (requirements/vm-measure.txt)")
     return path
 
 
@@ -108,7 +111,8 @@ def test_cmdline_tokens_are_pinned():
     assert tokens[:-1] == [
         "console=ttyS0", "loglevel=4", "panic=-1", "systemd.import_credentials=no", "systemd.getty_auto=0",
         "systemd.mask=getty@.service", "systemd.mask=serial-getty@.service", "systemd.mask=autovt@.service",
-        "systemd.mask=console-getty.service", "systemd.mask=qemu-guest-agent.service"]
+        "systemd.mask=console-getty.service", "systemd.mask=emergency.service", "systemd.mask=rescue.service",
+        "systemd.mask=debug-shell.service", "systemd.mask=qemu-guest-agent.service"]
     assert tokens[-1] == "cathedral.vm=" + IDS["a"]["identity_sha256"]
     line = IDS["a"]["cmdline"]
     assert len(line) <= vm.CMDLINE_MAX and all(0x21 <= ord(c) <= 0x7E for c in line.replace(" ", ""))
@@ -124,6 +128,7 @@ def test_cmdline_tokens_are_pinned():
     lambda s: s[:-64] + s[-64:].upper(),
     lambda s: s.replace("loglevel=4", "loglevel=7"),
     lambda s: s.replace(" systemd.mask=qemu-guest-agent.service", ""),
+    lambda s: s.replace(" systemd.mask=emergency.service", ""),
     lambda s: s.replace("panic=-1", "panic=-1 rdinit=/bin/sh"),
     lambda s: s.replace("cathedral.vm=", "cathedral.vm=0"),
 ])
@@ -269,7 +274,8 @@ def test_measurement_vectors(bundle, tool, v):
     assert got == {"bundle": VEC["bundles"][v["cpu_family"]]["bundle_id"], "identity_sha256": ident["identity_sha256"],
                    "cmdline": ident["cmdline"], "host_data": ident["host_data_hex"],
                    "host_data_b64": ident["host_data_b64"], "vcpus": v["vcpus"], "cpu_family": v["cpu_family"],
-                   "cpu_model": v["cpu_model"], "policy": "0x30000", "sev_snp_measure": "0.0.12",
+                   "cpu_model": v["cpu_model"], "cpu_signature": vm.CPU_SIGNATURES[v["cpu_model"]],
+                   "policy": "0x30000", "sev_snp_measure": "0.0.12",
                    "expected_measurement": v["expected_measurement"]}
 
 
@@ -303,6 +309,29 @@ def test_genoa_and_turin_differ_and_so_do_vcpu_counts():
     assert _vector("a", "genoa", 4) != _vector("a", "turin", 4)
     assert _vector("a", "genoa", 4) != _vector("a", "genoa", 2)
     assert len({m["expected_measurement"] for m in VEC["measurements"]}) == len(VEC["measurements"])
+
+
+def _direct(tool: str, d: Path, cpu: list[str], line: str, vcpus: int = 4) -> str:
+    return subprocess.run([tool, "--mode", "snp", "--vcpus", str(vcpus), *cpu, "--ovmf", str(d / "OVMF.amdsev.fd"),
+                           "--kernel", str(d / "vmlinuz"), "--initrd", str(d / "initrd.cpio.zst"), "--append", line],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_the_measurement_binds_the_cpu_signature_not_the_model(bundle, tool):
+    # Documents a limit, not a feature: QEMU models with one CPUID signature measure the
+    # same, though their feature sets differ (the CPUID page is outside the digest).
+    # The launch values name the signature; the VM init must check features (VM1b).
+    d, line = bundle(), IDS["a"]["cmdline"]
+    v4 = _direct(tool, d, ["--vcpu-type", "EPYC-v4"], line)
+    assert v4 == _vector("a", "turin", 4)
+    assert _direct(tool, d, ["--vcpu-type", "EPYC-v1"], line) == v4
+    assert _direct(tool, d, ["--vcpu-type", "EPYC-Genoa-v1"], line) != v4
+    # CPU_SIGNATURES is the signature the tool measures for each model.
+    for model, sig in vm.CPU_SIGNATURES.items():
+        family, cpu_model, stepping = (str(int(x, 16)) for x in sig.split(":"))
+        by_sig = _direct(tool, d, ["--vcpu-family", family, "--vcpu-model", cpu_model, "--vcpu-stepping", stepping], line)
+        assert by_sig == _direct(tool, d, ["--vcpu-type", model], line)
+    assert set(vm.CPU_SIGNATURES) == set(vm.CPU_MODELS.values())
 
 
 def test_a_bundle_for_another_family_is_refused_before_measuring(bundle, tmp_path):
@@ -405,6 +434,50 @@ def test_base_root_package_set():
     assert _assignment("KERNEL_PKGS") == "linux-image-virtual"
 
 
-def test_build_script_refuses_unknown_commands(tmp_path):
-    r = subprocess.run(["bash", str(BUILD), "everything", str(tmp_path / "none.env")], capture_output=True, text=True)
+@pytest.mark.parametrize("args", [
+    ["everything", "none.env"],
+    ["base-root", "none.env", "--fast"],
+    ["manifest", "none.env", "--verify-reproducible"],
+    ["kernel"],
+    ["kernel", "none.env", "--verify-reproducible", "extra"],
+])
+def test_build_script_refuses_bad_arguments(tmp_path, args):
+    r = subprocess.run(["bash", str(BUILD), *args], capture_output=True, text=True, cwd=tmp_path)
     assert r.returncode == 2 and "usage" in r.stderr
+
+
+def _e2fsprogs_floor(tmp_path: Path, banner: str) -> subprocess.CompletedProcess:
+    text = BUILD.read_text()
+    block = text[text.index("# >>> e2fsprogs floor"):text.index("# <<< e2fsprogs floor")]
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    (fake / "mke2fs").write_text(f"#!/bin/sh\necho '{banner}' >&2\necho '\tUsing EXT2FS Library version x' >&2\n")
+    (fake / "mke2fs").chmod(0o755)
+    env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}")
+    return subprocess.run(["bash", "-c", block + "\ne2fsprogs_floor && echo floor-ok"], capture_output=True, text=True,
+                          env=env)
+
+
+@pytest.mark.parametrize("banner,ok", [
+    ("mke2fs 1.47.1 (20-May-2024)", True),
+    ("mke2fs 1.47.2 (1-Jan-2025)", True),
+    ("mke2fs 1.48 (1-Jan-2027)", True),
+    ("mke2fs 1.47.0 (5-Feb-2023)", False),
+    ("mke2fs 1.46.5 (30-Dec-2021)", False),
+    ("mke2fs 1.47.1-rc1 (1-May-2024)", False),
+    ("something else", False),
+])
+def test_e2fsprogs_floor(tmp_path, banner, ok):
+    r = _e2fsprogs_floor(tmp_path, banner)
+    assert (r.returncode == 0 and "floor-ok" in r.stdout) is ok
+    if not ok:
+        assert "older than 1.47.1" in r.stderr
+
+
+def test_mkfs_runs_with_source_date_epoch_after_the_floor():
+    text = BUILD.read_text()
+    base = text[text.index("build_base_root() {"):text.index("# ---------------------------------------------------------------- kernel")]
+    assert base.index("e2fsprogs_floor") < base.index("pinned_root base-root")
+    mkfs = next(line for line in base.splitlines() if "mkfs.ext4" in line)
+    assert "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" in mkfs and "LC_ALL=C" in mkfs
+    assert "E2FSPROGS_FAKE_TIME=" not in base

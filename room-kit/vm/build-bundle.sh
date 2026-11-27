@@ -1,10 +1,17 @@
 #!/bin/bash
 # Build the files of one sealed customer VM bundle (AB#999, VM runtime spec r2 6.1 and 7.3).
-# Run as root on a build host with mmdebstrap, e2fsprogs, veritysetup (cryptsetup-bin), kmod.
+# Run as root on a build host with mmdebstrap, e2fsprogs 1.47.1 or later, veritysetup
+# (cryptsetup-bin) and kmod.
 #
-#   build-bundle.sh base-root bundle.env   the customer's base root: ext4 image + dm-verity tree
-#   build-bundle.sh kernel    bundle.env   the stock Ubuntu kernel and its module tree
-#   build-bundle.sh manifest  bundle.env   OVMF and the VM initrd in, then manifest.json
+#   build-bundle.sh base-root bundle.env [--verify-reproducible]
+#       the customer's base root: ext4 image + dm-verity tree
+#   build-bundle.sh kernel bundle.env [--verify-reproducible]
+#       the stock Ubuntu kernel and its module tree
+#   build-bundle.sh manifest bundle.env
+#       OVMF and the VM initrd in, then manifest.json
+#
+# --verify-reproducible builds the step a second time from nothing (a fresh mmdebstrap)
+# and stops unless every output is byte for byte the same. Run it before publishing.
 #
 # The VM initrd (PR VM1b) is built between kernel and manifest: it packs the module
 # tree from $VM_BUNDLE_OUT/build/modules-<release>.tar. Both package sets come from one
@@ -32,10 +39,15 @@ KERNEL_MODULES="sev-guest dm-verity dm-crypt qemu_fw_cfg virtio_blk virtio_net"
 KERNEL_CONFIG_Y="AMD_MEM_ENCRYPT EFI_STUB BLK_DEV_INITRD RD_ZSTD"
 KERNEL_CONFIG_YM="SEV_GUEST DM_VERITY DM_CRYPT VIRTIO_BLK VIRTIO_NET"
 
-usage() { echo "usage: build-bundle.sh base-root|kernel|manifest bundle.env" >&2; exit 2; }
-[ $# = 2 ] || usage
+usage() { echo "usage: build-bundle.sh base-root|kernel bundle.env [--verify-reproducible] | manifest bundle.env" >&2; exit 2; }
+[ $# = 2 ] || [ $# = 3 ] || usage
 CMD=$1
 case "$CMD" in base-root|kernel|manifest) ;; *) usage ;; esac
+VERIFY=0
+if [ $# = 3 ]; then
+  [ "$3" = --verify-reproducible ] && [ "$CMD" != manifest ] || usage
+  VERIFY=1
+fi
 ENV_FILE=$(readlink -f "$2")
 # shellcheck disable=SC1090
 source "$ENV_FILE"
@@ -63,7 +75,28 @@ mkdir -p "$B"
 # uuid_of LABEL: a UUID fixed by LABEL, so the file system and verity ids do not depend on the run.
 uuid_of() { python3 -c 'import hashlib,sys,uuid;print(uuid.UUID(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:32]))' "$1"; }
 # clamp DIR: every mtime is the epoch (pack-initrd.sh does the same for the kit initrd).
+# touch cannot set ctime; mke2fs clamps that one (the e2fsprogs floor below).
 clamp() { find "$1" -mindepth 1 -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +; }
+
+# >>> e2fsprogs floor (tests/test_vm_measure.py runs this block)
+# mke2fs -d copies each file's atime, ctime and mtime. Before 1.47.1 it copies them as
+# they are (misc/create_inode.c set_inode_extra, v1.47.0 line 130), so ctime, which is
+# the time of this build, lands in the image and two builds differ. 1.47.1 clamps every
+# timestamp to SOURCE_DATE_EPOCH when that is set (clamped_time; lib/ext2fs/initialize.c
+# turns it on only for SOURCE_DATE_EPOCH, not E2FSPROGS_FAKE_TIME). Older versions are
+# refused, even a distribution build with the change backported: the version is all
+# this can check, and --verify-reproducible is the real test.
+E2FSPROGS_MIN=1.47.1
+e2fsprogs_floor() {
+  local have
+  have=$(mke2fs -V 2>&1 | awk 'NR == 1 && $1 == "mke2fs" { print $2 }')
+  python3 -c 'import re, sys
+have, want = sys.argv[1], sys.argv[2]
+m = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", have)
+sys.exit(0 if m and tuple(int(x or 0) for x in m.groups()) >= tuple(map(int, want.split("."))) else 1)' "$have" "$E2FSPROGS_MIN" \
+    || { echo "[vm-bundle] mke2fs ${have:-not found} is older than $E2FSPROGS_MIN: it copies build-time ctimes into the image, so the base root would not be reproducible" >&2; exit 1; }
+}
+# <<< e2fsprogs floor
 
 # pinned_root NAME PACKAGES EXPECTED_LOCK: mmdebstrap NAME from the snapshot into $B/NAME and
 # write $OUT/NAME.packages.lock; stop unless it equals EXPECTED_LOCK (or LOCK_UPDATE=1).
@@ -91,6 +124,7 @@ pinned_root() {
 
 # ---------------------------------------------------------------- base root (7.3)
 build_base_root() {
+  e2fsprogs_floor
   pinned_root base-root "$BASE_PKGS" "${VM_BUNDLE_BASE_LOCK:-}"
   local R=$B/base-root
   if grep -E '^(linux-(image|modules|headers)-|grub|initramfs-tools |cloud-init |qemu-guest-agent )' \
@@ -150,19 +184,22 @@ EOF
     rm -f "$f.tmp"
   done
   rm -rf "${R:?}"/var/cache/apt/archives/*.deb "${R:?}"/var/lib/apt/lists/* "${R:?}"/tmp/* "${R:?}"/var/tmp/*
+  rm -f "$R/var/cache/ldconfig/aux-cache"   # holds inode numbers and times of this build
   find "$R/var/log" -type f -delete
   clamp "$R"
 
   # ext4 image of the root. The init copies it into the file system area of the LUKS
-  # root at first boot and grows it to the disk (7.2 step 4.2). Ids come from the lock,
-  # so two builds of one lock give one image (unverified: needs mke2fs -d to populate
-  # in a fixed order; build twice and compare before publishing).
+  # root at first boot and grows it to the disk (7.2 step 4.2). Ids come from the lock and
+  # every timestamp is the epoch, so two builds of one lock give one image;
+  # --verify-reproducible checks that.
   local lock_sha size_mib data_bytes salt root_hash
   lock_sha=$(sha256sum < "$OUT/base-root.packages.lock" | cut -d' ' -f1)
   size_mib=$(( $(du -s --apparent-size --block-size=1M "$R" | cut -f1) * 5 / 4 + 512 ))
   size_mib=$(( (size_mib + 3) / 4 * 4 ))
   rm -f "$B/base-root.ext4"
-  E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -F -b 4096 -L cathedral-root \
+  # SOURCE_DATE_EPOCH (not E2FSPROGS_FAKE_TIME) is what turns on the clamping; LC_ALL=C
+  # fixes the name order mke2fs -d adds files in (scandir with alphasort).
+  LC_ALL=C SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH mkfs.ext4 -q -F -b 4096 -L cathedral-root \
     -U "$(uuid_of "cathedral-vm-base-root-fs $lock_sha")" \
     -E "hash_seed=$(uuid_of "cathedral-vm-base-root-hash $lock_sha"),root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0,nodiscard" \
     -d "$R" "$B/base-root.ext4" "${size_mib}M"
@@ -241,8 +278,43 @@ build_manifest() {
   python3 -I "$VM/vm_measure.py" check-bundle "$OUT"
 }
 
-case "$CMD" in
-  base-root) build_base_root ;;
-  kernel) build_kernel ;;
-  manifest) build_manifest ;;
-esac
+# The outputs of each step, compared by --verify-reproducible.
+step_outputs() {
+  case "$CMD" in
+    base-root) echo base-root.raw base-root.packages.lock build/base-root.verity build/base-root.data-bytes ;;
+    kernel) echo vmlinuz kernel.packages.lock build/kernel-release "build/config-$(cat "$B/kernel-release")" \
+                 "build/modules-$(cat "$B/kernel-release").tar" ;;
+  esac
+}
+
+run_step() {
+  case "$CMD" in
+    base-root) build_base_root ;;
+    kernel) build_kernel ;;
+    manifest) build_manifest ;;
+  esac
+}
+
+run_step
+if [ "$VERIFY" = 1 ]; then
+  FIRST=$OUT
+  FILES=$(step_outputs)
+  OUT=$FIRST/build/second
+  B=$OUT/build
+  rm -rf "${OUT:?}"
+  mkdir -p "$B"
+  log "--verify-reproducible: building $CMD again from nothing in $OUT"
+  run_step
+  differ=0
+  for f in $FILES; do
+    if cmp -s "$FIRST/$f" "$OUT/$f"; then
+      log "same: $f $(sha256sum < "$OUT/$f" | cut -c1-16)"
+    else
+      echo "[vm-bundle] differs: $f" >&2
+      differ=1
+    fi
+  done
+  [ "$differ" = 0 ] || die "$CMD is not reproducible; the second build is kept in $OUT"
+  rm -rf "${OUT:?}"
+  log "$CMD reproducible: two builds from nothing gave the same bytes"
+fi

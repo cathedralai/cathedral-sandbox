@@ -1,6 +1,7 @@
 # sev-snp-measure for the sealed VM expected launch measurement (room-kit/vm/vm_measure.py,
 # AB#999). Same version as the sealed kit (install-sealed.sh SNP_MEASURE_VERSION) and the
-# custom guest operator. Digests from PyPI for the 0.0.12 wheel and sdist.
+# custom guest operator. Digests from PyPI for the 0.0.12 wheel and sdist. CI installs it
+# this way too (.github/workflows/ci.yml) and passes the tool as CATHEDRAL_SEV_SNP_MEASURE.
 #   python3 -m venv venv && venv/bin/pip install --no-deps --require-hashes -r requirements/vm-measure.txt
 # --no-deps: the measurement path (cli, guest, gctx, ovmf, sev_hashes, vmsa) imports only the
 # standard library. Its one dependency, cryptography, is used by its id-block tool only.

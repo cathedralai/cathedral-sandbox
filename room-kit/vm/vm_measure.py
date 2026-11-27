@@ -68,15 +68,23 @@ IDENTITY_PLACEHOLDER = "{identity_sha256}"
 #   console or any virtualizer console the host attaches (hvc0 and friends);
 # - the getty masks cover the statically enabled getty@tty1, logind's autovt@ on a VGA
 #   the host adds, serial-getty@ on an extra serial port, and console-getty;
+# - the recovery shells are masked: emergency.service and rescue.service run sulogin on
+#   the console, which the host reads and writes. After switch_root the host can make a
+#   required mount fail and reach emergency.target, where a customer-set root password
+#   would get a prompt and an empty one a shell. Masked, that boot stays down instead.
+#   debug-shell.service is a root shell on tty9 with no password;
 # - qemu-guest-agent is masked, so a host-added guest-agent channel gets no answer even
 #   if the customer installs the agent.
 # Masking a template unit masks every instance. Test T9 (live) proves no prompt and no
-# agent answer on an extra serial, VGA and virtio-serial device.
+# agent answer on an extra serial, VGA and virtio-serial device, and no prompt or shell
+# after a required-mount failure with a locked, a password-protected and an empty root.
 CMDLINE_TEMPLATE_V1 = (
     "console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no"
     " systemd.getty_auto=0"
     " systemd.mask=getty@.service systemd.mask=serial-getty@.service"
     " systemd.mask=autovt@.service systemd.mask=console-getty.service"
+    " systemd.mask=emergency.service systemd.mask=rescue.service"
+    " systemd.mask=debug-shell.service"
     " systemd.mask=qemu-guest-agent.service"
     " cathedral.vm=" + IDENTITY_PLACEHOLDER
 )
@@ -84,11 +92,19 @@ CMDLINE_TEMPLATE_V1 = (
 # kernel keeps 2047 bytes (spec D 9, custom_guest_protocol.py cmdline cap).
 CMDLINE_MAX = 2033
 
-# The QEMU -cpu model per host CPU family. It is measured: every VMSA carries the
-# model's CPUID signature. Genoa uses the kit default (guest-constants.sh:72). Turin
-# uses EPYC-v4, the model the kit runs on our Turin host, whose expected value matched
-# its live report; sev-snp-measure 0.0.12 knows no Turin model name.
+# The QEMU -cpu model per host CPU family. Only the model's CPUID signature (family,
+# model, stepping: the EDX reset value in every VMSA) is in the launch measurement. Its
+# feature set is not (the CPUID page is outside the digest), so models that share a
+# signature measure the same: EPYC-v1 and EPYC-v4 give one digest. The measurement
+# therefore proves the signature below, not the model name; checking the CPU features
+# in the guest before any key is released is the VM init's job (PR VM1b).
+# Genoa uses the kit default (guest-constants.sh:72). Turin uses EPYC-v4, the model the
+# kit runs on our Turin host, whose expected value matched its live report;
+# sev-snp-measure 0.0.12 knows no Turin model name.
 CPU_MODELS = {"genoa": "EPYC-Genoa-v1", "turin": "EPYC-v4"}
+# The measured signature of each model as family:model:stepping in hex, the form of
+# verify_guest_report.py --expected-cpuid (sev-snp-measure vcpu_types.py).
+CPU_SIGNATURES = {"EPYC-Genoa-v1": "19:11:00", "EPYC-v4": "17:01:02"}
 POLICY = "0x30000"
 SEV_SNP_MEASURE_VERSION = "0.0.12"
 # Same bounds as vm_ctl.py create (--vcpus 1..64) and the broker (vmMaxVCPUs).
@@ -428,6 +444,7 @@ def launch_values(bundle: Path, identity_raw: bytes, vcpus: int, cpu_family: str
     return {"bundle": hashlib.sha256(raw).hexdigest(), "identity_sha256": identity_hex, "cmdline": line,
             "host_data": hd.hex(), "host_data_b64": base64.b64encode(hd).decode(),
             "vcpus": vcpus, "cpu_family": cpu_family, "cpu_model": manifest["cpu_model"],
+            "cpu_signature": CPU_SIGNATURES[manifest["cpu_model"]],
             "policy": POLICY, "sev_snp_measure": SEV_SNP_MEASURE_VERSION,
             "expected_measurement": expected_measurement(bundle, manifest, line, vcpus, tool or default_tool())}
 

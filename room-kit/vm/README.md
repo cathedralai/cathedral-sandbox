@@ -143,12 +143,15 @@ Nothing below is used by `create` or the launcher yet (VM3 wires it in).
 - **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random
   salt, the first-boot SSH key and the bundle's base root hash. Written once at create.
 - **Cmdline:** the bundle template with `cathedral.vm=<sha256 of vm-identity.json>`, so
-  every VM has its own launch measurement. It masks every getty and the guest agent.
+  every VM has its own launch measurement. It masks every getty, the emergency, rescue
+  and debug shells, and the guest agent.
 - **HOST_DATA:** `sha256(b"cathedral-vm-v1\0" || sha256(vm-identity.json))`: 64 hex in a
   report, base64 for QEMU `host-data=`.
 - **Measurement:** `sev-snp-measure 0.0.12 --mode snp` (requirements/vm-measure.txt) over
-  digest-checked private copies. CPU family `genoa` measures `EPYC-Genoa-v1`, `turin`
-  measures `EPYC-v4`.
+  digest-checked private copies. CPU family `genoa` runs QEMU `-cpu EPYC-Genoa-v1`,
+  `turin` runs `EPYC-v4`. Only the model's CPUID signature (family, model, stepping) is
+  measured, not its feature set: EPYC-v1 and EPYC-v4 give one digest. The guest checks
+  its features itself (VM1b).
 
 ```
 vm_measure.py identity --bundle B --vm-id vm-0123456789ab --ssh-key-file key.pub --out vm-identity.json
