@@ -28,10 +28,14 @@ enrollment-operator = ["bittensor>=10.3.1,<11"]
 # this environment to avoid combining those incompatible codec stacks.
 dev = [
   "pytest>=8.0",
+  "zstandard==0.25.0",  # Reference custom-guest initrd build/check tests.
   "hypothesis>=6.100",
   "substrate-interface>=1.7.0,<2",
   "bittensor-wallet>=4.0.1,<5",
 ]
+
+# Build host only; never part of the measured guest executable closure.
+custom-guest-build = ["zstandard==0.25.0"]
 
 [project.scripts]
 cathedral = "cathedral.cli:main"

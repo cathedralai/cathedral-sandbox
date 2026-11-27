@@ -35,6 +35,39 @@ python3 room-kit/verify_custom_guest.py \
 
 The endpoint must match the owner-signed public host and first port mapping. The wrapper currently supports the strict Turin verifier; Genoa rehearsal evidence is a separate, partial qualification and must not be presented as Turin acceptance.
 
+## Reference initrd packaging
+
+`custom_guest_initrd.py` builds and validates the archive from a separately reviewed
+JSON mapping of executable path to SHA-256. `init` is mandatory; helpers belong
+under `usr/lib/cathedral/`. The staging tree contains only those files and their
+parent directories. No closure digest is learned from an untrusted archive.
+
+```sh
+python3 -m pip install -e '.[custom-guest-build]'
+python3 room-kit/custom_guest_initrd.py build \
+  --root STAGING_TREE --closure REVIEWED_CLOSURE.json --archive initrd.zst
+python3 room-kit/custom_guest_initrd.py check \
+  --closure REVIEWED_CLOSURE.json --archive initrd.zst
+```
+
+The build uses python-zstandard 0.25.0 / libzstd 1.5.7, level 19, one thread,
+content size and checksum. It normalizes timestamps, ownership, modes, ordering
+and inode numbers. Keep the input tree quiescent during the build. The output is
+created exclusively, so a previous artifact cannot be silently replaced.
+
+The checker accepts one bounded zstd frame containing one `newc` archive with a
+trailer, no trailing bytes, no repeated names or hard links, no symlinks or special
+files, and no files outside the pinned executable closure. Every executable must
+be an x86_64 ELF with no interpreter or shared-library dependency. The archive
+policy is deliberately stricter than the [kernel's general initramfs format](https://www.kernel.org/doc/html/v6.10/driver-api/early-userspace/buffer-format.html).
+Decompression checks the frame size before allocation and refuses extra frames,
+using the [zstandard decompression API](https://python-zstandard.readthedocs.io/en/latest/decompressor.html).
+
+`archive_verified` only verifies the bytes/layout against the supplied closure.
+It does not establish that `/init` enforces the bootstrap or is safe to boot.
+There is no published production closure or reference-image digest yet. The
+reference init and pinned helper build recipes must land before those can exist.
+
 ## Evidence and remaining work
 
 Tests exercise real OpenSSH key exchange and a forced report command on a loopback sshd, with explicitly synthetic SNP reports/certificates. The command is refused for tampered reports, and no key is saved on failure. Signed reports for another challenge or host key also fail. This is transport/cryptographic integration evidence, not a chip or customer-host test.
@@ -44,7 +77,7 @@ Before this foundation can be marked ready:
 - Build and qualify the static reference `/init`, its pinned static helper closure and deterministic single-archive initrd.
 - Enforce the bootstrap against guest-observed state before networking/root use; enforce root-only SNP and configfs report access.
 - Build the reference kernel and verified-root test image, configure SSH, verify the helper digest and disable cloud-init/imported credentials.
-- Add the owner-unlocked data-disk helper, archive closure checks and reproducible artifact evidence.
+- Add the owner-unlocked data-disk helper and reproducible reference-image evidence; archive checks now exist.
 - Cross-review the complete result, then run the approved hardware rehearsals through Spock's launcher/operator path.
 
 The launcher, broker hold and API are separate Spock-owned PRs. No host operation, customer interruption, new compute or production switch is part of this component.
