@@ -485,3 +485,26 @@ def test_a_sync_failure_after_the_commit_exits_21_and_the_same_op_id_finishes_it
     # The selection check passes now; run 2 has no start line yet, so that check answers instead.
     assert site.h.ctl("check-paid", "vm1")[1]["error"] == "start_not_recorded"
     assert site.h.ctl("start", "vm1", "--generation", "2")[0] == 0
+
+
+# ---- the identity document (spec r2 6.3) ---------------------------------------------
+
+def test_create_status_and_list_carry_the_exact_identity_document(host):
+    """verify_vm.py recomputes the measurement from vm-identity.json, salt included, so the host
+    serves its exact text; never a file other than the one launch.json's identity_sha256 names."""
+    code, vm = host.create()
+    assert code == 0, vm
+    d = host.root / "vm1"
+    raw = (d / "vm-identity.json").read_bytes()
+    launch = json.loads((d / "launch.json").read_text())
+    for answer in (vm, host.ctl("status", "vm1")[1], host.ctl("list")[1]["vms"][0]):
+        text = answer["identity_document"]
+        assert text.encode("ascii") == raw
+        assert hashlib.sha256(text.encode("ascii")).hexdigest() == answer["identity_sha256"] \
+            == launch["identity_sha256"]
+    ident = json.loads(vm["identity_document"])
+    assert ident["vm_id"] == vm["vm_id"] and len(ident["salt_hex"]) == 32
+    (d / "vm-identity.json").write_bytes(raw.replace(ident["salt_hex"].encode(), b"0" * 32))
+    for code, answer in (host.ctl("status", "vm1"), host.ctl("list")):
+        assert code == 0, answer
+        assert (answer["vms"][0] if "vms" in answer else answer)["identity_document"] is None

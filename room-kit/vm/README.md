@@ -252,6 +252,10 @@ cmdline and HOST_DATA from the identity on every launch.
   kernel from one pinned snapshot, then writes the manifest.
 - **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random
   salt, the first-boot SSH key and the bundle's base root hash. Written once at create.
+  `create`'s answer, `status` and `list` carry it as `identity_document`, the file's exact
+  text (the customer's input to `verify_vm.py`; its sha256 is `identity_sha256`), or `null`
+  when the file is not the one `launch.json` names. It is not secret: the salt and the key
+  are the customer's own.
 - **Cmdline:** the bundle template with `cathedral.vm=<sha256 of vm-identity.json>`, so
   every VM has its own launch measurement. It masks every getty, the emergency, rescue
   and debug shells, and the guest agent.

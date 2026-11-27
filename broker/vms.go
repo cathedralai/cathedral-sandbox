@@ -873,7 +873,7 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 	s.busy[id] = true
 	s.mu.Unlock()
 
-	_, cerr := s.call(r.Context(), h, 3*time.Minute, []byte(key+"\n"), "create", id,
+	doc, cerr := s.call(r.Context(), h, 3*time.Minute, []byte(key+"\n"), "create", id,
 		"--vcpus", strconv.Itoa(req.VCPUs), "--mem-gib", strconv.Itoa(req.MemGiB),
 		"--disk-gib", strconv.Itoa(req.DiskGiB), "--ssh-port", strconv.Itoa(port))
 
@@ -901,7 +901,11 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "state_not_saved", "the host created the VM but the broker could not record it")
 		return
 	}
-	writeJSON(w, 201, s.view(rec))
+	// The host's answer as GET gives it: a sealed VM's launch values and identity_document,
+	// which the customer needs to recompute the measurement (spec r2 6.3).
+	v := s.view(rec)
+	v["host_status"] = doc
+	writeJSON(w, 201, v)
 }
 
 // placeLocked picks a host with room and its lowest free SSH port. Every

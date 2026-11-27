@@ -927,12 +927,28 @@ def status_of(name: str) -> dict:
         # Sealed VM launch values (spec r2 6.3): the customer recomputes expected_measurement from
         # the published bundle and their identity document; the broker passes these through.
         **{k: launch[k] for k in LAUNCH_STATUS if k in launch},
-        **({"disks": {"root": (d / "root.raw").is_file(), "mailbox": (d / "mailbox.raw").is_file()},
+        **({"identity_document": identity_text(d, launch),
+            "disks": {"root": (d / "root.raw").is_file(), "mailbox": (d / "mailbox.raw").is_file()},
             # The caller passes it back as rebundle --expect-revision (spec r3 7.5 step 1).
             "bundle_selection_revision": launch.get("bundle_selection_revision", 0),
             **mailbox_view(d, env, state == "running")}
            if launch else {}),
     }
+
+
+def identity_text(d: Path, launch: dict) -> str | None:
+    """vm-identity.json exactly as create wrote it (spec r2 6.3): verify_vm.py needs it, salt
+    included, to recompute the measurement. Not secret: the salt and the public key are the
+    customer's own. None unless its sha256 is launch.json's identity_sha256, so a caller never gets
+    a document other than the one the measurement was computed from."""
+    try:
+        with open(d / "vm-identity.json", "rb") as f:
+            raw = f.read(vm_measure.DOC_MAX + 1)
+        if hashlib.sha256(raw).hexdigest() == launch.get("identity_sha256"):
+            return raw.decode("ascii")
+    except (OSError, UnicodeDecodeError):
+        pass
+    return None
 
 
 # ---- create ---------------------------------------------------------------------
