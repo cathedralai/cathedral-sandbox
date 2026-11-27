@@ -386,7 +386,26 @@ or configfs and never change the host SNP device. A mount namespace alone is
 not isolation for these kernel-global objects: do not run this setup component
 in a host/container rehearsal.
 
-This component is not yet wired into a complete PID1. The inherited `/run`
-capacity also needs validation with the reference systemd boot; the current
-16 MiB/256-inode cap has a review concern and is not a qualified runtime limit.
-These additions do not establish a bootable image or hardware acceptance.
+This component is not yet wired into a complete PID1. These additions do not
+establish a bootable image or hardware acceptance.
+
+### Runtime capacity and exact document fields
+
+The inherited `/run` now uses systemd 252's bounded capacity: 20% of guest RAM
+and 800k inodes, retaining `nosuid,nodev,noexec`. Systemd leaves an existing
+`/run` mount in place, so sizing it only for the four Cathedral files was too
+small. The source contracts are
+[the mount table](https://github.com/systemd/systemd/blob/v252/src/shared/mount-setup.c)
+and [the runtime limits](https://github.com/systemd/systemd/blob/v252/src/shared/mount-util.h).
+
+`scripts/test_custom_guest_runtime.sh` mounts only scratch tmpfs in a private
+mount namespace. It writes the runtime files, 512 zero-byte unit-state files
+and 17 MiB of simulated re-execution state. Restoring either old limit causes
+ENOSPC; the new limits pass. This validates capacity, not a complete systemd
+or SNP boot. That acceptance test remains required.
+
+Signed JSON field names must now match their declared spelling exactly,
+including nested network and port objects. Case aliases and simultaneous
+case variants are refused before decoding into Go structs. The optional
+`data_disk_gib` field remains optional; fixture signatures and HOST_DATA are
+unchanged. Eight signed regression cases failed before the fix.
