@@ -106,7 +106,7 @@ func vmConfig(t *testing.T, enabled bool, stateDir string) config {
 	}
 	host := func(id string, pmin, pmax, cpus int) vmHostConfig {
 		return vmHostConfig{ID: id, SSHTarget: "vmctl@" + id + ".example", SSHKeyFile: key, KnownHostsFile: kh, PublicIP: "203.0.113.9",
-			PortMin: pmin, PortMax: pmax, MaxVCPUs: cpus, MaxMemGiB: 32, MaxDiskGiB: 200}
+			PortMin: pmin, PortMax: pmax, MaxVCPUs: cpus, MaxMemGiB: 32, MaxDiskGiB: 200, Sealed: true, SNPVMRuntime: true}
 	}
 	return config{
 		Listen: "127.0.0.1:0", StateDir: stateDir, OperatorKeySHA256: sha("operator-key"),
@@ -1187,5 +1187,41 @@ func TestVMsCreateIdempotentRetryAfterLostHostReply(t *testing.T) {
 	}
 	if n := countHostCalls(tb, "create"); n != 1 {
 		t.Fatalf("host create calls: %d", n)
+	}
+}
+
+// AB#999: no unsealed VMs. A create needs a sealed host with the SNP VM runtime.
+func TestVMsCreateRefusedWithoutSealedSNPHost(t *testing.T) {
+	cases := map[string]func(h *vmHostConfig){
+		"not sealed":         func(h *vmHostConfig) { h.Sealed = false },
+		"sealed, no SNP VMs": func(h *vmHostConfig) { h.SNPVMRuntime = false },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := vmConfig(t, true, t.TempDir())
+			for i := range c.VMHosts {
+				mutate(&c.VMHosts[i])
+			}
+			tb := loadVMTestBroker(t, writeConfig(t, c))
+			code, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms", map[string]any{
+				"account": "acct1", "vcpus": 2, "mem_gib": 4, "disk_gib": 20, "ssh_public_key": testED25519Key()})
+			if code != 409 || vmErrCode(doc) != "vm_runtime_not_sealed" {
+				t.Fatalf("want 409 vm_runtime_not_sealed, got %d %v", code, doc)
+			}
+		})
+	}
+}
+
+func TestVMsCreateSkipsHostWithoutSNPAndRefusesNamedOne(t *testing.T) {
+	c := vmConfig(t, true, t.TempDir())
+	c.VMHosts[0].SNPVMRuntime = false // vmh-a is out, vmh-b stays eligible
+	tb := loadVMTestBroker(t, writeConfig(t, c))
+	if v := tb.create(t, nil); v["host"] != "vmh-b" {
+		t.Fatalf("create must skip the host without SNP: %v", v)
+	}
+	code, doc := tb.call(t, "operator-key", "POST", "/v1/broker/vms", map[string]any{
+		"account": "acct1", "vcpus": 1, "mem_gib": 1, "disk_gib": 20, "ssh_public_key": testED25519Key(), "host": "vmh-a"})
+	if code != 409 || vmErrCode(doc) != "vm_runtime_not_sealed" {
+		t.Fatalf("named non-SNP host: %d %v", code, doc)
 	}
 }

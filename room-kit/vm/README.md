@@ -2,9 +2,13 @@
 
 Long-lived customer Linux VMs on a KVM host: a persistent disk, the customer's
 SSH key, explicit start, stop, reboot and delete. Same pattern as the sealed
-hotel unit (`../sealed/launch-guest.sh`, `write-units.sh`, `host-net.sh`), but
-plain KVM: **v1 is not SEV-SNP**, so the host operator can read guest memory
-and disk. Sealed disk boot is a follow-up.
+hotel unit (`../sealed/launch-guest.sh`, `write-units.sh`, `host-net.sh`).
+
+**VMs are SEV-SNP only.** There is no plain KVM mode and no flag for one.
+`launch-vm.sh` refuses to start QEMU (exit 78, "VM launch refused: SEV-SNP is
+required (AB#999)") and the broker refuses a VM create (409
+`vm_runtime_not_sealed`) unless the host is sealed and declares
+`snp_vm_runtime`. Both stay refused until the SNP VM launch ships (AB#999).
 
 ## Files
 
@@ -79,4 +83,4 @@ uses the pinned image (no `--ssh-key-file`, no `--image`).
 
 ## Not in v1
 
-SEV-SNP, broker routes (`/v1/broker/vms`, next PR), resize, snapshots.
+The SNP launch itself (AB#999), resize, snapshots.
