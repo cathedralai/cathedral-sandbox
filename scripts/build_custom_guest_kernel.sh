@@ -47,7 +47,7 @@ done
 for option in CMDLINE_BOOL BOOT_CONFIG_EMBED BOOT_CONFIG_FORCE MODULES DEBUG_INFO \
     DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_BTF SYSTEM_TRUSTED_KEYRING \
     NET_9P 9P_FS DRM SOUND WLAN WIRELESS NFC ATA SCSI USB ETHERNET \
-    NFS_FS NFSD CIFS CEPH_FS; do
+    NFS_FS NFSD CIFS CEPH_FS IPV6_SIT; do
     "$config" --file "$work/build/.config" --disable "$option"
 done
 "$config" --file "$work/build/.config" --set-str INITRAMFS_SOURCE '' --set-str LOCALVERSION '-cathedral-custom-v1'
@@ -59,8 +59,14 @@ for option in IKCONFIG AMD_MEM_ENCRYPT SEV_GUEST TSM_REPORTS VIRTIO_PCI VIRTIO_B
     SQUASHFS CONFIGFS_FS FW_CFG_SYSFS; do
     grep -qx "CONFIG_$option=y" "$work/build/.config" || { echo "Required builtin missing: $option" >&2; exit 1; }
 done
-for option in CMDLINE_BOOL BOOT_CONFIG_EMBED BOOT_CONFIG_FORCE; do
-    ! grep -Eq "^CONFIG_$option=[ym]$" "$work/build/.config"
+# IPV6_SIT (on in x86_64_defconfig) makes the kernel create a device-less sit0
+# at boot, and bootstate refuses any interface but the one virtio NIC. "set -e"
+# ignores a "!" pipeline, so each forbidden option exits explicitly.
+for option in CMDLINE_BOOL BOOT_CONFIG_EMBED BOOT_CONFIG_FORCE IPV6_SIT; do
+    if grep -Eq "^CONFIG_$option=[ym]$" "$work/build/.config"; then
+        echo "Forbidden option set: $option" >&2
+        exit 1
+    fi
 done
 grep -qx 'CONFIG_INITRAMFS_SOURCE=""' "$work/build/.config"
 make -C "$work/source" O="$work/build" -j6 bzImage

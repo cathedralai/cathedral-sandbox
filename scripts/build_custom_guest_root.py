@@ -176,6 +176,13 @@ def configure(root, helper, helper_hash, data_helper=None, cryptsetup=None):
             raise ValueError('base is missing mke2fs (e2fsprogs)')
         if not (root / 'mnt').is_dir() or (root / 'mnt').is_symlink():
             raise ValueError('base is missing a plain /mnt directory')
+        # The root is read-only squashfs at boot, so cathedral-data cannot create its
+        # mount target then; it must already be in the image, owner-only and empty.
+        target = root / 'mnt/cathedral-data'
+        if target.is_symlink() or (target.exists() and (not target.is_dir() or any(target.iterdir()))):
+            raise ValueError('base /mnt/cathedral-data must be absent or an empty directory')
+        target.mkdir(exist_ok=True)
+        target.chmod(0o700)
         write(root, 'usr/bin/cathedral-data', data_helper, 0o755)
         write(root, 'usr/lib/cathedral/cryptsetup', cryptsetup, 0o755)
     write(root, 'etc/hostname', 'cathedral-guest\n')

@@ -153,6 +153,10 @@ def test_root_installs_data_tools_together_with_the_pinned_cryptsetup(tmp_path):
     assert (root / "usr/bin/cathedral-data").read_bytes() == b"data-tool"
     assert (root / "usr/lib/cathedral/cryptsetup").read_bytes() == b"static-cryptsetup"
     assert (root / "usr/bin/cathedral-data").stat().st_mode & 0o777 == 0o755
+    # cathedral-data cannot mkdir its mount target on the read-only root at boot.
+    target = root / "mnt/cathedral-data"
+    assert target.is_dir() and not target.is_symlink() and not any(target.iterdir())
+    assert target.stat().st_mode & 0o7777 == 0o700
     # Not installed unless asked: an image without a data disk carries no unlock tool.
     plain = root_tree(tmp_path / "plain" if (tmp_path / "plain").mkdir() is None else tmp_path)
     root_builder.configure(plain, b"attest", "aa" * 32)
@@ -173,3 +177,19 @@ def test_root_refuses_half_installed_data_tools_and_missing_mke2fs(tmp_path):
     sub.mkdir()
     with pytest.raises(ValueError, match="/mnt"):
         root_builder.configure(root_tree(sub, mnt=False), b"attest", "aa" * 32, b"data", b"crypt")
+
+
+
+@pytest.mark.parametrize("bad", ["file", "symlink", "nonempty"])
+def test_root_refuses_a_mount_target_it_did_not_make(tmp_path, bad):
+    root = root_tree(tmp_path)
+    target = root / "mnt/cathedral-data"
+    if bad == "file":
+        target.write_bytes(b"")
+    elif bad == "symlink":
+        target.symlink_to("/tmp")
+    else:
+        target.mkdir()
+        (target / "planted").write_bytes(b"x")
+    with pytest.raises(ValueError, match="cathedral-data"):
+        root_builder.configure(root, b"attest", "aa" * 32, b"data", b"crypt")

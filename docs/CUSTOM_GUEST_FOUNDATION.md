@@ -224,6 +224,9 @@ No kernel is installed, and no VM is launched. The source digest is checked
 before extraction. SNP, TSM, virtio, dm-verity, dm-crypt, dm-integrity, SquashFS
 and config extraction are built in. Modules, built-in command lines, embedded
 boot configuration, embedded initramfs and unused hardware drivers are disabled.
+`CONFIG_IPV6_SIT` is disabled too: `x86_64_defconfig` turns it on, the kernel
+then creates a device-less `sit0` at boot, and `bootstate` refuses every
+interface except the one virtio NIC. The build fails if any of these come back.
 
 The recipe contains one explicit source adjustment: x86 `COMMAND_LINE_SIZE`
 is increased from 2048 to 4096. Linux advertises one less in the boot header;
@@ -416,12 +419,20 @@ It re-reads the bound launch (`ReadBoundLaunch`) to get the signed
 `data_disk_gib`, holds only the `custom-data` disk (`datavolume.OpenData`), and
 runs `datavolume.Unlock`. First use on a disk that is all zero: LUKS2,
 `aes-xts-plain64`, 4096-byte sectors, `hmac-sha256` integrity (argon2id), then
-ext4, mounted at `/mnt/cathedral-data` with `nosuid,nodev,noexec`. A disk with a
+ext4, mounted at `/mnt/cathedral-data` with `nosuid,nodev,noexec`. The root is
+read-only at boot, so the root build creates that directory (empty, `0700`). A
+disk with a
 nonzero byte and no LUKS magic is refused untouched. A disk with LUKS and no ext4
 (a cut between format and mkfs) is refused and never formatted again; it needs
-deliberate recovery. A header that fails `CheckHeaderPolicy` (for example a null
-cipher) is refused before open. After open the live stack is read back from sysfs
-(crypt over dm-integrity over exactly the held disk) and `cryptsetup status`.
+deliberate recovery. The header is copied off the disk once
+(`luksHeaderBackup` into a private directory under `/run`); the policy check
+dumps that copy and `open --header` unlocks with it, so a host that rewrites the
+on-disk header after the check cannot substitute its own keyslots. A header that
+fails `CheckHeaderPolicy` (for example a null cipher) is refused before open.
+After open the live stack is read back from sysfs (crypt over dm-integrity over
+exactly the held disk) and `cryptsetup status`, in cryptsetup 2.8.4's output
+format. `mke2fs -F` runs only on a volume formatted in the same run whose
+plaintext still reads as all zero.
 
 First-use formatting wipes the integrity area, which takes time proportional to
 the disk. The unlock deadline is 6 hours. The adapter runs the pinned static
