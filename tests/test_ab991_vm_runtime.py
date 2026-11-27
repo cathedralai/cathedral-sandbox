@@ -629,6 +629,43 @@ def test_any_other_gate_answer_refuses_as_gates_failed(host, code, doc):
     assert host.ctl("status", "vm1")[1]["state"] == "created"
 
 
+def _start_refused_gates_failed(host, extra):
+    host.create()
+    host.ctl("authorize", "vm1", str(int(time.time()) + 600), "1")
+    rc, out = host.ctl("start", "vm1", "--generation", "1", extra=extra)
+    assert (rc, out["error"]) == (1, "gates_failed"), out
+    assert host.ctl("status", "vm1")[1]["state"] == "created"
+    hist = host.root / ".history" / "vm1.jsonl"
+    assert not hist.exists() or '"start"' not in hist.read_text()
+    assert not (host.root / "vm1" / "started").exists()
+
+
+def test_a_gates_script_that_hangs_refuses_as_gates_failed(host):
+    """A timeout never passes. The wait is shortened so the test is fast."""
+    hang = host.root.parent / "hang-gates"
+    hang.write_text("#!/bin/sh\nexec sleep 30\n")
+    hang.chmod(0o755)
+    _start_refused_gates_failed(host, {"VM_GATES": str(hang), "VM_GATE_WAIT": "1"})
+
+
+@pytest.mark.parametrize("mode", ["missing", "not_executable"])
+def test_a_gates_script_that_cannot_run_refuses_as_gates_failed(host, mode):
+    path = host.root.parent / "absent-gates"
+    if mode == "not_executable":
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o644)
+    _start_refused_gates_failed(host, {"VM_GATES": str(path)})
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "nan", "inf"])
+def test_a_bad_gate_wait_falls_back_and_breaks_nothing(host, bad):
+    host.create()
+    host.ctl("authorize", "vm1", str(int(time.time()) + 600), "1")
+    assert host.ctl("enforce", extra={"VM_GATE_WAIT": bad})[0] == 0
+    rc, out = host.ctl("start", "vm1", "--generation", "1", extra={"VM_GATE_WAIT": bad})
+    assert rc == 0 and out["state"] == "running", out
+
+
 def test_start_runs_when_the_gates_pass_after_the_paid_check(host):
     host.create()
     rc, out = host.ctl("start", "vm1", "--generation", "1")
