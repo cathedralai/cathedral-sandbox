@@ -160,14 +160,14 @@ func attachLoop(t *testing.T, path string, flags int) (*os.File, int64) {
 // hybrid is the fake platform with the real disk and root.
 type hybrid struct {
 	*fake
-	im       *image
-	tool     vmdisk.Tool
-	verity   vmroot.Tool
-	resize   vmroot.Tool
-	mountAt  string
-	dropPin  string // a manifest entry to leave out, to prove the adapter refuses
-	devices  Devices
-	statuses []string
+	im      *image
+	tool    vmdisk.Tool
+	verity  vmroot.Tool
+	resize  vmroot.Tool
+	mountAt string
+	dropPin string // a manifest entry to leave out, to prove the adapter refuses
+	devices Devices
+	fsArea  *os.File // what the disk package handed to Start, closed at power off
 }
 
 func (h *hybrid) Devices() (Devices, error) { h.call("devices"); return h.devices, nil }
@@ -200,6 +200,7 @@ func (r hybridRoot) Start(ctx context.Context, fsArea *os.File, link []byte, rea
 	if r.err != nil {
 		return r.err
 	}
+	r.h.fsArea = fsArea
 	m, err := vmroot.Mount(fsArea, r.h.mountAt)
 	if err != nil {
 		return err
@@ -216,6 +217,9 @@ func (r hybridRoot) Start(ctx context.Context, fsArea *os.File, link []byte, rea
 func (im *image) boot(t *testing.T, dropPin string) (*hybrid, error) {
 	t.Helper()
 	f := newFake(t)
+	// newFake wraps fd 0 in an os.File for its fake disk; its finalizer would close fd 0 under a later
+	// open. This test uses the real disk, so drop it.
+	f.outcome = vmdisk.Outcome{}
 	f.identity, f.cmdline, f.link = im.identity, im.cmdline, []byte("10.216.0.5 10.216.0.6")
 	rootFile, rootSize := attachLoop(t, im.root, os.O_RDWR)
 	baseFile, baseSize := attachLoop(t, im.base, os.O_RDONLY)
@@ -230,12 +234,24 @@ func (im *image) boot(t *testing.T, dropPin string) (*hybrid, error) {
 	return h, boot(context.Background(), h)
 }
 
-// powerOff releases everything a boot left: the root mount (and its binds), then the mappings.
+// powerOff does what a real power cycle does: nothing survives it. It releases the root mount (and its
+// binds), every descriptor the boot held, then each mapping, and fails the test if one is left. The
+// init itself closes nothing on the way down; the VM halts, so this is the test's job.
 func (im *image) powerOff(h *hybrid) {
 	exec.Command("umount", "-R", "-l", h.mountAt).Run()
 	os.Remove(h.mountAt)
-	for _, n := range []string{im.names.FS, im.names.Crypt, im.names.Probe, im.names.LUKS} {
-		exec.Command("dmsetup", "remove", "--force", "--retry", n).Run()
+	if h.fsArea != nil {
+		h.fsArea.Close()
+		h.fsArea = nil
+	}
+	for _, name := range []string{im.names.FS, im.names.Crypt, im.names.Probe, im.names.LUKS} {
+		if out, err := exec.Command("dmsetup", "remove", "--force", "--retry", name).CombinedOutput(); err != nil &&
+			!strings.Contains(string(out), "No such device") && !strings.Contains(string(out), "not exist") {
+			im.t.Logf("dmsetup remove %s: %v %s", name, err, out)
+		}
+	}
+	if out, _ := exec.Command("dmsetup", "ls").CombinedOutput(); strings.Contains(string(out), im.names.FS) {
+		im.t.Errorf("mapping %s survived the power off:\n%s", im.names.FS, out)
 	}
 }
 
@@ -363,6 +379,7 @@ func TestRootWiredRefusals(t *testing.T) {
 		im := newImage(t)
 		before := sha256File(t, im.root)
 		f := newFake(t)
+		f.outcome = vmdisk.Outcome{}
 		f.identity, f.cmdline, f.link = im.identity, im.cmdline, []byte("192.0.2.1 192.0.2.2")
 		h := &hybrid{fake: f, im: im}
 		err := boot(context.Background(), h)
