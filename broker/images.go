@@ -128,6 +128,9 @@ type placement struct {
 }
 
 func (pl placement) selects(h *hotel) bool {
+	if h.held() {
+		return false // a custom guest holds the host: no pick, retry or prefetch (custom_guest_hold.go)
+	}
 	if h.cfg.MinerHotkey != "" && !pl.policy.minerOptIn(h) {
 		return false
 	}
