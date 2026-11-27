@@ -153,7 +153,13 @@ def _u32(b: bytes, off: int) -> int:
 
 
 def check_bzimage(data: bytes) -> dict:
-    """x86_64 bzImage with an EFI stub, boot protocol >= 2.12, XLF_KERNEL_64, cmdline_size >= 2048."""
+    """x86_64 bzImage with an EFI stub, boot protocol >= 2.12, XLF_KERNEL_64, cmdline_size >= 2047.
+
+    cmdline_size is the longest command line without the terminating zero
+    (Documentation/arch/x86/boot.rst); a stock x86 kernel sets it to
+    COMMAND_LINE_SIZE - 1 = 2047 (arch/x86/boot/header.S). Spec 5.5 writes
+    ">= 2048", which no stock kernel meets; 2047 is the spec's own 4.4 figure.
+    """
     def bad(why: str) -> Refused:
         return Refused("custom_guest_not_snp_bootable", why)
 
@@ -170,8 +176,8 @@ def check_bzimage(data: bytes) -> dict:
     if not _u16(data, 0x236) & 0x1:
         raise bad("XLF_KERNEL_64 is not set")
     cmdline_size = _u32(data, 0x238)
-    if cmdline_size < 2048:
-        raise bad(f"cmdline_size {cmdline_size} is below 2048")
+    if cmdline_size < 2047:
+        raise bad(f"cmdline_size {cmdline_size} is below 2047")
     setup_sects = data[0x1F1] or 4
     pm_start = (setup_sects + 1) * 512
     payload_off, payload_len = _u32(data, 0x248), _u32(data, 0x24C)
@@ -402,7 +408,7 @@ def validate(inbox: str, staging: str) -> dict:
     root_bytes = req["root_disk"]["bytes"]
     parsed = check_cmdline(req["cmdline"], facts["owner_key"], root_bytes)
     line = req["cmdline"].encode()
-    if OVMF_PREFIX_LEN + len(line) + 1 > boot["cmdline_size"]:
+    if OVMF_PREFIX_LEN + len(line) > boot["cmdline_size"]:  # cmdline_size excludes the NUL
         raise Refused("custom_guest_cmdline_invalid", "the cmdline does not fit the kernel's cmdline_size")
     report["cmdline"] = parsed
 
