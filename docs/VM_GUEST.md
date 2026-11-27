@@ -127,5 +127,4 @@ pinned files and downloads nothing, builds twice and requires identical static E
 - `.github/workflows/vm-guest.yml` adds two jobs: `vmroot` (root, loop devices, real dm-verity and
   e2fsprogs; the cut-point reruns, a flipped base block, a wrong root hash, the pinned-helper
   refusals, `Finish`) and `tools` (the static build, in an Ubuntu 26.04 container pinned by digest).
-- The mailbox tests read `tests/fixtures/vm_mailbox_v1.json` from PR 794 and skip while it is absent.
-  Once that PR is on main they must fail instead of skip.
+- The mailbox tests read `tests/fixtures/vm_mailbox_v1.json` from main and fail if it is missing.

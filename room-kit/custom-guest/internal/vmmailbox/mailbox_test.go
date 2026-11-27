@@ -23,9 +23,8 @@ func (m *memFile) ReadAt(p []byte, off int64) (int, error) {
 func (m *memFile) WriteAt(p []byte, off int64) (int, error) { return copy(m.b[off:], p), nil }
 func (m *memFile) Sync() error                              { return nil }
 
-// fixturePath is the host side's contract (sandbox PR 794). It is read, never copied here. Until
-// that PR is on main, VM_MAILBOX_FIXTURE points at its branch's copy; with neither, the fixture
-// tests skip and the self-made vectors below still run.
+// fixturePath is the host side's contract (room-kit/vm/vm_mailbox.py), committed on main. It is read,
+// never copied here. VM_MAILBOX_FIXTURE overrides it for a local run.
 func fixturePath() string {
 	if p := os.Getenv("VM_MAILBOX_FIXTURE"); p != "" {
 		return p
@@ -58,7 +57,7 @@ func loadFixture(t *testing.T) fixture {
 	t.Helper()
 	raw, err := os.ReadFile(fixturePath())
 	if err != nil {
-		t.Skipf("mailbox fixture not present (%v): set VM_MAILBOX_FIXTURE", err)
+		t.Fatalf("mailbox fixture: %v", err)
 	}
 	var f fixture
 	if err := json.Unmarshal(raw, &f); err != nil {
