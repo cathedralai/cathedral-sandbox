@@ -1,0 +1,42 @@
+{
+  "aad": "offer_sha256 as 64 lowercase hex ASCII bytes; also the HKDF salt",
+  "cases": [
+    {
+      "answer": {
+        "ct": "FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/",
+        "epk": "AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=",
+        "nonce": "/r4pVndhO71h11ai",
+        "offer_sha256": "f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7",
+        "schema": "cathedral.vm.rewrap-answer/v1"
+      },
+      "customer_private_hex": "3418ab15a74e73dede7ea809f0f8fb440cf066aa7154a14a692eb2b8f93dc88b",
+      "offer_body_utf8": "{\"schema\":\"cathedral.vm.rewrap-offer/v1\",\"vector\":\"one\"}",
+      "offer_sha256": "f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7",
+      "recovery_key_hex": "aaee740bec4b27b5e94df52155f5b02cd08a66425b67a01adb77aa5387b0bbfa",
+      "shared_hex": "d105f639a1351b9c990fb709276f863b0adf1a08c46c6b03a3b0422309fa6564",
+      "vm_private_hex": "13340e9269c164d3371dd1738a840cdc5cd113754a9cd42383df69b93bb18db8",
+      "vm_public_b64": "VtyX8EiqKjtDDcgiX4O8aS2dzHN5Kxza7dDxiehLOlE=",
+      "wrapping_key_hex": "69c7c1d2164733ba03828d679029074499595855117bf453ac08f8c261010d5d"
+    },
+    {
+      "answer": {
+        "ct": "eq3FjPo47j5QSm7AxuMv4UnpgfY+hPKnBb2KBA7b5Zn+zijJL9W6fQaBcgwio6Hl",
+        "epk": "NdrDw5l9cM/2hIKoU07L85tuO/wihJg6FoJ4EXn1Yzs=",
+        "nonce": "8a18/hiWpL9mDYIV",
+        "offer_sha256": "a937313761d63287cd7ada253379834f888ab905fc4969b41b34c06d206f49da",
+        "schema": "cathedral.vm.rewrap-answer/v1"
+      },
+      "customer_private_hex": "00d0a41ddc0b0ac94ca37a51f81cb4b75be332c73db58f32ef2c00ee39894a79",
+      "offer_body_utf8": "{\"schema\":\"cathedral.vm.rewrap-offer/v1\",\"vector\":\"two\"}",
+      "offer_sha256": "a937313761d63287cd7ada253379834f888ab905fc4969b41b34c06d206f49da",
+      "recovery_key_hex": "0ee4bd59ff1d6ca729bfef599bfa1808918b5b3ee3674707b9a4748c003a6c7e",
+      "shared_hex": "9b9b164233e89491ccc4edcccb7a4fc5e831f912446d8c6bf032a3753ca1920b",
+      "vm_private_hex": "110565efe6c010dd47651f3a7c586a34ec1188d20dcbaee82ceaed56513b1617",
+      "vm_public_b64": "8G3qXusCG1lOX2fa+Vx0ht88H5B9JDD9VS8SY38h5HU=",
+      "wrapping_key_hex": "1aa1b73c6dc9cbe3c2168df244e19a0f8b9dd4a4a457823996da47a67e8a7975"
+    }
+  ],
+  "hkdf_info": "cathedral.vm-rewrap.v1",
+  "key_info_order": "info || epk || vm_pub",
+  "spec": "VM runtime spec r3 7.5 and the 27 Nov 14:44Z errata"
+}
