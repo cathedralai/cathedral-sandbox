@@ -358,6 +358,9 @@ def test_image_is_pinned():
 
 def test_no_em_dashes_in_the_kit():
     for f in KIT.iterdir():
+        # Importing vm_ctl in tests leaves a __pycache__ directory in the kit.
+        if not f.is_file():
+            continue
         assert "—" not in f.read_text(), f
 
 
