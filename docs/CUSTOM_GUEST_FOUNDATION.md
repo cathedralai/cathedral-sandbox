@@ -303,3 +303,19 @@ program. Observed-resource checks (including the unresolved memory rule), verity
 mounting, root checks and PID1 handoff remain mandatory. Tests use the shared
 signed protocol vector, synthetic firmware attributes and synthetic report
 responses; they are not hardware acceptance evidence.
+
+### Held root device
+
+`internal/bootstate.OpenRootDevice` repeats device selection, then opens only
+the selected root with read-only, no-follow and close-on-exec flags. It compares
+the descriptor's block-device number with kernel sysfs, and uses BLKROGET and
+BLKGETSIZE64 on that descriptor to require a read-only device of the signed size.
+It repeats inventory checks after opening and closes the descriptor on failure.
+It never opens the optional data disk. The caller owns the successful handle
+and must pass that handle to the verity helper instead of reopening its pathname.
+
+Tests show that replacing the pathname after opening does not replace the held
+file, that symlinks and regular files are refused, and that failures close the
+descriptor. The positive handle tests use synthetic files and an injected
+inspection seam; real block-device ioctls and dm-verity mounting still require
+guest integration testing. This component neither mounts nor executes a root.
