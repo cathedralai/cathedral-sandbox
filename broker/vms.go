@@ -626,6 +626,12 @@ func (s *vmStore) view(r *vmRecord) map[string]any {
 	if r.LastError != "" {
 		v["last_error"] = r.LastError
 	}
+	// The create's Idempotency-Key, so the API can tell exactly which of its
+	// creates a listed VM answers (polariscomputer #2345). It is the API's own
+	// derived id, never a customer value.
+	if r.RequestID != "" {
+		v["request_id"] = r.RequestID
+	}
 	return v
 }
 
