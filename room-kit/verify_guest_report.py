@@ -46,6 +46,9 @@ def verify(answer: dict, *, report_data_hex: str, expected_measurement: str,
     vr.need(rep["version"] in (3, 4, 5), "direct guest requires report version 3, 4 or 5")
     vr.need(vr.product(rep, product) == "Turin", "direct guest contract requires Turin")
     vr.need(bool(expected_chip_id), "direct guest requires --expected-chip-id")
+    vr.need(isinstance(expected_chip_id, str) and re.fullmatch(r"[0-9a-fA-F]{128}", expected_chip_id) is not None,
+            "expected-chip-id must be 128 hex characters")
+    expected_chip_id = expected_chip_id.lower()
     # This floor is approved for exactly one tuple. Never apply it to a different
     # stepping merely because both CPUs share the Turin TCB byte layout.
     approved_cpu = cpuid_tuple(expected_cpuid)

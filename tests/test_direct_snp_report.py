@@ -142,6 +142,12 @@ def test_signed_report_passes_with_all_expected_fields(tmp_path):
     assert result["fresh_report"]["vmpl"] == 0
 
 
+@pytest.mark.parametrize("chip_pin", [trust.CHIP.upper(), trust.CHIP.replace("abcdef", "aBcDeF")])
+def test_chip_pin_hex_case_does_not_change_identity(tmp_path, chip_pin):
+    answer, cache = signed_report(tmp_path)
+    assert verify(answer, cache, expected_chip_id=chip_pin)["verdict"] == "report_verified"
+
+
 @pytest.mark.parametrize("field,value,reason", [
     ("report_data_hex", "00" * 64, "REPORT_DATA"),
     ("expected_measurement", "00" * 48, "measurement"),
@@ -183,7 +189,7 @@ def test_verifier_cli_and_missing_pin_fail_closed(tmp_path):
     command = [sys.executable, str(KIT / "verify_guest_report.py"), str(path),
                "--report-data-hex", NONCE.hex(), "--expected-measurement", fixture.snp.MEASUREMENT,
                "--expected-host-data", HOST_DATA, "--ark-sha256", trust.cache_pin(cache),
-               "--kds-cache", str(cache), "--expected-chip-id", trust.CHIP,
+               "--kds-cache", str(cache), "--expected-chip-id", trust.CHIP.upper(),
                "--expected-cpuid", trust.CPU, "--min-tcb", trust.FLOOR, "--ark-crl", str(cache / "ark.crl")]
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
