@@ -515,16 +515,29 @@ def sev_gate() -> None:
                               " `vm-gates.sh baseline --replace --expect`")
 
 
-def accept_change() -> bool:
+def accept_change() -> tuple[bool, bool]:
     """The operator accepts the verified status: clears this boot's change and arms the boot again.
-    Caller holds the SEV lock and has written the new baseline. True when it cleared a change record
-    or a disarmed boot (a boot record without its token)."""
+    Caller holds the SEV lock and has written the new baseline. Returns (cleared, removed_stale):
+    cleared is True when it cleared this boot's change record or a disarmed boot (a boot record
+    without its token); removed_stale is True when it deleted a durable copy that names an earlier
+    boot, which is housekeeping and not a change this boot saw."""
     state_dir()
     cleared = present(hp(BOOTED)) and not armed()
+    stale = False
+    me = boot_id()
     for path in (hp(CHANGED), hp(DURABLE_CHANGED)):
+        this_boot = True
+        if path == hp(DURABLE_CHANGED):
+            try:
+                this_boot = me != "unknown" and load_object(path, "sev_platform_changed").get("boot_id") == me
+            except (GateRefusal, OSError):
+                this_boot = False  # unreadable: cannot tie it to this boot
         try:
             os.unlink(path)
-            cleared = True
+            if this_boot:
+                cleared = True
+            else:
+                stale = True
         except FileNotFoundError:
             pass
         except OSError as e:
@@ -534,7 +547,7 @@ def accept_change() -> bool:
         create_once(hp(BOOTED))
     except OSError as e:
         raise GateRefusal("sev_state_unavailable", f"cannot arm this boot: {e.strerror}") from None
-    return cleared
+    return cleared, stale
 
 
 def status_digest(status: dict) -> str:
@@ -644,10 +657,11 @@ def take_baseline(replace: bool, expect: str) -> dict:
                               f"the status now (digest {now[:16]}) is not the one verified ({expect[:16]}):"
                               " read it again with `vm-gates.sh status` and verify it")
         write_atomic(path, json.dumps(status, sort_keys=True).encode() + b"\n")  # mode 0600 (mkstemp)
-        cleared = accept_change()
+        cleared, stale = accept_change()
     if cleared:
         print("vm-gates: baseline: cleared this boot's SEV change record and armed the boot again", file=sys.stderr)
-    return {"ok": True, "baseline": str(path), "digest": now, "status": status, "cleared_change": cleared}
+    return {"ok": True, "baseline": str(path), "digest": now, "status": status, "cleared_change": cleared,
+            "removed_stale_change": stale}
 
 
 def baseline_args(rest: list[str]) -> tuple[bool, str]:
