@@ -216,7 +216,10 @@ def test_report_whether_the_unwrapped_unit_fails_on_this_systemd(host):
     state = wait_inactive(UNIT)
     print(f"systemd {systemd_version()}: the unit WITHOUT the host namespace ended {state}; "
           f"a failure here is the bug this change fixes\n{log_of(UNIT)}")
-    # The control: if it fails, it fails for the reason this change removes (the hidden host journal or a read-only
-    # /run), so the test above is known to be able to fail.
+    # The control. On systemd 259 the unwrapped unit must fail, and for the reason this change removes: the hook
+    # sees an empty /srv. That is the proof the old unit breaks there, and that the passing test above can fail.
+    # On older systemd it is only reported (255 happened to fail too, in CI, for the same reason).
+    if systemd_version() >= 259:
+        assert state == "failed", f"the unwrapped unit ended {state} on systemd {systemd_version()}"
     if state == "failed":
         assert re.search(r"hidden from this hook|Read-only file system|read-only|No such file", log_of(UNIT)), log_of(UNIT)
