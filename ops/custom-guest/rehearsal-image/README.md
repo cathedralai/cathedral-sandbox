@@ -38,12 +38,12 @@ Two kernel builds gave identical bytes. Two image builds, one from each kernel b
 |---|---|
 | `vmlinuz` (reference kernel, 9605632 bytes) | `667fda47b31d66625d48250fe5b183a6c1649f864419c31050e97fe137e76b54` |
 | `kernel.config` | `c5d2c0d1b2364b4e66c6b165aa9a5e0eca8afa65a41dc796cc8c08fbd5f4605f` |
-| `initrd.cpio.zst` | `b71ee9a177911231a70aded7b4df7d21a59dac91c55fc3993bb07c67f3f7a932` |
+| `initrd.cpio.zst` | `45ad5f1053d2622269d74ff6ce83035a67eda8fdf304d140c51683a804c33daf` |
 | `root.raw` | `0be4012bce6fd4460b706171df4f522ec8985f956d02e30c0053519a4004c59e` |
 | `cmdline` (test owner key) | `420641757c8120da7993f3e837fc6c942f6ed600ae29c39010dec273f441c071` |
 
-- **Expected measurement, 4 vCPUs, EPYC-v4:** `085d987f80fc8a301bc84f4f650506b2374ea23dca696fe0cb92fc26179f17020b05bced4c1accc56bc4bb2c0fddbe43`.
-- **56 vCPUs:** `0dc7617990cc515058ce8dca015bc6648fd1e0cf41f43a5ee815b80c4e91d93592c69e9a6456efa77ffd54e8c42ea1fa`.
+- **Expected measurement, 4 vCPUs, EPYC-v4:** `1a796519af57485fb466f93399231c8099d20325e62ac6ea01beab12a8ea5068f80beac016d8f8780e9af64aab9225fa`.
+- **56 vCPUs:** `0fb99d7606c3ab4b6223b4e12d3877b47716ebcf5887e50a79eea7a290710a1c81c55d02f8fd5370fba1bb55324b33b5`.
 - The cmdline carries the rehearsal's test owner public key. A different owner key gives a different cmdline and a different measurement.
 
 ## Using it in a rehearsal
