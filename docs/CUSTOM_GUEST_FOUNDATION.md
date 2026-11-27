@@ -319,3 +319,31 @@ file, that symlinks and regular files are refused, and that failures close the
 descriptor. The positive handle tests use synthetic files and an injected
 inspection seam; real block-device ioctls and dm-verity mounting still require
 guest integration testing. This component neither mounts nor executes a root.
+
+### Verity mount integration
+
+`internal/bootstate.MountVerifiedRoot` joins the held root handle to the pinned
+static verity helper and a read-only squashfs mount at `/newroot`. It refuses
+outside root PID1, requires a fresh mapper/mount target, and offers no raw-root
+or writable fallback. Its caller must first complete all launch, report and
+resource checks, establish fresh proc/sysfs/devtmpfs and private mounts, and
+power off on any error. Root inspection and key generation still follow it.
+
+The disk header is checked for reference format 1, SHA256, 4096-byte blocks,
+the signed data length and enough hash-tree space. The helper receives explicit
+geometry and the measured root hash with `--no-superblock`, so rereading a
+changed header cannot override the validated geometry. The salt is copied from
+the header; the expected root hash binds it. Hash data starts one block after
+the superblock. `--panic-on-corruption` is mandatory. Cryptsetup 2.8.4 creates
+verity mappings read-only; the mount also requests read-only, nodev and nosuid.
+
+The helper is read and checked against its build pin before execution through
+the same open handle. Both helper and root are inherited file descriptors; no
+shell or environment settings choose an alternative program or root. Execution
+is bounded to 30 seconds. This does not execute any owner-root program.
+
+The actual reference root passes userspace verification using these explicit
+parameters, the pinned static helper and inherited descriptors; a wrong root
+hash fails. Unit tests reject changed geometry, truncated headers/trees and
+invalid helper pins. Kernel mapper creation, mounting and a complete PID1 boot
+remain unqualified until guest rehearsal. No complete initrd is published yet.
