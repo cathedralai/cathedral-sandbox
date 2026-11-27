@@ -19,7 +19,7 @@ the unit's `ExecStartPre`, so a host boot, a crash restart and a guest reboot pa
 | 15 | `sev_baseline_missing` | no SEV baseline, or it is unsafe or invalid |
 | 16 | `sev_status_unreadable` | `/dev/sev` did not answer the status commands |
 | 17 | `sev_platform_changed` | the SEV status differs from the baseline, now or earlier in this boot |
-| 18 | `sev_state_unavailable` | this boot's SEV state cannot be held or kept (lock busy, `/run/cathedral-snp` unsafe or not writable) |
+| 18 | `sev_state_unavailable` | this boot's SEV state cannot be held or kept (lock busy, `/run/cathedral-snp` unsafe or not writable), or the boot is not armed: a change was seen and its record was lost |
 | 13 | `vm_bundle_mismatch` | a bundle file is missing or differs from its manifest |
 
 The gates run in the order of the table. A refusal prints one JSON line on stdout and one line,
@@ -30,10 +30,11 @@ refuse too.
 running VM. A change refuses new starts for the rest of the boot.
 
 The SEV state of a boot is in `/run/cathedral-snp/` (tmpfs, so a reboot clears it). The first
-compare of a boot arms the boot. A change replaces the armed token with a changed marker, and a
-durable copy goes to `/var/lib/cathedral-snp/vm-sev-changed.json` when the boot id is known. A full
-disk cannot lose the change, because the token is renamed and a rename needs no free space. Only a
-host reboot or `baseline --replace` ends the refusal.
+compare of a boot arms the boot, once. A change renames the armed token to a changed marker, or
+removes it, and a durable copy goes to `/var/lib/cathedral-snp/vm-sev-changed.json` when the boot id
+is known. Neither the rename nor the removal needs free space, so a full disk cannot lose the
+change: a boot without its token refuses every start. Only a host reboot or
+`baseline --replace --expect <digest>` ends the refusal.
 
 ## Host file
 
@@ -168,16 +169,29 @@ compare the fields that `sev_status.py` compares: API version, firmware build, t
 key masks, VLEK, current and reported TCB, owner and config flags. Guest count and state are not
 compared.
 
-**First baseline.** After the host boots with a platform you have verified (TCB at or above the
-floor, D 10.4):
+A baseline is taken only for a status you have verified. `vm-gates.sh status` prints the status
+and its `digest` (sha256 of the compared fields). You pass that digest to `baseline --expect`. The
+baseline command reads the status again under the lock and refuses (17) if it is not the status
+whose digest you passed, so a change between your check and the baseline is never accepted.
 
-```sh
-sudo room-kit/vm/vm-gates.sh baseline
-sudo python3 -I ops/custom-guest/sev_status.py compare /var/lib/cathedral-snp/vm-sev-baseline.json
-```
+**First baseline.** After the host boots:
+
+1. Read the status and verify it: TCB at or above the floor (D 10.4), chip key and chip ID masks and
+   VLEK as you expect.
+
+   ```sh
+   sudo room-kit/vm/vm-gates.sh status
+   ```
+
+2. Record it with the digest from step 1, then check it:
+
+   ```sh
+   sudo room-kit/vm/vm-gates.sh baseline --expect <digest>
+   sudo python3 -I ops/custom-guest/sev_status.py compare /var/lib/cathedral-snp/vm-sev-baseline.json
+   ```
 
 `baseline` does not replace a baseline unless you pass `--replace`. A baseline, new or replaced, is
-your explicit accept of the current status: it also clears a change that this boot saw, and it arms
+your explicit accept of the verified status: it also clears a change that this boot saw, and it arms
 the boot again.
 
 **`sev_platform_changed`.** A platform command reached the chip through a writable `/dev/sev`, or
@@ -192,19 +206,23 @@ the firmware changed.
    - `"sev": "equal"`: start the refused VMs (section 2, step 6).
    - exit 17: the change is persistent, for example a firmware or microcode update. Go to step 4.
      The enforce tick may also report it before you do.
-4. Read the status with `sudo python3 -I ops/custom-guest/sev_status.py read`. Verify the new TCB
-   against the floor (D 10.4). Make sure the chip key and chip ID masks and VLEK are as you expect.
-   Then accept the new status:
+4. Read the status with `sudo room-kit/vm/vm-gates.sh status`. It also lists the differences from
+   the baseline. Verify the new TCB against the floor (D 10.4). Make sure the chip key and chip ID
+   masks and VLEK are as you expect. Then accept that status with its digest:
 
    ```sh
-   sudo room-kit/vm/vm-gates.sh baseline --replace
+   sudo room-kit/vm/vm-gates.sh baseline --replace --expect <digest from status>
    sudo room-kit/vm/vm-gates.sh enforce        # must answer "sev": "equal"
    ```
 
+   If `baseline` refuses with 17, the status changed after you read it. Go back to step 2.
    Start the refused VMs (section 2, step 6).
 
-Do not take `baseline --replace` to skip the reboot after a change in the middle of a boot. The
-replace accepts whatever status the chip reports now.
+Do not take `baseline --replace` to skip the reboot after a change in the middle of a boot. Reboot,
+then verify.
+
+**Exit 18 "not armed".** A change was seen in this boot and its record could not be written. Treat
+it like `sev_platform_changed`: follow steps 2 to 4.
 
 **Planned firmware or microcode update.** Do it in a window like section 2. After the reboot, do
 steps 3 and 4.

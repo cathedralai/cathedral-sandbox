@@ -3,7 +3,9 @@
 
   vm-gates.sh check <name>          every gate for VM <name>: exit 0, or the refusing gate's code
   vm-gates.sh enforce               the enforce tick: SEV status against the baseline
-  vm-gates.sh baseline [--replace]  record the SEV baseline (operator, on a verified host)
+  vm-gates.sh status                print the SEV status and its digest (read only), to verify
+  vm-gates.sh baseline --expect <digest> [--replace]
+                                    record the verified status as the baseline (operator)
   vm-gates.sh host-build            print this host's build (read only), for the verified list
 
 Every command prints one JSON line on stdout. A refusal also prints one line,
@@ -23,7 +25,8 @@ in this order and the first refusal ends the check (exit code, error):
   16 sev_status_unreadable  /dev/sev did not answer the status commands
   17 sev_platform_changed   the SEV status differs from the baseline now, or did earlier in this boot
   18 sev_state_unavailable  this boot's SEV state cannot be held or kept (lock busy, /run unsafe or
-                            not writable), so a change could not be remembered
+                            not writable), or the boot is not armed: a change was seen and its
+                            record was lost, so only a reboot or an accept ends it
   13 vm_bundle_mismatch     manifest.json is not the bundle id, or a bundle file is missing or differs
                             from the size or sha256 the manifest names (read last: it is the slow one)
    1 internal error, 2 usage. Every failure refuses: no gate has a fallback.
@@ -34,14 +37,15 @@ every customer on the host would be the bigger harm. Exit 0 when equal, or "off"
 absent; else 15 to 18 as above.
 
 SEV state per boot (in /run, a tmpfs, so a reboot clears it). The first compare of a boot creates the
-armed token. A change renames the token to the changed marker; a rename needs no free space, so a full
-disk cannot lose the change. The detail is then written over the marker and, when the boot id is
-known, to a durable copy in /var/lib. A start passes only while the token exists, no marker and no
-durable copy for this boot exists, and the status equals the baseline. So a status that flips back
-still refuses, until a host reboot with a status equal to the baseline (the D 5.9 recovery) or the
-operator's explicit accept, `baseline --replace`, which records the current status, clears this
-boot's change and arms the boot again. Baseline reads, compares, state writes and the replace all run
-under one flock, so a replace cannot interleave with a compare.
+armed token and the boot record; a boot is armed once. A change renames the token to the changed
+marker, or else unlinks it; neither needs free space, so a full disk cannot lose the change. The
+detail is then written over the marker and, when the boot id is known, to a durable copy in /var/lib.
+A start passes only while the token exists, no marker and no durable copy for this boot exists, and
+the status equals the baseline; a boot record without a token refuses (18). So a status that flips
+back still refuses, until a host reboot with a status equal to the baseline (the D 5.9 recovery) or
+the operator's explicit accept, `baseline --replace --expect <digest>`. That records the status only if
+its digest is the one the operator verified (`status`), clears this boot's change and arms the boot
+again. Baseline reads, compares, state writes and the replace all run under one flock.
 
 Files (VM_GATES_ROOT prefixes the host paths, for tests; VM_ROOT as vm_ctl.py):
   /etc/cathedral/snp-vm-host.json              host file: `bundles` (read by the launcher too),
@@ -49,6 +53,7 @@ Files (VM_GATES_ROOT prefixes the host paths, for tests; VM_ROOT as vm_ctl.py):
   /var/lib/cathedral-snp/vm-sev-baseline.json  `sev_status.py read` output; `sev_status.py compare`
                                                reads the same file
   /run/cathedral-snp/vm-sev-armed              the armed token of this boot
+  /run/cathedral-snp/vm-sev-boot               the boot record: this boot was armed once
   /run/cathedral-snp/vm-sev-changed.json       the changed marker: boot_id, time and differences
   /var/lib/cathedral-snp/vm-sev-changed.json   its durable copy, written only with a known boot id
   /run/lock/cathedral-vm-sev.lock              the SEV state lock
@@ -84,6 +89,7 @@ HOST_FILE = "etc/cathedral/snp-vm-host.json"
 BASELINE = "var/lib/cathedral-snp/vm-sev-baseline.json"
 SEV_STATE = "run/cathedral-snp"
 ARMED = SEV_STATE + "/vm-sev-armed"
+BOOTED = SEV_STATE + "/vm-sev-boot"
 CHANGED = SEV_STATE + "/vm-sev-changed.json"
 DURABLE_CHANGED = "var/lib/cathedral-snp/vm-sev-changed.json"
 SEV_LOCK = "run/lock/cathedral-vm-sev.lock"
@@ -408,6 +414,10 @@ def seen_change() -> str | None:
     return None
 
 
+def present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
 def armed() -> bool:
     try:
         return stat.S_ISREG(os.lstat(hp(ARMED)).st_mode)
@@ -415,45 +425,67 @@ def armed() -> bool:
         return False
 
 
-def arm() -> None:
-    """Create this boot's armed token if it is missing. Only the first compare of a boot and the
-    operator's accept call this; a change renames the token away, so the next compare finds a marker."""
-    state_dir()
+def create_once(path: Path) -> None:
+    """Create a root-only record if it is missing. Its existence is what counts, not its bytes."""
     try:
-        fd = os.open(hp(ARMED), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except FileExistsError:
         return
-    except OSError as e:
-        raise GateRefusal("sev_state_unavailable", f"cannot arm this boot: {e.strerror}") from None
     try:
         os.write(fd, json.dumps({"boot_id": boot_id(), "at": now_iso()}).encode() + b"\n")
     except OSError:
-        pass  # the token's existence is what counts
+        pass
     finally:
         os.close(fd)
 
 
+def arm_boot() -> None:
+    """The first compare of a boot: the armed token, then the boot record. A boot is armed once.
+    After that only the operator's accept re-arms it, so a token that a change took away never
+    comes back by itself, and a missing token with a boot record refuses (18)."""
+    state_dir()
+    try:
+        create_once(hp(ARMED))
+        create_once(hp(BOOTED))
+    except OSError as e:
+        raise GateRefusal("sev_state_unavailable", f"cannot arm this boot: {e.strerror}") from None
+
+
 def revoke(diff: list[str]) -> str:
-    """Keep the change for the rest of this boot. The rename needs no free space, so a full disk
-    or a full /run cannot lose it; the detail and the durable copy are written after it."""
+    """Keep the change for the rest of this boot. The token is renamed to the marker, or else
+    unlinked; neither needs free space, so a full disk or a full /run cannot lose the change. Then
+    the boot record (so a missing token refuses), the detail and the durable copy."""
     record = json.dumps({"boot_id": boot_id(), "at": now_iso(), "diff": diff}, sort_keys=True).encode() + b"\n"
-    kept, notes = False, []
+    notes = []
     try:
         os.rename(hp(ARMED), hp(CHANGED))
-        kept = True
+    except FileNotFoundError:
+        pass  # this boot was not armed: its first compare could not arm it
     except OSError as e:
         notes.append(f"rename: {e.strerror}")
+        try:
+            os.unlink(hp(ARMED))
+        except FileNotFoundError:
+            pass
+        except OSError as e2:
+            notes.append(f"unlink: {e2.strerror}")
+    try:
+        state_dir()
+        create_once(hp(BOOTED))  # an empty file: it needs an inode, no data blocks
+    except OSError as e:
+        notes.append(f"boot record: {e.strerror}")
+    except GateRefusal as e:
+        notes.append(f"boot record: {e.detail}")
     try:
         write_atomic(hp(CHANGED), record)
-        kept = True
     except OSError as e:
         notes.append(f"marker: {e.strerror}")
     if boot_id() != "unknown":  # never a durable record that no later boot can tell apart
         try:
             write_atomic(hp(DURABLE_CHANGED), record)
-            kept = True
         except OSError as e:
             notes.append(f"durable copy: {e.strerror}")
+    kept = seen_change() is not None or (not armed() and present(hp(BOOTED)))
     return "" if kept else f" (not kept for this boot: {'; '.join(notes)})"
 
 
@@ -464,11 +496,11 @@ def sev_gate() -> None:
         if seen:
             raise GateRefusal("sev_platform_changed",
                               f"changed earlier in this boot {seen}; new starts stay refused until a host"
-                              " reboot with a baseline match, or `vm-gates.sh baseline --replace`")
+                              " reboot with a baseline match, or `vm-gates.sh baseline --replace --expect`")
         arm_error = None
-        if not armed():
+        if not present(hp(BOOTED)):
             try:
-                arm()
+                arm_boot()
             except GateRefusal as e:
                 arm_error = e  # still compare: a change must be seen and alerted
         diff = sev_tool().differences(base, read_sev())
@@ -477,12 +509,15 @@ def sev_gate() -> None:
         if arm_error:
             raise arm_error
         if not armed():
-            raise GateRefusal("sev_state_unavailable", f"{hp(ARMED)} is not a regular file")
+            raise GateRefusal("sev_state_unavailable",
+                              "this boot is not armed: a SEV change was seen and its record was lost, or"
+                              " the token was removed; reboot the host, or accept the status with"
+                              " `vm-gates.sh baseline --replace --expect`")
 
 
 def accept_change() -> None:
-    """`baseline --replace`: the operator accepts the current status. Clears this boot's change and
-    arms the boot again. Caller holds the SEV lock and has written the new baseline."""
+    """The operator accepts the verified status: clears this boot's change and arms the boot again.
+    Caller holds the SEV lock and has written the new baseline."""
     state_dir()
     for path in (hp(CHANGED), hp(DURABLE_CHANGED)):
         try:
@@ -491,7 +526,19 @@ def accept_change() -> None:
             pass
         except OSError as e:
             raise GateRefusal("sev_state_unavailable", f"cannot clear {path}: {e.strerror}") from None
-    arm()
+    try:
+        create_once(hp(ARMED))
+        create_once(hp(BOOTED))
+    except OSError as e:
+        raise GateRefusal("sev_state_unavailable", f"cannot arm this boot: {e.strerror}") from None
+
+
+def status_digest(status: dict) -> str:
+    """sha256 of the compared fields only (canonical JSON). Guest count and state move as guests start
+    and stop, so the digest an operator verified stays the same while VMs run."""
+    picked = {part: {f: (status.get(part) or {}).get(f) for f in fields}
+              for part, fields in sev_tool().COMPARED.items()}
+    return hashlib.sha256(json.dumps(picked, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 # ---- gate: bundle digests ------------------------------------------------------------------
@@ -564,17 +611,51 @@ def enforce() -> dict:
     return {"ok": True, "sev": "equal"}
 
 
-def take_baseline(replace: bool) -> dict:
-    """Operator: record the SEV status of a verified host as its baseline (D 5.9 `baselined`). This is
-    the explicit accept: it also clears a change this boot saw and arms the boot again."""
+def show_status() -> dict:
+    """Operator, read only: the status to verify before a baseline, and the digest to pass as --expect."""
+    status = read_sev()
+    doc = {"ok": True, "status": status, "digest": status_digest(status)}
+    try:
+        base = sev_baseline()
+        doc["baseline_digest"] = status_digest(base)
+        doc["differences"] = sev_tool().differences(base, status)
+    except GateRefusal as e:
+        doc["baseline"] = e.error
+    return doc
+
+
+def take_baseline(replace: bool, expect: str) -> dict:
+    """Operator: record the verified SEV status as the baseline (D 5.9 `baselined`). This is the explicit
+    accept: it also clears a change this boot saw and arms the boot again. It accepts only the status
+    the operator verified: `expect` is the digest `vm-gates.sh status` printed for it, and the status is
+    read again under the lock, so a change in between is refused, never accepted."""
     path = hp(BASELINE)
     with sev_lock():
-        if (path.exists() or path.is_symlink()) and not replace:
+        if present(path) and not replace:
             raise UsageError("baseline_exists", f"{path} exists; pass --replace after verifying the platform")
         status = read_sev()
+        now = status_digest(status)
+        if now != expect:
+            raise GateRefusal("sev_platform_changed",
+                              f"the status now (digest {now[:16]}) is not the one verified ({expect[:16]}):"
+                              " read it again with `vm-gates.sh status` and verify it")
         write_atomic(path, json.dumps(status, sort_keys=True).encode() + b"\n")  # mode 0600 (mkstemp)
         accept_change()
-    return {"ok": True, "baseline": str(path), "status": status}
+    return {"ok": True, "baseline": str(path), "digest": now, "status": status}
+
+
+def baseline_args(rest: list[str]) -> tuple[bool, str]:
+    replace, expect, i = False, None, 0
+    while i < len(rest):
+        if rest[i] == "--replace" and not replace:
+            replace, i = True, i + 1
+        elif rest[i] == "--expect" and expect is None and i + 1 < len(rest) and HEX64_RE.fullmatch(rest[i + 1]):
+            expect, i = rest[i + 1], i + 2
+        else:
+            raise UsageError("usage", USAGE)
+    if expect is None:
+        raise UsageError("usage", "baseline needs --expect <digest>, from `vm-gates.sh status` for the status you verified")
+    return replace, expect
 
 
 def host_build_info() -> dict:
@@ -588,7 +669,7 @@ def host_build_info() -> dict:
     return {"qemu_sha256": sha, "qemu_version": m.group(1), "kernel_release": kernel_release()}
 
 
-USAGE = "usage: vm-gates.sh check <name> | enforce | baseline [--replace] | host-build"
+USAGE = "usage: vm-gates.sh check <name> | enforce | status | baseline --expect <digest> [--replace] | host-build"
 
 
 def main(argv: list[str]) -> int:
@@ -597,8 +678,10 @@ def main(argv: list[str]) -> int:
             doc = check(argv[1])
         elif argv == ["enforce"]:
             doc = enforce()
-        elif argv in (["baseline"], ["baseline", "--replace"]):
-            doc = take_baseline(replace=len(argv) == 2)
+        elif argv == ["status"]:
+            doc = show_status()
+        elif argv[:1] == ["baseline"]:
+            doc = take_baseline(*baseline_args(argv[1:]))
         elif argv == ["host-build"]:
             doc = host_build_info()
         else:

@@ -90,6 +90,9 @@ class Host:
         shutil.rmtree(self.root / "run", ignore_errors=True)
         self.boot(boot_id)
 
+    def digest(self) -> str:
+        return gates.status_digest(self.sev)
+
     def lock_held(self) -> bool:
         fd = os.open(self.root / gates.SEV_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -459,14 +462,67 @@ def test_change_kept_when_the_rename_fails(host, capsys, monkeypatch):
     refused(host, capsys, "sev_platform_changed")  # the marker was written instead
 
 
-def test_a_change_nothing_could_keep_says_so(host, capsys, monkeypatch):
-    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+def test_failed_record_disarms_the_boot(host, capsys, monkeypatch):
+    """Astra r2 P1: the rename and every write fail, then the status flips back: no start passes."""
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0  # armed: token and boot record
     def fail(*a, **k):
         raise OSError(errno.EIO, os.strerror(errno.EIO))
     monkeypatch.setattr(gates.os, "rename", fail)
     monkeypatch.setattr(gates, "write_atomic", fail)
     host.sev = drifted("sev", "build")
+    detail = refused(host, capsys, "sev_platform_changed", "enforce")
+    assert "not kept" not in detail and not host.armed.exists() and not host.marker.exists()
+    assert not host.durable.exists()
+    host.sev = copy.deepcopy(STATUS)
+    assert "not armed" in refused(host, capsys, "sev_state_unavailable")
+    refused(host, capsys, "sev_state_unavailable", "enforce")
+    monkeypatch.undo()
+    monkeypatch.setenv("VM_GATES_ROOT", str(host.root))
+    monkeypatch.setenv("VM_ROOT", str(host.vms))
+    monkeypatch.setattr(gates, "read_sev", lambda: copy.deepcopy(host.sev))
+    host.reboot("boot-2")  # a reboot clears it
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+
+
+def test_change_in_a_boot_that_could_not_arm_is_kept(host, capsys, monkeypatch):
+    """The first compare of a boot cannot arm (ENOSPC) and sees a change it cannot write down: the
+    boot record alone (an empty file) makes every later start refuse."""
+    def full(*a, **k):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+    def no_arm():
+        raise gates.GateRefusal("sev_state_unavailable", "cannot arm this boot: No space left on device")
+    real_arm, real_write = gates.arm_boot, gates.write_atomic
+    monkeypatch.setattr(gates, "arm_boot", no_arm)
+    monkeypatch.setattr(gates, "write_atomic", full)
+    host.sev = drifted("snp", "vlek_en")
+    assert "not kept" not in refused(host, capsys, "sev_platform_changed", "enforce")
+    monkeypatch.setattr(gates, "arm_boot", real_arm)  # space is back, the status flips back
+    monkeypatch.setattr(gates, "write_atomic", real_write)
+    host.sev = copy.deepcopy(STATUS)
+    refused(host, capsys, "sev_state_unavailable")
+
+
+def test_a_change_nothing_could_keep_says_so(host, capsys, monkeypatch):
+    """The residual: rename, unlink and every write fail. The reason says so."""
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    def fail(*a, **k):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+    monkeypatch.setattr(gates.os, "rename", fail)
+    monkeypatch.setattr(gates.os, "unlink", fail)
+    monkeypatch.setattr(gates, "write_atomic", fail)
+    host.sev = drifted("sev", "build")
     assert "not kept for this boot" in refused(host, capsys, "sev_platform_changed", "enforce")
+
+
+def test_removed_token_refuses_until_reboot_or_accept(host, capsys):
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    host.armed.unlink()
+    assert "not armed" in refused(host, capsys, "sev_state_unavailable")
+    assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 0
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+    host.armed.unlink()
+    host.reboot("boot-2")
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
 
 
 def test_unknown_boot_id_never_writes_a_durable_change(host, capsys):
@@ -479,7 +535,7 @@ def test_unknown_boot_id_never_writes_a_durable_change(host, capsys):
     refused(host, capsys, "sev_platform_changed")
     host.reboot("boot-2")
     assert host.run("check", "vm1", capsys=capsys)[0] == 0
-    assert host.run("baseline", "--replace", capsys=capsys)[0] == 0
+    assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 0
 
 
 def test_durable_change_counts_only_for_its_own_boot(host, capsys):
@@ -510,6 +566,8 @@ def test_state_dir_unsafe_or_unwritable(host, capsys):
     refused(host, capsys, "sev_state_unavailable")
     host.sev = drifted("snp", "build_id")  # an arm failure still compares and reports the change
     refused(host, capsys, "sev_platform_changed")
+    host.sev = copy.deepcopy(STATUS)  # kept by the durable copy, though /run is unusable
+    assert "snp.build_id" in refused(host, capsys, "sev_platform_changed")
 
 
 def test_compare_and_baseline_run_under_the_sev_lock(host, capsys, monkeypatch):
@@ -523,7 +581,7 @@ def test_compare_and_baseline_run_under_the_sev_lock(host, capsys, monkeypatch):
     assert host.run("check", "vm1", capsys=capsys)[0] == 0
     host.sev = drifted("snp", "build_id")
     refused(host, capsys, "sev_platform_changed", "enforce")
-    assert host.run("baseline", "--replace", capsys=capsys)[0] == 0
+    assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 0
     assert {k for k, _ in seen} == {"baseline", "read", "write"} and all(held for _, held in seen), seen
     assert not host.lock_held()
 
@@ -535,7 +593,7 @@ def test_sev_lock_busy_refuses(host, capsys, monkeypatch):
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         assert "is held" in refused(host, capsys, "sev_state_unavailable")
-        assert host.run("baseline", "--replace", capsys=capsys)[0] == 18
+        assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 18
     finally:
         os.close(fd)
 
@@ -610,7 +668,7 @@ def test_gate_order_first_refusal_wins(host, capsys):
 def test_baseline_records_sev_status_read_output(host, capsys):
     host.baseline.unlink()
     host.sev["snp"]["guest_count"] = 3
-    code, doc, _ = host.run("baseline", capsys=capsys)
+    code, doc, _ = host.run("baseline", "--expect", host.digest(), capsys=capsys)
     assert code == 0 and doc["baseline"] == str(host.baseline)
     stored = json.loads(host.baseline.read_text())
     assert stored == host.sev and sev.differences(stored, STATUS) == []
@@ -621,9 +679,9 @@ def test_baseline_records_sev_status_read_output(host, capsys):
 def test_baseline_never_overwritten_without_replace(host, capsys):
     before = host.baseline.read_bytes()
     host.sev = drifted("snp", "build_id")
-    code, doc, _ = host.run("baseline", capsys=capsys)
+    code, doc, _ = host.run("baseline", "--expect", host.digest(), capsys=capsys)
     assert (code, doc["error"], host.baseline.read_bytes()) == (2, "baseline_exists", before)
-    assert host.run("baseline", "--replace", capsys=capsys)[0] == 0
+    assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 0
     assert json.loads(host.baseline.read_text()) == host.sev
 
 
@@ -634,7 +692,7 @@ def test_documented_recovery_for_a_persistent_change(host, capsys):
     host.reboot("boot-2")
     refused(host, capsys, "sev_platform_changed", "enforce")
     refused(host, capsys, "sev_platform_changed")
-    code, doc, _ = host.run("baseline", "--replace", capsys=capsys)
+    code, doc, _ = host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)
     assert code == 0 and json.loads(host.baseline.read_text()) == host.sev
     assert not host.marker.exists() and not host.durable.exists() and host.armed.is_file()
     assert host.run("enforce", capsys=capsys)[:2] == (0, {"ok": True, "sev": "equal"})
@@ -648,8 +706,56 @@ def test_replace_is_the_explicit_accept_in_the_same_boot(host, capsys):
     refused(host, capsys, "sev_platform_changed", "enforce")
     host.sev = copy.deepcopy(STATUS)
     refused(host, capsys, "sev_platform_changed")
-    assert host.run("baseline", "--replace", capsys=capsys)[0] == 0
+    assert host.run("baseline", "--replace", "--expect", host.digest(), capsys=capsys)[0] == 0
     assert host.run("check", "vm1", capsys=capsys)[0] == 0
+
+
+def test_replace_accepts_only_the_verified_status(host, capsys):
+    """Astra r2 P1: the operator verifies status B, another /dev/sev writer makes it C: C is refused."""
+    host.sev = drifted("snp", "current_tcb")  # B: a firmware update, verified by the operator
+    code, shown, _ = host.run("status", capsys=capsys)
+    assert code == 0 and shown["status"] == host.sev and shown["differences"] == ["snp.current_tcb: "
+        + f"{STATUS['snp']['current_tcb']} -> {host.sev['snp']['current_tcb']}"]
+    verified = shown["digest"]
+    host.sev["snp"]["mask_chip_key"] = 1  # C: changed after the operator read B
+    refused(host, capsys, "sev_platform_changed", "enforce")
+    before = host.baseline.read_bytes()
+    detail = refused(host, capsys, "sev_platform_changed", "baseline", "--replace", "--expect", verified)
+    assert "not the one verified" in detail and host.baseline.read_bytes() == before
+    refused(host, capsys, "sev_platform_changed")  # C is still refused
+    code, shown, _ = host.run("status", capsys=capsys)
+    assert host.run("baseline", "--replace", "--expect", shown["digest"], capsys=capsys)[0] == 0
+    assert host.run("check", "vm1", capsys=capsys)[0] == 0
+
+
+def test_first_baseline_also_needs_the_verified_digest(host, capsys):
+    host.baseline.unlink()
+    verified = host.digest()
+    host.sev = drifted("snp", "vlek_en")
+    refused(host, capsys, "sev_platform_changed", "baseline", "--expect", verified)
+    assert not host.baseline.exists()
+
+
+@pytest.mark.parametrize("argv", [("baseline",), ("baseline", "--replace"), ("baseline", "--expect"),
+                                  ("baseline", "--expect", "AB" * 32), ("baseline", "--expect", "ab"),
+                                  ("baseline", "--replace", "--replace", "--expect", "ab" * 32),
+                                  ("baseline", "--expect", "ab" * 32, "--expect", "ab" * 32)])
+def test_baseline_needs_one_expect_digest(host, capsys, argv):
+    before = host.baseline.read_bytes()
+    code, doc, _ = host.run(*argv, capsys=capsys)
+    assert (code, doc["error"], host.baseline.read_bytes()) == (2, "usage", before)
+
+
+def test_status_is_read_only_and_its_digest_ignores_guest_count(host, capsys):
+    code, doc, _ = host.run("status", capsys=capsys)
+    assert code == 0 and doc["digest"] == doc["baseline_digest"] == gates.status_digest(STATUS)
+    assert doc["differences"] == []
+    host.sev["snp"]["guest_count"] = 9
+    host.sev["sev"]["state"] = 0
+    assert host.run("status", capsys=capsys)[1]["digest"] == doc["digest"]
+    assert not (host.root / gates.SEV_STATE).exists()  # it neither arms nor records
+    host.baseline.unlink()
+    assert host.run("status", capsys=capsys)[1]["baseline"] == "sev_baseline_missing"
 
 
 if __name__ == "__main__":
