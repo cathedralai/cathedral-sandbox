@@ -62,6 +62,12 @@ jobs:
           go test -c -o "$RUNNER_TEMP/vmdisk.test" ./internal/vmdisk
           go test -c -tags vmcuttest -o "$RUNNER_TEMP/vmdisk-cut.test" ./internal/vmdisk
 
+      - name: VM init packages as a user (fake chip, fake platform, untagged-build hook check)
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: go test -count=1 ./cmd/cathedral-vm-init ./internal/vmidentity ./internal/vmkey ./internal/vmdisk
+
       - name: T3 init states (root, loop devices)
         working-directory: room-kit/custom-guest/internal/vmdisk
         run: |
