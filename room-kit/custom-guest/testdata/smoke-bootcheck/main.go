@@ -1,8 +1,9 @@
 // cathedral-rehearsal-bootcheck: the boot gate of the REHEARSAL-ONLY test initrd (AB#1008).
 // It is not the reference init of spec-r9 5.6 and is never offered to customers.
 //
-// build.sh compiles it inside a copy of this repository's room-kit/custom-guest as
-// cmd/cathedral-rehearsal-bootcheck, so it reuses #776's bootstrap.Validate unchanged.
+// It lives in testdata so that ./... (go vet, go test -race in CI) skips it, while it
+// still imports #776's internal bootstrap.Validate unchanged. ops/custom-guest/rehearsal-image/build.sh
+// builds it by its explicit path as the binary cathedral-rehearsal-bootcheck.
 //
 // Steps (spec-r9 8.7 items 1, 2 and 4; item 3, HOST_DATA, is done next by
 // `cathedral-attest --boot-host-data`, #776's own native report check):

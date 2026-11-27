@@ -6,7 +6,7 @@
 
 - **Kernel:** the #776 reference kernel, built with `scripts/build_custom_guest_kernel.sh` from the pinned `linux-source-7.0.0_7.0.0-44.44_all.deb`. It has IKCONFIG, every needed driver built in, and no module support, so the intake validator (`custom_guest_stage.py`, spec-r9 5.5) accepts it. A distribution kernel that loads `sev-guest`, `tsm_report` or `dm-verity` as modules is refused with `custom_guest_kernel_config_refused`.
 - **Initrd:** a busybox `/init` (`init.sh`) that never does `switch_root`. It loads no module. In order:
-  1. `cathedral-rehearsal-bootcheck` (`bootcheck.go`, built against #776's `bootstrap.Validate` without changes) checks the three fw_cfg documents, the owner signature, the cmdline owner and the guest-observed CPUs, memory, disks and NIC.
+  1. `cathedral-rehearsal-bootcheck` (`room-kit/custom-guest/testdata/smoke-bootcheck`, outside `./...`, built against #776's `bootstrap.Validate` without changes) checks the three fw_cfg documents, the owner signature, the cmdline owner and the guest-observed CPUs, memory, disks and NIC.
   2. `cathedral-attest --boot-host-data` (#776) checks HOST_DATA in a native report.
   3. It brings up the network from the signed bootstrap.
   4. It runs OpenSSH sshd from RAM with a host key made at boot.

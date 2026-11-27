@@ -14,7 +14,7 @@
 # Env: CG_WORK (work dir, kept), CG_OWNER_PUB (32 raw bytes, the owner's Ed25519 public key; required),
 #      CG_VCPUS (default 4), CG_KIT_DIR (optional measurement positive control: a dir with a kit's
 #      OVMF.amdsev.fd, vmlinuz, initrd.cpio.zst and cmdline) and CG_KIT_MEASUREMENT (its live value).
-# Runs on any Docker host; the Go helpers come from this checkout (git archive HEAD).
+# Runs on any Docker host; the Go helpers come from this checkout's committed HEAD (git archive).
 set -euo pipefail
 KDIR=$(cd "${1:?KERNEL_DIR}" && pwd)
 OVMF=$(cd "$(dirname "${2:?OVMF}")" && pwd)/$(basename "$2")
@@ -49,19 +49,17 @@ rm -rf "$WORK" && mkdir -p "$WORK/src" "$WORK/in" "$WORK/out"
 log "work $WORK, source $(git -C "$REPO" rev-parse --short HEAD)"
 
 # ---------------------------------------------------------------- 1. Go helpers (this checkout's #776 source)
+# The bootcheck main is room-kit/custom-guest/testdata/smoke-bootcheck: outside ./..., built by path.
 git -C "$REPO" archive HEAD room-kit/custom-guest tests/fixtures/custom_guest_v1.json | tar -x -C "$WORK/src"
-mkdir -p "$WORK/src/room-kit/custom-guest/cmd/cathedral-rehearsal-bootcheck"
-cp "$HERE/bootcheck.go" "$WORK/src/room-kit/custom-guest/cmd/cathedral-rehearsal-bootcheck/main.go"
 log "go: test bootstrap, build cathedral-attest and cathedral-rehearsal-bootcheck"
 docker run --rm -v "$WORK/src:/src" -w /src/room-kit/custom-guest "$GO_IMAGE" sh -euc '
   export GOTOOLCHAIN=local GOENV=off GOWORK=off GOFLAGS= GOPROXY=off GOSUMDB=off CGO_ENABLED=0
   go version
   go test ./internal/bootstrap/
-  GOOS=linux GOARCH=amd64 go vet ./cmd/cathedral-rehearsal-bootcheck/ ./cmd/cathedral-attest/
-  for cmd in cathedral-attest cathedral-rehearsal-bootcheck; do
-    GOOS=linux GOARCH=amd64 GOAMD64=v1 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" \
-      -o /src/out/$cmd ./cmd/$cmd
-  done
+  GOOS=linux GOARCH=amd64 go vet ./testdata/smoke-bootcheck/ ./cmd/cathedral-attest/
+  b() { GOOS=linux GOARCH=amd64 GOAMD64=v1 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o "/src/out/$1" "$2"; }
+  b cathedral-attest ./cmd/cathedral-attest
+  b cathedral-rehearsal-bootcheck ./testdata/smoke-bootcheck
   GOOS=linux GOARCH=amd64 go test -c -o /src/test/snp.test ./internal/snp/
   GOOS=linux GOARCH=amd64 go test -c -o /src/test/attest.test ./cmd/cathedral-attest/'
 # The Go toolchain crashes under amd64 emulation on an arm64 Mac, so the test binaries
