@@ -86,7 +86,15 @@ def can_write(path):
             return True
     except OSError:
         return False
-seen = sorted(os.listdir("/srv")) if os.path.isdir("/srv") else None
+seen = []
+for root, dirs, files in os.walk("/srv"):
+    rel = os.path.relpath(root, "/srv")
+    if rel != ".":
+        seen.append(rel)
+    seen.extend(os.path.join(rel, f) for f in files if rel != ".")
+    if rel.count(os.sep) >= 3:
+        dirs[:] = []
+seen.sort()
 with open(os.path.join(d, "run", "stub-ran"), "w") as f:
     f.write("ran\n")
 with open(os.path.join(d, "run", "guest-view.json"), "w") as f:
@@ -176,10 +184,13 @@ def test_the_generated_unit_starts_runs_its_hooks_on_the_host_and_hides_srv_from
     # 3. exited (ExecStopPost +) appended to the real journal after the stub ended.
     assert events[-1] == "exit", f"exited did not write the journal: {events}\n{detail}"
     assert state == "inactive", f"{state}\n{detail}"
-    # 4. The guest process still sees only its own folders: an empty /srv apart from nothing, no host journal,
-    #    images read-only, disks writable, and it is the unprivileged user.
+    # 4. The guest process still sees only its own folders, no host journal, images read-only, disks writable,
+    #    and it is the unprivileged user.
     view = json.loads((d / "run" / "guest-view.json").read_text())
-    assert view["srv"] == [], view
+    # Only the launch's own three folders, as the unit's binds make them: no other hotel, no other launch, no files.
+    own = f"custom-guest/{HOTEL}/{LAUNCH}"
+    assert view["srv"] == sorted(["custom-guest", f"custom-guest/{HOTEL}", own, f"{own}/images", f"{own}/disks", f"{own}/run"]
+                                 + [f"{own}/images/bootstrap.json"]), view
     assert view["journal_visible"] is False, view
     assert view["images_writable"] is False and view["disks_writable"] is True, view
     assert view["user"] != 0, view
@@ -204,4 +215,8 @@ def test_report_whether_the_unwrapped_unit_fails_on_this_systemd(host):
     sh("systemctl", "start", UNIT, check=False)
     state = wait_inactive(UNIT)
     print(f"systemd {systemd_version()}: the unit WITHOUT the host namespace ended {state}; "
-          f"a failure here is the bug this change fixes")
+          f"a failure here is the bug this change fixes\n{log_of(UNIT)}")
+    # The control: if it fails, it fails for the reason this change removes (the hidden host journal or a read-only
+    # /run), so the test above is known to be able to fail.
+    if state == "failed":
+        assert re.search(r"hidden from this hook|Read-only file system|read-only|No such file", log_of(UNIT)), log_of(UNIT)

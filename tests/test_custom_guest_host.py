@@ -205,6 +205,45 @@ def test_check_start_needs_a_fresh_boot_intent_as_latest_entry(host):
     assert host.phase("check-start")[1]["error_code"] == "custom_guest_boot_failed"
 
 
+def test_check_start_finds_its_intent_past_timer_entries(host):
+    """The held timer runs every minute and logs its own entries. One between the boot intent and the start
+    must not hide the intent (the most recent boot entry decides), and the token is still spent once."""
+    held(host)
+    mod = load_host_module(host.env)
+    ctx = mod.Ctx("boot", HOTEL, LAUNCH, {}, {})
+    ctx.log("boot", state="intent", generation=1, token="t1")
+    ctx.log("kit_data_changed", diff=[], context="tick")  # a timer entry after the intent
+    other = mod.Ctx("tick", HOTEL, "cg-aaaaaaaaaaaa", {}, {})
+    other.log("tick_ok")  # another launch's entry too
+    assert host.phase("check-start")[0] == 0
+    assert host.phase("check-start")[1]["error_code"] == "custom_guest_boot_failed", "the token is spent"
+
+
+def test_check_start_refuses_a_stale_or_used_or_foreign_intent(host):
+    held(host)
+    mod = load_host_module(host.env)
+    ctx = mod.Ctx("boot", HOTEL, LAUNCH, {}, {})
+    # An intent written in an earlier host boot is stale, even as the latest boot entry.
+    old = ctx.log("boot", state="intent", generation=1, token="t1")
+    lines = __import__("pathlib").Path(ctx.journal).read_text().splitlines()
+    doc = json.loads(lines[-1])
+    doc["boot_id"] = "an-earlier-boot"
+    __import__("pathlib").Path(ctx.journal).write_text("\n".join(lines[:-1] + [json.dumps(doc)]) + "\n")
+    assert host.phase("check-start")[1]["error_code"] == "custom_guest_boot_failed"
+    # The latest boot entry is another launch's intent: refused.
+    other = mod.Ctx("boot", HOTEL, "cg-bbbbbbbbbbbb", {}, {})
+    ctx.log("boot", state="intent", generation=2, token="t2")
+    other.log("boot", state="intent", generation=1, token="x")
+    assert host.phase("check-start")[1]["error_code"] == "custom_guest_boot_failed"
+    # An exit entry after the intent means that start already ran: refused.
+    ctx.log("boot", state="intent", generation=3, token="t3")
+    ctx.log("exit", generation=3)
+    assert host.phase("check-start")[1]["error_code"] == "custom_guest_boot_failed"
+    # And a fresh intent after all of that passes.
+    ctx.log("boot", state="intent", generation=4, token="t4")
+    assert host.phase("check-start")[0] == 0
+
+
 def test_check_start_refuses_while_the_kit_runs_or_guests_exist(host):
     held(host)
     mod = load_host_module(host.env)

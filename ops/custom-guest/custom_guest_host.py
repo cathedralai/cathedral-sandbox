@@ -1595,9 +1595,18 @@ def ph_tick(ctx: Ctx) -> dict:
 def ph_check_start(ctx: Ctx) -> dict:
     """ExecStartPre of the custom unit: a fresh boot token and the 5.1 boot checks, or no start."""
     entries = ctx.entries(launch_only=False)
-    latest = entries[-1] if entries else {}
+    # The most recent boot entry of the journal, not its last line: the held timer (every minute) may append its
+    # own entries between the boot intent and this start. That entry must be this launch's intent, written in this
+    # host boot (an intent from before a reboot is stale), and its token must not have been used already.
+    pos = next((i for i in range(len(entries) - 1, -1, -1) if entries[i].get("event") == "boot"), None)
+    latest = entries[pos] if pos is not None else {}
     if latest.get("launch_id") != ctx.launch or latest.get("event") != "boot" or latest.get("state") != "intent":
-        raise Halt("custom_guest_boot_failed", "the latest host journal entry is not a boot intent for this launch")
+        raise Halt("custom_guest_boot_failed", "the latest boot entry of the host journal is not a boot intent for this launch")
+    if latest.get("boot_id") != boot_id():
+        raise Halt("custom_guest_boot_failed", "the boot intent is from before this host boot")
+    after = entries[pos + 1:]
+    if any(e.get("event") in ("token_used", "exit") and e.get("launch_id") == ctx.launch for e in after):
+        raise Halt("custom_guest_boot_failed", "the boot intent was already used")
     if (marker_doc(ctx) or {}).get("state") != "held":
         raise Halt("custom_guest_boot_failed", "the hotel is not held for this launch")
     eligibility(ctx, "boot")
