@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build the static reference verity helper from the adjacent pinned input lock.
+"""Build the static reference verity helper (and optionally cryptsetup) from the adjacent pinned input lock.
+
+cryptsetup is the same pinned 2.8.4 source and flags, static, for cathedral-data. It is never
+the root's own cryptsetup (spec 5.6; decision 4): cathedral-data pins this binary's digest.
 
 Inputs are acquired separately. No downloads, install, mount or device mutation.
 This produces a candidate executable; it does not boot or qualify a guest.
@@ -70,12 +73,15 @@ def build(inputs, work, log):
          "--disable-udev", "--disable-ssh-token", "--disable-external-tokens", "--disable-blkid",
          "--disable-kernel_crypto", "--disable-luks2-reencryption", "--disable-nls",
          "--disable-asciidoc", "--with-crypto_backend=openssl"], crypt, env, log)
-    run(["make", "-j2", "veritysetup.static"], crypt, env, log)
-    result = crypt / "veritysetup.static"
-    static_elf(result.read_bytes())
-    version = subprocess.check_output([str(result), "--version"], env=env, text=True)
-    if not version.startswith("veritysetup 2.8.4 "):
-        raise ValueError("unexpected verity helper version")
+    run(["make", "-j2", "veritysetup.static", "cryptsetup.static"], crypt, env, log)
+    result = {}
+    for name, banner in (("veritysetup", "veritysetup 2.8.4 "), ("cryptsetup", "cryptsetup 2.8.4 ")):
+        built = crypt / f"{name}.static"
+        static_elf(built.read_bytes())
+        version = subprocess.check_output([str(built), "--version"], env=env, text=True)
+        if not version.startswith(banner):
+            raise ValueError(f"unexpected {name} version")
+        result[name] = built
     return result
 
 
@@ -83,10 +89,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--cryptsetup-output", type=Path, help="also write the static cryptsetup here")
     parser.add_argument("--log", type=Path, required=True)
     args = parser.parse_args()
-    if args.output.exists() or args.output.is_symlink():
-        parser.error("output must not exist")
+    for out in (args.output, args.cryptsetup_output):
+        if out is not None and (out.exists() or out.is_symlink()):
+            parser.error("output must not exist")
     inputs = args.inputs.resolve(strict=True)
     lock = json.loads(Path(__file__).with_name("custom_guest_verity_inputs.json").read_text())
     if set(p.name for p in inputs.iterdir()) != set(lock):
@@ -112,12 +120,19 @@ def main():
             directory = work / name
             directory.mkdir()
             built.append(build(snapshot, directory, log))
-        if built[0].read_bytes() != built[1].read_bytes():
-            raise ValueError("static helper builds differ")
-        with args.output.open("xb") as out:
-            out.write(built[0].read_bytes())
-        args.output.chmod(0o755)
-    print(json.dumps({"output": str(args.output), "sha256": digest(args.output),
+        for name in ("veritysetup", "cryptsetup"):
+            if built[0][name].read_bytes() != built[1][name].read_bytes():
+                raise ValueError(f"static {name} builds differ")
+        for name, destination in (("veritysetup", args.output), ("cryptsetup", args.cryptsetup_output)):
+            if destination is not None:
+                with destination.open("xb") as out:
+                    out.write(built[0][name].read_bytes())
+                destination.chmod(0o755)
+    summary = {}
+    if args.cryptsetup_output is not None:
+        summary = {"cryptsetup_output": str(args.cryptsetup_output),
+                   "cryptsetup_sha256": digest(args.cryptsetup_output)}
+    print(json.dumps({**summary, "output": str(args.output), "sha256": digest(args.output),
                       "double_build_identical": True, "static_elf": True,
                       "inputs_lock_sha256": digest(Path(__file__).with_name("custom_guest_verity_inputs.json")),
                       "boot_verified": False}, sort_keys=True))

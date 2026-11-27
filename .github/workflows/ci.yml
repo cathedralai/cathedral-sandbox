@@ -109,8 +109,38 @@ jobs:
         run: |
           go test -race ./...
           go vet ./...
-      - name: Build twice and require static identical bytes
-        run: python3 scripts/build_custom_guest_helper.py --output "$RUNNER_TEMP/cathedral-attest"
+      # The pins below are synthetic: this step proves the three mains rebuild
+      # identically with pins linked, not that any real helper is approved.
+      - name: Build init, data and attest twice and require static identical bytes
+        run: |
+          python3 scripts/build_custom_guest_helper.py --output "$RUNNER_TEMP/cathedral-attest" \
+            --init-output "$RUNNER_TEMP/cathedral-init" --verity-sha256 "$(printf 'verity' | sha256sum | cut -d' ' -f1)" \
+            --data-output "$RUNNER_TEMP/cathedral-data" --cryptsetup-sha256 "$(printf 'cryptsetup' | sha256sum | cut -d' ' -f1)"
+
+  # Real loop devices, cryptsetup, dm-crypt, dm-integrity, mke2fs and mount. Hosted
+  # runners only; never a hotel host or any machine with customer VMs.
+  custom-guest-data-root:
+    name: Custom guest data volume (root, loop devices)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.11"
+          cache: false
+      - name: Install cryptsetup and e2fsprogs, load device-mapper modules
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cryptsetup e2fsprogs util-linux
+          sudo modprobe dm_mod dm_crypt dm_integrity loop
+          sudo -n true
+      - name: Loop-device tests as root
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go test -c -o "$RUNNER_TEMP/datavolume.test" ./internal/datavolume
+          sudo -n env CATHEDRAL_ROOT_TESTS=1 "$RUNNER_TEMP/datavolume.test" -test.v -test.count=1 -test.run 'Loop|Passphrase|Execute|Pinned'
 
   broker:
     name: Broker (Go)

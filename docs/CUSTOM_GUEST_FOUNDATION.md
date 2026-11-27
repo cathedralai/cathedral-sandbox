@@ -112,10 +112,10 @@ Tests exercise real OpenSSH key exchange and a forced report command on a loopba
 
 Before this foundation can be marked ready:
 
-- Build and qualify the static reference `/init`, its pinned static helper closure and deterministic single-archive initrd.
+- Qualify the static reference `/init` (`cmd/cathedral-init`), its pinned helper closure and the deterministic initrd by booting them (image acceptance harness; not part of the recipe PR).
 - Enforce the bootstrap against guest-observed state before networking/root use; enforce root-only SNP and configfs report access.
 - Build the reference kernel and verified-root test image, configure SSH, verify the helper digest and disable cloud-init/imported credentials.
-- Add the owner-unlocked data-disk helper and reproducible reference-image evidence; archive checks now exist.
+- Reproducible reference-image evidence and a boot of `cathedral-data unlock` in a guest; the helper and its loop-device tests exist.
 - Cross-review the complete result, then run the approved hardware rehearsals through Spock's launcher/operator path.
 
 The launcher, broker hold and API are separate Spock-owned PRs. No host operation, customer interruption, new compute or production switch is part of this component.
@@ -135,13 +135,16 @@ A fresh base can be prepared in an isolated unshare namespace:
 ```sh
 mmdebstrap --mode=unshare --variant=minbase \
   --customize-hook='rm -f "$1"/etc/ssh/ssh_host_* "$1"/var/lib/systemd/random-seed' \
-  --include=systemd-sysv,openssh-server,iproute2,cryptsetup-bin,ca-certificates \
+  --include=systemd-sysv,openssh-server,iproute2,e2fsprogs,ca-certificates \
   bookworm base.tar https://deb.debian.org/debian
 sha256sum base.tar cathedral-attest
 python3 scripts/build_custom_guest_root.py \
   --base base.tar --base-sha256 EXPECTED_BASE_SHA256 \
   --helper cathedral-attest --helper-sha256 EXPECTED_HELPER_SHA256 \
   --epoch 1795770000 --output root.raw
+# For an image that supports a data disk, add the unlock tool and its own static
+# cryptsetup (never the root's): --data-helper cathedral-data --data-helper-sha256 SHA \
+#   --cryptsetup cryptsetup --cryptsetup-sha256 SHA
 ```
 
 The JSON output records `root_verity`, `root_data_bytes`, the full root digest,
@@ -160,7 +163,7 @@ are masked. The root account has a non-locking invalid password hash, not an
 empty password. DNS is left unconfigured rather than copying the build host's
 resolver settings. The system journal and `/tmp` are volatile.
 
-The future measured init must validate all signed launch fields and observed
+The measured init (`cathedral-init`, below) validates all signed launch fields and observed
 hardware, verify HOST_DATA, mount this root through dm-verity with
 `--panic-on-corruption`, and populate a root-only tmpfs `/run/cathedral` before
 entering `/sbin/init`. That tmpfs holds the fresh private/public SSH host keys,
@@ -193,8 +196,12 @@ from Ubuntu's signed package metadata. GCC 15.2.0 and Make 4.4.1 are required.
 
 ```sh
 python3 scripts/build_custom_guest_verity.py --inputs PINNED_INPUT_DIRECTORY \
-  --output veritysetup --log verity-build.log
+  --output veritysetup --cryptsetup-output cryptsetup --log verity-build.log
 ```
+
+`--cryptsetup-output` also writes the static `cryptsetup` from the same source,
+flags and double build. `cathedral-data` runs only that binary (pinned by digest),
+never a `cryptsetup` that the root image happens to contain.
 
 The builder snapshots and rechecks inputs, uses the pinned headers and static
 libraries, builds in two separate directories, requires identical output and
@@ -249,9 +256,9 @@ the signed MAC. Missing or unreadable attributes, duplicate disks, unexpected
 devices and arithmetic overflow refuse without returning a partial selection.
 Zero-sized unused loop/ram devices are ignored.
 
-This function neither opens a disk nor authorizes boot. The memory-observation
-rule from spec 8.7 is still unresolved: usable Linux memory is not nominal QEMU
-memory, so no tolerance or rounded comparison is guessed here. Native policy
+This function neither opens a disk nor authorizes boot. The memory rule from
+spec 8.7 is `bootstate.CheckMemory` (below); usable Linux memory is not nominal QEMU
+memory, so it is not part of this function. Native policy
 and HOST_DATA, dm-verity, root contract and PID1 integration remain required.
 The caller must use the returned disk only through verity and account for device
 changes before later access; a sysfs read is not a pinned device handle.
@@ -370,6 +377,69 @@ bypasses preparation; it does not prove signed inputs, verity or SNP boot.
 The complete PID1 caller, memory rule, data unlock and hardware proof remain
 pending. Do not treat these component tests as a complete boot image.
 
+### Memory observation (spec 8.7 errata)
+
+`bootstate.CheckMemory` sums `end - start + 1` over the `/sys/firmware/memmap`
+entries whose type is exactly `System RAM` and accepts only
+`mem_gib * 2^30 - 128 MiB <= S <= mem_gib * 2^30`. `MemTotal` is not used: it
+subtracts SWIOTLB and kernel reservations. A missing, empty or unparseable
+inventory (any entry, RAM or not), an inverted range and overlapping or touching
+RAM entries refuse. The kernel needs `CONFIG_FIRMWARE_MEMMAP=y`. The measured
+deficit on an 8 GiB guest was 5.6 MiB (one guest); the 128 MiB window is the
+errata's, not a fitted value.
+
+### Reference PID1
+
+`cmd/cathedral-init` runs, in order: `PrepareKernelViews`, `ReadBoundLaunch`,
+`CheckMemory`, `PrepareVerifiedRuntime` (devices, verity, root contract, RAM keys)
+and `Exec`. Any error, any panic and any return from `Exec` powers the guest off
+(sync, then `reboot(POWER_OFF)`; PID1 exit is a kernel panic, which ends a
+`-no-reboot` guest). There is no retry, shell or fallback root.
+
+The veritysetup digest and the `cathedral-attest` digest are linked into the init
+at build time (`-X main.pinVeritySHA256`, `-X main.pinReportSHA256`) by
+`build_custom_guest_helper.py --init-output`, and the attest digest is that of the
+binary built in the same run. An unlinked, short, uppercase or all-zero pin
+powers off before any mount. The pins are therefore part of the measured initrd.
+
+### Owner data unlock
+
+`cathedral-data unlock` runs in the verified root over the owner-bound SSH
+session. The passphrase is read from stdin only (at most 4096 bytes, a 30 second
+bound, a terminal is refused) and is never an argument or environment value:
+
+```sh
+printf '%s' "$PASSPHRASE" | ssh -p PORT root@HOST cathedral-data unlock
+```
+
+It re-reads the bound launch (`ReadBoundLaunch`) to get the signed
+`data_disk_gib`, holds only the `custom-data` disk (`datavolume.OpenData`), and
+runs `datavolume.Unlock`. First use on a disk that is all zero: LUKS2,
+`aes-xts-plain64`, 4096-byte sectors, `hmac-sha256` integrity (argon2id), then
+ext4, mounted at `/mnt/cathedral-data` with `nosuid,nodev,noexec`. A disk with a
+nonzero byte and no LUKS magic is refused untouched. A disk with LUKS and no ext4
+(a cut between format and mkfs) is refused and never formatted again; it needs
+deliberate recovery. A header that fails `CheckHeaderPolicy` (for example a null
+cipher) is refused before open. After open the live stack is read back from sysfs
+(crypt over dm-integrity over exactly the held disk) and `cryptsetup status`.
+
+First-use formatting wipes the integrity area, which takes time proportional to
+the disk. The unlock deadline is 6 hours. The adapter runs the pinned static
+`/usr/lib/cathedral/cryptsetup` through the digest-checked descriptor with an
+empty environment; `mke2fs` comes from the verity root. Tests that need root run
+in CI against loop devices (`custom-guest-data-root`).
+
+### Initrd recipe
+
+`scripts/custom_guest_initrd_closure.json` is the reviewed recipe: the initrd holds
+`init` and `usr/lib/cathedral/veritysetup`, nothing else. `scripts/make_custom_guest_initrd.py`
+takes `--cathedral-init` and `--veritysetup`, refuses extra or missing inputs,
+symlinks and non-static ELF files, derives the `{path: sha256}` closure, builds
+twice, requires identical bytes and verifies the archive with
+`custom_guest_initrd.py`. Build order: verity helper, then
+`build_custom_guest_helper.py --init-output ... --verity-sha256 <that digest>`, then
+this tool. The root carries the same `cathedral-attest` the init pinned.
+
 ### Early kernel views and report permissions
 
 `PrepareKernelViews` is a root-PID1-only component intended to run before any
@@ -386,8 +456,8 @@ or configfs and never change the host SNP device. A mount namespace alone is
 not isolation for these kernel-global objects: do not run this setup component
 in a host/container rehearsal.
 
-This component is not yet wired into a complete PID1. These additions do not
-establish a bootable image or hardware acceptance.
+`cmd/cathedral-init` now calls it first. None of this establishes a bootable image
+or hardware acceptance.
 
 ### Runtime capacity and exact document fields
 
