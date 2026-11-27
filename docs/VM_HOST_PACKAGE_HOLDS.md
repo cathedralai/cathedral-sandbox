@@ -52,7 +52,13 @@ running VM. A change refuses new starts for the rest of the boot.
 - `canary_vms`: test VMs that may start on a build that is not verified yet. Never list a customer
   VM. Empty outside an upgrade.
 
-A host file that cannot be read in full refuses every VM on the host.
+The file also holds the keys that the launcher and `vm-ctl.sh` read. The gates read only
+`bundles`, `verified` and `canary_vms`, and they ignore every other key. Keep the file at mode
+0644, because the launcher reads it as the VM's own user. If the gates cannot read the host file
+in full, they refuse every VM on the host.
+
+A refused start counts as a unit failure. The unit tries again every 15 seconds until it has
+started 5 times in 15 minutes, and then it stays failed until the next `vm-ctl.sh start`.
 
 ## 1. Hold the packages
 
