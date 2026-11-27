@@ -178,6 +178,32 @@ func TestVMsRebundleMapsHostRefusalsByExitAndToken(t *testing.T) {
 	}
 }
 
+// Exit 21: the host committed the selection but vm.env or the unit did not follow. A 502 that
+// says the same op_id finishes it, not a refusal of the change; vms.json is unchanged.
+func TestVMsRebundleCommittedButNotSyncedIs502RetryWithTheSameOpID(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	_, base := vmStopped(t, tb)
+	before := vmsFileBytes(t, tb)
+	for _, tc := range []struct {
+		token string
+		exit  int
+		code  string
+	}{{"selection_committed_sync_failed", 21, "selection_committed_sync_failed"}, {"selection_committed_sync_failed", 1, "vm_host_refused"}, {"internal", 21, "vm_host_refused"}} {
+		answer, exit := []byte(`{"error":"`+tc.token+`","detail":"x"}`), tc.exit
+		tb.host.answer = func([]string) ([]byte, int, error) { return answer, exit, nil }
+		st, doc := tb.call(t, "operator-key", "POST", base+"/rebundle", rebundleBody(1, 0))
+		if st != 502 || vmErrCode(doc) != tc.code {
+			t.Fatalf("%s exit %d: %d %v", tc.token, tc.exit, st, doc)
+		}
+		if msg := doc["error"].(map[string]any)["message"].(string); tc.exit == 21 && tc.token != "internal" && !strings.Contains(msg, "same op_id") {
+			t.Fatalf("message %q does not say to retry with the same op_id", msg)
+		}
+	}
+	if !bytes.Equal(vmsFileBytes(t, tb), before) {
+		t.Fatal("vms.json changed")
+	}
+}
+
 // Start's gate refusals keep their answer: 17 and 18 (vm_gates.py) are 502 at start, and
 // rebundle's 19 and 20 mean nothing there either. Only rebundle maps by exit code and token.
 func TestVMsStartGateExitsStay502AfterRebundleMapping(t *testing.T) {

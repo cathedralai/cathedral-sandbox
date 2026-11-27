@@ -45,6 +45,8 @@ var vmRebundleRefusals = map[string]vmHostRefusal{
 	"stale_generation":    {3, 409, "the generation is not the VM's current, closed run, or the VM runs"},
 	"stale_selection":     {19, 409, "expect_revision is not the VM's bundle_selection_revision, or the op_id was used for another request: read GET host_status"},
 	"bundle_incompatible": {20, 409, "the target bundle cannot start this VM on its host"},
+	// Committed on the host, only vm.env or the unit behind: not a refusal of the change.
+	"selection_committed_sync_failed": {21, 502, "the host committed the bundle selection but did not finish applying it: repeat this request with the same op_id to finish it"},
 }
 
 // vmHostRefusalOf is the "error" and "reason" tokens of the host's last JSON
@@ -128,6 +130,11 @@ func (b *broker) rebundleVM(w http.ResponseWriter, r *http.Request, id string) {
 		s.mu.Unlock()
 		return
 	}
+	// These run before the host's retry rule (an applied op_id answers its stored result). So a
+	// retry whose first answer was lost, sent after the VM started a new run, gets 409 here even
+	// though its change applied; GET host_status shows the selection. The spec accepts the same for
+	// an op_id evicted from the host's last 64: a 409 for a request that did apply, never a wrong
+	// selection.
 	var code, refuse string
 	switch {
 	case rec.DesiredState != vmStateStopped:

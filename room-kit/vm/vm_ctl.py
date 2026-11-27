@@ -8,8 +8,8 @@ guest as that user (launch-vm.py; VM runtime spec r2 6.3, 7.1, 8.1, 8.2).
 Every command prints one JSON line on stdout; a refusal prints {"error": ...} and exits nonzero:
   2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or exists, or
   {"error": "host_capacity", "resource": ...} from create and start (vm_capacity.py),
-  10 to 18 a pre-launch gate (start; vm_gates.EXIT), 19 stale bundle selection and 20 bundle
-  incompatible (rebundle), 1 anything else. A refusal may add fields, such as "reason", a token
+  10 to 18 a pre-launch gate (start; vm_gates.EXIT), 19 stale bundle selection, 20 bundle
+  incompatible and 21 selection committed but not synced (rebundle), 1 anything else. A refusal may add fields, such as "reason", a token
   naming the check.
 
 Re-wrap (spec r3 7.5): rebundle moves a stopped VM to another bundle, fenced by its closed
@@ -102,6 +102,9 @@ MAILBOX_RETRY_WAIT = float(os.environ.get("VM_MAILBOX_RETRY_WAIT", "0.2"))
 SELECTION_OPS_MAX = 64
 BUNDLE_ID_RE = re.compile(r"[0-9a-f]{64}")
 EXIT_STALE_SELECTION, EXIT_BUNDLE_INCOMPATIBLE = 19, 20  # 17 and 18 are the gates' (vm_gates.EXIT)
+# The selection is committed (launch.json) but vm.env, the unit or daemon-reload failed after it:
+# the same op_id again finishes it (the retry re-runs sync_selection), and so does start.
+EXIT_SELECTION_SYNC_FAILED = 21
 OP_ID_RE = re.compile(r"[0-9a-f]{32}")  # 128 random bits from the caller
 # MemoryMax headroom over guest memory: the dedicated unit's figure (D 5.8) until rehearsal A2
 # measures the SNP QEMU overhead. A cap, not a reservation: admission (VM4) counts its own.
@@ -1528,10 +1531,15 @@ def selection_values(name: str, d: Path, launch: dict, bundle: str) -> dict:
     """Check 4 of spec r3 7.5 step 1, then the launch values of this VM's identity on B2. B2 must
     pass what create checks (enabled, its manifest is its id) and what start's gates check (a
     verified build of B2 for this host and the VM's vCPUs, or the VM is a canary: the vm_gates
-    helpers themselves), and carry the identity's base root, which never changes. Any failure is
-    bundle_incompatible (exit 20) with the check as its reason; nothing is written."""
+    helpers themselves), be built for this host's CPU family and carry the identity's base root,
+    which never changes. Any failure is bundle_incompatible (exit 20) with the check as its reason;
+    nothing is written."""
     import vm_gates
-    cfg = host_config()
+    try:
+        cfg = host_config()
+        gates_cfg = vm_gates.host_config()  # the stricter read start's gate makes of the same file
+    except (Refusal, vm_gates.GateRefusal) as e:
+        raise incompatible("host_config_invalid", f"{e.error}: {e.detail}") from None
     if bundle not in cfg["bundles"]:
         raise incompatible("bundle_not_enabled", f"bundle {bundle} is not enabled on this host")
     try:
@@ -1540,10 +1548,13 @@ def selection_values(name: str, d: Path, launch: dict, bundle: str) -> dict:
         raise incompatible("no_bundle", f"bundle {bundle}: {e}") from None
     if hashlib.sha256(raw).hexdigest() != bundle:
         raise incompatible("no_bundle", f"bundle {bundle}: the manifest is not the one its directory names")
+    if manifest["cpu_family"] != cfg["cpu_family"]:
+        raise incompatible("cpu_family_differs",
+                           f"bundle {bundle} is built for {manifest['cpu_family']}, this host is {cfg['cpu_family']}")
     env = read_env(d / "vm.env")
     vcpus = int(env["VM_VCPUS"])
     try:
-        vm_gates.host_build_gate(vm_gates.host_config(), {"name": name, "bundle": bundle, "vcpus": vcpus})
+        vm_gates.host_build_gate(gates_cfg, {"name": name, "bundle": bundle, "vcpus": vcpus})
     except vm_gates.GateRefusal as e:
         raise incompatible("no_verified_build", f"{e.error}: {e.detail}") from None
     try:
@@ -1600,7 +1611,7 @@ def cmd_rebundle(args: list[str]) -> dict:
                 if (op["generation"], op["expect_revision"], op["to"]) != (gen, expect, dst):
                     raise Refusal("stale_selection", "this op_id was applied to another request",
                                   EXIT_STALE_SELECTION, reason="op_id_reused")
-                sync_selection(name, d)  # derived files only: a retry after a cut finishes them
+                synced_or_refuse(name, d)  # derived files only: a retry after a cut finishes them
                 return {"name": name, "op_id": op_id, **op["result"]}
         a = auth_of(d)
         if gen != a["generation"]:
@@ -1623,8 +1634,21 @@ def cmd_rebundle(args: list[str]) -> dict:
         committed = {**launch, **values, "bundle_selection_revision": revision + 1,
                      "selection_ops": ops[-SELECTION_OPS_MAX:]}
         write_atomic(d / "launch.json", json.dumps(committed, sort_keys=True) + "\n", 0o644)
-        sync_selection(name, d)
+        synced_or_refuse(name, d)
     return {"name": name, "op_id": op_id, **result}
+
+
+def synced_or_refuse(name: str, d: Path) -> None:
+    """sync_selection after the commit point: a failure here is not "rebundle failed" (exit 1).
+    The new selection is committed and recorded; only its derived files are behind, which the
+    same op_id again finishes (and start too, before its gates)."""
+    try:
+        sync_selection(name, d)
+    except Exception as e:
+        raise Refusal("selection_committed_sync_failed",
+                      f"the selection is committed; vm.env or the unit did not follow"
+                      f" ({getattr(e, 'error', type(e).__name__)}):"
+                      " repeat the same op_id to finish it", EXIT_SELECTION_SYNC_FAILED) from None
 
 
 # ---- rewrap (spec r3 7.5 step 4) ------------------------------------------------------------

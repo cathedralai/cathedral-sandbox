@@ -92,7 +92,7 @@ class Site:
         self.edit_config(lambda cfg: cfg.setdefault("verified", {}).update({bundle: [build]}))
 
     def bundle(self, label: str, kernel_byte: int = 0, verity: str | None = None, enable: bool = True,
-               verify: bool = True) -> str:
+               verify: bool = True, cpu_family: str | None = None) -> str:
         bundles = self.h.root / "bundles"
         staging = self.h.root.parent / f"staging-{label}"
         shutil.copytree(bundles / self.h.bundle, staging)
@@ -105,6 +105,8 @@ class Site:
             manifest["sha256"]["vmlinuz"] = hashlib.sha256(kernel).hexdigest()
         if verity:
             manifest["base_root_verity"] = verity
+        if cpu_family:
+            manifest["cpu_family"] = cpu_family
         raw = measure.canonical(manifest)
         (staging / "manifest.json").write_bytes(raw)
         bundle = hashlib.sha256(raw).hexdigest()
@@ -257,7 +259,8 @@ def test_the_op_log_keeps_the_last_64_and_an_evicted_retry_changes_nothing(site)
     ("bundle_incompatible", "no_bundle"), ("bundle_incompatible", "no_bundle/manifest"),
     ("bundle_incompatible", "no_verified_build"),
     ("bundle_incompatible", "no_verified_build/vcpus"), ("bundle_incompatible", "no_verified_build/qemu"),
-    ("bundle_incompatible", "base_root_differs")])
+    ("bundle_incompatible", "base_root_differs"), ("bundle_incompatible", "cpu_family_differs"),
+    ("bundle_incompatible", "host_config_invalid"), ("bundle_incompatible", "host_config_invalid/missing")])
 def test_fences_refuse_and_write_nothing(site, case):
     error, why = case
     site.ran_once()  # generation 1 closed
@@ -289,6 +292,12 @@ def test_fences_refuse_and_write_nothing(site, case):
         site.qemu.write_bytes(b"another QEMU build")  # the host build changed since it was verified
     elif why == "base_root_differs":
         dst = site.b3
+    elif why == "cpu_family_differs":
+        dst = site.bundle("turin-build", kernel_byte=4, cpu_family="turin")  # this host is genoa
+    elif why == "host_config_invalid":
+        site.edit_config(lambda cfg: cfg.update(verified="not a map"))  # start's gate refuses it too
+    elif why == "host_config_invalid/missing":
+        site.config.unlink()
     files = site.files()
     code, res = site.rebundle(gen, dst, 0, op(1))
     want_code = {"stale_generation": 3, "bundle_incompatible": 20}[error]
@@ -445,5 +454,34 @@ def test_a_sigkill_during_daemon_reload_is_finished_by_the_retry(site):
 def test_rebundle_is_documented():
     readme = (KIT / "README.md").read_text()
     for word in ("rebundle", "stale_selection", "bundle_incompatible", "op_id_reused", "no_verified_build",
-                 "bundle_selection_revision", "selection-synced.json"):
+                 "bundle_selection_revision", "selection-synced.json", "selection_committed_sync_failed",
+                 "host_config_invalid", "cpu_family_differs"):
         assert word in readme, word
+
+
+def test_a_sync_failure_after_the_commit_exits_21_and_the_same_op_id_finishes_it(site):
+    """daemon-reload fails after launch.json is committed: not "rebundle failed" (exit 1) but exit 21,
+    selection_committed_sync_failed. No launch gets through until the same op_id (or start) syncs."""
+    site.ran_once()
+    failing = site.h.root.parent / "failbin"
+    failing.mkdir()
+    (failing / "systemctl").write_text(textwrap.dedent(f"""\
+        #!/bin/sh
+        if [ "$1" = daemon-reload ]; then echo "Failed to reload daemon" >&2; exit 1; fi
+        exec {site.h.bin / 'systemctl'} "$@"
+        """))
+    (failing / "systemctl").chmod(0o755)
+    p = subprocess.run([str(CTL), *argv(1, site.b2, 0, op(1))], capture_output=True, text=True, timeout=60,
+                       env={**site.h.environ, "PATH": f"{failing}:{site.h.environ['PATH']}"})
+    res = json.loads(p.stdout)
+    assert (p.returncode, res["error"]) == (21, "selection_committed_sync_failed"), res
+    assert "same op_id" in res["detail"]
+    assert site.launch()["bundle"] == site.b2 and site.launch()["bundle_selection_revision"] == 1
+    assert site.h.ctl("authorize", "vm1", str(2**33), "2")[0] == 0
+    assert site.h.ctl("check-paid", "vm1")[1]["error"] == "selection_unsynced"
+    code, res = site.rebundle(1, site.b2, 0, op(1))
+    assert (code, res["bundle"], res["bundle_selection_revision"]) == (0, site.b2, 1)
+    assert json.loads((site.d / "selection-synced.json").read_text()) == {"revision": 1}
+    # The selection check passes now; run 2 has no start line yet, so that check answers instead.
+    assert site.h.ctl("check-paid", "vm1")[1]["error"] == "start_not_recorded"
+    assert site.h.ctl("start", "vm1", "--generation", "2")[0] == 0

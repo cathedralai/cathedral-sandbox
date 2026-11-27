@@ -203,6 +203,24 @@ def test_status_reads_each_slot_once_and_rewrap_waits_for_a_torn_offer(waiting, 
     assert refused.value.error == "no_rewrap_offer" and len(sleeps) == mod.MAILBOX_RETRIES
 
 
+def test_a_slot_that_is_always_torn_costs_list_one_read(waiting, monkeypatch):
+    """A guest that keeps rewriting its slots must not slow list for the host: each slot is read
+    once, with no wait, and shows as empty."""
+    torn = M.encode_slot(M.KIND_OFFER, OFFER_BODY)[:45 + 700] + bytes(M.SLOT_BYTES - 745)
+    put(waiting.box, M.OFFER_OFFSET, torn)
+    put(waiting.box, M.STATUS_OFFSET, M.encode_slot(M.KIND_STATUS, STATUS_BODY)[:45 + 9] + bytes(M.SLOT_BYTES - 54))
+    for k, v in waiting.environ.items():
+        monkeypatch.setenv(k, v)
+    mod = _load("vm_ctl_list_once_test", KIT / "vm_ctl.py")
+    reads, sleeps = [], []
+    real_pread = mod.os.pread
+    monkeypatch.setattr(mod.os, "pread", lambda fd, n, at: reads.append(at) or real_pread(fd, n, at))
+    monkeypatch.setattr(mod.time, "sleep", sleeps.append)
+    vm = mod.cmd_list([])["vms"][0]
+    assert vm["rewrap_offer"] is None and vm["guest_status"] is None
+    assert sorted(reads) == [M.STATUS_OFFSET, M.OFFER_OFFSET] and sleeps == []
+
+
 # ---- rewrap ------------------------------------------------------------------------------------
 
 def test_rewrap_writes_only_the_answer_slot_once(waiting):

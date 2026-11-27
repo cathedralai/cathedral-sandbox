@@ -51,8 +51,8 @@ sudo ./vm-ctl.sh capacity [--broker-max-vcpus N --broker-max-mem-gib N --broker-
 `/etc/systemd/system`) can be set in the environment. Exit codes: 0 ok,
 2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or conflict, or no room on
 the host (`{"error": "host_capacity", "resource": ...}`, see Host admission), 10 to 18 a
-pre-launch gate (`start`, `vm_gates.EXIT`), 19 stale bundle selection and 20 bundle
-incompatible (`rebundle`), 1 other. A refusal may carry a `reason` token. Callers map a
+pre-launch gate (`start`, `vm_gates.EXIT`), 19 stale bundle selection, 20 bundle
+incompatible and 21 selection committed but not synced (`rebundle`), 1 other. A refusal may carry a `reason` token. Callers map a
 refusal by its exit code and `error` token together, per command.
 
 ## What a VM is
@@ -295,11 +295,13 @@ Under the VM lock, in this order:
    `not_current`, `generation_open` (an authorized run that never started is cancelled
    first) or `unit_active`.
 3. **Revision fence:** N is `bundle_selection_revision`; else `stale_selection`, exit 19.
-4. **B2 can start here:** enabled in the host file, its manifest is its id, a verified
-   build of B2 for this host's QEMU and kernel and the VM's vCPUs (or the VM is a canary;
-   the `vm_gates.py` helpers start uses), and the identity's base root. Else
-   `bundle_incompatible`, exit 20, reason `bundle_not_enabled`, `no_bundle`,
-   `no_verified_build` or `base_root_differs`. Start runs its gates again.
+4. **B2 can start here:** the host file reads (as create and start's gate read it), B2 is
+   enabled in it, its manifest is its id, it is built for this host's CPU family, it has a
+   verified build for this host's QEMU and kernel and the VM's vCPUs (or the VM is a canary;
+   the `vm_gates.py` helpers start uses), and it carries the identity's base root. Else
+   `bundle_incompatible`, exit 20, reason `host_config_invalid`, `bundle_not_enabled`,
+   `no_bundle`, `cpu_family_differs`, `no_verified_build` or `base_root_differs`. Start runs
+   its gates again.
 5. **Apply:** B2's launch values (the expected measurement; the identity and HOST_DATA do
    not change), the revision + 1 and the request are written in one rename of
    `launch.json`, the commit point. Then `vm.env` `VM_BUNDLE`, the unit's bundle bind and
@@ -308,9 +310,12 @@ Under the VM lock, in this order:
 Refused requests are not recorded. A retry whose `X` has left the last 64 is evaluated as
 new and refused by the revision fence. A cut before the commit changes nothing; a cut after
 it is finished by the retry or by the next `start`, which derives `vm.env` and the unit from
-`launch.json` before its gates read `VM_BUNDLE`. Until then `check-paid` refuses every
-launch (`selection_unsynced`, exit 3). The marker exists because a cut between the unit
-write and `daemon-reload` leaves a right file and a stale systemd.
+`launch.json` before its gates read `VM_BUNDLE`. A sync step that fails after the commit
+(for example `daemon-reload`) exits 21, `selection_committed_sync_failed`, not 1: the change is
+committed, and the same `X` again finishes it. Until then `check-paid` refuses every launch
+(`selection_unsynced`, exit 3). The marker exists because a cut between the unit write and
+`daemon-reload` leaves a right file and a stale systemd. **A caller retries any failure it
+cannot read as a refusal (a lost answer, exit 21, any broker 5xx) with the same `X`.**
 
 ## Re-wrap: rewrap and the mailbox (AB#999, PR VM6 host side; spec r3 7.5)
 
