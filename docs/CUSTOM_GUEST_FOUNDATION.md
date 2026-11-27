@@ -236,3 +236,27 @@ No key is baked into the root or initrd. A reference PID1 must call it only afte
 bootstrap, observed-hardware, HOST_DATA and verified-root checks, then write the
 files mode 0600 into the root-owned 0700 tmpfs directory. This package alone does
 not implement PID1 or start SSH.
+
+### Guest-observed device checks
+
+`internal/bootstate.CheckDevices` is a read-only component for the reference
+init, called with a validated signed launch after mounting a fresh kernel sysfs
+and before any device mapping or networking. It compares the online CPU count,
+finds exactly one read-only `custom-root` virtio disk with the signed root size,
+and enforces the optional `custom-data` disk's presence and exact size. It
+selects by serial, never by assuming `vda` is the root. One virtio NIC must match
+the signed MAC. Missing or unreadable attributes, duplicate disks, unexpected
+devices and arithmetic overflow refuse without returning a partial selection.
+Zero-sized unused loop/ram devices are ignored.
+
+This function neither opens a disk nor authorizes boot. The memory-observation
+rule from spec 8.7 is still unresolved: usable Linux memory is not nominal QEMU
+memory, so no tolerance or rounded comparison is guessed here. Native policy
+and HOST_DATA, dm-verity, root contract and PID1 integration remain required.
+The caller must use the returned disk only through verity and account for device
+changes before later access; a sysfs read is not a pinned device handle.
+
+The device tests use synthetic sysfs trees with swapped disk enumeration and
+negative controls, not a booted SNP guest. The sysfs interfaces are defined by
+[Linux CPU topology](https://www.kernel.org/doc/html/latest/admin-guide/cputopology.html)
+and the [virtio block driver](https://github.com/torvalds/linux/blob/master/drivers/block/virtio_blk.c).
