@@ -278,6 +278,19 @@ def test_port_clash_refused_before_any_change(net, case):
     assert net.tagged() == [] and "cgst0" not in net.links()
 
 
+def test_up_on_a_host_with_its_own_addresses(net):
+    # A real host lists lo and its uplink before any tap; the last address line is not the tap.
+    links = {"lo": {"user": "", "group": "", "addrs": ["127.0.0.1/8"], "up": True},
+             "eth0": {"user": "", "group": "", "addrs": ["192.0.2.10/24"], "up": True}}
+    Path(f"{net.state}.links.json").write_text(json.dumps(links))
+    p = net.run("up")
+    assert p.returncode == 0, p.stderr
+    assert net.links()["cgst0"]["addrs"] == ["10.217.0.1/30"]
+    assert net.run("check", FAKE_UNIT_STATE="active").returncode == 0
+    again = net.run("up")
+    assert again.returncode == 0, again.stderr
+
+
 def test_link_clash_refused(net):
     links = {"eth9": {"user": "", "group": "", "addrs": ["10.217.0.5/24"], "up": True}}
     Path(f"{net.state}.links.json").write_text(json.dumps(links))
