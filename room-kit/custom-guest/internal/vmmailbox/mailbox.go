@@ -4,9 +4,14 @@ import (
 	"crypto/sha512"
 	"errors"
 	"io"
+	"unsafe"
 )
 
 // File is the mailbox disk. *os.File satisfies it; tests use a byte slice.
+//
+// The host rewrites this disk while the guest runs, so the guest must read the disk, not its page
+// cache: open the device with O_DIRECT (OpenDevice does). Every read and write here is a whole 64 KiB
+// slot at a 64 KiB offset in a 4 KiB aligned buffer, which O_DIRECT requires and a plain file allows.
 type File interface {
 	io.ReaderAt
 	io.WriterAt
@@ -49,11 +54,22 @@ type Answer struct {
 	CT          [48]byte
 }
 
+const directAlign = 4096
+
+// alignedBuffer returns n bytes at a 4 KiB aligned address, for O_DIRECT.
+func alignedBuffer(n int) []byte {
+	raw := make([]byte, n+directAlign)
+	skew := int((directAlign - uintptr(unsafe.Pointer(&raw[0]))%directAlign) % directAlign)
+	return raw[skew : skew+n : skew+n]
+}
+
 func (m *Mailbox) write(offset int64, kind Kind, body []byte) error {
-	slot, err := EncodeSlot(kind, body)
+	plain, err := EncodeSlot(kind, body)
 	if err != nil {
 		return err
 	}
+	slot := alignedBuffer(SlotBytes)
+	copy(slot, plain)
 	// One write of the whole slot at its offset, then a flush (7.5 Record).
 	if _, err := m.f.WriteAt(slot, offset); err != nil {
 		return err
@@ -104,14 +120,14 @@ func (m *Mailbox) WriteOffer(o Offer) (string, error) {
 // ZeroOffer clears the offer slot and reads it back as zero. The init calls it on every boot that
 // is not waiting for an answer, so status never shows an old offer.
 func (m *Mailbox) ZeroOffer() error {
-	zero := make([]byte, SlotBytes)
+	zero := alignedBuffer(SlotBytes)
 	if _, err := m.f.WriteAt(zero, OfferOffset); err != nil {
 		return err
 	}
 	if err := m.f.Sync(); err != nil {
 		return err
 	}
-	back := make([]byte, SlotBytes)
+	back := alignedBuffer(SlotBytes)
 	if _, err := m.f.ReadAt(back, OfferOffset); err != nil {
 		return err
 	}
@@ -131,7 +147,7 @@ func (m *Mailbox) ReadAnswer() (ans Answer, ok bool) {
 			ans, ok = Answer{}, false
 		}
 	}()
-	slot := make([]byte, SlotBytes)
+	slot := alignedBuffer(SlotBytes)
 	if _, err := m.f.ReadAt(slot, AnswerOffset); err != nil {
 		return Answer{}, false
 	}
@@ -170,7 +186,7 @@ func (m *Mailbox) readDoc(offset int64, kind Kind) (doc map[string]string, ok bo
 			doc, ok = nil, false
 		}
 	}()
-	slot := make([]byte, SlotBytes)
+	slot := alignedBuffer(SlotBytes)
 	if _, err := m.f.ReadAt(slot, offset); err != nil {
 		return nil, false
 	}

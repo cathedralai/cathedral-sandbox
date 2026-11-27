@@ -34,6 +34,7 @@ func openSSHEd25519(random io.Reader, comment string) (private, public []byte, b
 		return nil, nil, nil, err
 	}
 	str := func(b []byte) []byte { return append(binary.BigEndian.AppendUint32(nil, uint32(len(b))), b...) }
+	defer clear(priv) // the in-memory key is not kept past the file image
 	blob = append(str([]byte("ssh-ed25519")), str(pub)...)
 
 	section := append([]byte(nil), check[:]...)
@@ -46,7 +47,9 @@ func openSSHEd25519(random io.Reader, comment string) (private, public []byte, b
 		section = append(section, pad)
 	}
 
+	defer clear(section)
 	file := []byte("openssh-key-v1\x00")
+	defer clear(file)
 	file = append(file, str([]byte("none"))...)
 	file = append(file, str([]byte("none"))...)
 	file = append(file, str(nil)...)

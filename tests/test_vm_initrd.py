@@ -67,6 +67,17 @@ def stub_bytes(tmp_path_factory) -> bytes:
     return recipe.go_build(MODULE, "./testdata/vm-init-stub", out)
 
 
+@pytest.fixture(autouse=True)
+def allow_testdata(monkeypatch):
+    monkeypatch.setattr(recipe, "ALLOW_TESTDATA_MAINS", True)
+
+
+def test_a_testdata_main_is_refused_in_a_production_closure(monkeypatch):
+    monkeypatch.setattr(recipe, "ALLOW_TESTDATA_MAINS", False)
+    with pytest.raises(ValueError, match="testdata"):
+        recipe.check_closure_shape(unpinned_closure())
+
+
 def unpinned_closure() -> dict:
     closure = json.loads((KIT / "vm" / "vm_initrd_closure.json").read_text())
     closure["go_mains"]["init"] = "./testdata/vm-init-stub"

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // memFile is a mailbox disk in memory.
@@ -428,5 +429,43 @@ func TestEnvelopeOpensAndRefusesForgeries(t *testing.T) {
 	stranger, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	if _, err := OpenAnswer(stranger, offer, ans); err == nil {
 		t.Error("the wrong recipient opened")
+	}
+}
+
+// alignedFile fails any read or write whose buffer is not 4 KiB aligned or not a whole slot, as
+// O_DIRECT would with EINVAL.
+type alignedFile struct {
+	*memFile
+	t *testing.T
+}
+
+func (a alignedFile) check(p []byte, off int64) {
+	a.t.Helper()
+	if uintptr(unsafe.Pointer(&p[0]))%4096 != 0 || len(p)%4096 != 0 || off%4096 != 0 {
+		a.t.Errorf("unaligned direct I/O: len %d off %d", len(p), off)
+	}
+}
+func (a alignedFile) ReadAt(p []byte, off int64) (int, error) {
+	a.check(p, off)
+	return a.memFile.ReadAt(p, off)
+}
+func (a alignedFile) WriteAt(p []byte, off int64) (int, error) {
+	a.check(p, off)
+	return a.memFile.WriteAt(p, off)
+}
+
+func TestAllIOIsAlignedForODirect(t *testing.T) {
+	m := &Mailbox{f: alignedFile{newMem(), t}}
+	if err := m.WriteStatus(sampleStatus()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.WriteOffer(sampleOffer()); err != nil {
+		t.Fatal(err)
+	}
+	m.ReadOffer()
+	m.ReadStatus()
+	m.ReadAnswer()
+	if err := m.ZeroOffer(); err != nil {
+		t.Fatal(err)
 	}
 }

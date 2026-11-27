@@ -58,6 +58,8 @@ func OpenAnswer(private *ecdh.PrivateKey, offerSHA256 string, ans Answer) ([]byt
 	}
 	aad := []byte(offerSHA256)
 	key := wrappingKey(shared, aad, ans.EPK[:], private.PublicKey().Bytes())
+	defer clear(shared)
+	defer clear(key)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, errOpen

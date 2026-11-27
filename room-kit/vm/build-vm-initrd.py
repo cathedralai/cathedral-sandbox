@@ -43,6 +43,8 @@ MANIFEST_SCHEMA = "cathedral.vm.initrd-manifest/v1"
 MAX_BYTES = 512 * 1024 * 1024
 MAX_ENTRIES = 40000
 MAX_CLOSURE_BYTES = 8 * 1024 * 1024
+# Tests of the recipe build a stub init from testdata. A real closure may not name one.
+ALLOW_TESTDATA_MAINS = False
 RELEASE_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9]+")
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
 MODULE_SUFFIX_RE = re.compile(r"\.ko(\.zst|\.xz|\.gz)?$")
@@ -100,6 +102,7 @@ def check_closure_shape(closure: dict) -> None:
     require(isinstance(closure["go_mains"], dict) and "init" in closure["go_mains"], "go_mains needs init")
     for name, package in closure["go_mains"].items():
         require(isinstance(package, str) and re.fullmatch(r"\./(cmd|testdata)/[A-Za-z0-9/-]+", package), "go main package")
+        require(ALLOW_TESTDATA_MAINS or package.startswith("./cmd/"), "a testdata main in a production closure")
         require(name == "init" or re.fullmatch(r"usr/lib/cathedral/[A-Za-z0-9_.+-]+", name), "go main path")
     exes = closure["executables"]
     require(isinstance(exes, dict) and 0 < len(exes) <= 64 and "init" in exes, "executables")

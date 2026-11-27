@@ -25,6 +25,9 @@ The host side is `room-kit/vm/vm_mailbox.py` (sandbox PR 794) and its fixture
 (`CVMMBX1\0`, kind, length u32 big-endian, sha256 of the body), canonical flat JSON bodies, the
 slot offsets 0, 64 KiB and 128 KiB. Rules that matter:
 
+- Open the device with `vmmailbox.OpenDevice`: O_DIRECT, so a poll sees the host's write and not a
+  cached page. Every read and write is a whole 64 KiB slot in a 4 KiB aligned buffer (test fake
+  fails any other I/O). B's init must use it for the status write and the answer poll.
 - Every mailbox byte is untrusted, the guest's own earlier writes included. A reader checks the
   header, then a bounded pre-scan that refuses any `[` or `{` after the opening brace, then a strict
   parse of exactly the schema's keys. Any failure of any kind reads as an empty slot.
@@ -41,6 +44,10 @@ slot offsets 0, 64 KiB and 128 KiB. Rules that matter:
 - `key = HKDF-SHA256(ikm=shared, salt=AAD, info="cathedral.vm-rewrap.v1" || epk || vm_pub, 32)`
 - `ct = AES-256-GCM(key, nonce, R, AAD)`; R is 32 bytes, `ct` is 48 with its tag
 - `AAD = offer_sha256` as 64 lowercase hex ASCII bytes (it is also the HKDF salt)
+
+The HKDF info is `cathedral.vm-rewrap.v1 || epk || vm_pub` (the hotel envelope's layout, with this
+info string), which goes one step beyond "info = the string" of the 14:44Z decision. `verify_vm.py rewrap`
+(VM2) must implement exactly this order; the fixture holds `shared_hex` and `wrapping_key_hex` to check it.
 
 The offer's REPORT_DATA is `sha512("cathedral-vm-rewrap/v1\0" || pubkey || nonce)`
 (`vmmailbox.RewrapReportData`).

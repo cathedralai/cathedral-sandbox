@@ -56,7 +56,14 @@ func Mount(fs *os.File, path string) (*Mounted, error) {
 	if err := os.Mkdir(path, 0o700); err != nil {
 		return nil, err
 	}
-	if err := syscall.Mount(descriptorPath(fs), path, "ext4", syscall.MS_NODEV, ""); err != nil {
+	// The kernel records the source string in /proc/mounts, and resize2fs finds a mounted file system
+	// there by device. So a device opened by its /dev path is mounted by that path; the descriptor
+	// path is only a fallback and cannot be resized online.
+	source := descriptorPath(fs)
+	if name := fs.Name(); strings.HasPrefix(name, "/dev/") && !strings.Contains(name, "..") {
+		source = name
+	}
+	if err := syscall.Mount(source, path, "ext4", syscall.MS_NODEV, ""); err != nil {
 		os.Remove(path)
 		return nil, fmt.Errorf("mount root: %w", err)
 	}

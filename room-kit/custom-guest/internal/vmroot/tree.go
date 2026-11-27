@@ -196,6 +196,7 @@ func writeHostKey(root *os.Root, o TreeOptions) error {
 	if err != nil {
 		return errShortKey
 	}
+	defer clear(private)
 	if err := writeNew(root, "etc/ssh/ssh_host_ed25519_key", private, 0o600); err != nil {
 		return err
 	}

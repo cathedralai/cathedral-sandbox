@@ -142,13 +142,13 @@ def build(inputs: Path, work: Path, log) -> dict[str, Path]:
 
     e2 = work / f"e2fsprogs-{E2FS_VERSION}"
     e2env = dict(env)
-    e2env["LDFLAGS"] = "-static"
+    e2env["LDFLAGS"] = f"-static -L{libs}"  # the pinned libc.a, not the image's
     e2env.pop("LIBS", None)
-    # e2fsprogs uses its own bundled libuuid, libblkid and libcom_err, so the Ubuntu headers pinned
-    # above stay out of its way; the C library and compiler headers are still the pinned ones.
+    # e2fsprogs builds its own bundled libuuid, libblkid and libcom_err (the default; --disable-libuuid
+    # would ask for the system ones). The C library and compiler headers are still the pinned ones.
     run(["./configure", "--disable-nls", "--disable-elf-shlibs", "--disable-bsd-shlibs", "--disable-uuidd",
-         "--disable-fuse2fs", "--disable-defrag", "--disable-e2initrd-helper", "--disable-fsck",
-         "--disable-libuuid", "--disable-libblkid"], e2, e2env, log)
+         "--disable-fuse2fs", "--disable-defrag", "--disable-e2initrd-helper", "--disable-fsck"],
+        e2, e2env, log)
     run(["make", "-j2", "-C", "lib"], e2, e2env, log)
     run(["make", "-j2", "-C", "misc", "mke2fs"], e2, e2env, log)
     run(["make", "-j2", "-C", "resize", "resize2fs"], e2, e2env, log)
