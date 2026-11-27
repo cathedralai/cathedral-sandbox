@@ -124,13 +124,22 @@ VMs. `vm_capacity.py` counts both. It runs only while the VM host switch
 `/etc/cathedral/snp-vm-host.json` exists; without it create, start and `install-sealed.sh`
 behave as before.
 
-- **Kits:** every `room-sealed-<name>.service` unit file, enabled or not (not the `-net` check
-  units), and the env file on its `ExecStart` line, wherever `SEALED_DIR` is. Plus the kits
-  being installed: `install-sealed.sh` records `/var/lib/cathedral-snp/kits/<name>.json` before
-  its build. Counted by name, each size the larger of unit and record. A kit that is removed must
-  have its record removed too. A unit, env file or record that cannot be read (missing, a line
-  that is not `KEY=value`, a size only a shell could read) refuses every create and start:
-  resource `kit_unaccounted`.
+- **Kits:** every `room-sealed-<name>.service` unit file, enabled or not, and the env file on its
+  `ExecStart` line, wherever `SEALED_DIR` is. A `-net` unit is skipped only when it is exactly the
+  check unit `write-units.sh` writes (`Type=oneshot`, `ExecStart=<dir>/host-net.sh check <env>`);
+  any other unit, whatever its name, is a kit and must parse. Plus the kits being installed:
+  `install-sealed.sh` records `/var/lib/cathedral-snp/kits/<name>.json` before its build.
+  Counted by name, each size the larger of unit and record. A kit that is removed must have its
+  record removed too. A unit, env file or record that cannot be read (missing, a line that is not
+  `KEY=value`, a size only a shell could read) refuses every create and start: resource
+  `kit_unaccounted`.
+- **Rolls:** the record holds the larger of the running build and the replacement from the assess
+  step until the new guest's measurement matched (`vm_capacity.py commit-kit`, after
+  `systemctl enable`). A roll refused or failed after the env copy keeps the old size reserved.
+  A data-volume reset is reserved before `data.raw` moves (`assess-kit --data-reset`): the old
+  volume stays allocated as `data.raw.prev` (counted until it is removed) and the fresh `data.raw`
+  counts at its full size. A roll that is not confirmed restores the volume and keeps that
+  reservation until the next confirmed install.
 - **VMs:** every `vm.env`, in any state.
 - **create** (commit), exit 5 on the first resource that does not fit:
   - `memory`: kits + VMs + this VM, each plus `VM_GUEST_OVERHEAD_MIB` (default 1024), plus a

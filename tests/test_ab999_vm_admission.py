@@ -154,7 +154,7 @@ class Host:
         d = self.root / "var" / "lib" / "cathedral-snp" / "kits"
         d.mkdir(parents=True, exist_ok=True)
         rec = {"schema": "cathedral.snp.kit-reservation/v1", "name": name, "env": f"/x/{name}/sealed.env",
-               "sealed_dir": str(self.tmp / "srv" / f"sealed-hotel-{name}"), "vcpus": 8, "mem_gib": 64,
+               "sealed_dirs": [str(self.tmp / "srv" / f"sealed-hotel-{name}")], "vcpus": 8, "mem_gib": 64,
                "scratch_gib": 100, "data_gib": 0, "min_host_free_gib": 0, "recorded_at": 1, **fields}
         (d / f"{name}.json").write_text(json.dumps(rec))
         return d / f"{name}.json"
@@ -213,6 +213,10 @@ def cap(host, monkeypatch):
 
     monkeypatch.setattr(mod, "device_of", device_of)
     monkeypatch.setattr(mod, "fs_avail", lambda path: mod.avail.get(mod.device_of(path), 10 * 1024 * GIB))
+    mod.fake_files = {}  # str(path) -> (size, allocated, st_dev, st_ino), or None for "gone"
+    real_facts = mod.file_facts
+    monkeypatch.setattr(mod, "file_facts",
+                        lambda path: mod.fake_files[str(path)] if str(path) in mod.fake_files else real_facts(path))
     return mod
 
 
@@ -285,6 +289,34 @@ def test_an_unreadable_kit_refuses_every_create_and_start(host, cap, breakage):
         unit.symlink_to("/dev/null")
     assert refused(cap, cap.check_create, 1, 1, 4, host.vms / "vm2") == "kit_unaccounted"
     assert refused(cap, cap.check_start, "vm1") == "kit_unaccounted"
+
+
+def test_a_damaged_kit_unit_whose_name_ends_in_net_is_unaccounted(host, cap):
+    """Review P2: kit alpha-net's unit, truncated during a rewrite, while its guest runs."""
+    host.kit("alpha-net", active=True)
+    unit = host.units / "room-sealed-alpha-net.service"
+    unit.write_text(unit.read_text()[:120])  # cut before ExecStart
+    host.vm("vm1")
+    assert refused(cap, cap.check_create, 1, 1, 4, host.vms / "vm2") == "kit_unaccounted"
+    assert refused(cap, cap.check_start, "vm1") == "kit_unaccounted"
+    # Its intact -net check unit is still recognized and skipped.
+    assert [b["unit"] for b in cap.snapshot().unaccounted] == ["room-sealed-alpha-net.service"]
+
+
+@pytest.mark.parametrize("damage", ["truncated", "not_oneshot", "other_command"])
+def test_only_an_exact_net_check_unit_is_skipped(host, cap, damage):
+    host.kit("alpha")
+    net = host.units / "room-sealed-alpha-net.service"
+    text = net.read_text()
+    assert cap.is_net_helper(net.name, text)
+    if damage == "truncated":
+        net.write_text(text[:60])
+    elif damage == "not_oneshot":
+        net.write_text(text.replace("Type=oneshot", "Type=simple"))
+    else:
+        net.write_text(text.replace("host-net.sh check", "host-net.sh up"))
+    assert [b["unit"] for b in cap.snapshot().unaccounted] == ["room-sealed-alpha-net.service"]
+    assert refused(cap, cap.check_create, 1, 1, 4, host.vms / "vm1") == "kit_unaccounted"
 
 
 def test_a_vm_env_that_does_not_parse_refuses_create(host, cap):
@@ -476,7 +508,7 @@ def test_assess_kit_counts_vms_and_records_the_kit(host, cap):
     env = host.kit_env("alpha", mem=64, scratch=100)
     out = cap.assess_kit(str(env))
     rec = json.loads((host.root / "var/lib/cathedral-snp/kits/alpha.json").read_text())
-    assert out["recorded"] and (rec["mem_gib"], rec["scratch_gib"], rec["sealed_dir"]) == (64, 100, str(env.parent))
+    assert out["recorded"] and (rec["mem_gib"], rec["scratch_gib"], rec["sealed_dirs"]) == (64, 100, [str(env.parent)])
     # With a second VM there, the same kit still fits exactly; a larger roll does not, and its
     # refusal leaves the record as it was.
     host.vm("vm2", mem=8)
@@ -495,16 +527,88 @@ def test_assess_kit_counts_vm_disk_growth_on_its_file_system(host, cap):
     assert refused(cap, cap.assess_kit, str(env)) == "disk"
 
 
-def test_assess_kit_takes_the_larger_of_the_installed_build_and_replaces_its_record(host, cap):
+def test_a_shrinking_roll_keeps_the_running_size_until_the_new_guest_is_verified(host, cap):
+    """Review P1: a 194 GiB host, a running 128 GiB kit and a 32 GiB VM, full with overhead and
+    reserve. A roll to 64 GiB copies its env before the restart; if the restart is refused or
+    crashes, the 128 GiB guest still runs, so no 32 GiB VM may be admitted (227 GiB committed)."""
     host.facts(mem_total_gib=32 + 129 + 33)
-    host.kit("alpha", mem=128)  # the running build
-    host.vm("vm1", mem=32)  # 128 + 1 + 32 + 1 + 32 = 194: full
-    env = host.kit_env("alpha", mem=64)  # a smaller roll: the larger, installed size is what counts
+    installed = host.kit("alpha", mem=128, active=True)
+    host.vm("vm1", mem=32)
+    assert refused(cap, cap.check_create, 1, 32, 4, host.vms / "vm2") == "memory"
+    # The operator's new env (install-sealed.sh $ENV_FILE), same SEALED_DIR, 64 GiB.
+    new_env = host.tmp / "operator" / "alpha.env"
+    new_env.parent.mkdir()
+    new_env.write_text(installed.read_text().replace("SEALED_MEM_GIB=128", "SEALED_MEM_GIB=64"))
+    cap.assess_kit(str(new_env))
+    record = host.root / "var/lib/cathedral-snp/kits/alpha.json"
+    assert json.loads(record.read_text())["mem_gib"] == 128
+    # Step 4 copies the smaller env, then the restart is refused (rooms remain) or crashes.
+    shutil.copy(new_env, installed)
+    assert [k.mem_gib for k in cap.kit_units()[0]] == [64]
+    assert refused(cap, cap.check_create, 1, 32, 4, host.vms / "vm2") == "memory"
+    # A rerun of the install keeps the larger size too (the unit env is 64 now, the record is not).
+    cap.assess_kit(str(new_env))
+    assert json.loads(record.read_text())["mem_gib"] == 128
+    assert refused(cap, cap.check_create, 1, 32, 4, host.vms / "vm2") == "memory"
+    # The new guest is verified running at 64 GiB (install-sealed.sh commit-kit): the room comes back.
+    cap.commit_kit(str(installed))
+    assert json.loads(record.read_text())["mem_gib"] == 64
+    cap.check_create(1, 32, 4, host.vms / "vm2")
+
+
+def test_commit_kit_runs_only_after_the_measurement_matched():
+    text = (SEALED / "install-sealed.sh").read_text()
+    match = text[text.index('if [ "$GOT" = "$EXPECTED" ]'):text.index("MEASUREMENT DIFFERS")]
+    assert 'vm_capacity.py" commit-kit "$SEALED_DIR/sealed.env"' in match
+    assert match.index('systemctl enable -q "$UNIT"') < match.index("commit-kit")
+    assert text.count("commit-kit") == 1  # never on the refused, failed or mismatched paths
+    # A failed commit only keeps the larger reservation; it never fails a verified install.
+    block = match[match.index("commit-kit"):]
+    assert "|| log " in block[:300] and "|| exit" not in block[:300]
+
+
+def test_a_data_volume_reset_reserves_the_fresh_volume_next_to_data_raw_prev(host, cap):
+    """Review P2 numbers: 164 GiB avail, a fully allocated 100 GiB data.raw, 100 GiB of VM growth
+    and a 64 GiB reserve pass exactly. A reset moves data.raw aside (its blocks stay) and starts an
+    empty one: unreserved, that is 100 GiB over."""
+    env = host.kit("alpha", scratch=0, data=100, min_free=64, active=True)
+    d = env.parent
+    dev = os.stat(d).st_dev
+    data, prev = str(d / "data.raw"), str(d / "data.raw.prev")
+    cap.fake_files[data] = (100 * GIB, 100 * GIB, dev, 7)
+    host.vm("vm1", disk=100)
+    cap.avail[cap.device_of(d)] = 164 * GIB
     cap.assess_kit(str(env))
-    # The record is the new env's, not a merge with the installed one, so it can shrink.
-    assert json.loads((host.root / "var/lib/cathedral-snp/kits/alpha.json").read_text())["mem_gib"] == 64
-    env = host.kit_env("alpha", mem=129)  # a larger roll does not fit
-    assert refused(cap, cap.assess_kit, str(env)) == "memory"
+    assert cap.snapshot().fs_left(d)[0] == 0
+    # What the reset does to an unreserved ledger: 100 GiB over.
+    cap.fake_files.update({data: None, prev: (100 * GIB, 100 * GIB, dev, 7)})
+    assert cap.snapshot().fs_left(d)[0] == -100 * GIB
+    cap.fake_files.update({data: (100 * GIB, 100 * GIB, dev, 7), prev: None})
+    # The reset branch asks first, before anything moves, and is refused at 164 GiB.
+    assert refused(cap, cap.assess_kit, str(env), True) == "disk"
+    rec = json.loads((host.root / "var/lib/cathedral-snp/kits/alpha.json").read_text())
+    assert rec["data_reset_file"] is None
+    # With 100 GiB more it is reserved: before the move, after it, and until data.raw.prev is gone.
+    cap.avail[cap.device_of(d)] = 264 * GIB
+    cap.assess_kit(str(env), True)
+    rec = json.loads((host.root / "var/lib/cathedral-snp/kits/alpha.json").read_text())
+    assert rec["data_reset_file"] == [dev, 7]
+    assert cap.snapshot().fs_left(d)[0] == 0
+    assert refused(cap, cap.check_create, 1, 1, 1, host.vms / "vm2") == "disk"
+    cap.fake_files.update({data: None, prev: (100 * GIB, 100 * GIB, dev, 7)})  # mv data.raw data.raw.prev
+    assert cap.snapshot().fs_left(d)[0] == 0
+    cap.fake_files[data] = (100 * GIB, 0, dev, 8)  # launch-guest.sh truncates a fresh data.raw
+    assert cap.snapshot().fs_left(d)[0] == 0
+    assert refused(cap, cap.check_create, 1, 1, 1, host.vms / "vm2") == "disk"
+
+
+def test_the_reset_branch_asks_the_ledger_before_it_moves_the_volume():
+    text = (SEALED / "install-sealed.sh").read_text()
+    branch = text[text.index("    reset)"):text.index("    keep)")]
+    ask = branch.index('vm_capacity.py" assess-kit --data-reset "$ENV_FILE" || exit 1')
+    assert ask < branch.index('rm -f "$SEALED_DIR/data-on-new-build"')
+    assert ask < branch.index('mv -f "$SEALED_DIR/data.raw" "$SEALED_DIR/data.raw.prev"')
+    assert ask < branch.index("DATA_RESET=1")  # so the EXIT trap does not stop the running guest
 
 
 def test_assess_kit_refuses_while_another_kit_is_unaccounted_but_not_for_its_own(host, cap):

@@ -182,6 +182,12 @@ data_volume_new_build() {
         echo "sealed: data.raw.prev already exists from an earlier reset roll. Save or remove it, or set SEALED_DATA_OVERWRITE_PREV=1 to overwrite it." >&2
         exit 1
       fi
+      # VM host (AB#999): data.raw.prev keeps its blocks while a fresh data.raw grows, so reserve
+      # both in the host ledger before anything moves. A refusal here leaves the volume and the
+      # running guest as they are.
+      if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
+        python3 -I "$KIT/vm/vm_capacity.py" assess-kit --data-reset "$ENV_FILE" || exit 1
+      fi
       rm -f "$SEALED_DIR/data-on-new-build"
       mv -f "$SEALED_DIR/data.raw" "$SEALED_DIR/data.raw.prev"
       DATA_RESET=1
@@ -223,6 +229,12 @@ if [ "$GOT" = "$EXPECTED" ]; then
   # Boot the guest again at the next host start (an unattended reboot left
   # sealed guests off until a manual start). Only a verified image is enabled.
   systemctl enable -q "$UNIT"
+  # VM host (AB#999): the new guest now runs at its new size, so the host ledger's record of this
+  # kit, held at the larger of the old and new sizes since the assess step, may shrink to it.
+  if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
+    python3 -I "$KIT/vm/vm_capacity.py" commit-kit "$SEALED_DIR/sealed.env" \
+      || log "VM host ledger: the record of $SEALED_NAME keeps the larger size until the next install"
+  fi
 else
   # Do not serve a guest the operator cannot vouch for, and do not boot it
   # again at the next host start. The previous image is current again.
