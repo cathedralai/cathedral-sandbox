@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -988,5 +989,45 @@ func TestVMsLostStopOfARunThatRanKeepsItsReceipt(t *testing.T) {
 	}
 	if st, _ := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 2}); st != 200 {
 		t.Fatalf("next run after the receipt: %d", st)
+	}
+}
+
+// The host (room-kit/vm/vm_ctl.py KEY_TYPES) must accept exactly these types, or a
+// create passes the broker and fails as a 502 at the host. The Python host test
+// reads this map from broker/vms.go and compares; this test pins the list here.
+func TestVMsKeyTypesArePinnedToTheHostSet(t *testing.T) {
+	want := []string{
+		"ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+		"sk-ecdsa-sha2-nistp256@openssh.com", "sk-ssh-ed25519@openssh.com",
+		"ssh-ed25519", "ssh-rsa",
+	}
+	var got []string
+	for k := range vmKeyTypes {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("vmKeyTypes changed: %v; update room-kit/vm/vm_ctl.py KEY_TYPES to match", got)
+	}
+}
+
+func TestVMsCreateAcceptsSecurityKey(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	var blob []byte
+	put := func(b []byte) {
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(b)))
+		blob = append(append(blob, n[:]...), b...)
+	}
+	put([]byte("sk-ssh-ed25519@openssh.com"))
+	put(bytes.Repeat([]byte{7}, 32))
+	put([]byte("ssh:"))
+	key := "sk-ssh-ed25519@openssh.com " + base64.StdEncoding.EncodeToString(blob) + " tester@example"
+	doc := tb.create(t, map[string]any{"ssh_public_key": key})
+	if doc["id"] == nil && doc["vm"] == nil {
+		t.Fatalf("no vm in answer: %v", doc)
+	}
+	if got := tb.host.lastOf("create"); got == nil {
+		t.Fatal("create never reached the host")
 	}
 }

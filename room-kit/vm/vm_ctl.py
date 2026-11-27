@@ -38,7 +38,17 @@ from pathlib import Path
 
 KIT = Path(__file__).resolve().parent
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
-KEY_TYPES = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa")
+# Must equal the broker's vmKeyTypes (broker/vms.go); both test files pin the same set.
+# The sk-* security-key types are accepted by the guest sshd (OpenSSH 9.6 on the pinned Ubuntu 24.04).
+KEY_TYPES = (
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ssh-rsa",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+)
 NET = ipaddress.IPv4Network("10.216.0.0/16")
 SLOTS = NET.num_addresses // 4
 COMMANDS = ("create", "authorize", "start", "stop", "reboot", "delete", "status", "list", "enforce")
@@ -95,7 +105,7 @@ def check_key(text: str) -> str:
         raise Refusal("invalid_ssh_key", "the key file must hold exactly one public key line")
     parts = lines[0].strip().split()
     if len(parts) < 2 or parts[0] not in KEY_TYPES or not re.fullmatch(r"[A-Za-z0-9+/]+={0,3}", parts[1]):
-        raise Refusal("invalid_ssh_key", "not an ssh-ed25519, ecdsa-sha2-nistp* or ssh-rsa public key")
+        raise Refusal("invalid_ssh_key", "not an ssh-ed25519, ecdsa-sha2-nistp*, sk-* or ssh-rsa public key")
     try:
         blob = base64.b64decode(parts[1], validate=True)
     except (binascii.Error, ValueError):

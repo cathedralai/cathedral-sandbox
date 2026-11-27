@@ -159,6 +159,34 @@ def test_create_refuses_bad_keys(host, tmp_path, text):
     assert not (host.root / "vm1").exists()
 
 
+def _sk_key(typ):
+    import base64
+    blob = len(typ).to_bytes(4, "big") + typ.encode() + b"\x00" * 8
+    return typ + " " + base64.b64encode(blob).decode() + " user@laptop"
+
+
+@pytest.mark.parametrize("typ", ["sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"])
+def test_create_accepts_security_key_types(host, tmp_path, typ):
+    f = tmp_path / "sk.pub"
+    f.write_text(_sk_key(typ) + "\n")
+    code, out = host.create(key=f)
+    assert code == 0, out
+    assert (host.root / "vm1").exists()
+
+
+def test_key_types_equal_the_broker_set():
+    """Drift guard: the host KEY_TYPES must equal broker vmKeyTypes (broker/vms.go)."""
+    import importlib.util
+    import re
+    spec = importlib.util.spec_from_file_location("vm_ctl", KIT / "vm_ctl.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    src = (KIT.parents[1] / "broker" / "vms.go").read_text()
+    block = re.search(r"var vmKeyTypes = map\[string\]bool\{(.*?)\n\}", src, re.S).group(1)
+    broker = set(re.findall(r'"([^"]+)":\s+true', block))
+    assert broker and set(mod.KEY_TYPES) == broker
+
+
 def test_authorize_is_idempotent_and_monotonic(host):
     host.create()
     now = int(time.time())
