@@ -189,20 +189,28 @@ def test_a_host_without_nsenter_is_refused_before_anything_is_written(host, tmp_
 # ---------------------------------------------------------------- 5.11 isolation: the fds QEMU holds
 
 GMEM = "/[kvm-gmem] (deleted)"
+HOST_MNT, KERNEL_MNT = "48", "234"  # as surveyed on the kit's SNP QEMU: the host's ext4 is listed, gmem's mount is not
 
 
-def isolation_rig(host, tmp_path, monkeypatch, fds):
-    """verify_isolation over a fake /proc. fds maps a name to (readlink target, st_nlink, is a regular file)."""
+def isolation_rig(host, tmp_path, monkeypatch, fds, mountinfo=None, fdinfo=None):
+    """verify_isolation over a fake /proc. fds maps a name to (readlink target, regular file, mnt_id or None).
+    A gmem-named fd gets KERNEL_MNT and a real path HOST_MNT unless given; mnt_id None writes no fdinfo."""
     import types
     mod = load_host_module(host.env)
     ctx = mod.Ctx("boot", HOTEL, LAUNCH, {}, {})
-    root = tmp_path / "proc" / "4242" / "fd"
-    root.mkdir(parents=True)
+    pid = tmp_path / "proc" / "4242"
+    (pid / "fd").mkdir(parents=True)
+    (pid / "fdinfo").mkdir()
+    lines = mountinfo if mountinfo is not None else [f"{HOST_MNT} 1 8:1 / / rw - ext4 /dev/sda1 rw", "50 48 0:5 / /dev rw - devtmpfs devtmpfs rw"]
+    if lines is not False:
+        (pid / "mountinfo").write_text("\n".join(lines) + "\n")
     stats = {}
-    for name, (target, nlink, regular) in fds.items():
+    for name, (target, regular, mnt) in fds.items():
         target = target.replace("{D}", ctx.d)
-        (root / name).symlink_to(target)  # may dangle: the stat is faked below, as /proc would answer it
-        stats[target] = types.SimpleNamespace(st_mode=(0o100644 if regular else 0o020644), st_nlink=nlink)
+        (pid / "fd" / name).symlink_to(target)  # may dangle: the stat is faked below, as /proc would answer it
+        stats[target] = types.SimpleNamespace(st_mode=(0o100600 if regular else 0o020644), st_nlink=1)
+        if mnt is not None:
+            (pid / "fdinfo" / name).write_text(f"pos:\t0\nflags:\t02\nmnt_id:\t{mnt}\nino:\t5\n")
     monkeypatch.setattr(mod, "PROC", str(tmp_path / "proc"))
     monkeypatch.setattr(mod, "FD_STAT", lambda fd: stats[os.readlink(fd)])
     monkeypatch.setattr(mod, "custom_qemu", lambda c: [{"pid": 4242}])
@@ -211,55 +219,75 @@ def isolation_rig(host, tmp_path, monkeypatch, fds):
     return mod, ctx
 
 
-def test_a_kvm_guest_memfd_is_not_a_file_outside_the_launch_folder(host, tmp_path, monkeypatch):
+def refused(mod, ctx):
+    with pytest.raises(mod.Halt) as r:
+        mod.verify_isolation(ctx)
+    assert r.value.code == "custom_guest_isolation_failed"
+    return r.value.detail
+
+
+def test_a_kvm_guest_memfd_with_an_unlisted_mount_is_not_a_host_file(host, tmp_path, monkeypatch):
     mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {
-        "3": (GMEM, 0, True),                                   # SNP private memory
-        "4": ("/dev/kvm", 1, False),
-        "5": ("/memfd:qemu-ram (deleted)", 0, True)})
+        "3": (GMEM, True, KERNEL_MNT), "4": ("/dev/kvm", False, None), "5": ("/memfd:qemu-ram (deleted)", True, "9"),
+        "6": ("{D}/disks/root.raw", True, HOST_MNT), "7": ("anon_inode:kvm-vm", False, None)})
     assert mod.KVM_GMEM_TARGET == GMEM
-    mod.verify_isolation(ctx)  # does not raise
+    mod.verify_isolation(ctx)  # three gmem-like fds of different sizes in the real survey: the rule is the same
+
+
+def test_the_gmem_name_with_a_listed_mount_still_fails(host, tmp_path, monkeypatch):
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": (GMEM, True, HOST_MNT)})
+    assert GMEM in refused(mod, ctx)
 
 
 def test_a_regular_host_file_outside_the_launch_folder_still_fails(host, tmp_path, monkeypatch):
-    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": (GMEM, 0, True), "4": ("/etc/shadow", 1, True)})
-    with pytest.raises(mod.Halt) as refused:
-        mod.verify_isolation(ctx)
-    assert refused.value.code == "custom_guest_isolation_failed"
-    assert "/etc/shadow" in refused.value.detail and "kvm-gmem" not in refused.value.detail
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": (GMEM, True, KERNEL_MNT), "4": ("/etc/shadow", True, HOST_MNT)})
+    detail = refused(mod, ctx)
+    assert "/etc/shadow" in detail and "kvm-gmem" not in detail
+    # An unlisted mount id does not excuse another name.
+    mod, ctx = isolation_rig(host, tmp_path / "b", monkeypatch, {"3": ("/etc/shadow", True, KERNEL_MNT)})
+    assert "/etc/shadow" in refused(mod, ctx)
+
+
+def test_an_unreadable_fdinfo_or_mountinfo_fails_closed(host, tmp_path, monkeypatch):
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": (GMEM, True, None)})  # no fdinfo file
+    assert GMEM in refused(mod, ctx)
+    mod, ctx = isolation_rig(host, tmp_path / "m", monkeypatch, {"3": (GMEM, True, KERNEL_MNT)}, mountinfo=False)  # no mountinfo
+    assert GMEM in refused(mod, ctx)
+    mod, ctx = isolation_rig(host, tmp_path / "e", monkeypatch, {"3": (GMEM, True, KERNEL_MNT)}, mountinfo=[])  # empty mountinfo
+    assert GMEM in refused(mod, ctx)
+    mod, ctx = isolation_rig(host, tmp_path / "j", monkeypatch, {"3": (GMEM, True, KERNEL_MNT)}, mountinfo=["not-a-number rest"])
+    assert GMEM in refused(mod, ctx)
+    # A fdinfo with no mnt_id line.
+    mod, ctx = isolation_rig(host, tmp_path / "n", monkeypatch, {"3": (GMEM, True, KERNEL_MNT)})
+    (tmp_path / "n" / "proc" / "4242" / "fdinfo" / "3").write_text("pos:\t0\nflags:\t02\n")
+    assert GMEM in refused(mod, ctx)
 
 
 def test_a_file_inside_the_launch_folder_and_non_regular_fds_pass(host, tmp_path, monkeypatch):
-    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": ("{D}/disks/root.raw", 1, True),
-                                                           "4": ("/some/socket", 1, False)})
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": ("{D}/disks/root.raw", True, HOST_MNT), "4": ("/some/socket", False, None)})
     mod.verify_isolation(ctx)
 
 
 def test_every_offender_is_listed_once_in_one_bounded_line(host, tmp_path, monkeypatch):
-    fds = {"3": ("/etc/shadow", 1, True), "4": ("/var/lib/other\nline", 1, True), "5": ("/etc/shadow", 1, True),
-           "6": (GMEM, 1, True)}  # the same name with a link is not guest memory
+    fds = {"3": ("/etc/shadow", True, HOST_MNT), "4": ("/var/lib/other\nline", True, HOST_MNT), "5": ("/etc/shadow", True, HOST_MNT),
+           "6": (GMEM, True, HOST_MNT)}  # the gmem name on a listed mount is not guest memory
     for i in range(7, 30):
-        fds[str(i)] = (f"/root/very-long-name-{i}-" + "x" * 40, 1, True)
+        fds[str(i)] = (f"/root/very-long-name-{i}-" + "x" * 40, True, HOST_MNT)
     mod, ctx = isolation_rig(host, tmp_path, monkeypatch, fds)
-    with pytest.raises(mod.Halt) as refused:
-        mod.verify_isolation(ctx)
-    detail = refused.value.detail
-    assert refused.value.code == "custom_guest_isolation_failed"
+    detail = refused(mod, ctx)
     assert detail.count("/etc/shadow") == 1, "one entry per target"
     assert "/var/lib/other line" in detail and "\n" not in detail
     assert len(detail) <= 300 and all(" " <= c <= "~" for c in detail)
     assert detail.startswith("QEMU holds open, outside the launch folder: /etc/shadow, /var/lib/other line, /[kvm-gmem] (deleted)")
-    # Fewer offenders: all of them appear.
-    mod2, ctx2 = isolation_rig(host, tmp_path / "two", monkeypatch, {"3": ("/etc/shadow", 1, True), "4": ("/etc/gshadow", 1, True)})
-    with pytest.raises(mod2.Halt) as two:
-        mod2.verify_isolation(ctx2)
-    assert "/etc/shadow" in two.value.detail and "/etc/gshadow" in two.value.detail
+    mod2, ctx2 = isolation_rig(host, tmp_path / "two", monkeypatch, {"3": ("/etc/shadow", True, HOST_MNT), "4": ("/etc/gshadow", True, HOST_MNT)})
+    two = refused(mod2, ctx2)
+    assert "/etc/shadow" in two and "/etc/gshadow" in two
 
 
-def test_only_the_exact_gmem_name_with_no_link_is_skipped(host, tmp_path, monkeypatch):
-    for target, nlink in ((GMEM, 1), ("/[kvm-gmem]", 0), ("/[kvm-gmem] (deleted) ", 0), ("/x/[kvm-gmem] (deleted)", 0)):
-        mod, ctx = isolation_rig(host, tmp_path / f"c{abs(hash((target, nlink)))}", monkeypatch, {"3": (target, nlink, True)})
-        with pytest.raises(mod.Halt):
-            mod.verify_isolation(ctx)
+def test_only_the_exact_gmem_name_is_skipped(host, tmp_path, monkeypatch):
+    for i, target in enumerate(("/[kvm-gmem]", "/[kvm-gmem] (deleted) ", "/x/[kvm-gmem] (deleted)", "/[KVM-GMEM] (deleted)")):
+        mod, ctx = isolation_rig(host, tmp_path / f"c{i}", monkeypatch, {"3": (target, True, KERNEL_MNT)})
+        refused(mod, ctx)
 
 
 def test_validator_line_is_the_spec_line(host):

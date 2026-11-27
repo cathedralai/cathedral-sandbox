@@ -718,11 +718,45 @@ def custom_qemu(ctx: Ctx) -> list[dict]:
 
 
 # A KVM guest_memfd, which backs an SNP guest's private memory, reads back from /proc/<pid>/fd as this exact
-# name, stats as a regular file, and has no directory entry (st_nlink 0). It is kernel memory, not a host file, so
-# it is not "a file outside the launch folder". Only this exact name with no link is skipped: the same name with
-# a link, or any other path, still fails. A test seam so the fake /proc can say what stat would.
+# name and stats as a regular file with one link, so neither name nor link count separates it from a host file
+# (surveyed on the kit's SNP QEMU: three of them, 640 GiB, 4 MiB and 128 KiB). What does: its mount id (fdinfo
+# mnt_id) belongs to an internal kernel mount that no path reaches, so it is in no line of /proc/<pid>/mountinfo,
+# while a real file's mount id is. It is kernel memory, not a host file. An fd is skipped only with BOTH the exact
+# name and an unlisted mount id; if either read fails it is treated as an offender. The stat is a test seam so the
+# fake /proc can say what stat would.
 KVM_GMEM_TARGET = "/[kvm-gmem] (deleted)"
 FD_STAT = os.stat
+
+
+def fd_mount_id(pid: int, fd: str) -> str | None:
+    """The mnt_id of /proc/<pid>/fdinfo/<fd>, or None when it cannot be read."""
+    try:
+        with open(f"{PROC}/{pid}/fdinfo/{os.path.basename(fd)}") as f:
+            for line in f.read(4096).splitlines():
+                key, _, value = line.partition(":")
+                if key == "mnt_id" and value.strip().isdigit():
+                    return value.strip()
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def mount_ids(pid: int) -> set[str] | None:
+    """Every mount id in /proc/<pid>/mountinfo (the first field of each line), or None when it cannot be read."""
+    try:
+        with open(f"{PROC}/{pid}/mountinfo") as f:
+            ids = {line.split(" ", 1)[0] for line in f.read(1 << 20).splitlines() if line}
+    except (OSError, ValueError):
+        return None
+    return ids if ids and all(i.isdigit() for i in ids) else None
+
+
+def is_guest_memfd(pid: int, fd: str, target: str, mounts: set[str] | None) -> bool:
+    """True only for the exact guest_memfd name whose mount id is in no mountinfo line. Fails closed."""
+    if target != KVM_GMEM_TARGET or mounts is None:
+        return False
+    mnt = fd_mount_id(pid, fd)
+    return mnt is not None and mnt not in mounts
 
 
 def single_line(text: str, limit: int = 300) -> str:
@@ -751,6 +785,7 @@ def verify_isolation(ctx: Ctx) -> None:
             raise Halt("custom_guest_isolation_failed", "the root drive is not read-only")
     offenders: list[str] = []
     for q in custom_qemu(ctx):
+        mounts = mount_ids(q["pid"])
         for fd in sorted(glob.glob(f"{PROC}/{q['pid']}/fd/*"), key=lambda f: (len(f), f)):  # fd order, 9 before 10
             try:
                 target = os.readlink(fd)
@@ -764,7 +799,7 @@ def verify_isolation(ctx: Ctx) -> None:
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
-            if target == KVM_GMEM_TARGET and st.st_nlink == 0:
+            if is_guest_memfd(q["pid"], fd, target, mounts):
                 continue  # SNP private guest memory: kernel memory, not a host file
             if not os.path.normpath(target).startswith(ctx.d + os.sep) and target not in offenders:
                 offenders.append(target)
