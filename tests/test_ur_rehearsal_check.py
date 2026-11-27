@@ -49,14 +49,28 @@ def status(result):
     return {c["name"]: c["status"] for c in result["checks"]}
 
 
-DISKS = "%s  data.raw\n%s  root.raw\n" % ("aa" * 32, "bb" * 32)
-RESTART = json.dumps({"verdict": "PASS", "launch_id": LAUNCH_ID}) + "\n"
+LIVE_KEY = "ssh-ed25519 AAAA"  # what the fake verifier returns as the live report's key
+OLD_KEY = "ssh-ed25519 BBBB"   # the boot before the hold
+BODY = "%s  data.raw\n%s  root.raw\n" % ("aa" * 32, "bb" * 32)
 
 
-def evidence(a, tmp_path, before=DISKS, after=DISKS, restart=RESTART):
-    for name, text in (("before", before), ("after", after), ("restart", restart)):
+def listing(taken, body=BODY, launch=LAUNCH_ID):
+    return f"# cathedral.preserved/v1 launch_id={launch} taken={taken}\n" + body
+
+
+def result_line(key, verdict="PASS", launch=LAUNCH_ID, binding="verified"):
+    return json.dumps({"verdict": verdict, "launch_id": launch, "ssh_channel_binding": binding, "ssh_host_key": key}) + "\n"
+
+
+def evidence(a, tmp_path, before=None, after=None, pre=None, restart=None):
+    files = {"before": listing("2026-11-27T10:00:00Z") if before is None else before,
+             "after": listing("2026-11-27T11:00:00Z") if after is None else after,
+             "pre": result_line(OLD_KEY) if pre is None else pre,
+             "restart": result_line(LIVE_KEY) if restart is None else restart}
+    for name, text in files.items():
         (tmp_path / name).write_text(text)
-    a.preserved_before, a.preserved_after, a.restart_result = (str(tmp_path / n) for n in ("before", "after", "restart"))
+    a.preserved_before, a.preserved_after, a.pre_hold_result, a.restart_result = (
+        str(tmp_path / n) for n in ("before", "after", "pre", "restart"))
     return a
 
 
@@ -76,22 +90,45 @@ def test_main_exits_2_when_incomplete(tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("after,why", [
-    ("%s  data.raw\n%s  root.raw\n" % ("cc" * 32, "bb" * 32), "changed during the hold: data.raw"),
-    ("%s  root.raw\n" % ("bb" * 32), "differ"),
-    ("", "no disks"),
-    ("not a listing\n", "sha256sum"),
+    (listing("2026-11-27T11:00:00Z", "%s  data.raw\n%s  root.raw\n" % ("cc" * 32, "bb" * 32)), "changed during the hold: data.raw"),
+    (listing("2026-11-27T11:00:00Z", "%s  root.raw\n" % ("bb" * 32)), "differ"),
+    (listing("2026-11-27T11:00:00Z", ""), "no disks"),
+    ("", "empty"),
+    (BODY, "header"),
+    (listing("2026-11-27T11:00:00Z", launch="cg-ffffffffffff"), "another launch"),
+    (listing("2026-11-27T10:00:00Z"), "not older"),
+    (listing("2026-11-27T09:00:00Z"), "not older"),
+    (listing("2026-11-27T11:00:00Z", "not a listing\n"), "sha256sum"),
 ])
-def test_a_changed_or_missing_disk_fails(tmp_path, after, why):
+def test_a_changed_stale_or_unheaded_listing_fails(tmp_path, after, why):
     result = rc.run(evidence(args(tmp_path), tmp_path, after=after), runner())
     assert result["verdict"] == "FAIL" and status(result)["preserved_work"] == "fail"
     assert why in result["checks"][-1]["detail"]
 
 
-@pytest.mark.parametrize("restart", [
-    json.dumps({"verdict": "FAIL", "reason": "x"}), json.dumps({"verdict": "PASS", "launch_id": "cg-ffffffffffff"}), "", "[]"])
-def test_a_bad_restart_result_fails(tmp_path, restart):
-    result = rc.run(evidence(args(tmp_path), tmp_path, restart=restart), runner())
+def test_the_same_listing_file_twice_fails(tmp_path):
+    """Spock's P2: --preserved-before X --preserved-after X must not pass."""
+    a = evidence(args(tmp_path), tmp_path)
+    a.preserved_after = a.preserved_before
+    result = rc.run(a, runner())
+    assert status(result)["preserved_work"] == "fail" and "same file" in result["checks"][-1]["detail"]
+
+
+@pytest.mark.parametrize("pre,restart,why", [
+    (None, result_line(OLD_KEY), "another boot"),          # saved pre-hold output passed as the restart
+    (result_line(LIVE_KEY), None, "did not change"),        # no reboot happened
+    (None, result_line(LIVE_KEY, verdict="FAIL"), "not PASS"),  # FAIL with the right launch id (Spock's mutation note)
+    (None, result_line(LIVE_KEY, launch="cg-ffffffffffff"), "another launch"),
+    (None, result_line(LIVE_KEY, binding="unchecked"), "SSH-bound"),
+    (None, result_line(LIVE_KEY, verdict="FAIL") + result_line(LIVE_KEY), "one JSON line"),
+    (None, json.dumps({"verdict": "PASS", "launch_id": LAUNCH_ID, "ssh_channel_binding": "verified"}), "no host key"),
+    (None, "", "one JSON line"),
+    (None, "[]", "not PASS"),
+])
+def test_a_bad_or_stale_restart_result_fails(tmp_path, pre, restart, why):
+    result = rc.run(evidence(args(tmp_path), tmp_path, pre=pre, restart=restart), runner())
     assert result["verdict"] == "FAIL" and status(result)["restart_same_launch"] == "fail"
+    assert why in [c for c in result["checks"] if c["name"] == "restart_same_launch"][0]["detail"]
 
 
 def test_pass_needs_every_check_including_evidence(tmp_path):
