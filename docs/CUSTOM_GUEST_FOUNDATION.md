@@ -119,3 +119,62 @@ Before this foundation can be marked ready:
 - Cross-review the complete result, then run the approved hardware rehearsals through Spock's launcher/operator path.
 
 The launcher, broker hold and API are separate Spock-owned PRs. No host operation, customer interruption, new compute or production switch is part of this component.
+
+### Reference root component
+
+`scripts/build_custom_guest_root.py` builds a read-only SquashFS root and appends
+its dm-verity hash tree. It takes an explicitly SHA256-pinned Debian base tar and
+the pinned static report helper. It never executes or mounts the base. Build
+versions are pinned to mksquashfs 4.7.5 and veritysetup 2.8.4. A fixed epoch, salt
+and UUID make repeated builds from these same inputs identical. The initial
+package-resolution step is not itself a reproducible source build; preserve and
+publish the exact base tar, its package inventory and its digest with the recipe.
+
+A fresh base can be prepared in an isolated unshare namespace:
+
+```sh
+mmdebstrap --mode=unshare --variant=minbase \
+  --customize-hook='rm -f "$1"/etc/ssh/ssh_host_* "$1"/var/lib/systemd/random-seed' \
+  --include=systemd-sysv,openssh-server,iproute2,cryptsetup-bin,ca-certificates \
+  bookworm base.tar https://deb.debian.org/debian
+sha256sum base.tar cathedral-attest
+python3 scripts/build_custom_guest_root.py \
+  --base base.tar --base-sha256 EXPECTED_BASE_SHA256 \
+  --helper cathedral-attest --helper-sha256 EXPECTED_HELPER_SHA256 \
+  --epoch 1795770000 --output root.raw
+```
+
+The JSON output records `root_verity`, `root_data_bytes`, the full root digest,
+base/helper/package-inventory digests, and tool versions. It always records
+`boot_verified: false`. `veritysetup verify root.raw root.raw ROOT_HASH
+--hash-offset=ROOT_DATA_BYTES` checks the resulting component without a device
+mapper or VM. The output path must be new. Tar traversal, escaping links, device
+entries outside `/dev`, unpinned inputs and pre-existing owner SSH credentials
+are refused. Device/pseudo-filesystem contents from the base are omitted.
+
+The image has no baked-in SSH host key. Package-generated keys, machine ID and
+random seed are removed. SSH reads its host key and authorized keys exclusively
+from `/run/cathedral`, disables password/PAM authentication, and permits only the
+owner's root login. Cloud-init is disabled; other SSH and console login services
+are masked. The root account has a non-locking invalid password hash, not an
+empty password. DNS is left unconfigured rather than copying the build host's
+resolver settings. The system journal and `/tmp` are volatile.
+
+The future measured init must validate all signed launch fields and observed
+hardware, verify HOST_DATA, mount this root through dm-verity with
+`--panic-on-corruption`, and populate a root-only tmpfs `/run/cathedral` before
+entering `/sbin/init`. That tmpfs holds the fresh private/public SSH host keys,
+`authorized_keys`, and `network.env` with exactly these validated values:
+
+```text
+CATHEDRAL_INTERFACE=eth0
+CATHEDRAL_GUEST_CIDR=10.217.0.2/30
+CATHEDRAL_GATEWAY=10.217.0.1
+```
+
+These are examples, not defaults. Init must select the observed interface by the
+signed MAC and emit the signed address/prefix/gateway. The system manager reads
+the private file and invokes `ip` directly with one argument per value, without a
+shell. SSH requires successful network setup. No DHCP or alternate network
+manager is enabled. A root image alone is not the reference init, kernel,
+optional owner data-disk unlock helper, or a complete bootable test image.
