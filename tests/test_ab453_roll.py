@@ -1080,3 +1080,173 @@ def test_miner_hotel_gets_no_restart_flag_without_the_guards_ok(host):
     assert "install restart_with_rooms=0" in c, c
     assert not any(x.startswith("systemctl restart") for x in c), c
     assert "PHASE=rolled_back" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+# ---- AB#999 PR 2: the host lock and the custom guest hold marker (spec r9 5.3, 5.10, 14.1) -----------
+LAUNCH = "cg-0123456789ab"
+HOST_LOCK_LIB = ROOT / "room-kit" / "sealed" / "host-lock.sh"
+INSTALL_OK = """#!/bin/bash
+systemctl restart "room-sealed-hotel-x.service"
+echo "[sealed] guest starting; serial log"
+echo "[sealed] measurement matches the build"
+"""
+LOCK_SYSTEMCTL = """#!/bin/bash
+echo "systemctl $* record=$(cat "$CATHEDRAL_SNP_LOCK_DIR/cathedral-snp-host.owner" 2>/dev/null || echo none)" >> "$FAKE_DIR/calls.log"
+[ "$1" = is-active ] && { echo active; exit 0; }
+exit 0
+"""
+needs_flock = pytest.mark.skipif(not __import__("shutil").which("flock") or not Path("/proc/self/status").exists(),
+                                 reason="needs util-linux flock and /proc (Linux), as on the hosts")
+
+
+def hold_marker(d, state="held", launch=LAUNCH):
+    (d / "custom-guest.hold").write_text(json.dumps({"launch_id": launch, "state": state}) + "\n")
+
+
+def admit_new_when_installed(fake, d):
+    curl = fake.parent / "bin" / "curl"
+    curl.write_text(curl.read_text().replace(
+        '*/v1/broker/capacity) cat "$F/capacity.json" ;;',
+        f'*/v1/broker/capacity) [ "$(readlink {d}/images/current)" = old ] && cat "$F/capacity.json" || cat "$F/capacity.new" ;;'))
+    (fake / "capacity.new").write_text(capacity(NEW, drain=True))
+
+
+def logging_flock(e, fake):
+    import shutil
+    p = Path(e["PATH"].split(":")[0]) / "flock"
+    p.write_text(f'#!/bin/bash\necho "flock $*" >> "$FAKE_DIR/calls.log"\nexec {shutil.which("flock")} "$@"\n')
+    p.chmod(0o755)
+
+
+def resume_drained(home):
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=drained\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
+
+
+@needs_flock
+def test_roll_call_graph_runs_under_one_lock_from_host_install_to_write_units(host, tmp_path):
+    # roll host_install -> install.sh -> install-sealed.sh -> write-units.sh (spec 5.3, 14.1), all real
+    # except install-sealed.sh's SNP-host sections (assess, packages, build, start), which are cut.
+    import shutil
+    e, fake, home, d, kit = host
+    shutil.copy2(ROOT / "room-kit" / "install.sh", kit / "install.sh")
+    shutil.copytree(ROOT / "room-kit" / "sealed", kit / "sealed")
+    text = (kit / "sealed" / "install-sealed.sh").read_text()
+    head = text[:text.index("# ---------------------------------------------------------------- 1. assess")]
+    lock = text[text.index("# >>> host lock"):text.index("# <<< host lock")]
+    unit = text[text.index("# ---------------------------------------------------------------- 4. unit"):
+                text.index("# ---------------------------------------------------------------- 5. start and check")]
+    (kit / "sealed" / "install-sealed.sh").write_text(head + lock + unit + INSTALL_OK.split("\n", 1)[1])
+    bin_dir = Path(e["PATH"].split(":")[0])
+    (bin_dir / "systemctl").write_text(LOCK_SYSTEMCTL)
+    (bin_dir / "id").write_text('#!/bin/bash\ncase "${1:-}" in -u) echo 0 ;; *) exit 0 ;; esac\n')
+    (bin_dir / "id").chmod(0o755)
+    logging_flock(e, fake)
+    units = tmp_path / "fake-root"
+    e["ROOM_DESTDIR"] = str(units)
+    admit_new_when_installed(fake, d)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "RESULT=installed" in r.stdout and "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
+    c = calls(fake)
+    # flock -n 9 is roll.sh's own per-hotel run lock on the operator machine (run_apply); the host lock
+    # is taken once, by the roll's host step, and never again below it.
+    assert [x for x in c if x.startswith("flock")] == ["flock -n 9", "flock -w 60 9"], c
+    enable = [x for x in c if x.startswith("systemctl enable")]
+    assert enable and '"phase": "host_install"' in enable[0] and '"owner": "roll:hotel-x:' in enable[0], c
+    assert f"ExecStartPre=/bin/sh -c '[ ! -e {d}/custom-guest.hold ]" in (
+        units / "etc/systemd/system/room-sealed-hotel-x.service").read_text()
+    assert not (tmp_path / "run-lock" / "cathedral-snp-host.owner").exists()
+
+
+@needs_flock
+@pytest.mark.parametrize("state", ["held", "kit_start"])
+def test_a_held_hotel_gets_result_held_at_every_resume_until_the_marker_goes(host, state):
+    # A roll paused after preflight and its drain, resumed at R11, R12, R13 and R14: RESULT=held every
+    # time, nothing on the host changes and the hotel is never undrained. After R15 it proceeds.
+    e, fake, home, d, kit = host
+    (kit / "install.sh").write_text(INSTALL_OK)
+    (kit / "install.sh").chmod(0o755)
+    hold_marker(d, state)
+    env_before = (d / "sealed.env").read_text()
+    for _ in range(4):
+        resume_drained(home)
+        r = run(e, "apply", HOTEL)
+        assert r.returncode == 1, r.stdout
+        assert f"RESULT=held launch={LAUNCH} state={state}" in r.stdout
+        assert "PHASE=drained" in (home / "state" / f"{HOTEL}.env").read_text()
+        assert os.readlink(d / "images" / "current") == "old"
+        assert (d / "sealed.env").read_text() == env_before and not list(d.glob("sealed.env.bak-*"))
+        c = calls(fake)
+        assert not any(x.startswith("systemctl") for x in c), c
+        assert patches(fake) == [], c
+    (d / "custom-guest.hold").unlink()  # R15
+    admit_new_when_installed(fake, d)
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "RESULT=installed" in r.stdout and "PHASE=done" in (home / "state" / f"{HOTEL}.env").read_text()
+
+
+@needs_flock
+def test_preflight_refuses_a_held_hotel_before_the_drain(host):
+    e, fake, home, d, kit = host
+    e["FAKE_CHECK_EXEC"] = "1"
+    hold_marker(d, "kit_start")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert "host: custom_guest_hold=kit_start launch=" + LAUNCH in r.stdout
+    assert "a custom guest holds hotel-x" in r.stdout
+    no_mutation(fake)
+    (d / "custom-guest.hold").unlink()
+    r = run(e, "apply", HOTEL)
+    assert "host: custom_guest_hold=none" in r.stdout, r.stdout
+
+
+@needs_flock
+def test_a_rollback_of_a_held_hotel_is_refused_and_the_run_stays_stuck(host):
+    e, fake, home, d, kit = host
+    hold_marker(d, "held")
+    (fake / "capacity.json").write_text(capacity(CUR, drain=True))
+    (home / "state" / f"{HOTEL}.env").write_text(
+        f"PHASE=installed\nTS=20260101T000000Z\nOLDIMG=old\nCOMMIT=1234567\nPLAN_SHA={plan_sha(home)}\n")
+    (d / "images" / "current").unlink()
+    (d / "images" / "current").symlink_to("20260101T000000Z")
+    r = run(e, "apply", HOTEL)
+    assert r.returncode == 1
+    assert f"RESULT=held launch={LAUNCH}" in r.stdout and "host rollback refused, nothing changed" in r.stdout
+    assert "PHASE=stuck_drained" in (home / "state" / f"{HOTEL}.env").read_text()
+    assert os.readlink(d / "images" / "current") == "20260101T000000Z"
+    assert not any(x.startswith("systemctl") for x in calls(fake))
+    assert patches(fake) == []
+
+
+@needs_flock
+def test_install_stops_with_nothing_changed_while_another_step_holds_the_host_lock(host, tmp_path):
+    e, fake, home, d, kit = host
+    (kit / "install.sh").write_text(INSTALL_OK)
+    (kit / "install.sh").chmod(0o755)
+    e["CATHEDRAL_SNP_LOCK_WAIT"] = "1"
+    holder = subprocess.Popen(["bash", "-c", f"source {HOST_LOCK_LIB}; snp_lock_take custom-guest hold-stop hotel-x "
+                               f"{LAUNCH} 900 || exit 9; echo ready; sleep 60"], env=e, stdout=subprocess.PIPE, text=True,
+                              start_new_session=True)
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        resume_drained(home)
+        r = run(e, "apply", HOTEL)
+    finally:
+        os.killpg(holder.pid, 9)
+        holder.wait()
+    assert r.returncode == 1
+    assert "RESULT=busy" in r.stdout and "custom_guest_lifecycle_busy" in r.stdout and '"phase": "hold-stop"' in r.stdout
+    assert "PHASE=drained" in (home / "state" / f"{HOTEL}.env").read_text()
+    assert os.readlink(d / "images" / "current") == "old" and not list(d.glob("sealed.env.bak-*"))
+    assert patches(fake) == [] and not any(x.startswith("systemctl") for x in calls(fake))
+
+
+def test_host_steps_run_under_the_roll_deadline():
+    text = ROLL.read_text()
+    assert "HOST_STEP_MAX=3600" in text
+    assert text.count('timeout --kill-after=30s "$HOST_STEP_MAX"') == 2
+    for fn in ("host_install() {", "host_rollback() {", "host_check() {"):
+        body = text[text.index(fn):]
+        assert body.index('cat "$HOST_LOCK_LIB"') < body.index("REMOTE")

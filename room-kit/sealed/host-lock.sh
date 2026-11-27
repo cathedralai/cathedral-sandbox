@@ -98,13 +98,15 @@ snp_lock_inherited() {
   read -r rec_owner rec_pid rec_phase rec_launch <<< "$(snp_lock_record)"
   [ "$rec_owner" = "$owner" ] \
     || { echo "host lock: refused: the owner record names '$rec_owner', not the exported owner '$owner'" >&2; return 2; }
-  p=$PPID
+  # This process counts too: a holder that execs its helper (bash -c runs its last command by exec)
+  # keeps its pid and fd 9.
+  p=$$
   while [ "$p" -gt 1 ] && [ "$n" -lt 64 ]; do
     [ "$p" = "$rec_pid" ] && { SNP_LOCK_PHASE=$rec_phase SNP_LOCK_LAUNCH=$rec_launch; return 0; }
     p=$(snp_ppid "$p") || break
     n=$((n + 1))
   done
-  echo "host lock: refused: the owner record's pid $rec_pid is not an ancestor of this process" >&2
+  echo "host lock: refused: the owner record's pid $rec_pid is neither this process nor an ancestor" >&2
   return 2
 }
 
