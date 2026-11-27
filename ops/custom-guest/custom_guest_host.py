@@ -758,8 +758,10 @@ def verify_isolation(ctx: Ctx) -> None:
 # has TemporaryFileSystem=/srv:ro (so the guest user sees no other hotel or launch). Seen from there, check-start
 # finds an empty /srv and no host journal, and exited cannot append to it (EROFS). Those two are the real
 # breakage (rehearsal B, run 3, 27 Nov). A plain `+` hook can still write /run/lock and use netlink on 259
-# (probed with the full lockdown; the namespace is the part that bites), so custom-net.sh and the /dev/kvm wait, modprobe and rm lines are wrapped for
-# consistency, one rule for every host hook, not because they failed.
+# (probed with the full lockdown; the namespace is the part that bites). The /dev/kvm wait, modprobe and rm lines
+# are wrapped for consistency, one rule for every host hook. custom-net.sh up is more than consistency: in the unit's
+# namespace its kit-port check silently skips /srv/sealed-hotel-*/sealed.env (custom-net.sh port_clash), and its
+# ip_forward sysctl write may meet a read-only /proc/sys. Neither fails loudly, so the port check would just weaken.
 # `nsenter --mount=/proc/1/ns/mnt` puts only the hook, never the guest process, in PID 1's mount namespace
 # (probed on systemd 259 with the unit's sandbox: the wrapped hook saw /srv, the main process did not).
 # Chosen over binding the hooks' files into the unit (they would then be visible to the guest user, and the list

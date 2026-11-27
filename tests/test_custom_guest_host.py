@@ -159,6 +159,8 @@ def test_unit_confinement(host):
         assert want in lines, want
     assert "[Install]" not in text, "the unit is never enabled"
     pre = [ln for ln in text.splitlines() if ln.startswith("ExecStartPre=")]
+    # The modprobe line keeps its `-` (a failed modprobe must not stop the start): `+-`, not `+`.
+    assert [ln for ln in pre if "modprobe" in ln] == [f"ExecStartPre=+-{mod.HOST_NS} /sbin/modprobe -q kvm_amd"]
     assert pre[0] == f"ExecStartPre=+{mod.HOST_NS} {mod.LIBDIR}/custom-guest-host.sh check-start --hotel {HOTEL} --launch-id {LAUNCH}"
     assert all(ln.startswith("ExecStartPre=+") for ln in pre), "root steps are + prefixed only"
     assert [ln for ln in text.splitlines() if ln.startswith("ExecStart=")] == [
