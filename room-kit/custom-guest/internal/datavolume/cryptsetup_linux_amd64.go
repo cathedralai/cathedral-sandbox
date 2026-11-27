@@ -24,6 +24,10 @@ const (
 	diskFD = "/proc/self/fd/4"
 )
 
+// MountPoint is where a successful Unlock leaves the plaintext, mounted
+// nosuid,nodev,noexec.
+const MountPoint = mountTarget
+
 // tools is everything the adapter touches outside the held descriptor. Tests
 // replace paths and the exec seam; production uses productionTools.
 type tools struct {
