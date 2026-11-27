@@ -170,8 +170,8 @@ load() {
   read -r N GUEST HOST <<< "$first"
   PAIRS=$(tail -n +2 <<< "$BOOT")
   TAP=cgst$N
-  FWD=CGST-${TAP^^}-FWD
-  IN=CGST-${TAP^^}-IN
+  FWD=CGST-CGST$N-FWD
+  IN=CGST-CGST$N-IN
 }
 
 case "$ACTION" in
@@ -240,7 +240,7 @@ check)
       load
       rules_present && exit 0
       echo "custom-net: link rules for $LAUNCH were missing; restoring" >&2
-      exec "$0" up "$HOTEL" "$LAUNCH"
+      exec "$BASH" "$0" up "$HOTEL" "$LAUNCH"
       ;;
     inactive|failed)
       if [ -r "$D/images/bootstrap.json" ]; then load; fi
