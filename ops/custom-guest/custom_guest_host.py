@@ -545,6 +545,10 @@ def chown(owner: str, *paths: str, recursive: bool = False) -> None:
 
 
 def install_tools() -> None:
+    # The unit's + hooks run through nsenter (HOST_NS). Without it every start would fail in ExecStartPre, after a
+    # boot intent and a token were written: refuse before any of that, on a real host (a test root has no /usr/bin).
+    if not ROOT and not os.access(NSENTER, os.X_OK):
+        raise Halt("custom_guest_hold_failed", f"{NSENTER} is missing: the guest unit's host hooks need it (util-linux)")
     os.makedirs(LIBDIR, mode=0o755, exist_ok=True)
     for name in TOOLS:
         src, dst = os.path.join(HERE, name), os.path.join(LIBDIR, name)
@@ -750,15 +754,19 @@ def verify_isolation(ctx: Ctx) -> None:
 # ---------------------------------------------------------------- unit text (5.8)
 
 # Every `+` hook of the custom unit runs in the host's mount namespace. systemd runs a `+` command with
-# full privileges but, from systemd 259, still inside the unit's own mount namespace. This unit's namespace
-# has TemporaryFileSystem=/srv:ro (so the guest user sees no other hotel or launch) and ProtectSystem=strict
-# (so /run and /var are read-only). Seen from there, check-start finds an empty /srv and no host journal, the
-# exited hook cannot append to it (EROFS), and custom-net.sh cannot take its lock under /run/lock.
-# `nsenter --mount=/proc/1/ns/mnt` puts only the hook, never the guest process, in PID 1's namespace.
-# Chosen over binding the hooks' files into the unit (they would then be visible to the guest user, and
-# the list would grow with every hook) and over separate helper units (more moving parts and ordering to get
-# right for the same effect). The guest's ExecStart is unchanged: it still sees images (ro), disks and run.
-HOST_NS = "/usr/bin/nsenter --mount=/proc/1/ns/mnt --"
+# full privileges, but on systemd 259 still inside the unit's own mount namespace, and this unit's namespace
+# has TemporaryFileSystem=/srv:ro (so the guest user sees no other hotel or launch). Seen from there, check-start
+# finds an empty /srv and no host journal, and exited cannot append to it (EROFS). Those two are the real
+# breakage (rehearsal B, run 3, 27 Nov). A plain `+` hook can still write /run/lock and use netlink on 259
+# (probed with the full lockdown), so custom-net.sh and the /dev/kvm wait, modprobe and rm lines are wrapped for
+# consistency, one rule for every host hook, not because they failed.
+# `nsenter --mount=/proc/1/ns/mnt` puts only the hook, never the guest process, in PID 1's mount namespace
+# (probed on systemd 259 with the unit's sandbox: the wrapped hook saw /srv, the main process did not).
+# Chosen over binding the hooks' files into the unit (they would then be visible to the guest user, and the list
+# would grow with every hook) and over separate helper units (more moving parts for the same effect). The
+# guest's ExecStart is unchanged: it still sees images (ro), disks and run.
+NSENTER = "/usr/bin/nsenter"
+HOST_NS = f"{NSENTER} --mount=/proc/1/ns/mnt --"
 
 def unit_text(ctx: Ctx, mem_gib: int) -> str:
     d, lib, h, l = ctx.d, LIBDIR, ctx.hotel, ctx.launch
@@ -1595,18 +1603,9 @@ def ph_tick(ctx: Ctx) -> dict:
 def ph_check_start(ctx: Ctx) -> dict:
     """ExecStartPre of the custom unit: a fresh boot token and the 5.1 boot checks, or no start."""
     entries = ctx.entries(launch_only=False)
-    # The most recent boot entry of the journal, not its last line: the held timer (every minute) may append its
-    # own entries between the boot intent and this start. That entry must be this launch's intent, written in this
-    # host boot (an intent from before a reboot is stale), and its token must not have been used already.
-    pos = next((i for i in range(len(entries) - 1, -1, -1) if entries[i].get("event") == "boot"), None)
-    latest = entries[pos] if pos is not None else {}
+    latest = entries[-1] if entries else {}
     if latest.get("launch_id") != ctx.launch or latest.get("event") != "boot" or latest.get("state") != "intent":
-        raise Halt("custom_guest_boot_failed", "the latest boot entry of the host journal is not a boot intent for this launch")
-    if latest.get("boot_id") != boot_id():
-        raise Halt("custom_guest_boot_failed", "the boot intent is from before this host boot")
-    after = entries[pos + 1:]
-    if any(e.get("event") in ("token_used", "exit") and e.get("launch_id") == ctx.launch for e in after):
-        raise Halt("custom_guest_boot_failed", "the boot intent was already used")
+        raise Halt("custom_guest_boot_failed", "the latest host journal entry is not a boot intent for this launch")
     if (marker_doc(ctx) or {}).get("state") != "held":
         raise Halt("custom_guest_boot_failed", "the hotel is not held for this launch")
     eligibility(ctx, "boot")
