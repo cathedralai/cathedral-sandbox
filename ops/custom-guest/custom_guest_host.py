@@ -717,6 +717,21 @@ def custom_qemu(ctx: Ctx) -> list[dict]:
     return [q for q in qemu_processes() if q["unit"] == ctx.unit]
 
 
+# A KVM guest_memfd, which backs an SNP guest's private memory, reads back from /proc/<pid>/fd as this exact
+# name, stats as a regular file, and has no directory entry (st_nlink 0). It is kernel memory, not a host file, so
+# it is not "a file outside the launch folder". Only this exact name with no link is skipped: the same name with
+# a link, or any other path, still fails. A test seam so the fake /proc can say what stat would.
+KVM_GMEM_TARGET = "/[kvm-gmem] (deleted)"
+FD_STAT = os.stat
+
+
+def single_line(text: str, limit: int = 300) -> str:
+    """One line of printable ASCII, whitespace collapsed, at most `limit` characters (never empty). Same rule as
+    custom_guest.one_line in the operator tool, which is not installed on the host."""
+    flat = "".join(c if " " <= c <= "~" else " " for c in str(text))
+    return " ".join(flat.split())[:limit].rstrip() or "no detail given"
+
+
 def verify_isolation(ctx: Ctx) -> None:
     """Only allowlisted block nodes, and every regular file QEMU holds open is under D (5.11)."""
     try:
@@ -734,8 +749,9 @@ def verify_isolation(ctx: Ctx) -> None:
             raise Halt("custom_guest_isolation_failed", f"block file {f} is outside the launch folder")
         if b.get("device") == "root" and not (b.get("inserted") or {}).get("ro"):
             raise Halt("custom_guest_isolation_failed", "the root drive is not read-only")
+    offenders: list[str] = []
     for q in custom_qemu(ctx):
-        for fd in glob.glob(f"{PROC}/{q['pid']}/fd/*"):
+        for fd in sorted(glob.glob(f"{PROC}/{q['pid']}/fd/*"), key=lambda f: (len(f), f)):  # fd order, 9 before 10
             try:
                 target = os.readlink(fd)
             except OSError:
@@ -743,12 +759,20 @@ def verify_isolation(ctx: Ctx) -> None:
             if not target.startswith("/") or target.startswith(("/memfd:", "/dev/")):
                 continue
             try:
-                if not stat.S_ISREG(os.stat(fd).st_mode):
-                    continue
+                st = FD_STAT(fd)
             except OSError:
                 continue
-            if not os.path.normpath(target).startswith(ctx.d + os.sep):
-                raise Halt("custom_guest_isolation_failed", f"QEMU holds {target} open, outside the launch folder")
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if target == KVM_GMEM_TARGET and st.st_nlink == 0:
+                continue  # SNP private guest memory: kernel memory, not a host file
+            if not os.path.normpath(target).startswith(ctx.d + os.sep) and target not in offenders:
+                offenders.append(target)
+    if offenders:
+        # Every offender at once, so one run shows all of them. The detail is one bounded line: a file name can
+        # hold a newline, and the API refuses a multi-line detail.
+        shown = ", ".join(offenders)
+        raise Halt("custom_guest_isolation_failed", single_line(f"QEMU holds open, outside the launch folder: {shown}"))
 
 
 # ---------------------------------------------------------------- unit text (5.8)

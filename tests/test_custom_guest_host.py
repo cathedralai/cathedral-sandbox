@@ -186,6 +186,82 @@ def test_a_host_without_nsenter_is_refused_before_anything_is_written(host, tmp_
     assert not (tmp_path / "lib").exists(), "nothing was installed"
 
 
+# ---------------------------------------------------------------- 5.11 isolation: the fds QEMU holds
+
+GMEM = "/[kvm-gmem] (deleted)"
+
+
+def isolation_rig(host, tmp_path, monkeypatch, fds):
+    """verify_isolation over a fake /proc. fds maps a name to (readlink target, st_nlink, is a regular file)."""
+    import types
+    mod = load_host_module(host.env)
+    ctx = mod.Ctx("boot", HOTEL, LAUNCH, {}, {})
+    root = tmp_path / "proc" / "4242" / "fd"
+    root.mkdir(parents=True)
+    stats = {}
+    for name, (target, nlink, regular) in fds.items():
+        target = target.replace("{D}", ctx.d)
+        (root / name).symlink_to(target)  # may dangle: the stat is faked below, as /proc would answer it
+        stats[target] = types.SimpleNamespace(st_mode=(0o100644 if regular else 0o020644), st_nlink=nlink)
+    monkeypatch.setattr(mod, "PROC", str(tmp_path / "proc"))
+    monkeypatch.setattr(mod, "FD_STAT", lambda fd: stats[os.readlink(fd)])
+    monkeypatch.setattr(mod, "custom_qemu", lambda c: [{"pid": 4242}])
+    monkeypatch.setattr(mod, "qmp", lambda c, req: [{"return": [{"device": "root", "inserted": {"file": ctx.d + "/images/root.raw", "ro": True}}]}])
+    monkeypatch.setattr(mod, "load_doc", lambda path: ({"data_disk_gib": 0}, b"{}"))
+    return mod, ctx
+
+
+def test_a_kvm_guest_memfd_is_not_a_file_outside_the_launch_folder(host, tmp_path, monkeypatch):
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {
+        "3": (GMEM, 0, True),                                   # SNP private memory
+        "4": ("/dev/kvm", 1, False),
+        "5": ("/memfd:qemu-ram (deleted)", 0, True)})
+    assert mod.KVM_GMEM_TARGET == GMEM
+    mod.verify_isolation(ctx)  # does not raise
+
+
+def test_a_regular_host_file_outside_the_launch_folder_still_fails(host, tmp_path, monkeypatch):
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": (GMEM, 0, True), "4": ("/etc/shadow", 1, True)})
+    with pytest.raises(mod.Halt) as refused:
+        mod.verify_isolation(ctx)
+    assert refused.value.code == "custom_guest_isolation_failed"
+    assert "/etc/shadow" in refused.value.detail and "kvm-gmem" not in refused.value.detail
+
+
+def test_a_file_inside_the_launch_folder_and_non_regular_fds_pass(host, tmp_path, monkeypatch):
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, {"3": ("{D}/disks/root.raw", 1, True),
+                                                           "4": ("/some/socket", 1, False)})
+    mod.verify_isolation(ctx)
+
+
+def test_every_offender_is_listed_once_in_one_bounded_line(host, tmp_path, monkeypatch):
+    fds = {"3": ("/etc/shadow", 1, True), "4": ("/var/lib/other\nline", 1, True), "5": ("/etc/shadow", 1, True),
+           "6": (GMEM, 1, True)}  # the same name with a link is not guest memory
+    for i in range(7, 30):
+        fds[str(i)] = (f"/root/very-long-name-{i}-" + "x" * 40, 1, True)
+    mod, ctx = isolation_rig(host, tmp_path, monkeypatch, fds)
+    with pytest.raises(mod.Halt) as refused:
+        mod.verify_isolation(ctx)
+    detail = refused.value.detail
+    assert refused.value.code == "custom_guest_isolation_failed"
+    assert detail.count("/etc/shadow") == 1, "one entry per target"
+    assert "/var/lib/other line" in detail and "\n" not in detail
+    assert len(detail) <= 300 and all(" " <= c <= "~" for c in detail)
+    assert detail.startswith("QEMU holds open, outside the launch folder: /etc/shadow, /var/lib/other line, /[kvm-gmem] (deleted)")
+    # Fewer offenders: all of them appear.
+    mod2, ctx2 = isolation_rig(host, tmp_path / "two", monkeypatch, {"3": ("/etc/shadow", 1, True), "4": ("/etc/gshadow", 1, True)})
+    with pytest.raises(mod2.Halt) as two:
+        mod2.verify_isolation(ctx2)
+    assert "/etc/shadow" in two.value.detail and "/etc/gshadow" in two.value.detail
+
+
+def test_only_the_exact_gmem_name_with_no_link_is_skipped(host, tmp_path, monkeypatch):
+    for target, nlink in ((GMEM, 1), ("/[kvm-gmem]", 0), ("/[kvm-gmem] (deleted) ", 0), ("/x/[kvm-gmem] (deleted)", 0)):
+        mod, ctx = isolation_rig(host, tmp_path / f"c{abs(hash((target, nlink)))}", monkeypatch, {"3": (target, nlink, True)})
+        with pytest.raises(mod.Halt):
+            mod.verify_isolation(ctx)
+
+
 def test_validator_line_is_the_spec_line(host):
     mod = load_host_module(host.env)
     ctx = mod.Ctx("intake", HOTEL, LAUNCH, {}, {})
