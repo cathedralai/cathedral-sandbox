@@ -55,6 +55,12 @@ log "free ${FREE_GIB} GiB; after a full ${SEALED_SCRATCH_GIB} GiB scratch and ${
 [ "$LEFT" -ge "$SEALED_MIN_HOST_FREE_GIB" ] || { echo "not enough disk: lower SEALED_SCRATCH_GIB or SEALED_DATA_GIB" >&2; exit 1; }
 MEM_FREE_GIB=$(( $(awk '/MemAvailable/ {print $2}' /proc/meminfo) / 1048576 ))
 systemctl is-active -q "$UNIT" || [ "$MEM_FREE_GIB" -gt $(( SEALED_MEM_GIB + 32 )) ] || { echo "only ${MEM_FREE_GIB} GiB RAM available" >&2; exit 1; }
+# Customer VMs on this host (AB#999, VM spec r2 section 9): with the VM host switch on, the disk and
+# memory checks also count every VM and every other kit, and this kit's sizes are recorded in the
+# host ledger, under its capacity lock, before the build. Without the switch nothing here runs.
+if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
+  python3 -I "$KIT/vm/vm_capacity.py" assess-kit "$ENV_FILE" || exit 1
+fi
 
 # ---------------------------------------------------------------- 2. host packages
 need=()

@@ -1003,6 +1003,10 @@ intent before the host call. A host that does not answer gives 502
 `vm_host_unreachable` and leaves the intent with `last_error`: a timeout is
 never read as success or failure. A host refusal gives 502
 `vm_host_refused` with the exit code only; stderr never reaches the client.
+One exception: host exit 5 with `{"error": "host_capacity"}` (the host's
+admission ledger, room-kit/vm/README.md) is 409 `no_vm_capacity`, naming the
+resource when it is a known one. A refused create leaves no record; a refused
+first start stays stopped.
 
 ## Live config reload (AB#946)
 
