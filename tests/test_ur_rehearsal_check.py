@@ -32,7 +32,7 @@ def args(tmp_path, host="192.0.2.1", port=20022, signature=None):
         "--manifest", p["manifest"], "--bootstrap", p["bootstrap"],
         "--bootstrap-signature", p["bootstrap_signature"], "--owner-public-key", p["owner_public_key"],
         "--expected-measurement", "aa" * 48, "--expected-chip-id", "bb" * 64, "--expected-cpuid", "26:2:1",
-        "--ark-sha256", "cc" * 32, "--known-hosts-out", str(tmp_path / "kh"), "--min-tcb", "snp=1"])
+        "--ark-sha256", "cc" * 32, "--known-hosts-out", str(tmp_path / "kh"), "--min-tcb", "turin:fmc=1,bl=1,tee=1,snp=1,ucode=1"])
 
 
 def runner(code=0, out=None, calls=None):
@@ -58,7 +58,7 @@ def test_pass_needs_both_automated_checks(tmp_path):
     assert result["checks"][0]["detail"]["host_data"] == VECTOR["host_data_hex"]
     argv = calls[0]
     assert argv[1].endswith("verify_custom_guest.py")
-    assert argv[argv.index("--min-tcb") + 1] == "snp=1" and "--ark-crl" not in argv
+    assert argv[argv.index("--min-tcb") + 1] == "turin:fmc=1,bl=1,tee=1,snp=1,ucode=1" and "--ark-crl" not in argv
 
 
 def test_bad_signature_fails_without_connecting(tmp_path):
@@ -104,3 +104,13 @@ def test_oversized_document_fails(tmp_path):
     Path(a.manifest).write_bytes(b" " * (rc.DOC_LIMIT + 1))
     result = rc.run(a, runner())
     assert result["verdict"] == "FAIL" and "too large" in result["checks"][0]["detail"]
+
+
+def test_acceptance_passes_each_floor_whole(tmp_path, monkeypatch):
+    """The live test must hand the verifier complete floors, never comma fragments."""
+    sys.path.insert(0, str(ROOT / "room-kit"))
+    import verify_receipts
+    acceptance = (ROOT / "tests" / "acceptance" / "test_ur_rehearsal_a.py").read_text()
+    assert 'env["UR_MIN_TCB"].split()' in acceptance
+    floors = "turin:fmc=1,bl=1,tee=1,snp=1,ucode=1".split()
+    assert verify_receipts.parse_min_tcb(floors)["turin"]["ucode"] == 1

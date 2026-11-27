@@ -7,7 +7,8 @@ the owner's retained files; nothing is read from the API or the report itself.
   UR_REHEARSAL_HOST, UR_REHEARSAL_PORT (default 20022), UR_REHEARSAL_IDENTITY,
   UR_REHEARSAL_DIR (holds manifest.json, bootstrap.json, bootstrap.sig, owner.pub),
   UR_EXPECTED_MEASUREMENT, UR_EXPECTED_CHIP_ID, UR_EXPECTED_CPUID, UR_ARK_SHA256,
-  UR_MIN_TCB (comma separated, for example "bootloader=..,tee=..,snp=..,microcode=..").
+  UR_MIN_TCB (one floor per generation, separated by spaces, each in the verifier's form,
+  for example "turin:fmc=1,bl=1,tee=1,snp=1,ucode=1").
 """
 import json
 import os
@@ -36,8 +37,9 @@ def test_rehearsal_a_passes_against_live_guest(tmp_path):
             "--expected-measurement", env["UR_EXPECTED_MEASUREMENT"], "--expected-chip-id", env["UR_EXPECTED_CHIP_ID"],
             "--expected-cpuid", env["UR_EXPECTED_CPUID"], "--ark-sha256", env["UR_ARK_SHA256"],
             "--known-hosts-out", str(tmp_path / "known_hosts")]
-    for floor in env["UR_MIN_TCB"].split(","):
-        argv += ["--min-tcb", floor.strip()]
+    # Commas separate components inside one floor; only whitespace separates floors.
+    for floor in env["UR_MIN_TCB"].split():
+        argv += ["--min-tcb", floor]
     done = subprocess.run(argv, capture_output=True, timeout=300, check=False)
     result = json.loads(done.stdout)
     by_name = {c["name"]: c for c in result["checks"]}
