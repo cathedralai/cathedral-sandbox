@@ -341,12 +341,44 @@ def test_vm_net_up_blocks_private_ranges_and_forwards_only_ssh(host):
     assert "link del cvm0" in host.tools.read_text()
 
 
-def test_launch_keeps_the_process_on_guest_reboot():
-    text = (KIT / "launch-vm.sh").read_text()
-    assert "-no-reboot" not in text.replace("No -no-reboot", "")
-    for flag in ("-enable-kvm", "-cpu host", "q35", "cache=none", "virtio-blk-pci", "virtio-net-pci",
-                 "-qmp", "-display none", "seed.iso"):
-        assert flag in text, flag
+def _launch_code() -> str:
+    """launch-vm.sh without comment lines."""
+    return "\n".join(l for l in (KIT / "launch-vm.sh").read_text().splitlines() if not l.lstrip().startswith("#"))
+
+
+def test_launch_refuses_every_vm_without_sev_snp(tmp_path):
+    vm_dir = tmp_path / "vm1"
+    vm_dir.mkdir()
+    marker = tmp_path / "qemu-ran"
+    fake_qemu = tmp_path / "qemu"
+    fake_qemu.write_text(f'#!/bin/sh\necho ran > "{marker}"\n')
+    fake_qemu.chmod(0o755)
+    env_file = tmp_path / "vm.env"
+    env_file.write_text("\n".join([
+        "VM_NAME='vm1'", f"VM_DIR='{vm_dir}'", "VM_VCPUS='2'", "VM_MEM_GIB='4'",
+        "VM_TAP='cvm0'", "VM_MAC='52:54:00:d8:00:00'", ""]))
+    p = subprocess.run(["bash", str(KIT / "launch-vm.sh"), str(env_file)], capture_output=True, text=True,
+                       env=dict(os.environ, QEMU=str(fake_qemu)), timeout=30)
+    assert p.returncode == 78, (p.returncode, p.stderr)
+    assert "SEV-SNP is required" in p.stderr
+    assert not marker.exists()  # even a QEMU override is never run
+
+
+def test_launch_script_never_invokes_qemu_system():
+    code = _launch_code()
+    assert "qemu-system" not in code
+    assert "exec " not in code
+
+
+def test_launch_has_no_plain_mode_switch():
+    code = _launch_code().upper()
+    for name in ("PLAIN", "UNSEALED", "ALLOW", "INSECURE", "NO_SNP", "SKIP_SNP", "DISABLE_SNP"):
+        assert name not in code, name
+    # Every shipped file in the kit: no env name that reads as a plain-mode switch.
+    for f in KIT.iterdir():
+        if f.suffix in (".sh", ".py", ".example"):
+            text = f.read_text().upper()
+            assert "ALLOW_UNSEALED" not in text and "VM_PLAIN" not in text, f.name
 
 
 def test_image_is_pinned():
