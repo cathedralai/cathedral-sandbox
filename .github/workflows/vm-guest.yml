@@ -1,0 +1,88 @@
+name: VM guest
+
+# The root-needing tests of the sealed VM guest (AB#999, VM1b): loop devices, dm-verity and
+# e2fsprogs. The ordinary Go tests of these packages already run in ci.yml (go test -race ./...).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "room-kit/custom-guest/**"
+      - "room-kit/vm/**"
+      - "scripts/build_vm_initrd_tools.py"
+      - "scripts/vm_initrd_tools_inputs.json"
+      - "tests/test_vm_initrd.py"
+      - ".github/workflows/vm-guest.yml"
+  pull_request:
+    paths:
+      - "room-kit/custom-guest/**"
+      - "room-kit/vm/**"
+      - "scripts/build_vm_initrd_tools.py"
+      - "scripts/vm_initrd_tools_inputs.json"
+      - "tests/test_vm_initrd.py"
+      - ".github/workflows/vm-guest.yml"
+
+concurrency:
+  group: vm-guest-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  vmroot:
+    name: vmroot on loop devices (root)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.11"
+          cache: false
+      - name: Packages and kernel modules
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cryptsetup-bin e2fsprogs
+          sudo modprobe loop dm-mod dm-verity || true
+          lsmod | grep -E 'dm_verity|loop' || true
+          veritysetup --version
+      - name: Build the test binary as the runner user
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: go test -c -o "$RUNNER_TEMP/vmroot.test" ./internal/vmroot
+      - name: Build the mailbox device test as the runner user
+        working-directory: room-kit/custom-guest
+        env:
+          GOTOOLCHAIN: local
+        run: go test -c -o "$RUNNER_TEMP/vmmailbox.test" ./internal/vmmailbox
+      - name: Run it as root
+        working-directory: room-kit/custom-guest/internal/vmroot
+        run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmroot.test" -test.v -test.count=1
+      - name: Run the mailbox device test as root (O_DIRECT on a loop device)
+        working-directory: room-kit/custom-guest/internal/vmmailbox
+        run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmmailbox.test" -test.v -test.count=1 -test.run RootOpenDevice
+
+  tools:
+    name: Static tools (cryptsetup, veritysetup, mke2fs, resize2fs)
+    runs-on: ubuntu-24.04
+    # The builder needs gcc 15, as scripts/build_custom_guest_verity.py does. The image is pinned by digest
+    # (ubuntu:26.04); apt supplies the compiler, and the build prints the exact version it used.
+    container: ubuntu@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
+    steps:
+      - name: Toolchain
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends gcc libc6-dev make pkg-config python3 xz-utils binutils bzip2 patch ca-certificates
+          gcc --version | head -1
+          make --version | head -1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Lock shape
+        run: python3 scripts/build_vm_initrd_tools.py lock-check
+      - name: Fetch the pinned inputs (each digest is checked)
+        run: python3 scripts/build_vm_initrd_tools.py fetch --inputs "$RUNNER_TEMP/inputs"
+      - name: Build twice and require identical static tools
+        run: python3 scripts/build_vm_initrd_tools.py build --inputs "$RUNNER_TEMP/inputs" --output "$RUNNER_TEMP/tools" --log "$RUNNER_TEMP/tools-build.log"
+      - name: Build log on failure
+        if: failure()
+        run: tail -n 120 "$RUNNER_TEMP/tools-build.log" || true

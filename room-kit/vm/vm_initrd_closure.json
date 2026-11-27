@@ -1,0 +1,22 @@
+{
+  "schema": "cathedral.vm.initrd-closure/v1",
+  "status": "unpinned",
+  "kernel_release": "",
+  "boot_modules": ["sev-guest", "dm-verity", "dm-crypt", "qemu_fw_cfg", "virtio_blk", "virtio_net"],
+  "go_mains": {
+    "init": "./cmd/cathedral-vm-init",
+    "usr/lib/cathedral/cathedral-vm-attest": "./cmd/cathedral-vm-attest",
+    "usr/lib/cathedral/cathedral-vm": "./cmd/cathedral-vm"
+  },
+  "static_tools": ["usr/lib/cathedral/cryptsetup", "usr/lib/cathedral/veritysetup", "usr/lib/cathedral/mke2fs", "usr/lib/cathedral/resize2fs"],
+  "executables": {
+    "init": null,
+    "usr/lib/cathedral/cathedral-vm-attest": null,
+    "usr/lib/cathedral/cathedral-vm": null,
+    "usr/lib/cathedral/cryptsetup": null,
+    "usr/lib/cathedral/veritysetup": null,
+    "usr/lib/cathedral/mke2fs": null,
+    "usr/lib/cathedral/resize2fs": null
+  },
+  "modules": {}
+}
