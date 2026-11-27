@@ -96,10 +96,9 @@ def _runsc_flags(tenancy: str) -> str:
     return result.stdout
 
 
-def test_dedicated_runsc_flags_open_host_uds_and_keep_prefer_emulated():
-    flags = _runsc_flags("dedicated").split()
-    assert "--host-uds=open" in flags
-    assert "--character-device-policy=prefer-emulated" in flags  # dropped later, after the reseal
+def test_dedicated_runsc_flags_open_host_uds_only():
+    # The report socket (AB#1001) needs host UDS; no room opens a host character device.
+    assert _runsc_flags("dedicated") == "--platform=systrap --overlay2=none --net-raw --host-uds=open"
 
 
 def test_shared_runsc_flags_are_unchanged():

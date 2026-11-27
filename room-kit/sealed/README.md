@@ -170,12 +170,12 @@ Launch with `SEALED_OWNER_PUBKEY_FILE` as above. If the configured dedicated
 guest has no valid owner binding in its SNP report, the front refuses startup,
 including on an unsealed host. It cannot silently fall back to shared tenancy.
 Creates still need the owner's signature. TUN exposes only `/dev/net/tun`
-with `NET_ADMIN`. Dedicated builds also bind-mount `/dev/sev-guest` into rooms
-(when the device exists; opt out with `ROOM_EXPOSE_SEV_GUEST=0`) and set
-`ROOM_RUNSC_FLAGS` to `--character-device-policy=prefer-emulated` so the open
-goes through the gofer. Shared builds stay `emulated-only` and never mount
-`/dev/sev-guest`. Docker `--device` alone is not enough under runsc: the sentry
-puts a stub on `/dev` and opens fail with `ENXIO`.
+with `NET_ADMIN`. No room gets `/dev/sev-guest`. A dedicated room asks for a
+fresh SNP report over its own socket, `/run/cathedral/attest.sock` (read-only
+mount, `POST /v1/report` with `report_data_hex`); the answer's statement names
+the room, and `verify_receipts.py --room-report` checks it. Dedicated builds add
+`--host-uds=open` to `ROOM_RUNSC_FLAGS` for that socket; character devices stay
+`emulated-only` on every build.
 
 This dedicates the sealed guest to one owner, not the physical server. It is
 not a rollout or availability claim. Use separate capacity without customer

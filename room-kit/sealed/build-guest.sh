@@ -410,12 +410,11 @@ ROOM_DATA_SIZE_GB=0
 ROOM_BRIDGE=rmbr0
 ROOM_BRIDGE_CIDR=10.213.0.1/21
 ROOM_DNS="$SEALED_DNS"
-# Dedicated: prefer-emulated so a bind-mounted /dev/sev-guest opens through the
-# gofer (sentry emulated-only returns ENXIO for that char device). Shared stays
-# emulated-only. Still runsc — not a runc switch.
+# Dedicated and shared both keep the default emulated-only character devices: no
+# room opens /dev/sev-guest; a dedicated room gets its SNP report from its socket.
 if [ "$TENANCY" = dedicated ]; then
   # --host-uds=open: the room reaches its report socket (AB#1001) on a bind mount.
-  ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none --net-raw --character-device-policy=prefer-emulated --host-uds=open"
+  ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none --net-raw --host-uds=open"
 else
   ROOM_RUNSC_FLAGS="--platform=systrap --overlay2=none --net-raw"
 fi
