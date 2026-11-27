@@ -85,6 +85,10 @@ type hotelConfig struct {
 	// by its owner (pin_only.go, AB#982 Track A). Any change of ReservedFor
 	// clears it.
 	PinOnly bool `json:"pin_only,omitempty"`
+	// CustomGuestHold: a dedicated custom SNP guest holds the hotel's host
+	// (custom_guest_hold.go, AB#1008). Set by the operator PATCH only, never
+	// by the config file or a join; kept with the reservation.
+	CustomGuestHold *customGuestHold `json:"custom_guest_hold,omitempty"`
 	// MinerHotkey: the SS58 hotkey of the SN94 miner that runs the hotel.
 	// The hotel then carries the labels miner=true and miner_hotkey=<key>,
 	// so a guest policy can deny miner hotels ({"label": {"miner": "true"}}).
@@ -377,7 +381,7 @@ type hotel struct {
 	// guestPin is the verified guest TLS SPKI (miner_tls.go); nil: none yet.
 	// Read on every TLS handshake, so atomic.
 	guestPin atomic.Pointer[[sha256.Size]byte]
-	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.ReservationGeneration, cfg.ReservationRef, cfg.PinOnly, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
+	cfgMu    sync.RWMutex // guards cfg.Labels, cfg.Drain, cfg.DrainNotice, cfg.ReservedFor, cfg.ReservationGeneration, cfg.ReservationRef, cfg.PinOnly, cfg.CustomGuestHold, cfg.LentFrom and cfg.LentReportID, which PATCH changes while creates read them
 	sem      chan struct{}
 	conns    *connGate // data connection slots (hotelconns.go)
 
@@ -390,6 +394,8 @@ type hotel struct {
 	claims       int // prefetch, workspace create and prewarm calls selected here and not ended (pin_only.go)
 	diskPending  int // extra disk GiB of the creates in queued and creating (disk.go)
 	backoffUntil time.Time
+	secretCalls  int             // secret calls admitted here and not ended (custom_guest_hold.go)
+	secretClosed string          // the launch whose kit_down PATCH closed secret admission here; memory only
 	ok           bool            // health answered within okWindow, or room calls did (see syncHotel)
 	warm         map[string]bool // catalog images pulled since the hotel last came up (prewarm.go)
 	warmGen      int             // bumped when the hotel goes down, so a stale prewarm marks nothing
@@ -731,6 +737,9 @@ func loadBroker(path string) (*broker, error) {
 		}
 		if h.cfg.ReservationGeneration != 0 || h.cfg.ReservationRef != "" {
 			return nil, fmt.Errorf("config: hotel %q: reservation_generation and reservation_ref are set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
+		}
+		if h.cfg.CustomGuestHold != nil {
+			return nil, fmt.Errorf("config: hotel %q: custom_guest_hold is set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
 		}
 		if err := pinOnlyConfigError(h.cfg, c.StateDir); err != nil {
 			return nil, fmt.Errorf("config: hotel %q: %w", h.cfg.ID, err)

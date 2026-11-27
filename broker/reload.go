@@ -211,6 +211,9 @@ func parseConfigFile(raw []byte) (config, []*hotel, map[string]*guestState, map[
 		if h.cfg.ReservationGeneration != 0 || h.cfg.ReservationRef != "" {
 			return c, nil, nil, nil, fmt.Errorf("config: hotel %q: reservation_generation and reservation_ref are set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
 		}
+		if h.cfg.CustomGuestHold != nil {
+			return c, nil, nil, nil, fmt.Errorf("config: hotel %q: custom_guest_hold is set by PATCH and kept in state_dir, not in the config file", h.cfg.ID)
+		}
 		if err := pinOnlyConfigError(h.cfg, c.StateDir); err != nil {
 			return c, nil, nil, nil, fmt.Errorf("config: hotel %q: %w", h.cfg.ID, err)
 		}

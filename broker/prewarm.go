@@ -48,9 +48,9 @@ func (b *broker) prewarmHotel(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
 	pin, resGen := h.pinState()
-	if pin || h.quarantined() {
+	if pin || h.quarantined() || h.held() {
 		b.mu.Unlock()
-		return // a pin_only hotel takes no unmarked pull (pin_only.go, B6)
+		return // a pin_only or held hotel takes no unmarked pull (pin_only.go, B6; custom_guest_hold.go)
 	}
 	h.claim()
 	b.mu.Unlock()
@@ -329,9 +329,9 @@ func (b *broker) replayGuestPrefetch(h *hotel) {
 	b.mu.Lock()
 	gen := h.warmGen
 	pin, resGen := h.pinState()
-	if pin || h.quarantined() {
+	if pin || h.quarantined() || h.held() {
 		b.mu.Unlock()
-		return // a pin_only hotel takes no unmarked pull (pin_only.go, B6)
+		return // a pin_only or held hotel takes no unmarked pull (pin_only.go, B6; custom_guest_hold.go)
 	}
 	h.claim()
 	defer b.releaseClaim(h) // runs after the unlock below

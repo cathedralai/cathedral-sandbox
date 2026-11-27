@@ -145,10 +145,13 @@ func (h *hotel) reservedFor() string {
 	return h.cfg.ReservedFor
 }
 
+// drain is true while the hotel takes no new rooms: drained by the config
+// file or a PATCH, or held by a custom guest (custom_guest_hold.go), which no
+// reload can undo.
 func (h *hotel) drain() bool {
 	h.cfgMu.RLock()
 	defer h.cfgMu.RUnlock()
-	return h.cfg.Drain
+	return h.cfg.Drain || h.cfg.CustomGuestHold != nil
 }
 
 // addHotel adds h to the hotel set. The caller starts its sync loop.
@@ -411,6 +414,10 @@ func (b *broker) joinHotel(w http.ResponseWriter, r *http.Request, enroller bool
 		return
 	}
 	hc := req.hotelConfig
+	if hc.CustomGuestHold != nil {
+		writeErr(w, 400, "invalid_hotel", "custom_guest_hold is set by PATCH on a config file hotel, never by a join")
+		return
+	}
 	// Set by PATCH only (reservations.go, AB#982), never by the join.
 	hc.ReservationGeneration, hc.ReservationRef = 0, ""
 	if enroller {
@@ -693,6 +700,9 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		// pin_only (pin_only.go): the hotel takes only creates its owner marks
 		// for it. Operator only.
 		PinOnly *bool `json:"pin_only"`
+		// custom_guest_hold.go (AB#1008): set and cleared by the API's fence
+		// route only. Operator only.
+		CustomGuestHold json.RawMessage `json:"custom_guest_hold"`
 	}
 	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if json.Unmarshal(raw, &req) != nil {
@@ -700,8 +710,23 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		return
 	}
 	if enroller && (req.Drain == nil || !*req.Drain || req.MaxSlots != nil || req.Labels != nil || len(req.ReservedFor) != 0 || req.Lend != nil || req.AlertChatID != nil || len(req.MemFullPct) != 0 ||
-		req.ReservationRef != nil || req.ExpectGeneration != nil || req.PinOnly != nil) {
+		req.ReservationRef != nil || req.ExpectGeneration != nil || req.PinOnly != nil || len(req.CustomGuestHold) != 0) {
 		writeErr(w, 403, "enroller_scope", "miner enrollment may only set drain=true, with or without a drain_notice")
+		return
+	}
+	hr, herr := parseHoldRequest(req.CustomGuestHold)
+	switch {
+	case herr != nil:
+		writeErr(w, 400, "invalid_json", herr.Error())
+		return
+	case hr.present && h.runtime:
+		writeErr(w, 409, "custom_guest_hold_unsupported", "hotel "+id+" joined at runtime and keeps its state in "+runtimeHotelsFile+"; a custom guest hold needs a config file hotel")
+		return
+	case hr.present && b.cfg.StateDir == "":
+		writeErr(w, 409, "no_state_dir", "set state_dir in the config: custom_guest_hold must be saved")
+		return
+	case hr.present && req.ExpectGeneration == nil:
+		writeErr(w, 400, "invalid_json", "custom_guest_hold needs expect_generation in the same request")
 		return
 	}
 	var notice *drainNotice
@@ -808,17 +833,29 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		writeErr(w, 400, "invalid_lend", "lend takes true and no reserved_for; to take a lent hotel back, PATCH reserved_for")
 		return
 	}
+	if req.Lend != nil && h.held() {
+		// Before the lend's attestation call; checked again under b.mu.
+		writeErr(w, 409, "custom_guest_held", "hotel "+id+" is held for a custom guest: a lend waits until the restore clears the hold")
+		return
+	}
 	lc, e := b.prepareLend(r.Context(), h, req.Lend != nil, reserve)
 	if e != nil {
 		writeErr(w, e.status, e.code, e.msg)
 		return
 	}
 	b.mu.Lock()
+	if e := b.holdRefusalLocked(h, holdPatch{hr: hr, reserve: reserve, ref: ref, lend: req.Lend != nil, pinOnly: req.PinOnly, drain: req.Drain}); e != nil {
+		b.mu.Unlock()
+		writeErr(w, e.status, e.code, e.msg)
+		return
+	}
 	// An owner change of a pin_only hotel is an operator procedure: the broker
 	// cannot prove from its own clocks that no dispatched create is still
 	// starting a room, so it takes the hotel only while drained (AB#982). The
-	// one-time switch on (the hotel is not pin_only yet) is not covered.
-	if h.pinOnly() && !h.drain() {
+	// one-time switch on (the hotel is not pin_only yet) is not covered. The
+	// drain is the one the file or a PATCH set: a hold's forced drain does not
+	// count, so the restore that clears it needs the hotel really drained.
+	if h.pinOnly() && !h.cfgDrain() {
 		changesOwner := (reserve != nil && !lc.reclaim && (*reserve != h.reservedFor() || ref != h.cfg.ReservationRef)) ||
 			req.Lend != nil || (req.PinOnly != nil && !*req.PinOnly)
 		if changesOwner {
@@ -887,6 +924,17 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			return
 		}
 	}
+	// A hold is set under the same b.mu and h.cfgMu hold as the compare
+	// above: H3 only on a known-empty drained hotel, kit_down only with no
+	// create, claim or secret call counted (custom_guest_hold.go).
+	if hr.hold != nil {
+		if e := b.holdSetCheckLocked(h, hr.hold); e != nil {
+			h.cfgMu.Unlock()
+			b.mu.Unlock()
+			writeErr(w, e.status, e.code, e.msg)
+			return
+		}
+	}
 	// A resent notice (same notice_id) keeps its first received_at, so a
 	// retry cannot shorten its lead. A new notice may not replace one whose
 	// window is still open.
@@ -941,6 +989,9 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			h.cfg.ReservationGeneration++ // markers issued before the switch are void
 		}
 	}
+	if hr.present {
+		h.cfg.CustomGuestHold = hr.hold
+	}
 	if req.AlertChatID != nil {
 		h.cfg.AlertChatID = *req.AlertChatID
 	}
@@ -948,6 +999,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.MemFullPct = *memFull
 	}
 	h.cfgMu.Unlock()
+	beforeHotelPatchSave(h.cfg.ID)
 	var err error
 	if newNotice != nil {
 		// The log line goes first: it is the record that outlives the hotel.
@@ -974,7 +1026,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 	// back if a later save fails.
 	var reservationsBefore map[string]reservationRecord
 	reservationSaved := false
-	if err == nil && h.cfg.ReservationGeneration != oldCfg.ReservationGeneration && !h.runtime && b.cfg.StateDir != "" {
+	if err == nil && (h.cfg.ReservationGeneration != oldCfg.ReservationGeneration || !sameHold(h.cfg.CustomGuestHold, oldCfg.CustomGuestHold)) && !h.runtime && b.cfg.StateDir != "" {
 		reservationsBefore = maps.Clone(b.reservations)
 		b.noteConfigReservationLocked(h)
 		if err = b.saveConfigReservationsLocked(); err != nil {
@@ -1013,6 +1065,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 		h.cfg.ReservationGeneration = oldCfg.ReservationGeneration
 		h.cfg.ReservationRef = oldCfg.ReservationRef
 		h.cfg.PinOnly = oldCfg.PinOnly
+		h.cfg.CustomGuestHold = oldCfg.CustomGuestHold
 		h.cfg.LentFrom = oldCfg.LentFrom
 		h.cfg.LentReportID = oldCfg.LentReportID
 		h.cfg.AlertChatID = oldCfg.AlertChatID
@@ -1027,6 +1080,7 @@ func (b *broker) patchHotel(w http.ResponseWriter, r *http.Request, id string, e
 			h.resize(h.cfg.MaxSlots)
 		}
 	}
+	afterHoldPatchApplied(h)
 	b.mu.Unlock()
 	writeJSON(w, 200, b.hotelDoc(h))
 }
@@ -1109,34 +1163,39 @@ func (b *broker) leaveHotel(w http.ResponseWriter, id string, enroller, forget b
 }
 
 func (b *broker) hotelDoc(h *hotel) map[string]any {
+	// Everything under b.mu, the owner, tuple and hold in one h.cfgMu hold:
+	// a PATCH holds b.mu from its checks through its save and any rollback,
+	// so the view never shows a value a failed save undoes (the API fences
+	// its retries on this read-back).
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	labels := h.labels()
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	v := h.reservationView()
 	var reserved, lent, lentReport any
-	if r := h.reservedFor(); r != "" {
-		reserved = r
+	if v.reservedFor != "" {
+		reserved = v.reservedFor
 	}
-	if l := h.lentFrom(); l != "" {
-		lent, lentReport = l, h.lentReportID()
+	if v.lentFrom != "" {
+		lent, lentReport = v.lentFrom, v.lentReportID
 	}
-	gen, ref := h.reservation()
 	var resRef any // null when none, like reserved_for
-	if ref != "" {
-		resRef = ref
+	if v.ref != "" {
+		resRef = v.ref
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	now := time.Now()
-	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": h.drain(), "runtime": h.runtime,
-		"reserved_for": reserved, "reservation_generation": gen, "reservation_ref": resRef, "pin_only": h.pinOnly(), // AB#982
+	d := map[string]any{"id": h.cfg.ID, "name": h.cfg.Name, "labels": labels, "drain": v.drain, "runtime": h.runtime,
+		"reserved_for": reserved, "reservation_generation": v.gen, "reservation_ref": resRef, "pin_only": v.pinOnly, // AB#982
 		"lent_from": lent, "lent_report_id": lentReport, "class": hotelClass(h), "up": h.ok, "slots": h.slots, "max_slots": h.cfg.MaxSlots,
 		"free_rooms": b.admissibleFree(h, now), "miner_hotkey": h.cfg.MinerHotkey, "admission": b.admissionDoc(h, now),
 		"commitment": b.commitmentDoc(h), "drain_notice": h.drainNotice(),
 		// rooms_in_use: rooms the broker holds on the hotel, plus creates queued or in flight. A
 		// guest TLS hotel's host has no key to count them, so a re-seal waits for 0 here (AB#817).
 		"rooms_in_use": h.used(),
-		"mem_pct":      h.memPct, "mem_full_pct": b.memFullLimit(h), "mem_full": b.memFull(h)}
+		"mem_pct":      h.memPct, "mem_full_pct": b.memFullLimit(h), "mem_full": b.memFull(h),
+		"custom_guest_hold": holdDoc(v.hold)} // null when unset (custom_guest_hold.go)
 	diskDoc(h, d)
 	if p := b.probationDoc(h); p != nil {
 		d["probation"] = p
@@ -1201,6 +1260,10 @@ func (b *broker) loadRuntimeHotelList() error {
 		return err
 	}
 	for _, hc := range list {
+		if hc.CustomGuestHold != nil {
+			log.Printf("runtime hotel %s: custom_guest_hold dropped: a joined hotel takes no hold", hc.ID)
+			hc.CustomGuestHold = nil
+		}
 		if !hc.Sealed {
 			// Joined before AB#776 removed the unsealed class.
 			log.Printf("runtime hotel %s skipped: not sealed; every hotel must be sealed (AB#776)", hc.ID)
