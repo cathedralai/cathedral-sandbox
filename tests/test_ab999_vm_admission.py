@@ -628,7 +628,8 @@ def test_commit_kit_runs_only_after_the_measurement_matched():
     assert text.count("commit-kit") == 1  # never on the refused, failed or mismatched paths
     # A failed commit keeps the records; it never fails a verified install.
     block = match[match.index("commit-kit"):]
-    assert "&& VM_LEDGER_COMMITTED=1" in block[:300] and "|| log " in block[:300] and "|| exit" not in block[:300]
+    assert "&& VM_LEDGER_COMMITTED=1" in block[:300] and "|| VM_LEDGER_COMMIT_FAILED=1" in block[:300]
+    assert "|| exit" not in block[:300]
     # Every exit runs the ledger's exit step (log the open record, unlock), after the volume restore.
     assert "trap 'data_volume_restore_on_exit; vm_ledger_on_exit; snp_lock_release' EXIT" in text
     # The ledger's own trap keeps the host lock's release (host-lock.sh), set just before it.
@@ -844,6 +845,18 @@ def test_a_second_install_of_a_kit_stops_at_once(host):
         assert run_assess_slice(host, other).returncode == 0
     p = run_assess_slice(host, env)
     assert p.returncode == 0 and len(host.records("alpha")) == 1, p.stderr
+
+
+def test_a_failed_commit_is_logged_as_a_failed_commit(host):
+    """The guest was verified but commit-kit failed: the exit step says so, not "not confirmed"."""
+    host.switch_on()
+    host.facts(mem_total_gib=32 + 65 + 5)
+    env = host.kit_env("alpha", mem=64, scratch=1)
+    p = run_assess_slice(host, env, "VM_LEDGER_COMMIT_FAILED=1\n")
+    [rec] = host.records("alpha")
+    assert p.returncode == 0, p.stderr
+    assert f"commit failed for install {rec['install_id']} of alpha" in p.stderr
+    assert "was not confirmed" not in p.stderr
 
 
 @pytest.mark.parametrize("path", ["passes", "refused", "fails_later"])

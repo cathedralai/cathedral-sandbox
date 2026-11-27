@@ -146,8 +146,12 @@ Spec: `docs/VM_EXECUTION_HISTORY.md` (H1 to H9).
 
 One SNP host shares memory, disks, SNP ASIDs and threads between the sealed hotel kits and the
 VMs. `vm_capacity.py` counts both. It runs only while the VM host switch
-`/etc/cathedral/snp-vm-host.json` exists; without it create, start and `install-sealed.sh`
-behave as before.
+`/etc/cathedral/snp-vm-host.json` exists (also the VM3 host config: without it no VM is created,
+and `install-sealed.sh` behaves as before).
+
+- **Rollout:** turn the switch on only while no kit install is running on the host. An install
+  that started before it has no record and no install lock, so the ledger would count that kit
+  by its unit alone until its next install.
 
 - **Kits:** every `room-sealed-<name>.service` unit file, enabled or not, and the env file on its
   `ExecStart` line, wherever `SEALED_DIR` is. A `-net` unit is skipped only when it is exactly the

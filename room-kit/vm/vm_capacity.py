@@ -12,8 +12,8 @@ What it counts:
   (`<SEALED_DIR>/launch-guest.sh <SEALED_DIR>/sealed.env`, write-units.sh). No directory glob:
   SEALED_DIR is configurable. A -net check unit is skipped only when it is exactly what
   write-units.sh writes (oneshot, `host-net.sh check <env>`); any other unit is a kit and must
-  parse. Plus the kits being installed, from /var/lib/cathedral-snp/kits/<name>.json. The union
-  is taken by kit name, each size the larger of the two.
+  parse. Plus the kits being installed, from /var/lib/cathedral-snp/kits/<name>.<install id>.json
+  (below). The union is taken by kit name, each size the larger of the unit and every record.
 - Kit records: one per install, kits/<name>.<install id>.json. install-sealed.sh holds the kit's
   install lock from its assess step to its exit (one install of a kit at a time), writes its
   record (the larger of the running build and the replacement) and gets the id back. A kit
@@ -41,10 +41,13 @@ Rules (spec section 9 table), on create (commit) and start (live):
 The capacity lock (/run/lock/cathedral-snp-capacity.lock) is held only for check-and-record: by
 VM create (until vm.env is written), VM start (until the unit is enabled) and install-sealed.sh's
 assess step (until the kit record is written). stop, enforce, cancel and delete never take it, so
-the credit cutoff never waits on it. It is not the dedicated host lifecycle lock.
+the credit cutoff never waits on it. Lock order: the host lifecycle lock (host-lock.sh), then the
+kit's install lock, then this one; nothing that holds this one takes either of the others.
 
 Off by default: admission runs only while the VM host switch /etc/cathedral/snp-vm-host.json
-exists (VM spec r2 section 12). Without it vm_ctl.py and install-sealed.sh behave as before.
+exists (VM spec r2 section 12). It is also the VM3 host config, so without it no VM can be created
+and install-sealed.sh behaves as before. Turn it on only while no kit install is running: an
+install that started before has no record and no install lock.
 The custom-guest refusal (a dedicated custom-guest host never takes a VM) always runs on create.
 
 VM_CAPACITY_ROOT (default /) prefixes the host paths above, for tests.

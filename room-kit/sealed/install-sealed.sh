@@ -78,9 +78,12 @@ systemctl is-active -q "$UNIT" || [ "$MEM_FREE_GIB" -gt $(( SEALED_MEM_GIB + 32 
 # install's record; on any exit without the commit it stays (the env may already be copied).
 VM_LEDGER_ID=""
 VM_LEDGER_COMMITTED=0
+VM_LEDGER_COMMIT_FAILED=0
 KIT_INSTALL_LOCK=""
 vm_ledger_on_exit() {
-  if [ -n "$VM_LEDGER_ID" ] && [ "$VM_LEDGER_COMMITTED" != 1 ]; then
+  if [ -n "$VM_LEDGER_ID" ] && [ "$VM_LEDGER_COMMIT_FAILED" = 1 ]; then
+    echo "sealed: VM host ledger: commit failed for install $VM_LEDGER_ID of $SEALED_NAME (the guest was verified); the kit's records stay until a confirmed install of $SEALED_NAME (vm-ctl.sh capacity lists them)" >&2
+  elif [ -n "$VM_LEDGER_ID" ] && [ "$VM_LEDGER_COMMITTED" != 1 ]; then
     echo "sealed: VM host ledger: install $VM_LEDGER_ID of $SEALED_NAME was not confirmed; its record stays until a confirmed install of $SEALED_NAME (vm-ctl.sh capacity lists it)" >&2
   fi
   # Unlock, not only close: a process this install started may still hold the descriptor.
@@ -278,7 +281,7 @@ if [ "$GOT" = "$EXPECTED" ]; then
   if [ -n "${VM_LEDGER_ID:-}" ]; then
     python3 -I "$KIT/vm/vm_capacity.py" commit-kit --install-id "$VM_LEDGER_ID" "$SEALED_DIR/sealed.env" \
       && VM_LEDGER_COMMITTED=1 \
-      || log "VM host ledger: the commit of install $VM_LEDGER_ID failed; the records of $SEALED_NAME stay"
+      || VM_LEDGER_COMMIT_FAILED=1
   fi
 else
   # Do not serve a guest the operator cannot vouch for, and do not boot it
