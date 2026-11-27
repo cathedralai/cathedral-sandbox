@@ -1350,7 +1350,9 @@ def finish_boot(ctx: Ctx, gen: int) -> dict:
         run(["systemctl", "stop", ctx.unit], timeout=120)
         ctx.log("isolation_failed", generation=gen)
         raise
-    ctx.log("booted", generation=gen)
+    # The unit run and (via log) the host boot this entry is about: the operator matches both against the live
+    # unit before it records running, so an entry from before a host reboot proves nothing (11.3).
+    ctx.log("booted", generation=gen, invocation_id=show(ctx.unit, "InvocationID").get("InvocationID"))
     return {"ok": True, "generation": gen, "qemu": custom_qemu(ctx)}
 
 
