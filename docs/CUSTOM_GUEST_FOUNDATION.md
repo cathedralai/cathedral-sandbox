@@ -347,3 +347,25 @@ parameters, the pinned static helper and inherited descriptors; a wrong root
 hash fails. Unit tests reject changed geometry, truncated headers/trees and
 invalid helper pins. Kernel mapper creation, mounting and a complete PID1 boot
 remain unqualified until guest rehearsal. No complete initrd is published yet.
+
+### RAM runtime and root handoff
+
+`PrepareVerifiedRuntime` now orders device checks, verity mounting, root checks
+and fresh SSH material in a restricted tmpfs. The runtime directory must be
+root-owned and not writable by others; its new `cathedral` child is 0700 and
+all four files are 0600. Existing children, aliases, invalid network/owner inputs
+and entropy failures refuse. Keys are generated only after the preceding checks.
+The optional data disk remains unopened.
+
+Only successful preparation returns a `ReadyRoot`. Its handoff consumes the
+ready state, moves dev/sys/proc (proc last), switches root and executes only
+`/sbin/init` with fixed arguments and environment. Root descriptors are closed
+before owner code. Any error requires PID1 to power off, without retry or shell.
+The old initramfs is hidden but its memory is not reclaimed by this component.
+
+Tests exercise actual restricted tmpfs storage in a private mount namespace.
+`scripts/test_custom_guest_handoff.sh` additionally runs a synthetic root PID1
+and proves the root/mount/descriptor/environment handoff. It deliberately
+bypasses preparation; it does not prove signed inputs, verity or SNP boot.
+The complete PID1 caller, memory rule, data unlock and hardware proof remain
+pending. Do not treat these component tests as a complete boot image.
