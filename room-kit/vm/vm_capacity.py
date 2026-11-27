@@ -14,11 +14,14 @@ What it counts:
   write-units.sh writes (oneshot, `host-net.sh check <env>`); any other unit is a kit and must
   parse. Plus the kits being installed, from /var/lib/cathedral-snp/kits/<name>.json. The union
   is taken by kit name, each size the larger of the two.
-- Kit records: install-sealed.sh's assess step records the larger of the running build and the
-  replacement before its build. The record shrinks to the new size only after the new guest is
-  verified running (commit-kit), so a roll that fails or is refused after the env copy never
-  releases the running guest's room. A data-volume reset is reserved before data.raw is moved
-  aside (assess-kit --data-reset): data.raw.prev keeps its blocks while a fresh data.raw grows.
+- Kit records: one per install, kits/<name>.<install id>.json. install-sealed.sh's assess step
+  writes its own record (the larger of the running build and the replacement) and gets the id
+  back; commit-kit removes only that record, after the new guest is verified running. A kit
+  counts the larger of its unit env and every open record, so a roll that fails after the env
+  copy, or a second install of the same kit, never loses a reservation to another install.
+- Data-volume reset (assess-kit --data-reset, before data.raw moves): the volume set aside keeps
+  its blocks and cannot grow once detached (data.raw.prev counts only what it holds); the fresh
+  data.raw grows to the replacement's own size.
 - VMs: every $VM_ROOT/<name>/vm.env, in any state (the broker's rule).
 - A kit unit, env file or record that cannot be read refuses every VM create and start
   (resource kit_unaccounted): the ledger never guesses a size.
@@ -52,6 +55,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -81,6 +85,7 @@ KIT_RECORDS = "var/lib/cathedral-snp/kits"
 CUSTOM_GUEST_ALLOW = "etc/cathedral/custom-guest.allow"
 CUSTOM_GUEST_ROOT = "srv/custom-guest"
 RECORD_SCHEMA = "cathedral.snp.kit-reservation/v1"
+INSTALL_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
 KIT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,58}$")  # install-sealed.sh SEALED_NAME rule
 VM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")  # vm_ctl.py NAME_RE
@@ -199,9 +204,11 @@ class Kit:
     min_free_gib: int  # SEALED_MIN_HOST_FREE_GIB, -1 when the env does not set it
     unit: str | None = None
     active: bool = False
-    # [st_dev, st_ino] of the data.raw a pending reset will set aside: while data.raw is still that
-    # file, it counts as a fresh disk at full size (its blocks stay allocated as data.raw.prev).
+    # A pending data-volume reset: [st_dev, st_ino] of the data.raw it sets aside, and the
+    # replacement's size. -1 when none.
     reset_file: list[int] | None = None
+    reset_gib: int = -1
+    install_id: str | None = None  # a record's own install (never merged)
 
 
 def kit_from_env(name: str | None, env_path: str, source: str) -> Kit:
@@ -286,14 +293,18 @@ def kit_records() -> tuple[list[Kit], list[dict]]:
     if not d.is_dir():
         return kits, bad
     for path in sorted(d.glob("*.json")):
-        name = path.stem
+        name, _, install_id = path.stem.rpartition(".")
         try:
             rec = json.loads(path.read_text())
             ints = ("vcpus", "mem_gib", "scratch_gib", "data_gib")
             dirs = rec.get("sealed_dirs") if isinstance(rec, dict) else None
             reset = rec.get("data_reset_file") if isinstance(rec, dict) else None
+            reset_gib = rec.get("data_reset_gib") if isinstance(rec, dict) else None
             if (not isinstance(rec, dict) or rec.get("schema") != RECORD_SCHEMA or rec.get("name") != name
-                    or not KIT_NAME_RE.fullmatch(name)
+                    or not KIT_NAME_RE.fullmatch(name) or not INSTALL_ID_RE.fullmatch(install_id)
+                    or rec.get("install_id") != install_id
+                    or (reset is None) != (reset_gib is None)
+                    or not (reset_gib is None or (isinstance(reset_gib, int) and reset_gib >= 0))
                     or not all(isinstance(rec.get(k), int) and not isinstance(rec.get(k), bool) and rec[k] >= 0
                                for k in ints)
                     or not isinstance(dirs, list) or not dirs
@@ -303,14 +314,15 @@ def kit_records() -> tuple[list[Kit], list[dict]]:
                     or not (rec.get("min_host_free_gib") is None or isinstance(rec["min_host_free_gib"], int))):
                 raise ValueError("not a kit reservation record")
         except (OSError, UnicodeDecodeError, ValueError) as e:
-            bad.append({"record": str(path), "name": name, "detail": str(e) if isinstance(e, ValueError)
+            bad.append({"record": str(path), "name": name or path.stem, "detail": str(e) if isinstance(e, ValueError)
                         else f"record unreadable: {type(e).__name__}"})
             continue
         kits.append(Kit(name=name, source="record", env=str(rec.get("env", "")), dirs=sorted(set(dirs)),
                         vcpus=rec["vcpus"], mem_gib=rec["mem_gib"], scratch_gib=rec["scratch_gib"],
                         data_gib=rec["data_gib"],
                         min_free_gib=-1 if rec.get("min_host_free_gib") is None else rec["min_host_free_gib"],
-                        reset_file=reset))
+                        reset_file=reset, reset_gib=-1 if reset_gib is None else reset_gib,
+                        install_id=install_id))
     return kits, bad
 
 
@@ -324,6 +336,7 @@ def merge_kit(into: Kit, other: Kit) -> None:
     into.dirs = sorted(set(into.dirs) | set(other.dirs))
     into.unit = into.unit or other.unit
     into.reset_file = into.reset_file or other.reset_file
+    into.reset_gib = max(into.reset_gib, other.reset_gib)
 
 
 # ---- VMs -------------------------------------------------------------------------------
@@ -461,10 +474,17 @@ class Sparse:
     path: Path
     logical: int
     owner: str
-    fresh: bool = False  # replaced by a new empty file before it is written: grows by its full size
+    # "grow": full size less allocated. "detached": data.raw.prev, no guest writes it, so only its
+    # allocated blocks count (already out of avail). "replace": the data.raw a pending reset sets
+    # aside: the larger of its own growth and the fresh volume's full size (replace_bytes).
+    kind: str = "grow"
+    replace_bytes: int = 0
 
     def remaining(self) -> int:
-        return self.logical if self.fresh else growth(self.path, self.logical)
+        if self.kind == "detached":
+            return 0
+        g = growth(self.path, self.logical)
+        return max(g, self.replace_bytes) if self.kind == "replace" else g
 
 
 # ---- the ledger ----------------------------------------------------------------------------------
@@ -485,17 +505,22 @@ class Ledger:
                 files.append(Sparse(Path(d) / "scratch.raw", k.scratch_gib * GIB, f"kit:{k.name}"))
                 data = Path(d) / "data.raw"
                 facts = file_facts(data)
-                if k.data_gib or facts is not None:
-                    # A reset pending on this very file keeps its blocks (as data.raw.prev) and adds
-                    # a fresh volume at full size.
-                    fresh = (k.reset_file is not None and facts is not None
-                             and [facts[2], facts[3]] == list(k.reset_file))
-                    files.append(Sparse(data, k.data_gib * GIB, f"kit:{k.name}", fresh=fresh))
+                if k.reset_file is not None:
+                    if facts is not None and [facts[2], facts[3]] == list(k.reset_file):
+                        # Still the volume the reset sets aside. Its blocks stay (as data.raw.prev)
+                        # and the fresh volume takes its place; its own growth is kept in the max
+                        # because a roll that is not confirmed puts it back as data.raw.
+                        files.append(Sparse(data, k.data_gib * GIB, f"kit:{k.name}", "replace", k.reset_gib * GIB))
+                    else:
+                        # The fresh volume (or its place before launch-guest.sh makes it): its own size.
+                        files.append(Sparse(data, k.reset_gib * GIB, f"kit:{k.name}"))
+                elif k.data_gib or facts is not None:
+                    files.append(Sparse(data, k.data_gib * GIB, f"kit:{k.name}"))
                 prev = Path(d) / "data.raw.prev"
                 if file_facts(prev) is not None:
-                    # Set aside by a reset roll: kept until the operator removes it, and restored
-                    # as data.raw when the roll is not confirmed, so its own growth stays reserved.
-                    files.append(Sparse(prev, 0, f"kit:{k.name}"))
+                    # Set aside by a reset roll until the operator removes it. Nothing opens it,
+                    # so it holds its blocks and cannot grow.
+                    files.append(Sparse(prev, 0, f"kit:{k.name}", "detached"))
         for v in self.vms:
             files.append(Sparse(v.disk, v.disk_gib * GIB, f"vm:{v.name}"))
         return files
@@ -664,38 +689,60 @@ def write_atomic(path: Path, data: str) -> None:
         os.close(dfd)
 
 
-def kit_record(kit: Kit) -> dict:
-    return {"schema": RECORD_SCHEMA, "name": kit.name, "env": kit.env, "sealed_dirs": list(kit.dirs),
-            "vcpus": kit.vcpus, "mem_gib": kit.mem_gib, "scratch_gib": kit.scratch_gib, "data_gib": kit.data_gib,
+def record_path(name: str, install_id: str) -> Path:
+    return hp(KIT_RECORDS) / f"{name}.{install_id}.json"
+
+
+def kit_record(kit: Kit, install_id: str) -> dict:
+    return {"schema": RECORD_SCHEMA, "name": kit.name, "install_id": install_id, "env": kit.env,
+            "sealed_dirs": list(kit.dirs), "vcpus": kit.vcpus, "mem_gib": kit.mem_gib,
+            "scratch_gib": kit.scratch_gib, "data_gib": kit.data_gib,
             "min_host_free_gib": None if kit.min_free_gib < 0 else kit.min_free_gib,
-            "data_reset_file": kit.reset_file, "recorded_at": int(time.time())}
+            "data_reset_file": kit.reset_file, "data_reset_gib": None if kit.reset_file is None else kit.reset_gib,
+            "recorded_at": int(time.time())}
 
 
-def assess_kit(env_path: str, data_reset: bool = False) -> dict:
-    """The kit's disk and memory checks with every VM and every other kit counted, then its record.
+def assess_kit(env_path: str, data_reset: bool = False, install_id: str | None = None) -> dict:
+    """The kit's disk and memory checks with every VM and every other kit counted, then this
+    install's record. Returns the install id: commit_kit removes only that record.
 
     Under the capacity lock, so a VM create cannot take the room between this check and the unit
     that install-sealed.sh writes after the 10 to 20 minute build. The record is the larger of the
-    replacement, the installed env and any earlier record: the running guest keeps its size until
-    commit_kit sees the new one verified, so a roll that stops after the env copy (a refused or
-    failed restart) never releases it.
+    replacement and the installed env (the running guest keeps its size until this install's
+    commit), and, on a re-assess (install_id given), this install's earlier record: by then its
+    env copy has replaced the installed env. The check counts the kit at the larger of this record,
+    the unit and every other open record.
 
     data_reset: install-sealed.sh is about to move data.raw aside as data.raw.prev and start an
-    empty one. Both are reserved from here: the current file stays allocated, the new one grows to
-    its full size."""
+    empty one of the replacement's size."""
     new = kit_from_env(None, os.path.abspath(env_path), "record")
+    if install_id is not None and not INSTALL_ID_RE.fullmatch(install_id):
+        raise ValueError(f"install id {install_id!r} is not 16 hex characters")
     with capacity_lock():
         led = snapshot()
         led.refuse_unaccounted(skip_kit=new.name)
-        check = Kit(**{**new.__dict__, "dirs": list(new.dirs)})
-        for k in led.kits:
+        mine = Kit(**{**new.__dict__, "dirs": list(new.dirs)})
+        for k in kit_units()[0]:
             if k.name == new.name:
-                merge_kit(check, k)  # the installed env and the earlier record, already merged by name
-        check.source = "record"
+                merge_kit(mine, k)
+        if install_id is not None:
+            own = next((k for k in kit_records()[0] if k.name == new.name and k.install_id == install_id), None)
+            if own is None:
+                raise ValueError(f"no open record {record_path(new.name, install_id)}")
+            merge_kit(mine, own)
+        else:
+            install_id = secrets.token_hex(8)
+        mine.source, mine.unit, mine.install_id = "record", None, install_id
         if data_reset:
             facts = file_facts(Path(new.dirs[0]) / "data.raw")
             if facts is not None:
-                check.reset_file = [facts[2], facts[3]]
+                mine.reset_file, mine.reset_gib = [facts[2], facts[3]], new.data_gib
+        check = Kit(**{**mine.__dict__, "dirs": list(mine.dirs)})
+        for k in led.kits:
+            if k.name == new.name:
+                merge_kit(check, k)
+        if mine.reset_file is not None:
+            check.reset_file, check.reset_gib = mine.reset_file, mine.reset_gib
         led.kits = [k for k in led.kits if k.name != new.name] + [check]
         h = led.host
         if h.mem_total_kib is None:
@@ -708,18 +755,23 @@ def assess_kit(env_path: str, data_reset: bool = False) -> dict:
             if left < 0:
                 raise CapacityRefusal("disk", f"{d}: avail {gib(avail, GIB)} less the growth of every kit and VM"
                                               f" disk {gib(grow, GIB)} is under the {gib(reserve, GIB)} reserve")
-        write_atomic(hp(KIT_RECORDS) / f"{new.name}.json", json.dumps(kit_record(check), sort_keys=True) + "\n")
-    return {"kit": new.name, "recorded": True, "vms": len(led.vms), "kits": len(led.kits)}
+        write_atomic(record_path(new.name, install_id),
+                     json.dumps(kit_record(mine, install_id), sort_keys=True) + "\n")
+    return {"kit": new.name, "install_id": install_id, "recorded": True, "vms": len(led.vms), "kits": len(led.kits)}
 
 
-def commit_kit(env_path: str) -> dict:
-    """After install-sealed.sh verified the new guest running (its measurement matched): the record
-    becomes exactly the installed env, so a smaller roll gives its room back. data.raw.prev, if the
-    roll reset the data volume, is counted from the file until the operator removes it."""
+def commit_kit(env_path: str, install_id: str) -> dict:
+    """After install-sealed.sh verified the new guest running (its measurement matched): this
+    install's record goes, so the kit counts its installed env and any other open install. A
+    data.raw.prev left by a reset counts its own blocks until the operator removes it."""
     kit = kit_from_env(None, os.path.abspath(env_path), "record")
+    if not INSTALL_ID_RE.fullmatch(install_id):
+        raise ValueError(f"install id {install_id!r} is not 16 hex characters")
     with capacity_lock():
-        write_atomic(hp(KIT_RECORDS) / f"{kit.name}.json", json.dumps(kit_record(kit), sort_keys=True) + "\n")
-    return {"kit": kit.name, "committed": True}
+        path = record_path(kit.name, install_id)
+        existed = path.exists()
+        path.unlink(missing_ok=True)
+    return {"kit": kit.name, "install_id": install_id, "committed": existed}
 
 
 # ---- the capacity read ------------------------------------------------------------------------------
@@ -799,17 +851,29 @@ def report(broker: dict[str, int] | None = None) -> dict:
     return out
 
 
+USAGE = ("usage: vm_capacity.py assess-kit [--install-id ID] [--data-reset] <sealed.env>"
+         " | commit-kit --install-id ID <sealed.env>   (the read is vm-ctl.sh capacity)")
+
+
 def main(argv: list[str]) -> int:
-    cmd, args = (argv[0], argv[1:]) if argv else ("", [])
-    reset = cmd == "assess-kit" and args[:1] == ["--data-reset"]
-    if reset:
-        args = args[1:]
-    if cmd not in ("assess-kit", "commit-kit") or len(args) != 1:
-        print("usage: vm_capacity.py assess-kit [--data-reset] <sealed.env> | commit-kit <sealed.env>"
-              "   (the read is vm-ctl.sh capacity)", file=sys.stderr)
+    cmd, args = (argv[0], list(argv[1:])) if argv else ("", [])
+    install_id, reset = None, False
+    while args[:1] in (["--install-id"], ["--data-reset"]):
+        if args[0] == "--data-reset":
+            reset, args = True, args[1:]
+        elif len(args) >= 2:
+            install_id, args = args[1], args[2:]
+        else:
+            args = []
+    if (cmd not in ("assess-kit", "commit-kit") or len(args) != 1
+            or (cmd == "commit-kit" and (install_id is None or reset))):
+        print(USAGE, file=sys.stderr)
         return 2
     try:
-        res = assess_kit(args[0], data_reset=reset) if cmd == "assess-kit" else commit_kit(args[0])
+        if cmd == "assess-kit":
+            res = assess_kit(args[0], data_reset=reset, install_id=install_id)
+        else:
+            res = commit_kit(args[0], install_id)
     except CapacityRefusal as e:
         print(f"sealed: VM host ledger: not enough {e.resource}: {e.detail}", file=sys.stderr)
         return 1
@@ -817,13 +881,18 @@ def main(argv: list[str]) -> int:
         print(f"sealed: VM host ledger busy: {e}", file=sys.stderr)
         return 1
     except (OSError, UnicodeDecodeError, ValueError) as e:
-        print(f"sealed: VM host ledger: cannot read {args[0]}: {e}", file=sys.stderr)
+        print(f"sealed: VM host ledger: {args[0]}: {e}", file=sys.stderr)
         return 1
+    # stdout carries only the install id (install-sealed.sh keeps it for its commit); the log is stderr.
     if cmd == "commit-kit":
-        print(f"[sealed] VM host ledger: {res['kit']} recorded at its installed size")
+        print(f"[sealed] VM host ledger: install {install_id} of {res['kit']} committed; the kit counts its installed size",
+              file=sys.stderr)
     else:
-        what = "with a fresh data volume next to data.raw.prev" if reset else f"with {res['vms']} VM(s) and {res['kits']} kit(s)"
-        print(f"[sealed] VM host ledger: room for {res['kit']} {what}; recorded")
+        what = ("with a fresh data volume next to data.raw.prev" if reset
+                else f"with {res['vms']} VM(s) and {res['kits']} kit(s)")
+        print(f"[sealed] VM host ledger: room for {res['kit']} {what}; recorded as install {res['install_id']}",
+              file=sys.stderr)
+        print(res["install_id"])
     return 0
 
 

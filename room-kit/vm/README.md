@@ -128,18 +128,21 @@ behave as before.
   `ExecStart` line, wherever `SEALED_DIR` is. A `-net` unit is skipped only when it is exactly the
   check unit `write-units.sh` writes (`Type=oneshot`, `ExecStart=<dir>/host-net.sh check <env>`);
   any other unit, whatever its name, is a kit and must parse. Plus the kits being installed:
-  `install-sealed.sh` records `/var/lib/cathedral-snp/kits/<name>.json` before its build.
-  Counted by name, each size the larger of unit and record. A kit that is removed must have its
-  record removed too. A unit, env file or record that cannot be read (missing, a line that is not
+  each install of a kit records `/var/lib/cathedral-snp/kits/<name>.<install id>.json` before
+  its build. Counted by name, each size the larger of the unit and every open record. A kit that
+  is removed must have its records removed too. A unit, env file or record that cannot be read (missing, a line that is not
   `KEY=value`, a size only a shell could read) refuses every create and start: resource
   `kit_unaccounted`.
-- **Rolls:** the record holds the larger of the running build and the replacement from the assess
-  step until the new guest's measurement matched (`vm_capacity.py commit-kit`, after
-  `systemctl enable`). A roll refused or failed after the env copy keeps the old size reserved.
-  A data-volume reset is reserved before `data.raw` moves (`assess-kit --data-reset`): the old
-  volume stays allocated as `data.raw.prev` (counted until it is removed) and the fresh `data.raw`
-  counts at its full size. A roll that is not confirmed restores the volume and keeps that
-  reservation until the next confirmed install.
+- **Rolls:** `assess-kit` prints the install id; the install's record holds the larger of the
+  running build and the replacement until the new guest's measurement matched. Then
+  `commit-kit --install-id <id>` (after `systemctl enable`) removes that record only, so another
+  install of the same kit keeps its reservation. A roll refused or failed after the env copy
+  keeps its record (spec 9), and an operator removes it once the running build is vouched for.
+- **Data-volume reset:** reserved before `data.raw` moves (`assess-kit --install-id <id>
+  --data-reset`). The fresh `data.raw` is charged its own new size. `data.raw.prev` is detached
+  and cannot grow, so it counts only the blocks it holds (already out of `df` avail) until it is
+  removed. A roll that is not confirmed puts the volume back; it is then charged the larger of
+  its own growth and the replacement's size while that install's record stays.
 - **VMs:** every `vm.env`, in any state.
 - **create** (commit), exit 5 on the first resource that does not fit:
   - `memory`: kits + VMs + this VM, each plus `VM_GUEST_OVERHEAD_MIB` (default 1024), plus a

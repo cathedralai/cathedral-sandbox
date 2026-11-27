@@ -58,8 +58,10 @@ systemctl is-active -q "$UNIT" || [ "$MEM_FREE_GIB" -gt $(( SEALED_MEM_GIB + 32 
 # Customer VMs on this host (AB#999, VM spec r2 section 9): with the VM host switch on, the disk and
 # memory checks also count every VM and every other kit, and this kit's sizes are recorded in the
 # host ledger, under its capacity lock, before the build. Without the switch nothing here runs.
+# VM_LEDGER_ID is this install's record: only this install's commit removes it.
+VM_LEDGER_ID=""
 if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
-  python3 -I "$KIT/vm/vm_capacity.py" assess-kit "$ENV_FILE" || exit 1
+  VM_LEDGER_ID=$(python3 -I "$KIT/vm/vm_capacity.py" assess-kit "$ENV_FILE") || exit 1
 fi
 
 # ---------------------------------------------------------------- 2. host packages
@@ -186,7 +188,8 @@ data_volume_new_build() {
       # both in the host ledger before anything moves. A refusal here leaves the volume and the
       # running guest as they are.
       if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
-        python3 -I "$KIT/vm/vm_capacity.py" assess-kit --data-reset "$ENV_FILE" || exit 1
+        VM_LEDGER_ID=$(python3 -I "$KIT/vm/vm_capacity.py" assess-kit \
+          ${VM_LEDGER_ID:+--install-id "$VM_LEDGER_ID"} --data-reset "$ENV_FILE") || exit 1
       fi
       rm -f "$SEALED_DIR/data-on-new-build"
       mv -f "$SEALED_DIR/data.raw" "$SEALED_DIR/data.raw.prev"
@@ -229,11 +232,12 @@ if [ "$GOT" = "$EXPECTED" ]; then
   # Boot the guest again at the next host start (an unattended reboot left
   # sealed guests off until a manual start). Only a verified image is enabled.
   systemctl enable -q "$UNIT"
-  # VM host (AB#999): the new guest now runs at its new size, so the host ledger's record of this
-  # kit, held at the larger of the old and new sizes since the assess step, may shrink to it.
-  if [ -e "${VM_CAPACITY_ROOT:-}/etc/cathedral/snp-vm-host.json" ]; then
-    python3 -I "$KIT/vm/vm_capacity.py" commit-kit "$SEALED_DIR/sealed.env" \
-      || log "VM host ledger: the record of $SEALED_NAME keeps the larger size until the next install"
+  # VM host (AB#999): the new guest now runs at its new size, so this install's record in the host
+  # ledger, held at the larger of the old and new sizes since the assess step, goes. Another
+  # install's record of this kit stays.
+  if [ -n "${VM_LEDGER_ID:-}" ]; then
+    python3 -I "$KIT/vm/vm_capacity.py" commit-kit --install-id "$VM_LEDGER_ID" "$SEALED_DIR/sealed.env" \
+      || log "VM host ledger: install $VM_LEDGER_ID of $SEALED_NAME keeps its larger record; remove it once this build is vouched for"
   fi
 else
   # Do not serve a guest the operator cannot vouch for, and do not boot it
