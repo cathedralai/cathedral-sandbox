@@ -286,24 +286,12 @@ def unit_absent(name: str) -> bool:
     return p.returncode == 0 and props.get("LoadState") == "not-found" and props.get("ActiveState") == "inactive"
 
 
-def qmp(name: str, command: str, timeout: float = 5) -> bool:
-    """Send one QMP command; False when QEMU is not there to take it.
-
-    run/ belongs to the VM's QEMU user, so a QEMU that escaped its sandbox could put a link
-    there to another VM's socket. Root only connects to a socket file that is not a link and
-    that the VM's own user owns."""
-    path = root() / name / "run" / "qmp.sock"
-    try:
-        st = os.lstat(path)
-        user = read_env(root() / name / "vm.env").get("VM_USER")
-        if not stat.S_ISSOCK(st.st_mode) or (user is not None and st.st_uid != user_uid(user)):
-            return False
-    except (OSError, KeyError):
-        return False
+def qmp_exchange(sock_path: str, command: str, timeout: float) -> bool:
+    """qmp_capabilities, then one command, on one QMP socket. True when both returned."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
-            s.connect(str(path))
+            s.connect(sock_path)
             f = s.makefile("rwb")
             f.readline()  # greeting
             for cmd in ("qmp_capabilities", command):
@@ -318,6 +306,57 @@ def qmp(name: str, command: str, timeout: float = 5) -> bool:
             return True
     except (OSError, ValueError):
         return False
+
+
+QMP_COMMANDS = ("system_powerdown",)
+
+
+def qmp(name: str, command: str, timeout: float = 5) -> bool:
+    """Send one QMP command; False when QEMU is not there to take it.
+
+    run/ belongs to the VM's QEMU user, who can replace qmp.sock with a link to any path at
+    any time, so no check made by root before connect() holds (Astra #789 P1). The connect
+    therefore runs as that user: a child process starts in run/ (root resolves only the
+    root-owned path down to it), drops to the VM user with no supplementary groups, and
+    connects to "qmp.sock" relative to it. Whatever the link names, it is followed with the
+    VM user's rights, which reach no other VM (every VM directory is root's, mode 0700).
+    The lstat check below only fails fast; it is not what makes this safe."""
+    d = root() / name
+    run_dir = d / "run"
+    try:
+        st = os.lstat(run_dir / "qmp.sock")
+        if not stat.S_ISSOCK(st.st_mode):
+            return False
+        user = read_env(d / "vm.env").get("VM_USER")
+    except OSError:
+        return False
+    if user is None:
+        # A VM from before AB#999 VM3: QEMU ran as root and run/ is root's.
+        return qmp_exchange(str(run_dir / "qmp.sock"), command, timeout)
+    try:
+        import pwd
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return False
+    drop = {"user": pw.pw_uid, "group": pw.pw_gid, "extra_groups": []} if os.geteuid() == 0 else {}
+    try:
+        p = subprocess.run([sys.executable, "-I", str(KIT / "vm_ctl.py"), "qmp-as-vm-user", command, str(timeout)],
+                           cwd=str(run_dir), capture_output=True, timeout=timeout + 10, env={"PATH": "/usr/bin:/bin"},
+                           **drop)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0
+
+
+def cmd_qmp_as_vm_user(args: list[str]) -> dict:
+    """Internal (never from the broker): the child of qmp(), already the VM user, cwd run/."""
+    if len(args) != 2 or args[0] not in QMP_COMMANDS:
+        raise Refusal("usage", "qmp-as-vm-user <command> <timeout>")
+    if os.geteuid() == 0:
+        raise Refusal("usage", "qmp-as-vm-user runs only as a VM user, never as root")
+    if not qmp_exchange("qmp.sock", args[0], float(args[1])):
+        raise Refusal("qmp_failed", "QEMU did not take the command", 1)
+    return {"sent": args[0]}
 
 
 # ---- authorization -------------------------------------------------------------
@@ -757,11 +796,6 @@ def allocate(port: int) -> int:
 
 # ---- the VM user, its disks and its unit (spec r2 7.1, 8.2) ----------------------------
 
-def user_uid(user: str) -> int:
-    import pwd
-    return pwd.getpwnam(user).pw_uid
-
-
 def ensure_user(user: str) -> None:
     """One system user per VM. A user left by a delete cut before userdel owns no file: reused."""
     if run("getent", "passwd", user, check=False).returncode == 0:
@@ -1196,32 +1230,51 @@ def cmd_powerdown(args: list[str]) -> dict:
     return {"name": name, "powerdown_sent": sent}
 
 
+def reboot_marker(d: Path) -> Path:
+    return d / "reboot-pending.json"
+
+
 def cmd_reboot(args: list[str]) -> dict:
     """A fenced relaunch in the same generation (spec r2 8.1): an SNP guest cannot be reset in
     the same QEMU. Ask the guest to power off, wait up to STOP_WAIT, then restart the unit. The
     generation keeps its start line and has no close line, so check-paid lets the relaunch
-    through, no history line is added and nothing is charged again."""
+    through, no history line is added and nothing is charged again.
+
+    reboot-pending.json names the generation before the powerdown and goes only after the
+    restart is queued: a reboot cut between the two (Astra #789 P2) leaves the VM down with
+    the marker, and a retry for that same paid, open generation relaunches it instead of
+    answering not_running. stop, and any newer generation, make the marker inert."""
     opts = parse_opts(args, {"--generation"}, 1)
     name = check_name(opts["_"][0])
     d = vm_dir(name)
     with Lock(d / ".lock"):
         begin(name, d)
-        check_generation(opts, auth_of(d))
-        if not unit_active(name):
+        a = auth_of(d)
+        check_generation(opts, a)
+        g = a["generation"]
+        pending = reboot_marker(d)
+        resume = read_json(pending, {}).get("generation") == g
+        running = unit_active(name)
+        if not running and not resume:
+            pending.unlink(missing_ok=True)
             raise Refusal("not_running", f"VM {name} is not running", 5)
-        refusal = paid_refusal(auth_of(d), int(time.time()))
+        refusal = paid_refusal(a, int(time.time()))
         if refusal:
             raise refusal
+        write_atomic(pending, json.dumps({"generation": g, "at": int(time.time())}) + "\n")
         marker = powerdown_marker(d)
         marker.touch()  # the unit's ExecStop would ask and wait again
+        graceful = False
         try:
-            graceful = qmp(name, "system_powerdown") and wait_inactive(name, STOP_WAIT)
+            if running:
+                graceful = qmp(name, "system_powerdown") and wait_inactive(name, STOP_WAIT)
             systemctl("reset-failed", unit_name(name), check=False)
             systemctl("restart", unit_name(name))
         finally:
             marker.unlink(missing_ok=True)
-    return {"name": name, "rebooted_at": int(time.time()), "state": "running",
-            "generation": auth_of(d)["generation"], "graceful": graceful}
+        pending.unlink(missing_ok=True)
+    return {"name": name, "rebooted_at": int(time.time()), "state": "running", "generation": g,
+            "graceful": graceful, "resumed": resume and not running}
 
 
 # ---- delete, status, list, enforce ---------------------------------------------
@@ -1517,7 +1570,7 @@ def main(argv: list[str]) -> int:
             "authorize": cmd_authorize, "start": cmd_start, "stop": cmd_stop, "reboot": cmd_reboot,
             "delete": cmd_delete, "status": cmd_status, "list": cmd_list, "enforce": cmd_enforce,
             "check-paid": cmd_check_paid, "powerdown": cmd_powerdown, "cancel": cmd_cancel,
-            "history": cmd_history,
+            "history": cmd_history, "qmp-as-vm-user": cmd_qmp_as_vm_user,
         }
         if cmd == "create":
             out(cmd_create(rest, key_text))

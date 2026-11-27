@@ -17,6 +17,7 @@ import importlib.util
 import itertools
 import json
 import os
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -113,7 +114,7 @@ def test_golden_argv(site):
     hd = base64.b64encode(hashlib.sha256(b"cathedral-vm-v1\0" + hashlib.sha256(ident).digest()).digest()).decode()
     line = VM.CMDLINE_TEMPLATE_V1.replace("{identity_sha256}", hashlib.sha256(ident).hexdigest())
     assert L.build_argv(str(d)) == [
-        "/usr/bin/qemu-system-x86_64", "-no-user-config", "-nodefaults", "-no-reboot", "-name", "cathedral-vm-vm1",
+        "/usr/bin/qemu-system-x86_64", "-no-user-config", "-nodefaults", "-no-reboot", "-S", "-name", "cathedral-vm-vm1",
         "-enable-kvm", "-cpu", "EPYC-v4", "-smp", "2", "-m", "4G",
         "-machine", "q35,confidential-guest-support=sev0,memory-backend=ram1",
         "-object", "memory-backend-memfd,id=ram1,size=4G,share=true,prealloc=false",
@@ -176,6 +177,7 @@ def test_no_flag_changes_the_argv(site, args):
     lambda a: [x.replace("kernel-hashes=on", "kernel-hashes=off") for x in a],
     lambda a: [x.replace("confidential-guest-support=sev0,", "") for x in a],
     lambda a: [x for x in a if x != "-no-reboot"],
+    lambda a: [x for x in a if x != "-S"],
     lambda a: a + ["-smbios", "type=11,value=io.systemd.credential:x=y"],
     lambda a: a + ["-runas", "root"],
     lambda a: a + ["-fw_cfg", "name=opt/io.systemd.credentials/x,string=y"],
@@ -266,39 +268,70 @@ def test_the_launcher_never_runs_qemu_as_root(site, monkeypatch, capsys):
 
 @pytest.mark.parametrize("rc,reason,code", [
     (0, "guest-reset", 75), (0, "host-qmp-system-reset", 75), (0, "guest-shutdown", 0), (0, "host-signal", 0),
-    (0, "host-qmp-quit", 0), (0, None, 1), (0, "guest-panic", 1), (1, "guest-shutdown", 1), (-9, None, 1),
+    (0, "host-qmp-quit", 0), (0, None, 0), (0, "guest-panic", 1), (1, "guest-shutdown", 1), (-9, None, 1),
 ])
 def test_exit_code(rc, reason, code):
     assert L.exit_code(rc, reason) == code
 
 
+# A QEMU started with -S: the guest runs (and can power off or reset) only after cont.
 FAKE_QEMU = textwrap.dedent('''
     import json, socket, sys, time
-    path, reason, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    path, mode, rc, log = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+    if mode == "no-socket":
+        time.sleep(30)
+        sys.exit(0)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.bind(path)
     s.listen(1)
-    if reason == "none":
-        time.sleep(0.3)
-        sys.exit(rc)
     c, _ = s.accept()
     f = c.makefile("rwb")
     f.write(b'{"QMP": {"version": {}, "capabilities": []}}\\n'); f.flush()
-    f.readline()
-    f.write(b'{"return": {}}\\n')
-    f.write(json.dumps({"event": "SHUTDOWN", "data": {"guest": True, "reason": reason}}).encode() + b"\\n")
-    f.flush()
+    got = []
+    for _ in range(2):
+        got.append(json.loads(f.readline())["execute"])
+        open(log, "w").write(json.dumps(got))
+        if got[-1] == "cont" and mode == "refuse-cont":
+            f.write(b'{"error": {"class": "GenericError", "desc": "no"}}\\n'); f.flush()
+            time.sleep(30)  # paused until the launcher ends it
+            sys.exit(0)
+        if got[-1] == "cont":
+            f.write(b'{"event": "RESUME", "data": {}}\\n')  # an event before the reply, as QEMU may send
+        f.write(b'{"return": {}}\\n'); f.flush()
+    if mode != "none":  # the guest ran, then powered off or reset
+        f.write(json.dumps({"event": "SHUTDOWN", "data": {"guest": True, "reason": mode}}).encode() + b"\\n")
+        f.flush()
     sys.exit(rc)
 ''')
 
 
-@pytest.mark.parametrize("reason,rc,code", [("guest-reset", 0, 75), ("guest-shutdown", 0, 0), ("none", 0, 1),
-                                            ("guest-shutdown", 1, 1)])
-def test_run_maps_the_qemu_shutdown_event(tmp_path, short_dir, reason, rc, code):
-    script = tmp_path / "fake_qemu.py"
+@pytest.mark.parametrize("mode,rc,code", [("guest-reset", 0, 75), ("guest-shutdown", 0, 0), ("none", 0, 0),
+                                          ("guest-shutdown", 1, 1), ("refuse-cont", 0, 1), ("no-socket", 0, 1)])
+def test_run_lets_the_guest_run_only_after_it_listens(tmp_path, short_dir, monkeypatch, mode, rc, code):
+    """Astra #789 P2: QEMU starts paused and the launcher sends cont only after qmp_capabilities,
+    so no SHUTDOWN can be lost; no socket or a refused cont ends QEMU as a failure."""
+    import time
+    monkeypatch.setattr(L, "EVENTS_CONNECT_WAIT", 1.0)
+    script, log = tmp_path / "fake_qemu.py", tmp_path / "qmp.log"
     script.write_text(FAKE_QEMU)
     sock = short_dir / "ev.sock"
-    assert L.run([sys.executable, str(script), str(sock), reason, str(rc)], str(sock)) == code
+    t0 = time.monotonic()
+    assert L.run([sys.executable, str(script), str(sock), mode, str(rc), str(log)], str(sock)) == code
+    assert time.monotonic() - t0 < 20  # a paused QEMU is ended, not waited on
+    if mode != "no-socket":
+        assert json.loads(log.read_text()) == ["qmp_capabilities", "cont"]
+
+
+def test_start_paused_changes_no_measured_input():
+    """-S is not a launch measurement input: every measured option is the same with and without it."""
+    kw = dict(name="x", cpu_model="EPYC-v4", vcpus=2, mem_gib=4, host_data_b64="A" * 43 + "=", ovmf="/b/o",
+              kernel="/b/k", initrd="/b/i", cmdline="console=ttyS0", devices=[], qmp_sockets=["/r/q"])
+    plain, paused = SNP.snp_argv(**kw), SNP.snp_argv(**kw, start_paused=True)
+    assert [x for x in paused if x != "-S"] == plain and paused.count("-S") == 1
+    for flag in ("-object", "-machine", "-cpu", "-smp", "-m", "-bios", "-kernel", "-initrd", "-append"):
+        assert opt(paused, flag) == opt(plain, flag), flag
+    with pytest.raises(SNP.SnpArgvError):
+        SNP.sealed_vm_argv(**{k: v for k, v in kw.items() if k != "cpu_model"}, start_paused=False)
 
 
 # ---- Astra r2 P1 #2: the unit exposes what the launcher reads ----------------------------------
@@ -410,46 +443,161 @@ def test_unit_confinement_and_restart_policy(host):  # noqa: F811
     assert "-runas" not in text
 
 
-def test_the_qmp_helper_never_follows_a_link_in_run(short_dir, monkeypatch):
-    """run/ is the QEMU user's: a link there must not send root's powerdown to another socket."""
+def _qmp_server(path: Path, got: list):
     import socket
     import threading
-    (short_dir / "vm1" / "run").mkdir(parents=True)
-    (short_dir / "vm1" / "vm.env").write_text("VM_NAME='vm1'\nVM_USER='cvm-0'\n")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen(1)
+    srv.settimeout(5)
+
+    def one():
+        try:
+            c, _ = srv.accept()
+        except OSError:
+            return
+        f = c.makefile("rwb")
+        f.write(b'{"QMP": {}}\n')
+        f.flush()
+        for _ in range(2):
+            got.append(json.loads(f.readline())["execute"])
+            f.write(b'{"return": {}}\n')
+            f.flush()
+        c.close()
+    threading.Thread(target=one, daemon=True).start()
+    return srv
+
+
+def test_the_qmp_helper_connects_as_the_vm_user_from_run(short_dir, monkeypatch):
+    """Astra #789 P1: root's QMP connect runs in a child that starts in run/, drops to the VM
+    user with no supplementary groups, and connects to qmp.sock relative to run/."""
+    import pwd
+    me = pwd.getpwuid(os.getuid())
+    run_dir = short_dir / "vm1" / "run"
+    run_dir.mkdir(parents=True)
+    (short_dir / "vm1" / "vm.env").write_text(f"VM_NAME='vm1'\nVM_USER='{me.pw_name}'\n")
     monkeypatch.setenv("VM_ROOT", str(short_dir))
     mod = _load("vm_ctl_qmp_test", KIT / "vm_ctl.py")
-    monkeypatch.setattr(mod, "user_uid", lambda user: os.getuid())
-
-    def serve(path: Path, got: list) -> socket.socket:
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(str(path))
-        srv.listen(1)
-        srv.settimeout(5)
-
-        def one():
-            try:
-                c, _ = srv.accept()
-            except OSError:
-                return
-            f = c.makefile("rwb")
-            f.write(b'{"QMP": {}}\n')
-            f.flush()
-            for _ in range(2):
-                got.append(json.loads(f.readline())["execute"])
-                f.write(b'{"return": {}}\n')
-                f.flush()
-            c.close()
-        threading.Thread(target=one, daemon=True).start()
-        return srv
-
     other, got = short_dir / "o.sock", []
-    srv = serve(other, got)
-    sock = short_dir / "vm1" / "run" / "qmp.sock"
+    srv = _qmp_server(other, got)
+    sock = run_dir / "qmp.sock"
     os.symlink(other, sock)
-    assert mod.qmp("vm1", "system_powerdown", timeout=1) is False and got == []
+    assert mod.qmp("vm1", "system_powerdown", timeout=1) is False and got == []  # fails fast on a link
     srv.close()
     sock.unlink()
     got = []
-    srv = serve(sock, got)
-    assert mod.qmp("vm1", "system_powerdown", timeout=2) is True and got == ["qmp_capabilities", "system_powerdown"]
+    srv = _qmp_server(sock, got)
+    assert mod.qmp("vm1", "system_powerdown", timeout=3) is True and got == ["qmp_capabilities", "system_powerdown"]
     srv.close()
+    # As root, the child gets exactly the VM user's uid and gid, no groups, and cwd run/.
+    seen = {}
+
+    def spy(argv, **kw):
+        seen.update(kw, argv=argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(mod.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(mod.subprocess, "run", spy)
+    assert mod.qmp("vm1", "system_powerdown") is True
+    assert (seen["user"], seen["group"], seen["extra_groups"]) == (me.pw_uid, me.pw_gid, [])
+    assert seen["cwd"] == str(run_dir) and seen["argv"][-3:] == ["qmp-as-vm-user", "system_powerdown", "5"]
+    assert "qmp-as-vm-user" not in mod.COMMANDS  # never reachable from the broker
+    with pytest.raises(mod.Refusal):  # and never run as root itself
+        mod.cmd_qmp_as_vm_user(["system_powerdown", "1"])
+    with pytest.raises(mod.Refusal):
+        mod.cmd_qmp_as_vm_user(["quit", "1"])
+
+
+ROOT_SWAP = textwrap.dedent('''
+    import importlib.util, json, os, pwd, shutil, socket, stat, sys, threading
+    kit, base = sys.argv[1], sys.argv[2]
+    nobody = pwd.getpwnam("nobody")
+    try:
+        victim = os.path.join(base, "victim")
+        os.mkdir(victim, 0o700)  # another VM's directory: root's, 0700
+        hits = []
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(os.path.join(victim, "qmp.sock"))
+        srv.listen(4)
+        srv.settimeout(3)
+
+        def accept():
+            try:
+                while True:
+                    c, _ = srv.accept()
+                    hits.append(1)
+                    c.close()
+            except OSError:
+                pass
+        threading.Thread(target=accept, daemon=True).start()
+        # The kit in a world-readable place, so the dropped child can run it.
+        kit_copy = os.path.join(base, "kit")
+        os.mkdir(kit_copy, 0o755)
+        for f in ("vm_ctl.py", "vm_measure.py"):
+            shutil.copy(os.path.join(kit, f), kit_copy)
+        vms = os.path.join(base, "vms")
+
+        def vm(name):
+            d = os.path.join(vms, name)
+            os.makedirs(os.path.join(d, "run"))
+            os.chmod(d, 0o700)
+            os.chown(os.path.join(d, "run"), nobody.pw_uid, nobody.pw_gid)
+            with open(os.path.join(d, "vm.env"), "w") as f:
+                f.write(f"VM_NAME='{name}'\\nVM_USER='nobody'\\n")
+            return d
+        d = vm("vm1")
+        # Positive control: vm2's own socket, served by "its QEMU" (owned by nobody), is reached.
+        d2 = vm("vm2")
+        own = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        own.bind(os.path.join(d2, "run", "qmp.sock"))
+        os.chown(os.path.join(d2, "run", "qmp.sock"), nobody.pw_uid, nobody.pw_gid)
+        own.listen(1)
+        own.settimeout(5)
+
+        def serve_own():
+            c, _ = own.accept()
+            f = c.makefile("rwb")
+            f.write(b'{"QMP": {}}\\n'); f.flush()
+            for _ in range(2):
+                f.readline()
+                f.write(b'{"return": {}}\\n'); f.flush()
+            c.close()
+        threading.Thread(target=serve_own, daemon=True).start()
+        # The swap after root's check: qmp.sock is a link to the victim, yet lstat says socket.
+        os.symlink(os.path.join(victim, "qmp.sock"), os.path.join(d, "run", "qmp.sock"))
+        os.environ["VM_ROOT"] = vms
+        spec = importlib.util.spec_from_file_location("vm_ctl_root", os.path.join(kit_copy, "vm_ctl.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        real_lstat = os.lstat
+        fake = os.stat_result((stat.S_IFSOCK | 0o755,) + tuple(real_lstat(victim))[1:])
+        mod.os.lstat = lambda p, *a, **k: fake if str(p).endswith("qmp.sock") else real_lstat(p, *a, **k)
+        own_ok = mod.qmp("vm2", "system_powerdown", timeout=3)
+        ok = mod.qmp("vm1", "system_powerdown", timeout=2)
+        print(json.dumps({"own": own_ok, "qmp": ok, "victim_hits": len(hits)}))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+''')
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux and passwordless sudo")
+def test_a_swapped_qmp_link_cannot_reach_another_vm_as_root(tmp_path):
+    """Astra #789 P1, the review's deterministic swap, run as root: the link passes root's
+    check, and the connect, made as the VM user, still cannot reach the victim's socket."""
+    import shutil
+    import tempfile
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+        if os.environ.get("CI"):
+            pytest.fail("CI must run this as root (sudo -n)")
+        pytest.skip("no passwordless sudo")
+    base = tempfile.mkdtemp(prefix="vq", dir="/tmp")
+    os.chmod(base, 0o755)
+    script = tmp_path / "swap.py"
+    script.write_text(ROOT_SWAP)
+    try:  # the base interpreter, so the dropped child can run it too (not a venv under $HOME)
+        p = subprocess.run(["sudo", "-n", os.path.realpath(sys.executable), "-I", "-B", str(script), str(KIT), base],
+                           capture_output=True, text=True, timeout=60)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)  # the script removes what root made
+    assert p.returncode == 0, p.stderr
+    assert json.loads(p.stdout.strip().splitlines()[-1]) == {"own": True, "qmp": False, "victim_hits": 0}

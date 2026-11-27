@@ -366,6 +366,48 @@ def test_reboot_is_a_fenced_relaunch_in_the_same_generation(host):
     assert code == 4 and out["error"] == "unpaid"
 
 
+# The fake systemctl, plus "restart": it fails once (and leaves the unit down, as after the
+# guest's powerdown) while a .fail-restart flag exists, and starts the unit otherwise.
+FLAKY_RESTART = FAKE_SYSTEMCTL.replace(
+    'if verb == "start": u["active"] = True',
+    'if verb == "restart" and os.path.exists(path + ".fail-restart"):\n'
+    '    os.unlink(path + ".fail-restart"); u["active"] = False; json.dump(state, open(path, "w")); sys.exit(1)\n'
+    'if verb in ("start", "restart"): u["active"] = True')
+
+
+def test_an_interrupted_reboot_relaunches_on_retry(host):
+    """Astra #789 P2: powerdown done, restart never queued. The retry for the same paid, open
+    generation relaunches instead of answering not_running; nothing else can revive it."""
+    assert FLAKY_RESTART != FAKE_SYSTEMCTL
+    (host.bin / "systemctl").write_text(FLAKY_RESTART)
+    host.create()
+    now = int(time.time())
+    host.ctl("authorize", "vm1", str(now + 600), "1")
+    assert host.ctl("start", "vm1", "--generation", "1")[0] == 0
+    hist = (host.root / ".history" / "vm1.jsonl").read_text()
+    (host.root.parent / "systemd.json.fail-restart").write_text("")
+    code, out = host.ctl("reboot", "vm1", "--generation", "1")
+    assert code == 1 and out["error"] == "command_failed", out
+    assert host.ctl("status", "vm1")[1]["state"] == "stopped"
+    assert json.loads((host.root / "vm1" / "reboot-pending.json").read_text())["generation"] == 1
+    code, out = host.ctl("reboot", "vm1", "--generation", "1")
+    assert code == 0 and out["state"] == "running" and out["resumed"] is True, out
+    assert host.ctl("status", "vm1")[1]["state"] == "running"
+    assert not (host.root / "vm1" / "reboot-pending.json").exists()
+    assert (host.root / ".history" / "vm1.jsonl").read_text() == hist  # same run, no new line
+    # A marker cannot revive a stopped run, nor one of an older generation.
+    (host.root.parent / "systemd.json.fail-restart").write_text("")
+    assert host.ctl("reboot", "vm1", "--generation", "1")[0] == 1
+    assert host.ctl("stop", "vm1", "--generation", "1")[0] == 0
+    code, out = host.ctl("reboot", "vm1", "--generation", "1")
+    assert code == 3 and out["error"] == "generation_closed", out
+    host.ctl("authorize", "vm1", str(now + 600), "2")
+    code, out = host.ctl("reboot", "vm1", "--generation", "2")
+    assert code == 5 and out["error"] == "not_running"
+    assert not (host.root / "vm1" / "reboot-pending.json").exists()
+    assert host.ctl("status", "vm1")[1]["state"] == "stopped"
+
+
 @pytest.mark.parametrize("command", [
     "status vm1; rm -rf /",
     "status $(id)",

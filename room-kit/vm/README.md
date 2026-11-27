@@ -66,7 +66,13 @@ sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the 
   run, so it returns after a host reboot.
 - Reboot is a relaunch (`-no-reboot`): a guest reset ends QEMU, the launcher exits 75
   and systemd starts it again in the same generation; `vm-ctl reboot` asks the guest to
-  power off, waits up to 60 s, then restarts the unit. Neither adds a history line.
+  power off, waits up to 60 s, then restarts the unit. Neither adds a history line. A
+  `vm-ctl reboot` cut after the powerdown leaves `reboot-pending.json`, and its retry
+  relaunches the same paid, open generation.
+- QEMU starts paused (`-S`); the launcher lets the guest run (`cont`) only after it
+  listens for QMP events, so no poweroff or reset goes unseen.
+- Root's QMP commands (`stop`, `reboot`, the unit's `ExecStop`) connect as the VM's
+  user from inside `run/`, so a link put there reaches nothing that user cannot.
 - Network: guest `.2` on its own /30 in 10.216.0.0/16, NAT to the internet,
   no access to private ranges or to this host, and one way in: the host's
   `--ssh-port` forwarded to guest port 22.

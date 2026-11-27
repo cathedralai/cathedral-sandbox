@@ -17,10 +17,10 @@ Every launch refuses (exit 78, and the unit does not restart) unless HOST_CONFIG
 lists the VM's bundle: a host without it runs no VM, as the stub before this file did.
 The vCPU model is always snp_qemu.VM_CPU_MODEL (EPYC-v4), with no flag or key to change it.
 
--no-reboot: a guest reset ends QEMU. The launcher stays QEMU's parent and reads SHUTDOWN
-events on a second QMP socket: a reset exits 75 (the unit's RestartForceExitStatus, so the
-VM relaunches in the same generation), a poweroff exits 0 (the unit stays down), anything
-else exits 1 (Restart=on-failure).
+-no-reboot: a guest reset ends QEMU. QEMU starts paused (-S); the launcher stays its parent,
+negotiates a second QMP socket, sends cont, and reads SHUTDOWN events there: a reset
+exits 75 (the unit's RestartForceExitStatus, so the VM relaunches in the same generation),
+a poweroff exits 0 (the unit stays down), anything else exits 1 (Restart=on-failure).
 """
 from __future__ import annotations
 
@@ -166,6 +166,8 @@ def check_argv(argv: list[str], d: str, bundle: str) -> None:
     snp_qemu.check_snp_argv(argv)
     if snp_qemu.values_of(argv, "-cpu") != [snp_qemu.VM_CPU_MODEL]:
         raise LaunchError(f"a sealed VM runs only the {snp_qemu.VM_CPU_MODEL} vCPU model")
+    if argv.count("-S") != 1:
+        raise LaunchError("QEMU must start paused: the launcher lets the guest run after it listens for events")
     p = paths_of(d, bundle)
     fw = [x.split(",", 1)[0] for x in snp_qemu.values_of(argv, "-fw_cfg")]
     if fw != [f"name={n}" for n in FW_CFG_NAMES]:
@@ -189,16 +191,38 @@ def check_argv(argv: list[str], d: str, bundle: str) -> None:
 # ---- run -------------------------------------------------------------------------------
 
 def exit_code(qemu_rc: int, reason: str | None) -> int:
-    """The unit's exit code for one QEMU run: 75 relaunches, 0 stays down, 1 is a failure."""
+    """The unit's exit code for one QEMU run: 75 relaunches, 0 stays down, 1 is a failure.
+
+    A clean QEMU exit with no SHUTDOWN event seen counts as a poweroff (Astra #789 P2
+    fallback): staying down is the safe side, and the watcher's own failures exit 1 in run()."""
     if reason in RELAUNCH_REASONS:
         return EXIT_RELAUNCH
-    if qemu_rc == 0 and reason in POWEROFF_REASONS:
+    if qemu_rc == 0 and (reason is None or reason in POWEROFF_REASONS):
         return EXIT_POWEROFF
     return EXIT_FAILED
 
 
+def _reply(f, box: dict) -> dict:
+    """The next command reply on a QMP stream, recording any SHUTDOWN event read before it."""
+    while True:
+        raw = f.readline()
+        if not raw:
+            raise OSError("QMP closed")
+        msg = json.loads(raw)
+        if not isinstance(msg, dict):
+            continue
+        if "event" in msg:
+            if msg.get("event") == "SHUTDOWN" and isinstance(msg.get("data"), dict):
+                box["reason"] = msg["data"].get("reason")
+            continue
+        return msg
+
+
 def watch_shutdown(path: str, proc: subprocess.Popen, box: dict) -> None:
-    """Record the reason of the last SHUTDOWN event QEMU sends on the events socket."""
+    """Negotiate the events socket, then let the guest run (cont), then record the reason of
+    the last SHUTDOWN event. QEMU starts paused (-S) and sends no event before negotiation, so
+    a guest can power off only after this watcher listens (Astra #789 P2). If the socket
+    cannot be reached or cont fails, QEMU is ended and the run counts as a failure."""
     deadline = time.monotonic() + EVENTS_CONNECT_WAIT
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -207,22 +231,29 @@ def watch_shutdown(path: str, proc: subprocess.Popen, box: dict) -> None:
                 s.connect(path)
                 break
             except OSError:
-                if proc.poll() is not None or time.monotonic() > deadline:
+                if proc.poll() is not None:
+                    return
+                if time.monotonic() > deadline:
+                    box["error"] = "events socket unreachable"
+                    proc.terminate()
                     return
                 time.sleep(0.05)
         f = s.makefile("rwb")
         f.readline()  # greeting
-        f.write(b'{"execute": "qmp_capabilities"}\n')
-        f.flush()
-        box["connected"] = True
-        for raw in f:
-            try:
-                msg = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(msg, dict) and msg.get("event") == "SHUTDOWN" and isinstance(msg.get("data"), dict):
-                box["reason"] = msg["data"].get("reason")
-    except OSError:
+        for command in ("qmp_capabilities", "cont"):
+            f.write(json.dumps({"execute": command}).encode() + b"\n")
+            f.flush()
+            if "return" not in _reply(f, box):
+                box["error"] = f"QMP {command} refused"
+                proc.terminate()
+                return
+        box["running"] = True
+        while True:
+            _reply(f, box)  # only events follow; returns at EOF by raising
+    except (OSError, ValueError) as e:
+        if not box.get("running") and proc.poll() is None:
+            box["error"] = f"events socket: {type(e).__name__}"
+            proc.terminate()
         return
     finally:
         s.close()
@@ -242,9 +273,9 @@ def run(argv: list[str], events: str) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
     watcher.join(5)
-    code = exit_code(rc, box.get("reason"))
-    print(f"launch-vm: qemu exit {rc}, shutdown reason {box.get('reason') or 'none seen'}, exit {code}",
-          file=sys.stderr)
+    code = EXIT_FAILED if box.get("error") else exit_code(rc, box.get("reason"))
+    print(f"launch-vm: qemu exit {rc}, shutdown reason {box.get('reason') or 'none seen'}"
+          f"{', ' + box['error'] if box.get('error') else ''}, exit {code}", file=sys.stderr)
     return code
 
 

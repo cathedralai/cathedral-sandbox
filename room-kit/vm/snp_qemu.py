@@ -37,11 +37,13 @@ class SnpArgvError(ValueError):
 
 def snp_argv(*, name: str, cpu_model: str, vcpus: int, mem_gib: int, host_data_b64: str,
              ovmf: str, kernel: str, initrd: str, cmdline: str, devices: list[str],
-             qmp_sockets: list[str]) -> list[str]:
+             qmp_sockets: list[str], start_paused: bool = False) -> list[str]:
     """The whole argv: QEMU's SNP boot lines, then `devices`, then the fixed tail.
 
     -no-reboot: an SNP guest cannot be reset inside the same QEMU, so a reset ends QEMU and
-    the launcher decides whether to relaunch. The cmdline is one argv element."""
+    the launcher decides whether to relaunch. The cmdline is one argv element.
+    start_paused adds -S: no vCPU runs until a QMP client sends cont. It changes no measured
+    input (firmware, kernel, initrd, cmdline, vCPU count and model, policy)."""
     if cpu_model not in CPU_MODELS:
         raise SnpArgvError(f"cpu model {cpu_model!r} is not an SNP model")
     if not (isinstance(vcpus, int) and 1 <= vcpus <= 64 and isinstance(mem_gib, int) and 1 <= mem_gib <= 640):
@@ -50,7 +52,7 @@ def snp_argv(*, name: str, cpu_model: str, vcpus: int, mem_gib: int, host_data_b
         raise SnpArgvError("host data must be 32 bytes in base64")
     if "\n" in cmdline or "\0" in cmdline:
         raise SnpArgvError("the cmdline is one line")
-    argv = [QEMU, "-no-user-config", "-nodefaults", "-no-reboot", "-name", name,
+    argv = [QEMU, "-no-user-config", "-nodefaults", "-no-reboot", *(["-S"] if start_paused else []), "-name", name,
             "-enable-kvm", "-cpu", cpu_model, "-smp", str(vcpus), "-m", f"{mem_gib}G",
             "-machine", MACHINE,
             "-object", f"memory-backend-memfd,id=ram1,size={mem_gib}G,share=true,prealloc=false",
@@ -68,10 +70,11 @@ def snp_argv(*, name: str, cpu_model: str, vcpus: int, mem_gib: int, host_data_b
 
 
 def sealed_vm_argv(**kwargs) -> list[str]:
-    """snp_argv for a sealed customer VM: the CPU model is VM_CPU_MODEL, never a parameter."""
-    if "cpu_model" in kwargs:
-        raise SnpArgvError("a sealed VM's CPU model is fixed")
-    return snp_argv(cpu_model=VM_CPU_MODEL, **kwargs)
+    """snp_argv for a sealed customer VM: the CPU model is VM_CPU_MODEL, never a parameter, and
+    QEMU starts paused, so the launcher sees every QMP event from the guest's first instruction."""
+    if "cpu_model" in kwargs or "start_paused" in kwargs:
+        raise SnpArgvError("a sealed VM's CPU model and start are fixed")
+    return snp_argv(cpu_model=VM_CPU_MODEL, start_paused=True, **kwargs)
 
 
 def values_of(argv: list[str], option: str) -> list[str]:
