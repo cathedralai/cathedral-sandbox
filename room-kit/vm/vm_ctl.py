@@ -375,7 +375,7 @@ def paid_refusal(a: dict, now: int) -> Refusal | None:
 
 # ---- pre-launch gates (spec r2 8.3, #788) ---------------------------------------------
 
-GATE_WAIT = 90  # gate 13 reads every bundle file; the broker gives start 2 min in all
+GATE_WAIT = float(os.environ.get("VM_GATE_WAIT") or 90)  # tests shorten it; gate 13 reads every bundle file; the broker gives start 2 min in all
 
 
 def gates_command() -> str:
