@@ -279,3 +279,27 @@ root, symlink loops and special files fail. Go's `os.Root` confines file access;
 the module now requires Go 1.26, matching the existing pinned 1.26.11 build and
 CI compiler. Tests include a real extracted reference root, but do not exercise
 a kernel dm-verity mapping or replace the pending PID1/hardware qualification.
+
+### Firmware input and native HOST_DATA binding
+
+`internal/bootstrap.ReadBoundLaunch` joins the signed-document validator to the
+native report collector. It reads only the three fixed Cathedral firmware
+attributes and `/proc/cmdline`, after measured init mounts fresh proc/sysfs and
+restricts the SNP device to root. Reads are bounded, including the binary
+signature; missing, extra or malformed inputs refuse before any report request.
+Kernel-created directory symlinks in the
+[Linux fw_cfg ABI](https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-firmware-qemu_fw_cfg)
+are supported, but the final raw attribute cannot be a symlink, FIFO or device.
+
+After the owner signature and measured command line agree, a new random boot
+challenge is sent through the native ioctl collector. The returned report must
+match the challenge, expected policy, VMPL, VCEK selection and computed
+HOST_DATA. Failure returns no launch fields. No report or nonce is published by
+this function, and no test backend or input path is selectable by a caller.
+
+This is local input binding, not owner-side certificate verification or complete
+boot approval. It starts no network, opens no data disk and executes no owner
+program. Observed-resource checks (including the unresolved memory rule), verity
+mounting, root checks and PID1 handoff remain mandatory. Tests use the shared
+signed protocol vector, synthetic firmware attributes and synthetic report
+responses; they are not hardware acceptance evidence.
