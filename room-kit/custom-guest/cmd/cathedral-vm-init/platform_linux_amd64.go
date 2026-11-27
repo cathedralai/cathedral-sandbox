@@ -337,6 +337,11 @@ func (p *linuxPlatform) CryptsetupFloor() error {
 	return vmdisk.CheckCryptsetupVersion(out)
 }
 
+// mailboxFlags open the mailbox disk as internal/vmmailbox requires (PR C,
+// vmmailbox.OpenDevice): O_DIRECT, so each poll reads what the host wrote
+// and not a cached page. vmmailbox.New takes this file and size as they are.
+const mailboxFlags = os.O_RDWR | syscall.O_DIRECT
+
 func (p *linuxPlatform) Devices() (Devices, error) {
 	var names map[string]string
 	var err error
@@ -355,7 +360,7 @@ func (p *linuxPlatform) Devices() (Devices, error) {
 	if d.Base, d.BaseBytes, err = openDisk(sysBlock, "/dev", names[serialBase], os.O_RDONLY); err != nil {
 		return Devices{}, err
 	}
-	if d.Mailbox, d.MailboxSize, err = openDisk(sysBlock, "/dev", names[serialMailbox], os.O_RDWR); err != nil {
+	if d.Mailbox, d.MailboxSize, err = openDisk(sysBlock, "/dev", names[serialMailbox], mailboxFlags); err != nil {
 		return Devices{}, err
 	}
 	return d, nil

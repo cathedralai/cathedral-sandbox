@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -195,6 +196,16 @@ func TestOpenDiskChecksTheDeviceNumber(t *testing.T) {
 		t.Fatalf("the loop device: %d %v", size, err)
 	}
 	f.Close()
+	// The mailbox open reads the device, not the page cache (vmmailbox).
+	f, _, err = openDisk(sys, "/dev", name, mailboxFlags)
+	if err != nil {
+		t.Fatalf("the mailbox open: %v", err)
+	}
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_GETFL, 0)
+	f.Close()
+	if errno != 0 || flags&syscall.O_DIRECT == 0 || flags&syscall.O_ACCMODE != syscall.O_RDWR {
+		t.Fatalf("the mailbox is not open O_RDWR|O_DIRECT: %#x %v", flags, errno)
+	}
 	// A link to the right device is refused too: the init opens no link.
 	dev := t.TempDir()
 	os.Symlink(loop, filepath.Join(dev, name))
