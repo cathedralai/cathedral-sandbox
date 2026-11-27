@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -142,9 +143,59 @@ func decode(raw []byte, dst any) error {
 	if !bytes.Equal(raw, canonical) {
 		return errors.New("document is not canonical JSON")
 	}
+	// encoding/json matches field names case-insensitively; the owner side does not.
+	if err := exactKeys(value, reflect.TypeOf(dst).Elem()); err != nil {
+		return err
+	}
 	decoder = json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(dst)
+}
+
+// exactKeys requires every object key to equal a json tag of the target struct byte for byte.
+func exactKeys(value any, t reflect.Type) error {
+	switch t.Kind() {
+	case reflect.Struct:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("object expected")
+		}
+		fields := map[string]reflect.Type{}
+		for i := 0; i < t.NumField(); i++ {
+			name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+			fields[name] = t.Field(i).Type
+		}
+		for key, child := range object {
+			ft, ok := fields[key]
+			if !ok {
+				return fmt.Errorf("unknown field %q", key)
+			}
+			if err := exactKeys(child, ft); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice:
+		items, ok := value.([]any)
+		if !ok {
+			return errors.New("array expected")
+		}
+		for _, item := range items {
+			if err := exactKeys(item, t.Elem()); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return errors.New("object expected")
+		}
+		for _, child := range object {
+			if err := exactKeys(child, t.Elem()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Cmdline accepts only the measured launch allowlist, never an alternate init/root.
