@@ -14,13 +14,19 @@ checks the SNP report the VM returns on that same connection:
 Before any connection, the identity must name the SSH key you gave at create: the host writes
 vm-identity.json, and whoever holds the key it names is root at first boot.
 
-  verify_vm.py verify --bundle DIR --identity vm-identity.json --vcpus N --cpu-family genoa|turin
-                      --ark-sha256 HEX --host HOST --port PORT --ssh-key FILE [--create-key FILE.pub]
-                      [--user cathedral] [--min-tcb SPEC] [--ark-crl FILE] [--kds-cache DIR] [--tool PATH]
+  verify_vm.py verify|pin --bundle DIR --identity vm-identity.json --vcpus N --cpu-family genoa|turin
+                          --ark-sha256 HEX --host HOST --port PORT --ssh-key FILE [--create-key FILE.pub]
+                          [--user cathedral] [--min-tcb SPEC] [--ark-crl FILE] [--kds-cache DIR]
+                          [--tool PATH] [--pin-dir DIR]
+
+`pin` (spec r3 7.5, once, after first login) is `verify` plus, on the same connection and only
+after the attest command succeeded, `cathedral-vm recovery show`. It keeps the recovery key,
+the chip and the SSH host key locally, keyed by identity sha256, only when every check passed.
+`verify` with a pin also refuses another SSH host key (host_key_changed) or another chip
+(chip_id_changed). The pin store is ${XDG_DATA_HOME:-~/.local/share}/cathedral/vm-pins/.
 
 One JSON line on stdout. Exit 0 PASS; 1 FAIL (the VM's evidence was refused); 2 ERROR (the
-check could not run: local inputs, sev-snp-measure, SSH or AMD KDS unreachable).
-`pin` (spec 7.5: the recovery key and the chip, kept locally) is reserved for the next PR.
+check could not run: local inputs, the pin store, sev-snp-measure, SSH or AMD KDS unreachable).
 
 Needs Python 3.11+, cryptography>=42 and sev-snp-measure 0.0.12 (requirements/vm-measure.txt),
 with vm_measure.py beside this file and verify_receipts.py one folder up, from one reviewed
@@ -36,11 +42,14 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import selectors
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from cryptography import x509
@@ -64,6 +73,13 @@ GUEST_ATTEST_COMMAND = "sudo -n " + GUEST_ATTEST + " {challenge_hex}"
 # custom guest pattern (D 10.1, 10.2) under the VM's own tag.
 REPORT_DATA_DOMAIN = b"cathedral-vm-report/v1\0"
 ANSWER_REPORT_KEY = "report_b64"  # the guest prints one JSON object with this member
+# spec r3 7.5: `sudo cathedral-vm recovery show` prints R, vm_id, identity_sha256 and CHIP_ID.
+# Its output here (VM1b confirms): one JSON object on one line with exactly these members, R as
+# canonical base64 of 32 bytes, chip_id as 128 hex.
+GUEST_VM_TOOL = "/run/cathedral/bin/cathedral-vm"
+GUEST_RECOVERY_COMMAND = "sudo -n " + GUEST_VM_TOOL + " recovery show"
+RECOVERY_FIELDS = frozenset({"recovery_key_b64", "vm_id", "identity_sha256", "chip_id"})
+RECOVERY_KEY_BYTES = 32
 
 # ---- report rules -----------------------------------------------------------------
 # 3 and 4 carry the CPUID fields; Turin firmware writes 5 (AMD SEV-SNP ABI 1.58, table 23).
@@ -84,14 +100,23 @@ APPROVED_CPUS = {
 }
 CHECKS = ("identity names your create key", "bundle and identity", "SSH connection host key", "report version", "CPU family and stepping",
           "AMD chain and report signature", "REPORT_DATA: challenge and SSH host key", "POLICY 0x30000",
-          "VMPL 0", "VCEK signer, chip key not masked", "TCB floor", "MEASUREMENT", "HOST_DATA")
+          "VMPL 0", "VCEK signer, chip key not masked", "TCB floor", "MEASUREMENT", "HOST_DATA",
+          "pinned SSH host key and CHIP_ID, when this identity has a pin")
 DOES_NOT_PROVE = [
     "what runs after switch_root: your own OS and software",
     "disk freshness: the host can corrupt or roll back root disk blocks (spec r3 Q6)",
     "availability",
     "that a later connection reaches this VM, unless it checks this host key and attests again",
-    "that the VM stays on one chip across reports: the chip pin (verify_vm.py pin, spec 7.5) is not in this version",
 ]
+NOT_PINNED = "that the VM stays on one chip across reports: this identity has no pin yet (verify_vm.py pin)"
+
+# ---- the pin store (spec r3 7.5) ----------------------------------------------------
+PIN_SCHEMA = "cathedral.vm.pin/v1"
+PIN_FIELDS = frozenset({"schema", "vm_id", "identity_sha256", "chip_id", "ssh_host_key", "recovery_key_b64",
+                        "pinned_at"})
+# What a second pin of the same VM must repeat. pinned_at is the first pin's and is kept.
+PIN_COMPARED = ("vm_id", "identity_sha256", "chip_id", "ssh_host_key", "recovery_key_b64")
+PIN_MAX = 4096
 
 SSH_BIN = "/usr/bin/ssh"
 SSH_TIMEOUT = 45
@@ -207,13 +232,15 @@ def endpoint(host: str, port: int) -> str:
     return host if port == 22 else f"[{host}]:{port}"
 
 
-def ssh_argv(host: str, port: int, user: str, ssh_key: str, known_hosts: Path, challenge: bytes) -> list[str]:
+def ssh_argv(host: str, port: int, user: str, ssh_key: str, known_hosts: Path, challenge: bytes,
+             remote: str | None = None) -> list[str]:
     """One connection, no user or system config, no agent, mux or proxy, ed25519 host keys only.
 
     accept-new on an empty known_hosts: OpenSSH writes the server's key there before it has
     verified the KEX signature. That is safe here because a failed verification makes ssh exit
     255, and exchange() refuses any nonzero exit before it reads the file. The pin PR must keep
-    a host key only from a run that exited 0, for the same reason."""
+    a host key only from a run that exited 0, for the same reason (it does: pin stores the key
+    exchange() returns, which exists only after exit 0)."""
     endpoint(host, port)
     need(type(user) is str and USER_RE.fullmatch(user) is not None, "ssh_target", "--user is invalid", CannotCheck)
     need(type(challenge) is bytes and len(challenge) == 32, "challenge", "the challenge must be 32 bytes", CannotCheck)
@@ -231,7 +258,7 @@ def ssh_argv(host: str, port: int, user: str, ssh_key: str, known_hosts: Path, c
     for key, value in options.items():
         argv += ["-o", f"{key}={value}"]
     return argv + ["-i", str(Path(ssh_key).resolve()), "-p", str(port), "-l", user, host,
-                   GUEST_ATTEST_COMMAND.format(challenge_hex=challenge.hex())]
+                   remote or GUEST_ATTEST_COMMAND.format(challenge_hex=challenge.hex())]
 
 
 def run_bounded(argv: list[str], timeout: float = SSH_TIMEOUT, limit: int = ANSWER_MAX) -> tuple[int, bytes, bytes]:
@@ -289,19 +316,22 @@ def _printable(raw: bytes, limit: int = 200) -> str:
     return "".join(c for c in raw[:limit].decode("ascii", "replace") if 0x20 <= ord(c) <= 0x7E)
 
 
-def exchange(host: str, port: int, user: str, ssh_key: str, challenge: bytes) -> tuple[bytes, bytes]:
-    """One SSH connection: run the guest's attest command with the challenge. Returns its stdout
-    and the host key blob that OpenSSH verified on that same connection."""
+def exchange(host: str, port: int, user: str, ssh_key: str, challenge: bytes,
+             remote: str | None = None) -> tuple[bytes, bytes]:
+    """One SSH connection: run the guest's attest command with the challenge (or remote, which
+    starts with it). Returns its stdout and the host key blob OpenSSH recorded on that same
+    connection. The key is read only after ssh exited 0."""
     need(Path(ssh_key).is_file(), "ssh_key", f"--ssh-key {ssh_key}: not a file", CannotCheck)
     with tempfile.TemporaryDirectory(prefix="cathedral-vm-verify-") as temp:
         known = Path(temp) / "known_hosts"
         known.touch(mode=0o600)
         try:
-            code, out, err = run_bounded(ssh_argv(host, port, user, ssh_key, known, challenge))
+            code, out, err = run_bounded(ssh_argv(host, port, user, ssh_key, known, challenge, remote))
         except OSError as exc:
             raise CannotCheck("ssh_failed", f"cannot run {SSH_BIN}: {exc.strerror or type(exc).__name__}") from None
         need(code != SSH_EXIT_ERROR, "ssh_failed", f"ssh failed: {_printable(err)}", CannotCheck)
-        need(code == 0, "attest_failed", f"the VM's attest command exited {code}: {_printable(out or err)}")
+        # stderr only: under pin, stdout may hold the recovery key.
+        need(code == 0, "attest_failed", f"the VM's command exited {code}: {_printable(err)}")
         with open(known, "rb") as f:
             host_blob = connection_key(f.read(4097), host, port)
     return out, host_blob
@@ -318,6 +348,163 @@ def report_data(challenge: bytes, host_blob: bytes) -> bytes:
 def new_challenge() -> bytes:
     """32 fresh bytes per run, so an answer recorded earlier never matches."""
     return os.urandom(32)
+
+
+# ---- the pin store ------------------------------------------------------------------
+
+def default_pin_dir() -> Path:
+    """${XDG_DATA_HOME:-~/.local/share}/cathedral/vm-pins (a relative XDG_DATA_HOME is ignored)."""
+    base = os.environ.get("XDG_DATA_HOME", "")
+    root = Path(base) if base.startswith("/") else Path.home() / ".local" / "share"
+    return root / "cathedral" / "vm-pins"
+
+
+def _pin_name(identity_sha256: str) -> str:
+    need(type(identity_sha256) is str and HEX64_RE.fullmatch(identity_sha256) is not None, "pin_store_invalid",
+         "an identity sha256 is 64 lowercase hex", CannotCheck)
+    return identity_sha256 + ".json"
+
+
+def _open_pin_dir(pin_dir: Path, create: bool) -> int | None:
+    """The pin directory, opened without following a link, owned by us and closed to others.
+    None when it does not exist and create is false."""
+    if create:
+        try:
+            os.makedirs(pin_dir, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise CannotCheck("pin_store_invalid", f"{pin_dir}: {exc.strerror or type(exc).__name__}") from None
+    try:
+        fd = os.open(pin_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CannotCheck("pin_store_invalid", f"{pin_dir}: {exc.strerror or type(exc).__name__} "
+                          "(it must be a directory, not a link)") from None
+    st = os.fstat(fd)
+    if not (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and st.st_mode & 0o077 == 0):
+        os.close(fd)
+        raise CannotCheck("pin_store_invalid", f"{pin_dir} must be a directory you own with mode 0700")
+    return fd
+
+
+def _check_pin(doc: dict, identity_sha256: str) -> dict:
+    ok = (set(doc) == PIN_FIELDS and doc["schema"] == PIN_SCHEMA and doc["identity_sha256"] == identity_sha256
+          and type(doc["vm_id"]) is str and vm_measure.VM_ID_RE.fullmatch(doc["vm_id"]) is not None
+          and type(doc["chip_id"]) is str and re.fullmatch(r"[0-9a-f]{128}", doc["chip_id"]) is not None
+          and type(doc["pinned_at"]) is str and len(doc["pinned_at"]) <= 32)
+    need(ok, "pin_store_invalid", f"{identity_sha256}.json: not a {PIN_SCHEMA} record for this identity", CannotCheck)
+    try:
+        host_key = doc["ssh_host_key"].split(" ")
+        blob = base64.b64decode(host_key[1], validate=True)
+        r = base64.b64decode(doc["recovery_key_b64"], validate=True)
+    except (AttributeError, IndexError, TypeError, binascii.Error, ValueError):
+        raise CannotCheck("pin_store_invalid", f"{identity_sha256}.json: a key is not base64") from None
+    need(len(host_key) == 2 and host_key[0] == "ssh-ed25519" and base64.b64encode(blob).decode() == host_key[1]
+         and blob.startswith(ED25519_BLOB_PREFIX) and len(blob) == len(ED25519_BLOB_PREFIX) + 32
+         and len(r) == RECOVERY_KEY_BYTES and base64.b64encode(r).decode() == doc["recovery_key_b64"],
+         "pin_store_invalid", f"{identity_sha256}.json: a key has the wrong form", CannotCheck)
+    return doc
+
+
+def load_pin(identity_sha256: str, pin_dir: Path | None = None) -> dict | None:
+    """The pin of one identity, checked, or None when there is none. verify reads it, and VM6
+    re-wrap reads R from it.
+    A pin that is a link, not ours, open to others or malformed refuses (pin_store_invalid)."""
+    name = _pin_name(identity_sha256)
+    dfd = _open_pin_dir(pin_dir or default_pin_dir(), create=False)
+    if dfd is None:
+        return None
+    try:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CannotCheck("pin_store_invalid", f"{name}: {exc.strerror or type(exc).__name__} "
+                              "(it must be a regular file, not a link)") from None
+        try:
+            st = os.fstat(fd)
+            need(stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and st.st_mode & 0o077 == 0,
+                 "pin_store_invalid", f"{name} must be a regular file you own with mode 0600", CannotCheck)
+            raw = b""
+            while len(raw) <= PIN_MAX:
+                chunk = os.read(fd, PIN_MAX + 1 - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    need(len(raw) <= PIN_MAX, "pin_store_invalid", f"{name}: more than {PIN_MAX} bytes", CannotCheck)
+    try:
+        doc = vm_measure.parse_document(raw, "pin")
+    except vm_measure.Refusal as exc:
+        raise CannotCheck("pin_store_invalid", f"{name}: {exc}") from None
+    return _check_pin(doc, identity_sha256)
+
+
+def _same_pin(existing: dict, record: dict) -> str:
+    differs = [k for k in PIN_COMPARED if existing[k] != record[k]]
+    # Names only: the values include the recovery key.
+    need(not differs, "pin_exists", f"this identity is already pinned with another {', '.join(differs)}; "
+         "the pin is left unchanged")
+    return "unchanged"
+
+
+def store_pin(record: dict, pin_dir: Path | None = None) -> tuple[str, Path]:
+    """Keep a pin. Never replaces one: the same values again is "unchanged", other values refuse
+    pin_exists. The record is written to a new private file, then linked into place, so a pin is
+    either whole or absent and a concurrent pin of the same identity cannot be overwritten."""
+    pin_dir = pin_dir or default_pin_dir()
+    name = _pin_name(record["identity_sha256"])
+    _check_pin(record, record["identity_sha256"])
+    existing = load_pin(record["identity_sha256"], pin_dir)
+    if existing is not None:
+        return _same_pin(existing, record), pin_dir / name
+    raw = vm_measure.canonical(record)
+    dfd = _open_pin_dir(pin_dir, create=True)
+    temp = f".{name}.{secrets.token_hex(8)}.tmp"
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        try:
+            os.write(fd, raw)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(temp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+        except FileExistsError:
+            existing = load_pin(record["identity_sha256"], pin_dir)
+            return _same_pin(existing, record) if existing else "unchanged", pin_dir / name
+        finally:
+            os.unlink(temp, dir_fd=dfd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return "stored", pin_dir / name
+
+
+def parse_recovery(raw: bytes, expected: dict, chip_id: str) -> str:
+    """R from the guest's `cathedral-vm recovery show` line, after the attestation passed. The
+    line is untrusted: it must name this identity and the chip the verified report names."""
+    try:
+        doc = json.loads(raw.decode("ascii"), object_pairs_hook=_unique, parse_constant=_no_constant)
+    except (UnicodeError, ValueError, RecursionError):
+        raise Refused("recovery_invalid", "the recovery record is not one strict ASCII JSON object") from None
+    need(type(doc) is dict and set(doc) == RECOVERY_FIELDS and all(type(v) is str for v in doc.values()),
+         "recovery_invalid", f"the recovery record must have exactly {', '.join(sorted(RECOVERY_FIELDS))}")
+    try:
+        r = base64.b64decode(doc["recovery_key_b64"], validate=True)
+    except (binascii.Error, ValueError):
+        raise Refused("recovery_invalid", "recovery_key_b64 is not base64") from None
+    need(len(r) == RECOVERY_KEY_BYTES and base64.b64encode(r).decode() == doc["recovery_key_b64"],
+         "recovery_invalid", f"the recovery key must be {RECOVERY_KEY_BYTES} bytes in canonical base64")
+    need(doc["vm_id"] == expected["vm_id"] and doc["identity_sha256"] == expected["identity_sha256"],
+         "recovery_identity_mismatch", "the recovery record names another VM than your identity")
+    need(doc["chip_id"].lower() == chip_id, "recovery_chip_mismatch",
+         "the recovery record names another chip than the verified report")
+    return doc["recovery_key_b64"]
 
 
 # ---- the report ---------------------------------------------------------------------
@@ -407,26 +594,66 @@ def check_report(report: bytes, *, expected: dict, report_data_bytes: bytes, cpu
             "amd": amd}
 
 
-def verify(*, bundle: Path, identity_raw: bytes, create_key: str, vcpus: int, cpu_family: str, ark_sha256: str,
-           host: str, port: int, user: str, ssh_key: str, floor: dict, cache: str, ark_crl: bytes | None,
-           tool: str | None, exchange=exchange) -> dict:
-    """The PASS verdict, or Refused / CannotCheck naming the first check that did not pass."""
+def _attest(*, bundle: Path, identity_raw: bytes, create_key: str, vcpus: int, cpu_family: str,
+            ark_sha256: str, host: str, port: int, user: str, ssh_key: str, floor: dict, cache: str,
+            ark_crl: bytes | None, tool: str | None, pin_dir: Path | None, with_recovery: bool,
+            exchange) -> tuple[dict, bytes | None, dict]:
+    """Every verify check. Returns the PASS verdict, the recovery line (pin only) and the
+    expected values, or raises Refused / CannotCheck naming the first check that did not pass."""
     need(type(ark_sha256) is str and HEX64_RE.fullmatch(ark_sha256.lower()) is not None, "ark_sha256",
          "--ark-sha256 must be 64 hex characters", CannotCheck)
     host = host.lower() if type(host) is str else host  # OpenSSH records the host name lowercased
     key = identity_key(identity_raw, create_key)  # before any connection
     expected = expected_values(bundle, identity_raw, vcpus, cpu_family, tool)
+    pin_dir = pin_dir or default_pin_dir()
+    pinned = load_pin(expected["identity_sha256"], pin_dir)
     challenge = new_challenge()
-    answer, host_blob = exchange(host, port, user, ssh_key, challenge)
-    checked = check_report(parse_answer(answer), expected=expected,
+    remote = GUEST_ATTEST_COMMAND.format(challenge_hex=challenge.hex())
+    if with_recovery:
+        # Same exec, so the same connection; && so R is printed only after the attest command succeeded.
+        remote += " && " + GUEST_RECOVERY_COMMAND
+    out, host_blob = exchange(host, port, user, ssh_key, challenge, remote)
+    host_key = "ssh-ed25519 " + base64.b64encode(host_blob).decode()
+    need(pinned is None or pinned["ssh_host_key"] == host_key, "host_key_changed",
+         "this connection's SSH host key differs from the one pinned for this identity")
+    recovery = None
+    if with_recovery:
+        lines = [line for line in out.split(b"\n") if line.strip()]
+        need(len(lines) == 2, "answer_invalid", "pin expects two lines: the report answer, then the recovery record")
+        out, recovery = lines
+    checked = check_report(parse_answer(out), expected=expected,
                            report_data_bytes=report_data(challenge, host_blob), cpu_family=cpu_family,
                            floor=floor, ark_sha256=ark_sha256.lower(), cache=cache, ark_crl=ark_crl)
-    return {"schema": SCHEMA, "verdict": "PASS", "vm_id": expected["vm_id"],
-            "identity_sha256": expected["identity_sha256"], "bundle": expected["bundle"],
-            "cpu_family": cpu_family, "vcpus": vcpus, "challenge_hex": challenge.hex(), "identity_key": key,
-            "ssh": {"host": host, "port": port, "user": user, "channel_binding": "verified",
-                    "host_key": "ssh-ed25519 " + base64.b64encode(host_blob).decode()},
-            **checked, "checks": list(CHECKS), "chip_id_pin": "not_checked", "does_not_prove": DOES_NOT_PROVE}
+    need(pinned is None or pinned["chip_id"] == checked["report"]["chip_id"], "chip_id_changed",
+         "the report's CHIP_ID differs from the one pinned for this identity: the VM runs on another chip")
+    result = {"schema": SCHEMA, "verdict": "PASS", "vm_id": expected["vm_id"],
+              "identity_sha256": expected["identity_sha256"], "bundle": expected["bundle"],
+              "cpu_family": cpu_family, "vcpus": vcpus, "challenge_hex": challenge.hex(), "identity_key": key,
+              "ssh": {"host": host, "port": port, "user": user, "channel_binding": "verified", "host_key": host_key},
+              **checked, "checks": list(CHECKS),
+              "pin": {"state": "matched" if pinned else "none", "path": str(pin_dir / _pin_name(expected["identity_sha256"]))},
+              "does_not_prove": DOES_NOT_PROVE + ([] if pinned else [NOT_PINNED])}
+    return result, recovery, expected
+
+
+def verify(*, exchange=exchange, pin_dir: Path | None = None, **inputs) -> dict:
+    """The PASS verdict, or Refused / CannotCheck naming the first check that did not pass.
+    Reads the pin of this identity, if any, and never writes one."""
+    return _attest(**inputs, pin_dir=pin_dir, with_recovery=False, exchange=exchange)[0]
+
+
+def pin(*, exchange=exchange, pin_dir: Path | None = None, **inputs) -> dict:
+    """verify, then keep R, the chip and the host key of this identity (spec r3 7.5). Nothing is
+    written unless every check passed and the guest's record names this identity and this chip."""
+    result, recovery, expected = _attest(**inputs, pin_dir=pin_dir, with_recovery=True, exchange=exchange)
+    record = {"schema": PIN_SCHEMA, "vm_id": expected["vm_id"], "identity_sha256": expected["identity_sha256"],
+              "chip_id": result["report"]["chip_id"], "ssh_host_key": result["ssh"]["host_key"],
+              "recovery_key_b64": parse_recovery(recovery, expected, result["report"]["chip_id"]),
+              "pinned_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    state, path = store_pin(record, pin_dir)
+    result["pin"] = {"state": state, "path": str(path)}
+    result["does_not_prove"] = DOES_NOT_PROVE
+    return result
 
 
 # ---- command line -------------------------------------------------------------------
@@ -441,10 +668,7 @@ def _read_limited(path: str, limit: int, code: str) -> bytes:
     return raw
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("verify", help="attest one SSH connection to your VM")
+def _add_inputs(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bundle", required=True, help="the bundle directory your VM runs (manifest.json and files)")
     p.add_argument("--identity", required=True, help="your VM's vm-identity.json, kept from create")
     p.add_argument("--vcpus", required=True, type=int)
@@ -459,14 +683,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ark-crl", help="a current AMD KDS DER CRL for offline use; otherwise fetched live")
     p.add_argument("--kds-cache", default=os.path.expanduser("~/.cache/amd-kds"))
     p.add_argument("--tool", help="sev-snp-measure 0.0.12 path (default: beside this Python, then PATH)")
-    sub.add_parser("pin", help="reserved: spec 7.5, the next PR")
-    # pin takes any arguments for now and answers not_available; verify takes none it does not know.
-    args, unknown = parser.parse_known_args(argv)
-    if unknown and args.command == "verify":
-        parser.error("unrecognized arguments: " + " ".join(unknown))
+    p.add_argument("--pin-dir", help="the pin store (default: ${XDG_DATA_HOME:-~/.local/share}/cathedral/vm-pins)")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name, text in (("verify", "attest one SSH connection to your VM"),
+                       ("pin", "verify, then keep the recovery key, chip and host key locally (spec r3 7.5)")):
+        _add_inputs(sub.add_parser(name, help=text))
+    args = parser.parse_args(argv)
     try:
-        need(args.command == "verify", "not_available", "verify_vm.py pin (spec 7.5) is not in this version",
-             CannotCheck)
         identity_raw = _read_limited(args.identity, vm_measure.DOC_MAX, "identity_invalid")
         create_raw = _read_limited(args.create_key or args.ssh_key + ".pub", vm_measure.DOC_MAX, "create_key")
         try:
@@ -474,10 +701,12 @@ def main(argv: list[str] | None = None) -> int:
         except UnicodeDecodeError:
             raise CannotCheck("create_key", "--create-key: not an ASCII public key file") from None
         crl = _read_limited(args.ark_crl, CRL_MAX, "ark_crl") if args.ark_crl else None
-        result = verify(bundle=Path(args.bundle), identity_raw=identity_raw, create_key=create_key, vcpus=args.vcpus,
-                        cpu_family=args.cpu_family, ark_sha256=args.ark_sha256, host=args.host, port=args.port,
-                        user=args.user, ssh_key=args.ssh_key, floor=floor_for(args.cpu_family, args.min_tcb),
-                        cache=args.kds_cache, ark_crl=crl, tool=args.tool)
+        run = verify if args.command == "verify" else pin
+        result = run(bundle=Path(args.bundle), identity_raw=identity_raw, create_key=create_key, vcpus=args.vcpus,
+                     cpu_family=args.cpu_family, ark_sha256=args.ark_sha256, host=args.host, port=args.port,
+                     user=args.user, ssh_key=args.ssh_key, floor=floor_for(args.cpu_family, args.min_tcb),
+                     cache=args.kds_cache, ark_crl=crl, tool=args.tool,
+                     pin_dir=Path(args.pin_dir) if args.pin_dir else None)
     except Refused as exc:
         print(json.dumps({"schema": SCHEMA, "verdict": exc.verdict, "code": exc.code, "reason": str(exc)},
                          sort_keys=True))

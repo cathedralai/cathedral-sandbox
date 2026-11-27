@@ -27,7 +27,7 @@ and lists the VM's bundle.
 | `vm_mailbox.py` | The mailbox disk: slots, records, the body pre-scan and strict parsers (re-wrap). |
 | `vm_measure.py` | Sealed VM launch values: identity document, measured cmdline, HOST_DATA, expected measurement; bundle manifest. |
 | `build-bundle.sh`, `bundle.env.example` | Recipe for one sealed VM bundle: base root, kernel and modules, manifest. |
-| `verify_vm.py` | The customer's verifier, run on their own machine: one SSH connection, a fresh challenge, the SNP report checked against their bundle and identity. |
+| `verify_vm.py` | The customer's verifier, run on their own machine: one SSH connection, a fresh challenge, the SNP report checked against their bundle and identity. `pin` also keeps the recovery key, chip and host key locally. |
 
 ## Use
 
@@ -297,6 +297,7 @@ proxy; an empty known_hosts; ed25519 host keys only), runs
 | POLICY `0x30000`, VMPL 0, VCEK signer with the chip key not masked | `policy`, `vmpl`, `signer` |
 | every component of the four TCBs at or above the floor | `tcb_floor` |
 | MEASUREMENT and HOST_DATA equal `vm_measure.py launch` over their files | `measurement_mismatch`, `host_data_mismatch` |
+| when this identity has a pin: the same SSH host key and CHIP_ID as pinned | `host_key_changed`, `chip_id_changed`; an unsafe pin store: `pin_store_invalid` (exit 2) |
 
 Floors: Turin `1a:02:01` at `fmc=1,bl=3,tee=3,snp=8,ucode=118` (D 10.4); Genoa `19:11:01`
 at `bl=12,tee=0,snp=30,ucode=88`, the current sealed floor, to confirm at the first Genoa
@@ -322,6 +323,25 @@ Turin `1f084161...`); a mismatch is a reason to stop, not to pick one.
 One JSON line: `PASS` (exit 0), `FAIL` with a code (exit 1, the VM's evidence was refused)
 or `ERROR` with a code (exit 2, the check could not run). The guest side of the command
 (path, user, output) is PR VM1b's to confirm; the constants sit in one block at the top.
+
+### Pin (spec r3 7.5)
+
+Run `verify_vm.py pin` once, after first login, with the same flags. On the same SSH
+connection it runs `cathedral-attest <challenge> && cathedral-vm recovery show`, so the
+recovery key R is printed only after the guest's attest command succeeded. It keeps a pin
+only when every verify check passed, ssh exited 0, and the guest's recovery record names
+your identity's `vm_id` and `identity_sha256` and the CHIP_ID of the verified report
+(`recovery_identity_mismatch`, `recovery_chip_mismatch`, `recovery_invalid` otherwise).
+A host key comes only from a run that exited 0: OpenSSH writes an accept-new key before it
+checks the key exchange signature.
+
+The pin is `${XDG_DATA_HOME:-~/.local/share}/cathedral/vm-pins/<identity sha256>.json`
+(`--pin-dir` to choose another): canonical JSON, schema `cathedral.vm.pin/v1`, with R,
+`vm_id`, `identity_sha256`, CHIP_ID, the SSH host key and the time. The directory is 0700 and
+the file 0600, created exclusively and never through a link; a pin that is a link, not
+yours, or open to others refuses (`pin_store_invalid`). R is never printed. Pinning again
+with the same values is a no-op (`unchanged`); other values refuse `pin_exists` and leave
+the pin as it was. VM6 re-wrap reads R with `load_pin`.
 
 ## Rebundle (AB#999, PR VM6 host side; spec r3 7.5 step 1)
 
@@ -402,6 +422,3 @@ exit 2). It is written only while G is the current, open generation (`stale_gene
 
 Admission across VMs and kits (VM4), the guest side of re-wrap (VM1b, VM2), the status
 record's measurement check (`vm_measurement_differs`, spec 7.2), resize, snapshots.
-
-`verify_vm.py pin` and its local store (the recovery key and the chip, spec 7.5) are the
-next VM2 PR; until then a verdict says `chip_id_pin: not_checked`.
