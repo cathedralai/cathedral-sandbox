@@ -253,8 +253,12 @@ def test_enforce_stops_expired_vms_and_keeps_their_disks(host):
     for name in ("vm1", "vm2"):
         host.ctl("authorize", name, str(int(time.time()) + 3600), "1")
         host.ctl("start", name)
-    # The broker installs a new generation whose window already ended.
-    host.ctl("authorize", "vm1", str(int(time.time()) - 5), "2")
+    # vm1's paid window ends while it runs (a higher generation over a started run is refused,
+    # AB#992, so the window is moved the way an expiry would).
+    auth = host.root / "vm1" / "authorization.json"
+    a = json.loads(auth.read_text())
+    a["paid_through"] = int(time.time()) - 5
+    auth.write_text(json.dumps(a))
     code, out = host.ctl("enforce")
     assert code == 0 and [s["name"] for s in out["stopped"]] == ["vm1"] and out["checked"] == 2
     assert host.ctl("status", "vm1")[1]["state"] == "stopped"
