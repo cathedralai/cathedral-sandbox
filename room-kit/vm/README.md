@@ -24,6 +24,7 @@ and lists the VM's bundle.
 | `vm.env.example` | What `create` writes per VM. |
 | `vm_measure.py` | Sealed VM launch values: identity document, measured cmdline, HOST_DATA, expected measurement; bundle manifest. |
 | `build-bundle.sh`, `bundle.env.example` | Recipe for one sealed VM bundle: base root, kernel and modules, manifest. |
+| `verify_vm.py` | The customer's verifier, run on their own machine: one SSH connection, a fresh challenge, the SNP report checked against their bundle and identity. |
 
 ## Use
 
@@ -188,7 +189,42 @@ vm_measure.py check-bundle B
 Shared vectors: `tests/fixtures/vm_measure_v1.json` (identity, cmdline, HOST_DATA, five
 measurements) for the VM init (VM1b) and the verifier (VM2).
 
+## Verify a VM (AB#999, PR VM2)
+
+The customer runs `verify_vm.py` on a machine they trust, with their own bundle
+directory, their `vm-identity.json` and the AMD root fingerprint they trust for the CPU
+family (spec r3 6.4). It opens one SSH connection to the VM (no user config, agent, mux or
+proxy; an empty known_hosts; ed25519 host keys only), runs
+`sudo -n /run/cathedral/bin/cathedral-attest <challenge>` there, and checks the report:
+
+| Check | Refusal code |
+|---|---|
+| bundle and identity agree (CPU family, base root) | `bundle_cpu_family` (exit 2), `identity_bundle_mismatch` |
+| report version 3, 4 or 5 (2 has no CPUID: refused) | `report_version` |
+| CPU family, and the exact CPUID its floor is approved for | `cpu_family_mismatch`, `cpuid_unapproved` |
+| ARK pin, ASK and VCEK from AMD KDS, validity, CRL, report signature | `amd_chain` |
+| REPORT_DATA = `sha512(b"cathedral-vm-report/v1\0" \|\| challenge \|\| sha256(host key blob))` | `report_data_mismatch` |
+| POLICY `0x30000`, VMPL 0, VCEK signer with the chip key not masked | `policy`, `vmpl`, `signer` |
+| every component of the four TCBs at or above the floor | `tcb_floor` |
+| MEASUREMENT and HOST_DATA equal `vm_measure.py launch` over their files | `measurement_mismatch`, `host_data_mismatch` |
+
+Floors: Turin `1a:02:01` at `fmc=1,bl=3,tee=3,snp=8,ucode=118` (D 10.4); Genoa `19:11:01`
+at `bl=12,tee=0,snp=30,ucode=88`, the current sealed floor, to confirm at the first Genoa
+live proof. `--min-tcb` may only raise a floor.
+
+```
+verify_vm.py verify --bundle B --identity vm-identity.json --vcpus 2 --cpu-family genoa \
+  --ark-sha256 "$AMD_ARK_SHA256" --host <host> --port <ssh port> --ssh-key ~/.ssh/id_ed25519
+```
+
+One JSON line: `PASS` (exit 0), `FAIL` with a code (exit 1, the VM's evidence was refused)
+or `ERROR` with a code (exit 2, the check could not run). The guest side of the command
+(path, user, output) is PR VM1b's to confirm; the constants sit in one block at the top.
+
 ## Not here yet
 
 Admission across VMs and kits (VM4), the pre-launch gates and host change gate (VM5),
 re-wrap (VM6), resize, snapshots.
+
+`verify_vm.py pin` and its local store (the recovery key and the chip, spec 7.5) are the
+next VM2 PR; until then a verdict says `chip_id_pin: not_checked`.
