@@ -154,7 +154,7 @@ print("RESULT " + json.dumps(r))
 
 # ---------------------------------------------------------------- fake API and broker
 
-# PR 3 contract (bigailabs/polariscomputer#2336 at 1604dad, polaris/services/cathedral_custom_guest.py):
+# PR 3 contract (bigailabs/polariscomputer#2336 at 1b54b25, polaris/services/cathedral_custom_guest.py):
 # apply_patch, _check_host_fields, _start_hold, _finish_hold, _fence_ready, _finalize, live_rows, and the
 # unresolved-send guard (settle_unresolved, _retire, unresolved_error; the three fence transactions with
 # intent_id and one send entry per call: claimed, sending, then answered or unanswered).
@@ -224,6 +224,7 @@ class World:
         self.race: set[str] = set()                  # target -> another call rewrites the intent between the 2 commits
         self.crash_after_send: dict[str, int] = {}   # target -> the API dies after the broker applied, before commit
         self.die_after_claim: dict[str, int] = {}    # target -> the API restarts between its first two transactions
+        self.race_after_send: set[str] = set()       # target -> another call settles the step before transaction 3
         self.broker_patches: list[str] = []          # every fence PATCH the API sent (applied or delayed), by target
         self.nonce = 0
         self.calls: list[str] = []
@@ -546,6 +547,7 @@ class World:
         if not self.from_ok(host, to):
             return unsent(moved("the live reservation or hold is in none of the states this step expects"))
         res["unresolved"]["sends"][intent_id] = "sending"
+        sent_from = (rec["state"], rec["hold_phase"])
         spec, code, answered = self.patch_args(host, to), None, True
         self.broker_patches.append(to)
         if to == "fenced" and self.rooms_active:
@@ -565,11 +567,18 @@ class World:
         if answered and code is None and self.crash_after_send.get(to):
             self.crash_after_send[to] -= 1
             return 500, {"error": "internal"}  # step 3 never committed: the intent and the "sending" entry stay
-        # 3. Under the lock again: record the answer, then the read-back decides.
+        if to in self.race_after_send:
+            self.race_after_send.discard(to)
+            self.fence(to)  # another call, while this PATCH is out: it reads the target and settles the step
+        # 3. Under the lock again: always record the answer, finalize only at the step the PATCH was sent for.
+        res = host["reservation"]
         p = res.get("unresolved")
         if p is not None and p["sends"].get(intent_id) == "sending":
             p["sends"][intent_id] = "answered" if answered else "unanswered"
             self.settle(host, read=False)
+        if code is None and (res.get("intent_id") != intent_id or res.get("intent") != to
+                             or (rec["state"], rec["hold_phase"]) != sent_from):
+            return 200, {"launch_id": LAUNCH, "to": to, "sent": True, "stale": True, "record": rec}
         if code:
             return 409, {"error": code, "message": f"the broker refused the {to} PATCH"}
         self.settle(host)
@@ -1337,4 +1346,51 @@ def test_a_claimed_send_never_blocks_after_an_api_restart(rig, to):
     rc, out = rig.hold(CG_SEND_WAIT="5")
     assert rc == 0, out
     assert rig.world.broker_patches.count(to) == 1
+    assert_held(rig)
+
+
+# ---------------------------------------------------------------- refused abort, stale answer (Astra on #785)
+
+def test_a_refused_abort_after_the_kit_stopped_leaves_the_hold_free(rig):
+    """Interrupt after H6a stopped the kit; abort is refused before it journals anything; resume reaches held."""
+    rc, _ = rig.hold(CG_FAULT="op:hold#1:H6a")
+    assert rc == 137 and rig.host()["kit"]["state"] == "inactive"
+    rc, out = rig.run("abort", "--reason", "custom_guest_hold_failed")
+    assert rc == 1 and out["error_code"] == "custom_guest_hold_failed", out
+    assert not [e for e in rig.journal() if e.get("step", "").startswith("abort#")], "nothing journaled"
+    rc, out = rig.run("resume")
+    assert rc == 0, out
+    assert_held(rig)
+
+
+@pytest.mark.parametrize("how", ["resume", "hold", "abort"])
+def test_an_open_abort_that_never_restored_is_closed_for_forward_recovery(rig, how):
+    """An abort#1 opened by an earlier run that stopped before its restore (no restore sent, no intent, nothing
+    unresolved) never traps the hold: resume and hold close it as refused; abort refuses and closes it."""
+    rc, _ = rig.hold(CG_FAULT="op:hold#1:H6a")
+    assert rc == 137
+    path = rig.home / HOTEL / "journal.jsonl"
+    seq = max(e["seq"] for e in rig.journal())
+    for i, (sub, phase, detail) in enumerate([("begin", "intent", {"argv": ["abort"]}),
+                                              ("reason", "done", {"error_code": "custom_guest_hold_failed"})]):
+        path.open("a").write(json.dumps({"seq": seq + 1 + i, "launch_id": LAUNCH, "generation": None,
+                                         "step": "abort#1", "sub": sub, "phase": phase, "at": iso(time.time()),
+                                         "detail": detail}, sort_keys=True) + "\n")
+    if how == "abort":
+        rc, out = rig.run("abort", "--reason", "custom_guest_hold_failed")
+        assert rc == 1 and "closed as refused" in out["detail"], out
+        how = "resume"
+    rc, out = rig.hold() if how == "hold" else rig.run("resume")
+    assert rc == 0, out
+    assert_held(rig)
+    assert [e for e in rig.journal() if e.get("step") == "abort#1" and e["sub"] == "refused"]
+
+
+def test_a_stale_fence_answer_lets_the_observer_decide(rig):
+    """1b54b25: transaction 3 finds the step settled by another call and answers sent, stale. Nothing is
+    finalized twice; the operator reads the record back and goes on."""
+    rig.world.race_after_send.add("fenced")
+    rc, out = rig.hold()
+    assert rc == 0, out
+    assert '"stale_answer": "fenced"' in rig.stderr
     assert_held(rig)

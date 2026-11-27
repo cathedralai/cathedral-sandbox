@@ -427,6 +427,10 @@ class Op:
                 status, doc = 0, {}
             fault(f"op:fence:{to}")  # test hook: die with the API's answer unread
             if status == 200:
+                if doc.get("stale"):
+                    # PR 3 recorded the answer but the record moved on (another call settled this step): it did
+                    # not finalize. The sub's observe reads the record back and decides.
+                    print(json.dumps({"stale_answer": to, "launch_id": self.launch}), file=sys.stderr, flush=True)
                 return
             code = error_code(doc) if 0 < status < 500 else "no_answer"
             if status == 409 and code in retry and time.time() < end:
@@ -685,6 +689,8 @@ class Op:
         if not [e for e in self.j.entries() if e.get("step") == "versions" and e.get("phase") == "done"]:
             raise Blocked("custom_guest_hold_unsupported", "record the deployed roll.sh commits first (record-versions, 5.10)")
         n = self.attempt()
+        if rec["state"] == "holding" and self.open_step(f"abort#{n}") and self.abort_untouched(n):
+            self.close_abort(n, "hold")  # no restore was sent: going forward is still allowed (11.2)
         if rec["state"] == "holding" and self.open_step(f"abort#{n}"):
             # 11.2: once an abort began, its restore may be sent; after that only the abort follows (PR 3 refuses
             # every other step). Finish it with resume or abort.
@@ -870,8 +876,38 @@ class Op:
         self.sub(step, "H9", lambda: self.record()["state"] == "held", h9_act)
 
     # ================================================================ abort (11.2)
+    def kit_down_code(self) -> str | None:
+        """None while the kit runs; else why no abort is possible (the kit stopped, only forward or Toby)."""
+        f = self.facts()
+        if (f.get("kit_unit") or {}).get("state") == "active":
+            return None
+        return "custom_guest_kit_failed" if not self.hj(f, "kit_stop") else "custom_guest_hold_failed"
+
+    def abort_untouched(self, n: int) -> bool:
+        """abort#n never began the restore: no restore sub journaled, and the record has no restore intent, no
+        restore expect and no unresolved send."""
+        if self.j.find(self.launch, f"abort#{n}", "restore"):
+            return False
+        rec = self.record()
+        res = self.res(rec)
+        return not res.get("intent") and res.get("expect") != "restored" and unresolved_of(rec) is None
+
+    def close_abort(self, n: int, by: str) -> None:
+        self.j.write(self.launch, None, f"abort#{n}", "refused", "done", {"closed_by": by})
+        self.end(f"abort#{n}")
+
     def abort(self, n: int, code: str) -> None:
         step = f"abort#{n}"
+        # Eligibility before any journal entry: a refused abort must leave nothing open that blocks going forward.
+        refused = self.kit_down_code()
+        if refused:
+            if not self.open_step(step):
+                raise Blocked(refused, "the kit is not active: no abort, only forward (or Toby decides); "
+                                       "nothing was journaled, run resume to go on")
+            if self.abort_untouched(n):
+                self.close_abort(n, "abort")
+                raise Blocked(refused, f"the kit is not active: abort#{n} never began the restore and is closed "
+                                       "as refused; run resume to go on")
         self.begin(step)
         # The first run's error code is the one the record gets, whatever a resumed run was told.
         first = self.j.find(self.launch, step, "reason", "done")
@@ -1161,6 +1197,14 @@ class Op:
         for e in self.j.find(self.launch, sub="begin"):
             if self.open_step(e["step"]) and e["step"] not in opened:
                 opened.append(e["step"])
+        # An open abort that never began the restore, with the kit already stopped, can never finish: close it
+        # and resume the hold it interrupted (forward recovery, 11.2).
+        while opened and opened[-1].startswith("abort#"):
+            n = int(opened[-1].split("#", 1)[1])
+            if not (self.abort_untouched(n) and self.kit_down_code()):
+                break
+            self.close_abort(n, "resume")
+            opened.pop()
         if not opened:
             print(json.dumps({"ok": True, "open": None}))
             return False
