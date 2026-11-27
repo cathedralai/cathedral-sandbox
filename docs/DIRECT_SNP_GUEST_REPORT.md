@@ -92,6 +92,18 @@ the collector running inside the intended guest and the direct device call.
 
 ## Release acceptance
 
+Every customer VM in this release must run as a sealed SEV-SNP guest. A custom
+image does not permit an unsealed VM, a plain QEMU fallback, or a debug-enabled
+guest. If SNP launch or attestation fails, refuse the launch or release instead
+of downgrading protection. An SNP-capable host or an existing `/dev/sev-guest`
+device alone is not proof that the intended customer VM is sealed.
+
+Before calling that VM ready, require its fresh, verified AMD-signed report
+against the independently expected measurement, HOST_DATA and approved TCB
+floor, with debug and migration-agent policies disabled. The authenticated
+connection must be bound to that intended guest by the reviewed launch/channel
+contract; this standalone report verifier does not establish that connection.
+
 Spock owns the end-to-end run with the authorized dedicated key. First rehearse
 on separate SNP capacity without customer work. Record the deployed launch
 revision, image digests, independently calculated measurement and HOST_DATA,
