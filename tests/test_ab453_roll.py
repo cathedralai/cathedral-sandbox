@@ -1082,7 +1082,7 @@ def test_miner_hotel_gets_no_restart_flag_without_the_guards_ok(host):
     assert "PHASE=rolled_back" in (home / "state" / f"{HOTEL}.env").read_text()
 
 
-# ---- AB#999 PR 2: the host lock and the custom guest hold marker (spec r9 5.3, 5.10, 14.1) -----------
+# ---- AB#1008 PR 2: the host lock and the custom guest hold marker (spec r9 5.3, 5.10, 14.1) -----------
 LAUNCH = "cg-0123456789ab"
 HOST_LOCK_LIB = ROOT / "room-kit" / "sealed" / "host-lock.sh"
 INSTALL_OK = """#!/bin/bash

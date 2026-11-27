@@ -38,7 +38,7 @@ func (b *broker) noteConfigDrainLocked(h *hotel) {
 	if b.drains == nil {
 		b.drains = map[string]drainRecord{}
 	}
-	if d := h.drain(); d == h.fileDrain {
+	if d := h.cfgDrain(); d == h.fileDrain { // the hold's forced drain is not saved here
 		delete(b.drains, h.cfg.ID) // back to what the file says: nothing to keep
 	} else {
 		b.drains[h.cfg.ID] = drainRecord{Drain: d, ConfigDrain: h.fileDrain}

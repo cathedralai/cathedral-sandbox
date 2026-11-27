@@ -25,6 +25,11 @@
 // The file is written with fsync on the file and its directory before the
 // PATCH answers 200 (writeFileDurable, drains.go). A lend state
 // (hotel-lends.json, lend.go) still wins over reserved_for at load.
+//
+// A record also keeps a custom guest hold (custom_guest_hold.go). A record
+// with a hold is never dropped for a changed file: it is kept whole, with an
+// OPS alert, and its config_reserved_for stays the baseline, so the first
+// start after the hold is cleared finds the file changed and applies it.
 package main
 
 import (
@@ -49,6 +54,15 @@ type reservationRecord struct {
 	Generation        uint64 `json:"reservation_generation"`
 	ConfigReservedFor string `json:"config_reserved_for"` // the file's reserved_for when the PATCH came
 	PinOnly           bool   `json:"pin_only,omitempty"`
+	// CustomGuestHold: the hold, kept so a restart or a swap keeps placement
+	// off and the secret skip (custom_guest_hold.go).
+	CustomGuestHold *customGuestHold `json:"custom_guest_hold,omitempty"`
+}
+
+func sameReservationRecord(a, b reservationRecord) bool {
+	ah, bh := a.CustomGuestHold, b.CustomGuestHold
+	a.CustomGuestHold, b.CustomGuestHold = nil, nil
+	return a == b && sameHold(ah, bh)
 }
 
 // reservation is h's reservation_generation and reservation_ref.
@@ -78,10 +92,11 @@ func (b *broker) noteConfigReservationLocked(h *hotel) bool {
 		b.reservations = map[string]reservationRecord{}
 	}
 	h.cfgMu.RLock()
-	r := reservationRecord{ReservedFor: h.cfg.ReservedFor, Ref: h.cfg.ReservationRef, Generation: h.cfg.ReservationGeneration, ConfigReservedFor: h.fileReservedFor, PinOnly: h.cfg.PinOnly}
+	r := reservationRecord{ReservedFor: h.cfg.ReservedFor, Ref: h.cfg.ReservationRef, Generation: h.cfg.ReservationGeneration, ConfigReservedFor: h.fileReservedFor, PinOnly: h.cfg.PinOnly,
+		CustomGuestHold: h.cfg.CustomGuestHold}
 	h.cfgMu.RUnlock()
 	old, ok := b.reservations[h.cfg.ID]
-	if (ok && old == r) || (!ok && r.Generation == 0) {
+	if (ok && sameReservationRecord(old, r)) || (!ok && r.Generation == 0 && r.CustomGuestHold == nil) {
 		return false // nothing new; a hotel never changed needs no record
 	}
 	b.reservations[h.cfg.ID] = r
@@ -117,6 +132,15 @@ func (b *broker) applySavedReservationLocked(h *hotel) bool {
 	if !ok {
 		return false
 	}
+	if r.ConfigReservedFor != h.fileReservedFor && r.CustomGuestHold != nil {
+		// Kept whole while a custom guest holds the hotel: dropping it would
+		// drop the hold. The record's baseline stays, so every save during the
+		// hold and the clear keep it, and the first start after the clear
+		// applies the file.
+		b.alerts.send("OPS-ALERT", b.alerts.opsChat, fmt.Sprintf("HOLD KEPT: hotel %s: the config file's reserved_for is %q, not %q as when the reservation was saved, but custom guest %s holds the hotel; the saved reservation and hold are kept whole. The file applies at the first start after the restore.",
+			h.cfg.ID, h.fileReservedFor, r.ConfigReservedFor, r.CustomGuestHold.Launch), nil, nil)
+		h.fileReservedFor = r.ConfigReservedFor
+	}
 	h.cfgMu.Lock()
 	defer h.cfgMu.Unlock()
 	if r.ConfigReservedFor != h.fileReservedFor {
@@ -127,7 +151,11 @@ func (b *broker) applySavedReservationLocked(h *hotel) bool {
 	}
 	h.cfg.ReservedFor, h.cfg.ReservationRef, h.cfg.ReservationGeneration = r.ReservedFor, r.Ref, r.Generation
 	h.cfg.PinOnly = r.PinOnly && r.ReservedFor != ""
+	h.cfg.CustomGuestHold = r.CustomGuestHold
 	log.Printf("hotel %s: reserved_for %q (ref %q, generation %d) kept from before the restart (%s)", h.cfg.ID, r.ReservedFor, r.Ref, r.Generation, reservationsFile)
+	if c := r.CustomGuestHold; c != nil {
+		log.Printf("hotel %s: custom guest hold of %s (kit_down %v) kept from before the restart", h.cfg.ID, c.Launch, c.KitDown)
+	}
 	return false
 }
 

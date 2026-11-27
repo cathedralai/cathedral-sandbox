@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# The one host lock of a sealed host, and the custom guest hold marker (AB#999; spec r9 5.3, 5.10).
+# The one host lock of a sealed host, and the custom guest hold marker (AB#1008; spec r9 5.3, 5.10).
 # Sourced by install-sealed.sh and write-units.sh, and sent ahead of roll.sh's host_install and
 # host_rollback blocks, so every kit lifecycle entry speaks the same protocol. Defines functions only.
 #

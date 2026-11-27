@@ -44,7 +44,7 @@ if [ -n "${SEALED_BOOTSTRAP_SHA256:-}" ]; then
   [[ "$SEALED_BOOTSTRAP_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "SEALED_BOOTSTRAP_SHA256 must be 64 lowercase hex digits (owner_sign.py --bootstrap-digest)" >&2; exit 1; }
 fi
 # >>> host lock
-# One kit or custom guest lifecycle step per host at a time (AB#999; spec r9 5.3), taken before the
+# One kit or custom guest lifecycle step per host at a time (AB#1008; spec r9 5.3), taken before the
 # first host change and held to the end. Under a roll's host step this checks the roll's lock
 # instead of taking a second one. While a custom guest holds this hotel (5.10) nothing here runs:
 # its return starts the kit itself, never through this installer (11.6).

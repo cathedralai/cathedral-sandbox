@@ -30,19 +30,37 @@ var secretNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 
 // secretFanout runs one call on every hotel the guest may use and returns
 // the status of each hotel (0: the hotel did not answer; secretBusy: it had
-// no free connection and was not asked).
+// no free connection and was not asked). A hotel held by a custom guest with
+// its kit down is skipped, and a DELETE counts it as not found; while its
+// kit_down PATCH has closed admission, it gets 0 with no call
+// (custom_guest_hold.go).
 func (b *broker) secretFanout(ctx context.Context, g *guestState, method, path string, body []byte) (map[string]int, map[string][]byte) {
 	statuses := map[string]int{}
 	bodies := map[string][]byte{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, h := range b.hotelList() {
-		if !g.limitsAllow(b, h.cfg.ID) {
+		switch b.secretAdmit(g, h) {
+		case secretNotAllowed:
+			continue
+		case secretKitDown:
+			if method == "DELETE" {
+				mu.Lock()
+				statuses[h.cfg.ID] = 404 // the stopped kit kept no secret
+				mu.Unlock()
+			}
+			continue
+		case secretClosed:
+			mu.Lock()
+			statuses[h.cfg.ID] = 0 // what the stopped kit would give; not done until kit_down is saved
+			mu.Unlock()
 			continue
 		}
 		wg.Add(1)
 		go func(h *hotel) {
 			defer wg.Done()
+			defer b.secretCallEnded(h) // whatever the outcome
+			afterSecretAdmit(h.cfg.ID)
 			status, _, out, err := h.doGuest(ctx, g, method, path, nil, body, 30*time.Second)
 			mu.Lock()
 			defer mu.Unlock()

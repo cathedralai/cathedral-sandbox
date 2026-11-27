@@ -31,6 +31,7 @@ type restartCheck struct {
 	Queued     int      `json:"queued"`      // creates waiting for a slot
 	PoolClaims int      `json:"pool_claims"` // pool claims in flight (poolClaimBegin; no claim path calls it yet)
 	Unreaped   int      `json:"unreaped"`    // failed create batches whose rooms are not yet confirmed gone
+	Claims     int      `json:"claims"`      // prefetch, workspace create and prewarm calls (h.claims); not in restart_ok (custom_guest_hold.go)
 	HotelRooms int      `json:"hotel_rooms"` // running plus frozen rooms in the hotel's last health answer
 	CountKnown bool     `json:"count_known"` // a room list answered since start and the last one did
 	Reasons    []string `json:"reasons"`
@@ -39,7 +40,7 @@ type restartCheck struct {
 // restartCheckLocked counts h. Caller holds b.mu.
 func (b *broker) restartCheckLocked(h *hotel) restartCheck {
 	c := restartCheck{Hotel: h.cfg.ID, Drain: h.drain(), Rooms: len(h.rooms), Creating: h.creating,
-		Queued: h.queued, Unreaped: len(h.unreaped), HotelRooms: h.apiRunning,
+		Queued: h.queued, Unreaped: len(h.unreaped), Claims: h.claims, HotelRooms: h.apiRunning,
 		CountKnown: !h.roomsUnchecked && h.listOK, Reasons: []string{}}
 	if b.pool != nil {
 		if ph := b.pool.hotels[h.cfg.ID]; ph != nil {

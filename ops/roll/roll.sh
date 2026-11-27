@@ -42,7 +42,7 @@ DRAIN_SETTLE=${ROLL_DRAIN_SETTLE:-5}
 UNDRAIN_SETTLE=${ROLL_UNDRAIN_SETTLE:-20}
 STAGE_TIMEOUT=${ROLL_STAGE_TIMEOUT:-2400}
 STAGE_ROOT=${ROLL_STAGE_ROOT:-/root}   # on the hotel host: stage dirs and kit bundles
-# The host lock protocol and the custom guest hold marker (AB#999; spec r9 5.3, 5.10). This copy of
+# The host lock protocol and the custom guest hold marker (AB#1008; spec r9 5.3, 5.10). This copy of
 # the kit's host-lock.sh is sent ahead of every host step, so the roll.sh an operator runs carries
 # the guard whatever kit commit is staged. A host step runs under timeout: a killed step frees the
 # lock with its whole process group.

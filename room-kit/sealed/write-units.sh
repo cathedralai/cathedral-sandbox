@@ -7,7 +7,7 @@
 # Used by install-sealed.sh (step 4), by a roll that only updates the units, and by the
 # custom guest return (spec r9 11.6 R6).
 #
-# Host lock and hold marker (AB#999; spec r9 5.3, 5.10, host-lock.sh): run directly, this script
+# Host lock and hold marker (AB#1008; spec r9 5.3, 5.10, host-lock.sh): run directly, this script
 # takes the host lock; under a holder (install-sealed.sh, a roll, a custom guest phase) it checks
 # the inherited lock instead. While a custom guest holds the hotel (SEALED_DIR/custom-guest.hold)
 # it refuses, unless the caller is that launch's return phase. The kit unit's first ExecStartPre is

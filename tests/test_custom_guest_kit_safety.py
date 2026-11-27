@@ -1,4 +1,4 @@
-"""AB#999 PR 2 kit safety: the host lock, the kit unit guard and the custom guest hold marker.
+"""AB#1008 PR 2 kit safety: the host lock, the kit unit guard and the custom guest hold marker.
 
 Spec r9 5.3 (one host lock, an explicit owner, a timeout, no nesting), 5.10 (kit guard and marker)
 and the 14.1 "Lock" and "Guard" cases. Everything runs the real scripts with real flock and real
