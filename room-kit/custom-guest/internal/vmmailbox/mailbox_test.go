@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -268,9 +269,16 @@ func TestAnswerOverBoundIsRefused(t *testing.T) {
 	copy(slot, magic[:])
 	slot[8] = byte(KindAnswer)
 	slot[11], slot[12] = 0x10, 0x01 // 4097
+	sum := sha256.Sum256(big)       // a header that is otherwise valid: only the length bound can refuse it
+	copy(slot[13:HeaderBytes], sum[:])
 	copy(slot[HeaderBytes:], big)
 	if _, err := DecodeSlot(slot, KindAnswer); !errors.Is(err, ErrTorn) {
 		t.Fatalf("got %v", err)
+	}
+	box := newMem()
+	copy(box.b[AnswerOffset:], slot)
+	if _, ok := (&Mailbox{f: box}).ReadAnswer(); ok {
+		t.Fatal("a 4097-byte answer was read")
 	}
 }
 
@@ -410,6 +418,12 @@ func TestEnvelopeOpensAndRefusesForgeries(t *testing.T) {
 	low.EPK = [32]byte{}
 	if _, err := OpenAnswer(vm, offer, low); err == nil {
 		t.Error("a low-order epk opened")
+	}
+	// An answer that names another offer is refused even when its ciphertext is for this one.
+	misnamed := ans
+	misnamed.OfferSHA256 = otherOffer
+	if k, err := OpenAnswer(vm, offer, misnamed); err == nil || k != nil {
+		t.Error("an answer that names another offer opened")
 	}
 	// Another VM's key cannot open it.
 	stranger, _ := ecdh.X25519().GenerateKey(rand.Reader)
