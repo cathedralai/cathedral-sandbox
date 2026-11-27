@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,11 +20,35 @@ import (
 type mapping struct {
 	dev     string // "major:minor" of the held disk
 	size    int64
+	header  string // the checked header snapshot it was opened with; "" reads the disk
 	tools   *tools
 	mounted bool
 }
 
-func (m *mapping) node() string { return m.tools.mapperDir + "/" + mapperName }
+// dmLink is udev's form of /dev/mapper/<name>: a relative link to the dm-N node
+// one directory up. No other link is followed.
+var dmLink = regexp.MustCompile(`^\.\./dm-[0-9]+$`)
+
+// node returns the mapping's block device node. Without udev, libdevmapper
+// makes /dev/mapper/cathedral-data itself; with udev (a systemd guest, the CI
+// runner) it is a link to ../dm-N. Only that exact form is followed, one level.
+// Callers still require a block device, and Verify ties its device number to
+// our dm name and uuid through sysfs.
+func (m *mapping) node() (string, error) {
+	path := m.tools.mapperDir + "/" + mapperName
+	st, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if st.Mode()&os.ModeSymlink == 0 {
+		return path, nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil || !dmLink.MatchString(target) {
+		return "", errors.New("unexpected mapper link")
+	}
+	return filepath.Join(filepath.Dir(m.tools.mapperDir), strings.TrimPrefix(target, "../")), nil
+}
 
 // devNumber returns the kernel's "major:minor" for a block device node.
 func devNumber(path string) (string, error) {
@@ -117,7 +142,11 @@ func statusPolicy(raw []byte) error {
 // Each refusal names the check that failed; none carries secret material.
 func (m *mapping) Verify(ctx context.Context) error {
 	fail := func(what string) error { return errors.New("data mapping policy mismatch: " + what) }
-	crypt, err := devNumber(m.node())
+	node, err := m.node()
+	if err != nil {
+		return fail("mapper node")
+	}
+	crypt, err := devNumber(node)
 	if err != nil {
 		return fail("mapper node")
 	}
@@ -151,7 +180,11 @@ func (m *mapping) Verify(ctx context.Context) error {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	res, err := m.tools.exec(cctx, command{args: []string{"status", mapperName}})
+	args := []string{"status", mapperName}
+	if m.header != "" {
+		args = []string{"status", "--header", m.header, mapperName}
+	}
+	res, err := m.tools.exec(cctx, command{args: args})
 	if err != nil {
 		return fail("status unavailable")
 	}
@@ -166,7 +199,11 @@ func (m *mapping) Filesystem(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	fd, err := syscall.Open(m.node(), syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+	node, err := m.node()
+	if err != nil {
+		return "", err
+	}
+	fd, err := syscall.Open(node, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
 	}
@@ -193,12 +230,17 @@ func (m *mapping) Filesystem(ctx context.Context) (string, error) {
 }
 
 // MakeFilesystem runs mke2fs on the mapping node. Unlock calls it only after
-// Format created this volume in the same invocation.
+// Format created this volume in the same invocation and Filesystem probed it
+// "empty", so -F never overwrites anything.
 func (m *mapping) MakeFilesystem(ctx context.Context) error {
+	node, err := m.node()
+	if err != nil {
+		return err
+	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
-	_, err := m.tools.exec(cctx, command{program: m.tools.mke2fs,
-		args: []string{"-t", "ext4", "-F", "-q", "-L", mapperName, m.node()}})
+	_, err = m.tools.exec(cctx, command{program: m.tools.mke2fs,
+		args: []string{"-t", "ext4", "-F", "-q", "-L", mapperName, node}})
 	if err != nil {
 		return errors.New("mke2fs failed")
 	}
@@ -263,11 +305,15 @@ func (m *mapping) Mount(ctx context.Context) error {
 	if before, err := mounts(m.tools.mountinfo, target); err != nil || len(before) != 0 {
 		return errors.New("mount target already in use")
 	}
-	crypt, err := devNumber(m.node())
+	node, err := m.node()
 	if err != nil {
 		return err
 	}
-	if err := syscall.Mount(m.node(), target, "ext4", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""); err != nil {
+	crypt, err := devNumber(node)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Mount(node, target, "ext4", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""); err != nil {
 		return err
 	}
 	m.mounted = true

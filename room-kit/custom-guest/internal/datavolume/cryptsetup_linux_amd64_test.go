@@ -26,7 +26,7 @@ func (r *recording) tools(t *testing.T) *tools {
 		t.Fatal(err)
 	}
 	return &tools{helperPath: "unused", mke2fs: "unused", mapperDir: mapper, sys: filepath.Join(root, "sys"),
-		mountinfo: filepath.Join(root, "mountinfo"), mountTarget: filepath.Join(root, "mnt"),
+		mountinfo: filepath.Join(root, "mountinfo"), mountTarget: filepath.Join(root, "mnt"), scratch: root,
 		exec: func(_ context.Context, c command) (result, error) {
 			r.calls = append(r.calls, c)
 			if r.reply != nil {
@@ -64,6 +64,11 @@ func TestPassphraseOnlyOnStdin(t *testing.T) {
 	if err := d.Format(context.Background(), []byte(testSecret)); err != nil {
 		t.Fatal(err)
 	}
+	format := r.calls[0]
+	// Header's backup and dump carry no secret; only Format and Open are checked.
+	r.reply = func(command) (result, error) { return result{stdout: []byte("{}")}, nil }
+	checked(t, d)
+	r.calls = []command{format}
 	m, err := d.Open(context.Background(), []byte(testSecret))
 	if err != nil || m == nil {
 		t.Fatal(err)
@@ -177,8 +182,14 @@ func TestHeaderProbe(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || !bytes.Equal(got, json) || len(r.calls) != 1 || r.calls[0].args[0] != "luksDump" {
+			// One backup of the header off the disk, then the dump reads that copy.
+			if err != nil || !bytes.Equal(got, json) || len(r.calls) != 2 {
 				t.Fatalf("err=%v calls=%d", err, len(r.calls))
+			}
+			backup, dump := r.calls[0].args, r.calls[1].args
+			if strings.Join(backup[:2], " ") != "luksHeaderBackup "+diskFD || backup[2] != "--header-backup-file" ||
+				strings.Join(dump, " ") != "luksDump --dump-json-metadata "+backup[3] || d.header != backup[3] {
+				t.Fatalf("backup=%v dump=%v", backup, dump)
 			}
 		})
 	}
@@ -201,11 +212,58 @@ func TestHeaderFailureIsNeverNotLUKS(t *testing.T) {
 	}
 }
 
+// checked runs Header on a disk with LUKS magic, so it holds a header snapshot.
+func checked(t *testing.T, d *HeldDevice) {
+	t.Helper()
+	poke(t, d, 0, []byte("LUKS\xba\xbe"))
+	if _, err := d.Header(context.Background()); err != nil || d.header == "" {
+		t.Fatalf("header snapshot: %v", err)
+	}
+}
+
+// Open unlocks with the snapshot Header checked, never a fresh read of the disk:
+// without one it refuses, and with one it passes exactly that file as --header.
+func TestOpenUsesOnlyTheCheckedHeader(t *testing.T) {
+	r := &recording{reply: func(command) (result, error) { return result{stdout: []byte("{}")}, nil }}
+	d := fileDisk(t, 1<<30, r.tools(t))
+	if m, err := d.Open(context.Background(), []byte(testSecret)); err == nil || m != nil || len(r.calls) != 0 {
+		t.Fatalf("opened without a checked header: %v %v %d", m, err, len(r.calls))
+	}
+	checked(t, d)
+	snapshot := d.header
+	r.calls = nil
+	m, err := d.Open(context.Background(), []byte(testSecret))
+	if err != nil || m == nil || len(r.calls) != 1 {
+		t.Fatalf("%v %v %d", m, err, len(r.calls))
+	}
+	want := "open --type luks2 --header " + snapshot + " --batch-mode --key-file=- " + diskFD + " " + mapperName
+	if got := strings.Join(r.calls[0].args, " "); got != want {
+		t.Fatalf("open args %q", got)
+	}
+	if m.(*mapping).header != snapshot {
+		t.Fatal("mapping does not carry the snapshot for status")
+	}
+	// A later Header that finds no LUKS leaves nothing to open with.
+	poke(t, d, 0, make([]byte, 6))
+	if _, err := d.Header(context.Background()); !errors.Is(err, ErrNotLUKS) || d.header != "" {
+		t.Fatalf("stale snapshot kept: %v %q", err, d.header)
+	}
+	dir := d.headerDir
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory left behind: %v", err)
+	}
+}
+
 func TestOpenRefusesExistingMapping(t *testing.T) {
 	for _, name := range []string{mapperName, mapperName + "_dif"} {
-		r := &recording{}
+		r := &recording{reply: func(command) (result, error) { return result{stdout: []byte("{}")}, nil }}
 		tl := r.tools(t)
 		d := fileDisk(t, 1<<30, tl)
+		checked(t, d)
+		r.calls = nil
 		if err := os.WriteFile(filepath.Join(tl.mapperDir, name), nil, 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -217,12 +275,13 @@ func TestOpenRefusesExistingMapping(t *testing.T) {
 
 func TestOpenFailureReturnsPartialMappingOnlyIfNodeExists(t *testing.T) {
 	var tl *tools
-	r := &recording{}
+	r := &recording{reply: func(command) (result, error) { return result{stdout: []byte("{}")}, nil }}
+	tl = r.tools(t)
+	d := fileDisk(t, 1<<30, tl)
+	checked(t, d)
 	r.reply = func(command) (result, error) {
 		return result{}, errors.New("exit status 2")
 	}
-	tl = r.tools(t)
-	d := fileDisk(t, 1<<30, tl)
 	if m, err := d.Open(context.Background(), []byte(testSecret)); err == nil || m != nil {
 		t.Fatalf("clean failure returned a mapping: %v %v", m, err)
 	}
@@ -326,6 +385,38 @@ func TestStatusPolicy(t *testing.T) {
 		}
 		if err := statusPolicy([]byte(strings.Replace(status2_8_4, edit[0], edit[1], 1))); err == nil {
 			t.Fatalf("%s accepted", name)
+		}
+	}
+}
+
+// udev makes /dev/mapper/<name> a link to ../dm-N. Only that form is followed.
+func TestMapperNodeFollowsOnlyUdevLink(t *testing.T) {
+	tl := (&recording{}).tools(t)
+	m := &mapping{tools: tl}
+	link := filepath.Join(tl.mapperDir, mapperName)
+	if _, err := m.node(); err == nil {
+		t.Fatal("missing node resolved")
+	}
+	if err := os.WriteFile(link, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.node(); err != nil || got != link {
+		t.Fatalf("plain node: %q %v", got, err)
+	}
+	for target, ok := range map[string]bool{
+		"../dm-3": true, "../dm-12": true, "dm-3": false, "/dev/dm-3": false, "../sda": false,
+		"../../dm-3": false, "../dm-3/x": false, "../dm-": false, "../loop0": false,
+	} {
+		os.Remove(link)
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		got, err := m.node()
+		if ok && (err != nil || got != filepath.Join(filepath.Dir(tl.mapperDir), target[3:])) {
+			t.Fatalf("%s: %q %v", target, got, err)
+		}
+		if !ok && err == nil {
+			t.Fatalf("%s followed to %q", target, got)
 		}
 	}
 }

@@ -22,6 +22,8 @@ type HeldDevice struct {
 	name       string
 	dev        string // "major:minor" of the held disk, as the kernel reports it
 	tools      *tools // set by OpenData; nil in descriptor-only tests
+	// header is the snapshot the last Header call dumped; Open uses only it.
+	header, headerDir string
 }
 
 func (d *HeldDevice) Size() int64 { return d.size }
@@ -43,6 +45,10 @@ func (d *HeldDevice) Close() error {
 	if d.lock != nil {
 		err = errors.Join(err, d.lock.Close())
 		d.lock = nil
+	}
+	if d.headerDir != "" {
+		err = errors.Join(err, os.RemoveAll(d.headerDir))
+		d.headerDir, d.header = "", ""
 	}
 	return err
 }

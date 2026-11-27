@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -32,6 +33,7 @@ const MountPoint = mountTarget
 // replace paths and the exec seam; production uses productionTools.
 type tools struct {
 	helperPath, mke2fs, mapperDir, sys, mountinfo, mountTarget string
+	scratch                                                    string // parent of the private header snapshot directory
 	helperSHA                                                  [32]byte
 	exec                                                       func(context.Context, command) (result, error)
 }
@@ -47,7 +49,7 @@ type result struct{ stdout, stderr []byte }
 
 func productionTools(helperSHA [32]byte) *tools {
 	t := &tools{helperPath: cryptsetupPath, mke2fs: mke2fsPath, mapperDir: "/dev/mapper", sys: "/sys",
-		mountinfo: "/proc/self/mountinfo", mountTarget: mountTarget, helperSHA: helperSHA}
+		mountinfo: "/proc/self/mountinfo", mountTarget: mountTarget, scratch: "/run", helperSHA: helperSHA}
 	t.exec = t.execute
 	return t
 }
@@ -179,6 +181,7 @@ func (d *HeldDevice) Header(ctx context.Context) ([]byte, error) {
 	if err := d.ready(); err != nil {
 		return nil, err
 	}
+	d.header = "" // until this call has a fresh snapshot, Open has nothing to use
 	found := false
 	probe := make([]byte, 6)
 	for _, off := range append([]int64{0}, secondaryOffsets...) {
@@ -200,11 +203,40 @@ func (d *HeldDevice) Header(ctx context.Context) ([]byte, error) {
 	if !found {
 		return nil, ErrNotLUKS
 	}
-	res, err := d.run(ctx, 30*time.Second, command{args: []string{"luksDump", "--dump-json-metadata", diskFD}})
+	snapshot, err := d.snapshotHeader(ctx)
+	if err != nil {
+		return nil, errors.New("LUKS header backup failed")
+	}
+	res, err := d.run(ctx, 30*time.Second, command{args: []string{"luksDump", "--dump-json-metadata", snapshot}})
 	if err != nil || len(res.stdout) == 0 {
 		return nil, errors.New("LUKS metadata unreadable")
 	}
 	return res.stdout, nil
+}
+
+// snapshotHeader copies the LUKS header off the held disk once, into a private
+// directory. Header dumps this copy and Open unlocks with it (--header), so the
+// header the policy checked is the header that unlocks: a host that rewrites the
+// on-disk header between the two cannot substitute its own keyslots. Each call
+// replaces the previous snapshot; Close removes it.
+func (d *HeldDevice) snapshotHeader(ctx context.Context) (string, error) {
+	if d.headerDir == "" {
+		dir, err := os.MkdirTemp(d.tools.scratch, "cathedral-data-")
+		if err != nil {
+			return "", err
+		}
+		d.headerDir = dir
+	}
+	path := filepath.Join(d.headerDir, "luks-header")
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if _, err := d.run(ctx, 30*time.Second, command{args: []string{
+		"luksHeaderBackup", diskFD, "--header-backup-file", path}}); err != nil {
+		return "", err
+	}
+	d.header = path
+	return path, nil
 }
 
 // Format creates LUKS2 with aes-xts-plain64, 4096-byte sectors and hmac-sha256
@@ -237,13 +269,18 @@ func exists(path string) (bool, error) {
 	return false, err
 }
 
-// Open creates this invocation's mapping. Existing mapper nodes under either
-// name are refused, so it can never adopt another invocation's mapping. If the
+// Open creates this invocation's mapping from the header snapshot the last
+// Header call checked, never from a fresh read of the disk. Existing mapper
+// nodes under either name are refused, so it can never adopt another
+// invocation's mapping. If the
 // helper fails after creating a node, the partial mapping is returned so the
 // caller can close it.
 func (d *HeldDevice) Open(ctx context.Context, passphrase []byte) (OwnedMapping, error) {
 	if err := d.ready(); err != nil {
 		return nil, err
+	}
+	if d.header == "" {
+		return nil, errors.New("no checked LUKS header to open with")
 	}
 	for _, n := range []string{mapperName, mapperName + "_dif"} {
 		present, err := exists(d.tools.mapperDir + "/" + n)
@@ -251,9 +288,9 @@ func (d *HeldDevice) Open(ctx context.Context, passphrase []byte) (OwnedMapping,
 			return nil, errors.New("data mapping already exists or is unreadable")
 		}
 	}
-	m := &mapping{dev: d.dev, size: d.size, tools: d.tools}
+	m := &mapping{dev: d.dev, size: d.size, header: d.header, tools: d.tools}
 	_, err := d.run(ctx, 5*time.Minute, command{stdin: passphrase, args: []string{
-		"open", "--type", "luks2", "--batch-mode", "--key-file=-", diskFD, mapperName}})
+		"open", "--type", "luks2", "--header", d.header, "--batch-mode", "--key-file=-", diskFD, mapperName}})
 	if err != nil {
 		for _, n := range []string{mapperName, mapperName + "_dif"} {
 			if present, _ := exists(d.tools.mapperDir + "/" + n); present {

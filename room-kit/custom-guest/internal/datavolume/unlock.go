@@ -18,6 +18,8 @@ var ErrNotLUKS = errors.New("candidate has no LUKS header")
 // This interface is an execution contract, not proof that an adapter meets it.
 // Header is a read-only cryptsetup LUKS2 JSON probe; Format creates the required
 // LUKS2/XTS/HMAC layout and must not create a filesystem or print the passphrase.
+// Open must unlock with exactly the header the last Header call returned, never
+// a fresh read of the disk, so the header the policy checked is the one used.
 // Open must return a non-nil owned mapping even on failure if it allocated one;
 // it must never return an existing mapping belonging to another invocation.
 // Methods must not retain the passphrase after returning.
@@ -33,7 +35,8 @@ type LockedCandidate interface {
 // encrypted/integrity stack, its complete backing-device identity and geometry;
 // a successful passphrase or metadata check alone is insufficient. Filesystem
 // probes read-only and returns a specific type, or an error if unknown/unreadable.
-// MakeFilesystem creates ext4, and is called only after Format succeeded here.
+// MakeFilesystem creates ext4, and is called only after Format succeeded here
+// and Filesystem reported "empty".
 // Mount must use a fixed safe target and nosuid,nodev,noexec, and verify the
 // resulting mount before returning success. Close must unmount any partial mount
 // and close only this invocation's mappings, reporting cleanup failures.
@@ -121,6 +124,15 @@ func Unlock(ctx context.Context, disk LockedCandidate, passphrase []byte) (err e
 		return err
 	}
 	if created {
+		// mke2fs -F overwrites whatever it finds, so it runs only on a plaintext
+		// that probes as all zero, which is what a fresh format leaves.
+		fs, err := mapping.Filesystem(ctx)
+		if err != nil || fs != "empty" {
+			return errors.New("new data volume is not empty; preserve for recovery")
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
 		if err = mapping.MakeFilesystem(ctx); err != nil {
 			return errors.New("filesystem initialization failed; preserve for recovery")
 		}

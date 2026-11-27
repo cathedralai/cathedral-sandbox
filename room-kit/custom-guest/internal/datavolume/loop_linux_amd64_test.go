@@ -91,7 +91,7 @@ func newLoop(t *testing.T) *loopFixture {
 	target := filepath.Join(dir, "mnt")
 	l := &loopFixture{t: t, image: image, device: device}
 	l.tools = &tools{helperPath: helper, helperSHA: sha256.Sum256(raw), mke2fs: mke2fs, mapperDir: "/dev/mapper",
-		sys: "/sys", mountinfo: "/proc/self/mountinfo", mountTarget: target}
+		sys: "/sys", mountinfo: "/proc/self/mountinfo", mountTarget: target, scratch: dir}
 	base := l.tools.execute
 	l.tools.exec = func(ctx context.Context, c command) (result, error) {
 		res, err := base(ctx, c)
@@ -142,10 +142,11 @@ func (l *loopFixture) mapperPresent() bool {
 
 type spy struct {
 	*HeldDevice
-	t       *testing.T
-	formats int
-	opens   int
-	mkfs    error // injected MakeFilesystem failure: a power cut at that step
+	t          *testing.T
+	formats    int
+	opens      int
+	mkfs       error  // injected MakeFilesystem failure: a power cut at that step
+	beforeOpen func() // runs between the header check and Open: a host write
 }
 
 func (s *spy) Format(ctx context.Context, p []byte) error {
@@ -178,6 +179,9 @@ func (l loggedMapping) Verify(ctx context.Context) error {
 
 func (s *spy) Open(ctx context.Context, p []byte) (OwnedMapping, error) {
 	s.opens++
+	if s.beforeOpen != nil {
+		s.beforeOpen()
+	}
 	m, err := s.HeldDevice.Open(ctx, p)
 	if m == nil {
 		return nil, err
@@ -382,5 +386,52 @@ func TestLoopMountTargetInUseRefused(t *testing.T) {
 	}
 	if l.mapperPresent() {
 		t.Fatal("mapping left open after a refused mount")
+	}
+}
+
+// The host can rewrite the on-disk header after the policy check. Open must use
+// the checked snapshot: here a swapped-in header for the same passphrase, with
+// its own volume key, is ignored and the original data still reads back.
+func TestLoopHeaderSwapAfterCheckIsIgnored(t *testing.T) {
+	l := newLoop(t)
+	if err := l.unlock(&spy{t: t, HeldDevice: l.held()}, testSecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(l.tools.mountTarget, "keep"), []byte("kept"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	l.teardown()
+	original := sh(t, l.tools.helperPath, "luksUUID", l.device)
+	// Same layout and passphrase, different volume key: the swap a host could make.
+	dir := t.TempDir()
+	other := filepath.Join(dir, "other.img")
+	if err := os.WriteFile(other, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(other, loopSize); err != nil {
+		t.Fatal(err)
+	}
+	format := exec.Command(l.tools.helperPath, "luksFormat", "--type", "luks2", "--cipher", "aes-xts-plain64",
+		"--key-size", "512", "--sector-size", "4096", "--integrity", "hmac-sha256", "--integrity-no-wipe",
+		"--pbkdf", "pbkdf2", "--pbkdf-force-iterations", "1000", "--batch-mode", "--key-file=-", other)
+	format.Stdin = strings.NewReader(testSecret)
+	if out, err := format.CombinedOutput(); err != nil {
+		t.Fatalf("swap header fixture: %v\n%s", err, out)
+	}
+	swap := filepath.Join(dir, "swap-header")
+	sh(t, l.tools.helperPath, "luksHeaderBackup", other, "--header-backup-file", swap)
+	s := &spy{t: t, HeldDevice: l.held(), beforeOpen: func() {
+		sh(t, l.tools.helperPath, "luksHeaderRestore", "--batch-mode", l.device, "--header-backup-file", swap)
+	}}
+	if err := l.unlock(s, testSecret); err != nil {
+		t.Fatal(err)
+	}
+	// Positive control: the disk really carries the other header now.
+	if now := sh(t, l.tools.helperPath, "luksUUID", l.device); now == original {
+		t.Fatal("header swap did not happen")
+	}
+	got, err := os.ReadFile(filepath.Join(l.tools.mountTarget, "keep"))
+	if err != nil || string(got) != "kept" {
+		t.Fatalf("opened with the swapped header: %q %v", got, err)
 	}
 }
