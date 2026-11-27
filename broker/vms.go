@@ -80,6 +80,8 @@ const (
 	// Exit codes of vm-ctl.sh the broker maps to 409.
 	vmExitStale  = 3 // authorize: older generation or lower paid_through; start/stop/reboot: not the host's generation
 	vmExitUnpaid = 4 // start: now >= paid_through
+	// Exit 5 is also "no such VM" or "exists" (502 as before); only its host_capacity refusal is a 409.
+	vmExitConflict = 5 // create/start: {"error":"host_capacity","resource":...} from the host ledger (AB#999)
 
 	vmHostAnswerMax = 256 << 10
 )
@@ -421,6 +423,16 @@ func (s *vmStore) call(ctx context.Context, h vmHostConfig, timeout time.Duratio
 		return nil, &vmCallErr{409, "stale_authorization", "the host holds a newer generation or a later paid_through", false}
 	case vmExitUnpaid:
 		return nil, &vmCallErr{409, "not_paid", "the host has no paid_through after now for this VM", false}
+	case vmExitConflict:
+		if res, ok := vmCapacityRefusal(out); ok {
+			msg := "the VM host has no room for this VM"
+			if res != "" {
+				msg += " (" + res + ")"
+			}
+			return nil, &vmCallErr{409, "no_vm_capacity", msg, false}
+		}
+		log.Printf("vms: host %s: %s: exit %d", h.ID, args[0], code)
+		return nil, &vmCallErr{502, "vm_host_refused", fmt.Sprintf("the VM host refused %s (exit %d)", args[0], code), false}
 	default:
 		log.Printf("vms: host %s: %s: exit %d", h.ID, args[0], code)
 		return nil, &vmCallErr{502, "vm_host_refused", fmt.Sprintf("the VM host refused %s (exit %d)", args[0], code), false}
@@ -440,6 +452,33 @@ func vmHostDoc(h vmHostConfig, verb string, out []byte) (map[string]any, *vmCall
 		return nil, &vmCallErr{502, "vm_host_bad_answer", "the VM host's answer is not one JSON object", true}
 	}
 	return doc, nil
+}
+
+// vmCapacityResources are the host ledger's resource names (room-kit/vm/vm_capacity.py
+// RESOURCES). Only these reach the client, in the 409 message.
+var vmCapacityResources = map[string]bool{
+	"memory": true, "disk": true, "asid": true, "vcpu": true,
+	"kit_unaccounted": true, "vm_unaccounted": true, "custom_guest_host": true,
+}
+
+// vmCapacityRefusal reads a host exit 5: ok when it is the ledger's
+// host_capacity refusal, with its resource when that is a known name.
+func vmCapacityRefusal(out []byte) (resource string, ok bool) {
+	line := bytes.TrimSpace(out)
+	if i := bytes.LastIndexByte(line, '\n'); i >= 0 {
+		line = line[i+1:]
+	}
+	var doc struct {
+		Error    string `json:"error"`
+		Resource string `json:"resource"`
+	}
+	if json.Unmarshal(line, &doc) != nil || doc.Error != "host_capacity" {
+		return "", false
+	}
+	if !vmCapacityResources[doc.Resource] {
+		return "", true
+	}
+	return doc.Resource, true
 }
 
 // sshVMExecutor runs `ssh ... <target> <args...>`. The host's forced

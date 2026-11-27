@@ -18,6 +18,7 @@ and lists the VM's bundle.
 | File | Role |
 |------|------|
 | `vm-ctl.sh` (`vm_ctl.py`) | The control command. One JSON line on stdout per call. |
+| `vm_capacity.py` | The host admission ledger across VMs and sealed hotel kits (AB#999). |
 | `launch-vm.py` | `ExecStart` of `cathedral-vm-<name>.service`, as the VM's user: QEMU in the foreground, exit 75 on a guest reset, 0 on a poweroff. `--print` shows the argv. |
 | `snp_qemu.py` | The SEV-SNP argv lines and their property check, shared with `ops/custom-guest/launch-custom-guest.py`. |
 | `vm-gates.sh` (`vm_gates.py`) | Pre-launch gates and the host change gate (spec 8.3): `check <name>` before every start and launch, `enforce` on the enforce tick. Exit codes in `vm_gates.py`. |
@@ -41,13 +42,15 @@ sudo ./vm-ctl.sh cancel vm1 <generation>    # close a run in any state (see Exec
 ./vm-ctl.sh history vm1 <generation>         # read only, works after delete
 sudo ./vm-ctl.sh rebundle vm1 --generation G --expect-revision N --op-id <32 hex> --to <B2>
 sudo ./vm-ctl.sh delete vm1 --confirm vm1   # the only command that removes the disk
+sudo ./vm-ctl.sh capacity [--broker-max-vcpus N --broker-max-mem-gib N --broker-max-disk-gib N]
 ```
 
 `VM_ROOT` (default `/srv/cathedral-vms`) and `SYSTEMD_UNIT_DIR` (default
 `/etc/systemd/system`) can be set in the environment. Exit codes: 0 ok,
-2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or conflict,
-10 to 18 a pre-launch gate (`start`, `vm_gates.EXIT`), 19 stale bundle selection and
-20 bundle incompatible (`rebundle`), 1 other. A refusal may carry a `reason` token. Callers map a
+2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or conflict, or no room on
+the host (`{"error": "host_capacity", "resource": ...}`, see Host admission), 10 to 18 a
+pre-launch gate (`start`, `vm_gates.EXIT`), 19 stale bundle selection and 20 bundle
+incompatible (`rebundle`), 1 other. A refusal may carry a `reason` token. Callers map a
 refusal by its exit code and `error` token together, per command.
 
 ## What a VM is
@@ -154,6 +157,71 @@ Spec: `docs/VM_EXECUTION_HISTORY.md` (H1 to H9).
   an untrusted clock or an unbounded start.
 - A final line with no newline is a torn write: readers ignore it and the next writer cuts it.
 
+## Host admission (AB#999, VM spec r2 section 9)
+
+One SNP host shares memory, disks, SNP ASIDs and threads between the sealed hotel kits and the
+VMs. `vm_capacity.py` counts both. It runs only while the VM host switch
+`/etc/cathedral/snp-vm-host.json` exists (also the VM3 host config: without it no VM is created,
+and `install-sealed.sh` behaves as before).
+
+- **Rollout:** turn the switch on only while no kit install is running on the host. An install
+  that started before it has no record and no install lock, so the ledger would count that kit
+  by its unit alone until its next install.
+
+- **Kits:** every `room-sealed-<name>.service` unit file, enabled or not, and the env file on its
+  `ExecStart` line, wherever `SEALED_DIR` is. A `-net` unit is skipped only when it is exactly the
+  check unit `write-units.sh` writes (`Type=oneshot`, `ExecStart=<dir>/host-net.sh check <env>`);
+  any other unit, whatever its name, is a kit and must parse. Plus the kits being installed:
+  each install of a kit records `/var/lib/cathedral-snp/kits/<name>.<install id>.json` before
+  its build. Counted by name, each size the larger of the unit and every open record. A kit that
+  is removed must have its records removed too. A unit, env file or record that cannot be read (missing, a line that is not
+  `KEY=value`, a size only a shell could read) refuses every create and start: resource
+  `kit_unaccounted`.
+- **One install of a kit at a time:** with the switch on, `install-sealed.sh` holds
+  `/run/lock/cathedral-kit-<name>.install.lock` from its assess step to its exit (unlocked by its
+  EXIT trap). A second install of the same kit stops at once; it does not wait.
+- **Rolls:** `assess-kit` prints the install id; the install's record holds the larger of the
+  running build and the replacement. When the new guest's measurement matched (after
+  `systemctl enable`), `commit-kit --install-id <id>` drops every open record of the kit: the
+  guest now runs from the current `sealed.env`. An id with no open record is refused (exit 1).
+  Any other exit (refused for live rooms, a failed build, a crash) keeps the record, because the
+  env may already be copied while the old guest runs; the exit step logs its id, and `capacity`
+  lists each kit's `open_installs`.
+- **A stale record** may be removed only after the kit's guest has restarted from the current
+  `sealed.env`, or by the next confirmed install. Right after a failed install the running build
+  is still the old one.
+- **Data-volume reset:** reserved before `data.raw` moves (`assess-kit --install-id <id>
+  --data-reset`). The fresh `data.raw` is charged its own new size. `data.raw.prev` is detached
+  and cannot grow, so it counts only the blocks it holds (already out of `df` avail) until it is
+  removed. A roll that is not confirmed puts the volume back; it is then charged the larger of
+  its own growth and the replacement's size while that install's record stays.
+- **VMs:** every `vm.env`, in any state.
+- **create** (commit), exit 5 on the first resource that does not fit:
+  - `memory`: kits + VMs + this VM, each plus `VM_GUEST_OVERHEAD_MIB` (default 1024), plus a
+    32 GiB reserve, at most `MemTotal`;
+  - `disk`: on this VM's file system, `df` avail less the remaining growth of every sparse file on
+    it (VM disks, kit `scratch.raw` and `data.raw`: full size less allocated) less this VM's full
+    size, at least the reserve (the largest `SEALED_MIN_HOST_FREE_GIB` of a kit on that file
+    system, and `VM_MIN_HOST_FREE_GIB`, default 64);
+  - `asid`: one per kit, running or not, one per VM, and this one, at most `misc.capacity sev_es`;
+  - `vcpu`: kits + VMs + this VM at most threads less 4.
+- **start** (live): `MemAvailable` at least the VM, its overhead and the reserve; the disk rule
+  without adding the VM again; ASIDs in use (`misc.current sev_es`, or the running kits and the
+  VMs that run or are enabled, whichever is more) plus one per stopped kit plus one, at most the
+  capacity. A start of a running VM is not checked again. The check runs before the history start
+  line, so a refused start bills nothing.
+- **Custom-guest hosts:** create always refuses (resource `custom_guest_host`) on a host with
+  `/etc/cathedral/custom-guest.allow`, a `custom-guest.hold` marker in a kit's `SEALED_DIR` or in
+  `/srv/sealed-hotel-*/`, or a launch folder `/srv/custom-guest/<hotel>/[inbox/|staging/]cg-*`.
+- **Lock:** `/run/lock/cathedral-snp-capacity.lock`, held only from the check to the record:
+  create until `vm.env` is written, start until the unit is enabled, the kit install until its
+  record is written. `stop`, `enforce`, `cancel` and `delete` never take it.
+- **`capacity`** (read only): kits, VMs, host figures, each file system's growth and reserve, and
+  the VM share left after the kits. With the broker's `max_vcpus`, `max_mem_gib` and
+  `max_disk_gib` for this host it checks they fit that share (exit 1 when not): the broker's
+  static maxima must stay at or under it.
+- The broker maps exit 5 `host_capacity` to 409 `no_vm_capacity`; other exit 5 answers stay 502.
+
 ## Broker access
 
 For an `authorized_keys` forced command:
@@ -244,5 +312,5 @@ write and `daemon-reload` leaves a right file and a stale systemd.
 
 ## Not here yet
 
-Admission across VMs and kits (VM4), re-wrap (`rewrap` and the mailbox: VM6, the next PR;
-the guest side: VM1b, VM2), resize, snapshots.
+Re-wrap (`rewrap` and the mailbox: VM6, the next PR; the guest side: VM1b, VM2), resize,
+snapshots.
