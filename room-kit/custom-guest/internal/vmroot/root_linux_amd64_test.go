@@ -264,8 +264,8 @@ func TestRootAFlippedBaseBlockFailsTheCopy(t *testing.T) {
 	base = openBase(t, basePath, base)
 	dev := loopDevice(t, 96<<20)
 	cfg := firstBootConfig(t, base, dev, nil)
-	if _, _, err := FirstBoot(cfg); err == nil {
-		t.Fatal("a flipped base block was copied")
+	if _, _, err := FirstBoot(cfg); err == nil || !strings.Contains(err.Error(), "verified read at") {
+		t.Fatalf("a flipped base block must fail the verified read, got: %v", err)
 	}
 	mapperGone(t)
 	if _, err := os.Lstat(cfg.MountPoint); !errors.Is(err, os.ErrNotExist) {
@@ -279,8 +279,8 @@ func TestRootAWrongRootHashFailsTheCopy(t *testing.T) {
 	base = openBase(t, basePath, base)
 	base.RootHash = strings.Repeat("0", 64)
 	dev := loopDevice(t, 96<<20)
-	if _, _, err := FirstBoot(firstBootConfig(t, base, dev, nil)); err == nil {
-		t.Fatal("a base that does not match the identity's root hash was copied")
+	if _, _, err := FirstBoot(firstBootConfig(t, base, dev, nil)); err == nil || !strings.Contains(err.Error(), "veritysetup") {
+		t.Fatalf("a wrong root hash must fail the verity open, got: %v", err)
 	}
 	mapperGone(t)
 }
@@ -401,4 +401,3 @@ func TestSwitchRootGuards(t *testing.T) {
 		t.Error("Finish with no tools was accepted")
 	}
 }
-

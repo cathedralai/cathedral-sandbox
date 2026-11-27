@@ -54,3 +54,27 @@ jobs:
       - name: Run it as root
         working-directory: room-kit/custom-guest/internal/vmroot
         run: sudo env CATHEDRAL_VM_ROOT_TESTS=1 "$RUNNER_TEMP/vmroot.test" -test.v -test.count=1
+
+  tools:
+    name: Static tools (cryptsetup, veritysetup, mke2fs, resize2fs)
+    runs-on: ubuntu-24.04
+    # The builder needs gcc 15, as scripts/build_custom_guest_verity.py does. The image is pinned by digest
+    # (ubuntu:26.04); apt supplies the compiler, and the build prints the exact version it used.
+    container: ubuntu@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
+    steps:
+      - name: Toolchain
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends gcc make pkg-config python3 xz-utils binutils bzip2 patch ca-certificates
+          gcc --version | head -1
+          make --version | head -1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Lock shape
+        run: python3 scripts/build_vm_initrd_tools.py lock-check
+      - name: Fetch the pinned inputs (each digest is checked)
+        run: python3 scripts/build_vm_initrd_tools.py fetch --inputs "$RUNNER_TEMP/inputs"
+      - name: Build twice and require identical static tools
+        run: python3 scripts/build_vm_initrd_tools.py build --inputs "$RUNNER_TEMP/inputs" --output "$RUNNER_TEMP/tools" --log "$RUNNER_TEMP/tools-build.log"
+      - name: Build log on failure
+        if: failure()
+        run: tail -n 120 "$RUNNER_TEMP/tools-build.log" || true

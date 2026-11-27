@@ -333,7 +333,7 @@ func TestWriteNetworkAndLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	for why, raw := range map[string]string{
-		"public":         "8.8.8.1 8.8.8.2",
+		"public":         "8.8.8.1 8.8.8.2", // leak-guard: allow
 		"not a /30 pair": "10.216.0.5 10.216.0.7",
 		"host not first": "10.216.0.6 10.216.0.7",
 		"swapped":        "10.216.0.6 10.216.0.5",
@@ -342,7 +342,7 @@ func TestWriteNetworkAndLink(t *testing.T) {
 		"newline":        "10.216.0.5 10.216.0.6\n",
 		"three fields":   "10.216.0.5 10.216.0.6 10.216.0.7",
 		"empty":          "",
-		"172.32":         "172.32.0.1 172.32.0.2",
+		"172.32":         "172.32.0.1 172.32.0.2", // leak-guard: allow
 	} {
 		if _, err := ParseLink([]byte(raw)); err == nil {
 			t.Errorf("%s: accepted", why)
@@ -367,7 +367,7 @@ func TestWriteNetworkAndLink(t *testing.T) {
 	if err := WriteNetwork(root, good); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteNetwork(root, []byte("1.1.1.1 1.1.1.2")); err == nil {
+	if err := WriteNetwork(root, []byte("1.1.1.1 1.1.1.2")); err == nil { // leak-guard: allow
 		t.Fatal("bad link accepted")
 	}
 }

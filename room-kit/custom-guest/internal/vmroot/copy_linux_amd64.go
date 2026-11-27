@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"regexp"
 	"syscall"
 	"time"
 )
@@ -68,6 +70,10 @@ func CopyBase(verity Tool, b Base, fs *os.File, cut func(string) error) (err err
 // copyVerified reads exactly size bytes of the mapping into fs from offset 0, flushes, and checks
 // that the mapping is a block device of that size.
 func copyVerified(path string, size int64, fs *os.File, cut func(string) error) error {
+	path, err := resolveMapper(path)
+	if err != nil {
+		return err
+	}
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -102,4 +108,25 @@ func copyVerified(path string, size int64, fs *os.File, cut func(string) error) 
 		return err
 	}
 	return cut(CutCopyDone)
+}
+
+// resolveMapper returns the device node of a mapping. In the guest, devtmpfs and libdevmapper make
+// /dev/mapper/<name> a node. Where udev runs (the CI runner) it is a link to /dev/dm-N: that one
+// link is followed, and only to a dm node directly under /dev.
+func resolveMapper(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return path, nil
+	}
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if !regexp.MustCompile(`^/dev/dm-[0-9]+$`).MatchString(target) {
+		return "", errors.New("the verity mapping links outside /dev/dm-N")
+	}
+	return target, nil
 }
