@@ -430,3 +430,23 @@ verification and restricted filesystem handling. Existing filesystems must never
 be reformatted; first-use formatting must follow the full blank check under the
 same device hold. Nothing opens the data disk at boot. The owner unlock command,
 complete PID1/initrd integration and hardware acceptance remain unfinished.
+
+The unlock coordinator now enforces operation ordering against an explicit
+adapter contract. Existing headers must pass policy checks before any open;
+only an explicit non-LUKS probe followed by a full zero scan permits first-use
+formatting. Filesystem creation is permitted only in that same invocation.
+Interrupted initialization is preserved for recovery on a later retry, never
+silently reformatted. The coordinator checks the active mapping before filesystem
+work and again before mounting, and accepts only ext4 from the filesystem probe.
+
+Failed opens that allocated a mapping, failed checks and cancelled operations
+close only that invocation's mapping using a fresh bounded cleanup context.
+Cleanup failures remain visible. Passphrases are bounded to 4096 raw bytes,
+never normalized or placed in error text, and the consumed buffer is cleared.
+The future CLI must supply a bounded non-TTY input stream; it must never echo a
+passphrase or pass it through arguments, environment variables or disk files.
+
+These are tests with an injected disk/mapping adapter, including partial failures
+and relaunch retries. No Linux adapter, unlock CLI, real LUKS format/mount or
+hardware proof is supplied by this component. Adapter identity, serialization,
+cryptsetup behavior and mount restrictions still require independent validation.
