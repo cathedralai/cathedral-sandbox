@@ -26,7 +26,7 @@ permissions:
 jobs:
   unit:
     name: Generated unit under real systemd (root, ${{ matrix.os }})
-    # 26.04 ships systemd 259, the version of the host where rehearsal B run 3 failed; 24.04 has 255.
+    # 26.04 ships systemd 259, the version of the host where rehearsal B run 3 failed; 24.04 has 255. The unwrapped unit fails on both.
     strategy:
       fail-fast: false
       matrix:

@@ -754,11 +754,11 @@ def verify_isolation(ctx: Ctx) -> None:
 # ---------------------------------------------------------------- unit text (5.8)
 
 # Every `+` hook of the custom unit runs in the host's mount namespace. systemd runs a `+` command with
-# full privileges, but on systemd 259 still inside the unit's own mount namespace, and this unit's namespace
+# full privileges, but still inside the unit's own mount namespace (seen in CI on systemd 255 and 259), and this unit's namespace
 # has TemporaryFileSystem=/srv:ro (so the guest user sees no other hotel or launch). Seen from there, check-start
 # finds an empty /srv and no host journal, and exited cannot append to it (EROFS). Those two are the real
 # breakage (rehearsal B, run 3, 27 Nov). A plain `+` hook can still write /run/lock and use netlink on 259
-# (probed with the full lockdown), so custom-net.sh and the /dev/kvm wait, modprobe and rm lines are wrapped for
+# (probed with the full lockdown; the namespace is the part that bites), so custom-net.sh and the /dev/kvm wait, modprobe and rm lines are wrapped for
 # consistency, one rule for every host hook, not because they failed.
 # `nsenter --mount=/proc/1/ns/mnt` puts only the hook, never the guest process, in PID 1's mount namespace
 # (probed on systemd 259 with the unit's sandbox: the wrapped hook saw /srv, the main process did not).

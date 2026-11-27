@@ -165,7 +165,7 @@ def test_unit_confinement(host):
         f"ExecStart=/usr/bin/python3 -I {mod.LIBDIR}/launch-custom-guest.py {ctx.d}"]
     assert f"ExecStopPost=+{mod.HOST_NS} {mod.LIBDIR}/custom-guest-host.sh exited --hotel {HOTEL} --launch-id {LAUNCH}" in lines
     # Every + hook enters the host mount namespace: the unit's own (TemporaryFileSystem=/srv:ro, ProtectSystem=strict)
-    # hides the host journal and makes /run and /var read-only, from systemd 259 on, even for + commands.
+    # hides the host journal from a + hook as well, on systemd 255 and 259 alike.
     assert mod.HOST_NS == "/usr/bin/nsenter --mount=/proc/1/ns/mnt --"
     privileged = [ln for ln in text.splitlines() if ln.startswith(("ExecStartPre=+", "ExecStopPost=+"))]
     assert len(privileged) == 6
