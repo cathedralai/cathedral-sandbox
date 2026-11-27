@@ -15,6 +15,7 @@ vm_measure.py, so a host-edited copy of them cannot reach QEMU.
 
 Every launch refuses (exit 78, and the unit does not restart) unless HOST_CONFIG exists and
 lists the VM's bundle: a host without it runs no VM, as the stub before this file did.
+The vCPU model is always snp_qemu.VM_CPU_MODEL (EPYC-v4), with no flag or key to change it.
 
 -no-reboot: a guest reset ends QEMU. The launcher stays QEMU's parent and reads SHUTDOWN
 events on a second QMP socket: a reset exits 75 (the unit's RestartForceExitStatus, so the
@@ -127,6 +128,8 @@ def build_argv(d: str) -> list[str]:
     manifest, manifest_raw = vm_measure.read_manifest(Path(p["bundle"]))
     if hashlib.sha256(manifest_raw).hexdigest() != v["bundle"]:
         raise LaunchError("the bundle manifest is not the one its directory names")
+    if manifest["cpu_model"] != snp_qemu.VM_CPU_MODEL:
+        raise LaunchError(f"the bundle was measured for {manifest['cpu_model']}, not {snp_qemu.VM_CPU_MODEL}")
     with open(p["identity"], "rb") as f:
         identity_raw = f.read(DOC_MAX + 1)
     identity = vm_measure.parse_identity(identity_raw)
@@ -149,8 +152,8 @@ def build_argv(d: str) -> list[str]:
     # The link in the kit's format (launch-guest.sh): "<host ip> <guest ip>", one argv element.
     devices += ["-fw_cfg", f"name={FW_CFG_NAMES[0]},file={p['identity']}",
                 "-fw_cfg", f"name={FW_CFG_NAMES[1]},string={v['host_ip']} {v['guest_ip']}"]
-    argv = snp_qemu.snp_argv(
-        name=f"cathedral-vm-{v['name']}", cpu_model=manifest["cpu_model"], vcpus=v["vcpus"], mem_gib=v["mem_gib"],
+    argv = snp_qemu.sealed_vm_argv(
+        name=f"cathedral-vm-{v['name']}", vcpus=v["vcpus"], mem_gib=v["mem_gib"],
         host_data_b64=hd, ovmf=os.path.join(p["bundle"], "OVMF.amdsev.fd"),
         kernel=os.path.join(p["bundle"], "vmlinuz"), initrd=os.path.join(p["bundle"], "initrd.cpio.zst"),
         cmdline=line, devices=devices, qmp_sockets=[p["qmp"], p["events"]])
@@ -161,6 +164,8 @@ def build_argv(d: str) -> list[str]:
 def check_argv(argv: list[str], d: str, bundle: str) -> None:
     """The shared SNP property, plus this launcher's own: three drives, two fw_cfg names, one tap."""
     snp_qemu.check_snp_argv(argv)
+    if snp_qemu.values_of(argv, "-cpu") != [snp_qemu.VM_CPU_MODEL]:
+        raise LaunchError(f"a sealed VM runs only the {snp_qemu.VM_CPU_MODEL} vCPU model")
     p = paths_of(d, bundle)
     fw = [x.split(",", 1)[0] for x in snp_qemu.values_of(argv, "-fw_cfg")]
     if fw != [f"name={n}" for n in FW_CFG_NAMES]:

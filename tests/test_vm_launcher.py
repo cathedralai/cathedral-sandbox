@@ -114,7 +114,7 @@ def test_golden_argv(site):
     line = VM.CMDLINE_TEMPLATE_V1.replace("{identity_sha256}", hashlib.sha256(ident).hexdigest())
     assert L.build_argv(str(d)) == [
         "/usr/bin/qemu-system-x86_64", "-no-user-config", "-nodefaults", "-no-reboot", "-name", "cathedral-vm-vm1",
-        "-enable-kvm", "-cpu", "EPYC-Genoa-v1", "-smp", "2", "-m", "4G",
+        "-enable-kvm", "-cpu", "EPYC-v4", "-smp", "2", "-m", "4G",
         "-machine", "q35,confidential-guest-support=sev0,memory-backend=ram1",
         "-object", "memory-backend-memfd,id=ram1,size=4G,share=true,prealloc=false",
         "-object", f"sev-snp-guest,id=sev0,policy=0x30000,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on,host-data={hd}",
@@ -139,6 +139,7 @@ def test_golden_argv(site):
 
 # A vm.env key, an env name or an argument that reads as a way out of SNP.
 HOSTILE_ENV = {"VM_PLAIN": "1", "VM_SNP": "0", "VM_SEALED": "0", "VM_MACHINE": "pc", "VM_POLICY": "0x0",
+               "VM_CPU_MODEL": "EPYC-Genoa-v1", "CPU_MODEL": "host", "VM_CPU": "host",
                "VM_KERNEL_HASHES": "off", "QEMU": "/bin/true", "VM_SMBIOS": "type=11,value=x",
                "VM_EXTRA_ARGS": "-machine pc"}
 
@@ -149,7 +150,8 @@ def test_property_every_argv_keeps_the_snp_object(site, monkeypatch):
         d = site.vm(f"vm{n}", family, cpus, mem, slot)
         plain = L.build_argv(str(d))
         assert_snp(plain)
-        assert opt(plain, "-cpu") == [VM.CPU_MODELS[family]] and opt(plain, "-smp") == [str(cpus)]
+        # Toby 12:19Z: EPYC-v4 is the one vCPU model, on Genoa and Turin hosts alike.
+        assert opt(plain, "-cpu") == ["EPYC-v4"] and opt(plain, "-smp") == [str(cpus)]
         assert [f.split(",", 1)[0] for f in opt(plain, "-fw_cfg")] == [
             "name=opt/cathedral/vm-identity.json", "name=opt/cathedral/link"]
         # The same VM with hostile vm.env keys and process env: byte for byte the same argv.
@@ -182,6 +184,8 @@ def test_no_flag_changes_the_argv(site, args):
     lambda a: a + ["-object", "sev-guest,id=sev1,policy=0x1"],
     lambda a: [x.replace(",iommu_platform=true", "") for x in a],
     lambda a: a + ["-netdev", "user,id=net1"],
+    lambda a: [x.replace("EPYC-v4", "EPYC-Genoa-v1") for x in a],
+    lambda a: [x.replace("EPYC-v4", "host") for x in a],
 ])
 def test_check_argv_refuses_every_mutation(site, mutate):
     d = site.vm()
@@ -191,10 +195,22 @@ def test_check_argv_refuses_every_mutation(site, mutate):
         L.check_argv(mutate(list(argv)), str(d), site.bundle["genoa"])
 
 
+def test_the_vm_cpu_model_is_epyc_v4_and_not_a_parameter():
+    assert SNP.VM_CPU_MODEL == VM.CPU_MODEL == "EPYC-v4"  # launch and expected measurement agree
+    assert set(VM.CPU_MODELS.values()) == {"EPYC-v4"}
+    with pytest.raises(SNP.SnpArgvError):
+        SNP.sealed_vm_argv(cpu_model="EPYC-Genoa-v1", name="x", vcpus=1, mem_gib=1, host_data_b64="A" * 43 + "=",
+                           ovmf="o", kernel="k", initrd="i", cmdline="c", devices=[], qmp_sockets=[])
+    src = LAUNCHER.read_text()
+    assert "EPYC-" not in src.replace("(EPYC-v4)", "") and "cpu_model=" not in src
+
+
 def test_both_launchers_build_through_one_snp_function():
+    assert "snp_qemu.sealed_vm_argv(" in LAUNCHER.read_text()
+    assert "snp_qemu.snp_argv(" in CUSTOM_LAUNCHER.read_text()
     for path in (LAUNCHER, CUSTOM_LAUNCHER):
         src = path.read_text()
-        assert "snp_qemu.snp_argv(" in src and "snp_qemu.check_snp_argv(" in src, path.name
+        assert "snp_qemu.check_snp_argv(" in src, path.name
         assert '"sev-snp-guest' not in src and "'sev-snp-guest" not in src, path.name  # no SNP object of its own
     # The custom guest reaches the same file through a link, and installs it beside its launcher.
     assert (REPO / "ops" / "custom-guest" / "snp_qemu.py").resolve() == (KIT / "snp_qemu.py").resolve()

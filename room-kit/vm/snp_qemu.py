@@ -18,7 +18,12 @@ import re
 QEMU = "/usr/bin/qemu-system-x86_64"
 POLICY = "0x30000"
 MACHINE = "q35,confidential-guest-support=sev0,memory-backend=ram1"
+# Models a custom guest manifest may name (the dedicated product measures its own).
 CPU_MODELS = frozenset({"EPYC-Genoa-v1", "EPYC-v4"})
+# The one vCPU model of a sealed customer VM, on Genoa and Turin hosts alike (decision, Toby
+# 27 Nov 12:19Z: until the measurement tool supports Turin). vm_measure.CPU_MODEL is the same
+# value, so the expected measurement and the launch use one model; a test pins both.
+VM_CPU_MODEL = "EPYC-v4"
 SANDBOX = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
 # Options no Cathedral SNP launch may carry: host-set SMBIOS (credentials, cloud-init ds=),
 # legacy drives that bypass -drive checks, and -runas (QEMU would start as root first).
@@ -60,6 +65,13 @@ def snp_argv(*, name: str, cpu_model: str, vcpus: int, mem_gib: int, host_data_b
              "-sandbox", SANDBOX]
     check_snp_argv(argv)
     return argv
+
+
+def sealed_vm_argv(**kwargs) -> list[str]:
+    """snp_argv for a sealed customer VM: the CPU model is VM_CPU_MODEL, never a parameter."""
+    if "cpu_model" in kwargs:
+        raise SnpArgvError("a sealed VM's CPU model is fixed")
+    return snp_argv(cpu_model=VM_CPU_MODEL, **kwargs)
 
 
 def values_of(argv: list[str], option: str) -> list[str]:
