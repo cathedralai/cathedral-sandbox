@@ -7,6 +7,8 @@
 //	POST   /v1/broker/vms/{id}/start       optional {"generation": n}
 //	POST   /v1/broker/vms/{id}/stop        {"generation": n}
 //	POST   /v1/broker/vms/{id}/reboot      optional {"generation": n}
+//	POST   /v1/broker/vms/{id}/rebundle    {"generation", "from", "to", "expect_revision", "op_id"} (stopped VM)
+//	POST   /v1/broker/vms/{id}/rewrap      {"generation", "answer": {...}} (running VM; the answer goes on stdin)
 //	DELETE /v1/broker/vms/{id}             {"confirm": "<id>"}
 //	GET    /v1/broker/vms/{id}/runs/{n}    the closed run n: started_at, stopped_at (vm_history.go)
 //
@@ -362,6 +364,10 @@ func (b *broker) handleVMs(w http.ResponseWriter, r *http.Request, rest string) 
 		b.stopVM(w, r, id)
 	case action == "reboot" && r.Method == "POST":
 		b.rebootVM(w, r, id)
+	case action == "rebundle" && r.Method == "POST":
+		b.rebundleVM(w, r, id)
+	case action == "rewrap" && r.Method == "POST":
+		b.rewrapVM(w, r, id)
 	default:
 		writeErr(w, 404, "route_not_found", "no such VM route")
 	}
@@ -422,13 +428,18 @@ func (s *vmStore) call(ctx context.Context, h vmHostConfig, timeout time.Duratio
 		log.Printf("vms: host %s: %s: exit %d", h.ID, args[0], code)
 		return nil, &vmCallErr{502, "vm_host_refused", fmt.Sprintf("the VM host refused %s (exit %d)", args[0], code), false}
 	}
+	return vmHostDoc(h, args[0], out)
+}
+
+// vmHostDoc decodes the JSON line of a host answer that exited 0.
+func vmHostDoc(h vmHostConfig, verb string, out []byte) (map[string]any, *vmCallErr) {
 	var doc map[string]any
 	line := bytes.TrimSpace(out)
 	if i := bytes.LastIndexByte(line, '\n'); i >= 0 {
 		line = line[i+1:]
 	}
 	if err := json.Unmarshal(line, &doc); err != nil || doc == nil {
-		log.Printf("vms: host %s: %s: answer is not one JSON object", h.ID, args[0])
+		log.Printf("vms: host %s: %s: answer is not one JSON object", h.ID, verb)
 		return nil, &vmCallErr{502, "vm_host_bad_answer", "the VM host's answer is not one JSON object", true}
 	}
 	return doc, nil
