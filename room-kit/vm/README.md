@@ -278,6 +278,7 @@ proxy; an empty known_hosts; ed25519 host keys only), runs
 
 | Check | Refusal code |
 |---|---|
+| the identity names the SSH key you gave at create (`--create-key`, default `<--ssh-key>.pub`), before any connection | `identity_key_mismatch`; no readable key: `create_key` (exit 2) |
 | bundle and identity agree (CPU family, base root) | `bundle_cpu_family` (exit 2), `identity_bundle_mismatch` |
 | report version 3, 4 or 5 (2 has no CPUID: refused) | `report_version` |
 | CPU family, and the exact CPUID its floor is approved for | `cpu_family_mismatch`, `cpuid_unapproved` |
@@ -295,6 +296,18 @@ live proof. `--min-tcb` may only raise a floor.
 verify_vm.py verify --bundle B --identity vm-identity.json --vcpus 2 --cpu-family genoa \
   --ark-sha256 "$AMD_ARK_SHA256" --host <host> --port <ssh port> --ssh-key ~/.ssh/id_ed25519
 ```
+
+`AMD_ARK_SHA256` is the SHA-256 of the AMD root certificate (ARK) for the VM's product,
+`Genoa` or `Turin`. Fetch AMD's chain yourself and compute it locally; never take it from
+the VM, the report or the API. The chain is the ASK, then the ARK:
+
+```
+curl -fsS -o chain.pem https://kdsintf.amd.com/vcek/v1/Genoa/cert_chain   # or .../Turin/cert_chain
+awk '/BEGIN CERTIFICATE/{n++} n==2' chain.pem | openssl x509 -outform DER | openssl dgst -sha256 -r
+```
+
+It should equal the pin for that product in `broker/amd_chain.go` (Genoa `4c6598d1...`,
+Turin `1f084161...`); a mismatch is a reason to stop, not to pick one.
 
 One JSON line: `PASS` (exit 0), `FAIL` with a code (exit 1, the VM's evidence was refused)
 or `ERROR` with a code (exit 2, the check could not run). The guest side of the command

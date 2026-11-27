@@ -11,9 +11,12 @@ checks the SNP report the VM returns on that same connection:
   vm-identity.json, never values from the VM, the host or the API;
 - POLICY 0x30000, VMPL 0, a VCEK signer, an approved CPU and its firmware floor.
 
+Before any connection, the identity must name the SSH key you gave at create: the host writes
+vm-identity.json, and whoever holds the key it names is root at first boot.
+
   verify_vm.py verify --bundle DIR --identity vm-identity.json --vcpus N --cpu-family genoa|turin
-                      --ark-sha256 HEX --host HOST --port PORT --ssh-key FILE [--user cathedral]
-                      [--min-tcb SPEC] [--ark-crl FILE] [--kds-cache DIR] [--tool PATH]
+                      --ark-sha256 HEX --host HOST --port PORT --ssh-key FILE [--create-key FILE.pub]
+                      [--user cathedral] [--min-tcb SPEC] [--ark-crl FILE] [--kds-cache DIR] [--tool PATH]
 
 One JSON line on stdout. Exit 0 PASS; 1 FAIL (the VM's evidence was refused); 2 ERROR (the
 check could not run: local inputs, sev-snp-measure, SSH or AMD KDS unreachable).
@@ -79,7 +82,7 @@ APPROVED_CPUS = {
     # proof. CPUID of our Genoa hotel reports (snpverify/testdata/attestation-library.json).
     "genoa": {"cpuid": (0x19, 0x11, 0x01), "floor": {"bl": 12, "tee": 0, "snp": 30, "ucode": 88}},
 }
-CHECKS = ("bundle and identity", "SSH connection host key", "report version", "CPU family and stepping",
+CHECKS = ("identity names your create key", "bundle and identity", "SSH connection host key", "report version", "CPU family and stepping",
           "AMD chain and report signature", "REPORT_DATA: challenge and SSH host key", "POLICY 0x30000",
           "VMPL 0", "VCEK signer, chip key not masked", "TCB floor", "MEASUREMENT", "HOST_DATA")
 DOES_NOT_PROVE = [
@@ -150,6 +153,28 @@ def expected_values(bundle: Path, identity_raw: bytes, vcpus: int, cpu_family: s
     return values
 
 
+def identity_key(identity_raw: bytes, create_key: str) -> dict:
+    """The identity's first-boot SSH key must be the public key the customer gave at create.
+
+    The host writes vm-identity.json at create. An identity naming the operator's key would
+    boot a VM, measured and attested like any other, whose root at first boot is the operator,
+    who could plant anything and then add the customer's key. MEASUREMENT and HOST_DATA only
+    prove which identity booted, so this comparison is what ties that identity to the customer."""
+    try:
+        identity = vm_measure.parse_identity(identity_raw)
+    except vm_measure.Refusal as exc:
+        raise CannotCheck("identity_invalid", str(exc)) from None
+    try:
+        given = vm_measure.ssh_public_key(create_key)
+    except vm_measure.Refusal as exc:
+        raise CannotCheck("create_key", f"--create-key: {exc}") from None
+    need(identity["ssh_public_key"] == given, "identity_key_mismatch",
+         "the identity names another first-boot SSH key than the one you gave at create")
+    digest = hashlib.sha256(base64.b64decode(given.split()[1])).digest()
+    # The fingerprint ssh-keygen -l prints: SHA256 of the key blob, base64 without padding.
+    return {"key": given, "sha256": "SHA256:" + base64.b64encode(digest).decode().rstrip("=")}
+
+
 def floor_for(cpu_family: str, specs: list[str] | None) -> dict[str, int]:
     """The approved floor, or a --min-tcb for this family that raises it (never lowers it)."""
     floor = dict(APPROVED_CPUS[cpu_family]["floor"])
@@ -184,7 +209,11 @@ def endpoint(host: str, port: int) -> str:
 
 def ssh_argv(host: str, port: int, user: str, ssh_key: str, known_hosts: Path, challenge: bytes) -> list[str]:
     """One connection, no user or system config, no agent, mux or proxy, ed25519 host keys only.
-    accept-new on an empty file records the key only after OpenSSH verified the KEX signature."""
+
+    accept-new on an empty known_hosts: OpenSSH writes the server's key there before it has
+    verified the KEX signature. That is safe here because a failed verification makes ssh exit
+    255, and exchange() refuses any nonzero exit before it reads the file. The pin PR must keep
+    a host key only from a run that exited 0, for the same reason."""
     endpoint(host, port)
     need(type(user) is str and USER_RE.fullmatch(user) is not None, "ssh_target", "--user is invalid", CannotCheck)
     need(type(challenge) is bytes and len(challenge) == 32, "challenge", "the challenge must be 32 bytes", CannotCheck)
@@ -328,7 +357,11 @@ def parse_answer(raw: bytes) -> bytes:
 def check_report(report: bytes, *, expected: dict, report_data_bytes: bytes, cpu_family: str, floor: dict,
                  ark_sha256: str, cache: str, ark_crl: bytes | None) -> dict:
     """Every check of spec r3 6.4 on one report, in order. The AMD chain comes before the field
-    checks, so a refusal named after a field is about a report AMD signed."""
+    checks, so a refusal named after a field is about a report AMD signed.
+
+    The version, product and CPUID are read from the unsigned bytes first only to choose the
+    chain (the product's KDS path and TCB layout) and the floor. They can only refuse: a forged
+    value either names a chain that does not sign the report or fails the checks after it."""
     rep = vr.parse_report(report)
     version = rep["version"]
     need(version in REPORT_VERSIONS, "report_version",
@@ -374,13 +407,14 @@ def check_report(report: bytes, *, expected: dict, report_data_bytes: bytes, cpu
             "amd": amd}
 
 
-def verify(*, bundle: Path, identity_raw: bytes, vcpus: int, cpu_family: str, ark_sha256: str, host: str,
-           port: int, user: str, ssh_key: str, floor: dict, cache: str, ark_crl: bytes | None,
+def verify(*, bundle: Path, identity_raw: bytes, create_key: str, vcpus: int, cpu_family: str, ark_sha256: str,
+           host: str, port: int, user: str, ssh_key: str, floor: dict, cache: str, ark_crl: bytes | None,
            tool: str | None, exchange=exchange) -> dict:
     """The PASS verdict, or Refused / CannotCheck naming the first check that did not pass."""
     need(type(ark_sha256) is str and HEX64_RE.fullmatch(ark_sha256.lower()) is not None, "ark_sha256",
          "--ark-sha256 must be 64 hex characters", CannotCheck)
     host = host.lower() if type(host) is str else host  # OpenSSH records the host name lowercased
+    key = identity_key(identity_raw, create_key)  # before any connection
     expected = expected_values(bundle, identity_raw, vcpus, cpu_family, tool)
     challenge = new_challenge()
     answer, host_blob = exchange(host, port, user, ssh_key, challenge)
@@ -389,7 +423,7 @@ def verify(*, bundle: Path, identity_raw: bytes, vcpus: int, cpu_family: str, ar
                            floor=floor, ark_sha256=ark_sha256.lower(), cache=cache, ark_crl=ark_crl)
     return {"schema": SCHEMA, "verdict": "PASS", "vm_id": expected["vm_id"],
             "identity_sha256": expected["identity_sha256"], "bundle": expected["bundle"],
-            "cpu_family": cpu_family, "vcpus": vcpus, "challenge_hex": challenge.hex(),
+            "cpu_family": cpu_family, "vcpus": vcpus, "challenge_hex": challenge.hex(), "identity_key": key,
             "ssh": {"host": host, "port": port, "user": user, "channel_binding": "verified",
                     "host_key": "ssh-ed25519 " + base64.b64encode(host_blob).decode()},
             **checked, "checks": list(CHECKS), "chip_id_pin": "not_checked", "does_not_prove": DOES_NOT_PROVE}
@@ -419,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--host", required=True)
     p.add_argument("--port", required=True, type=int, help="the VM's SSH port")
     p.add_argument("--ssh-key", required=True, help="your SSH private key file for the VM")
+    p.add_argument("--create-key", help="the public key you gave at create (default: <--ssh-key>.pub)")
     p.add_argument("--user", default=GUEST_USER)
     p.add_argument("--min-tcb", action="append", help="raise the built-in floor: " + vr.MIN_TCB_HELP)
     p.add_argument("--ark-crl", help="a current AMD KDS DER CRL for offline use; otherwise fetched live")
@@ -433,8 +468,13 @@ def main(argv: list[str] | None = None) -> int:
         need(args.command == "verify", "not_available", "verify_vm.py pin (spec 7.5) is not in this version",
              CannotCheck)
         identity_raw = _read_limited(args.identity, vm_measure.DOC_MAX, "identity_invalid")
+        create_raw = _read_limited(args.create_key or args.ssh_key + ".pub", vm_measure.DOC_MAX, "create_key")
+        try:
+            create_key = create_raw.decode("ascii")
+        except UnicodeDecodeError:
+            raise CannotCheck("create_key", "--create-key: not an ASCII public key file") from None
         crl = _read_limited(args.ark_crl, CRL_MAX, "ark_crl") if args.ark_crl else None
-        result = verify(bundle=Path(args.bundle), identity_raw=identity_raw, vcpus=args.vcpus,
+        result = verify(bundle=Path(args.bundle), identity_raw=identity_raw, create_key=create_key, vcpus=args.vcpus,
                         cpu_family=args.cpu_family, ark_sha256=args.ark_sha256, host=args.host, port=args.port,
                         user=args.user, ssh_key=args.ssh_key, floor=floor_for(args.cpu_family, args.min_tcb),
                         cache=args.kds_cache, ark_crl=crl, tool=args.tool)
@@ -442,6 +482,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"schema": SCHEMA, "verdict": exc.verdict, "code": exc.code, "reason": str(exc)},
                          sort_keys=True))
         return exc.exit_code
+    except Exception as exc:  # noqa: BLE001 - anything unforeseen is "could not check", never a PASS
+        print(json.dumps({"schema": SCHEMA, "verdict": "ERROR", "code": "unexpected_error",
+                          "reason": f"{type(exc).__name__}: {str(exc)[:200]}"}, sort_keys=True))
+        return 2
     print(json.dumps(result, sort_keys=True))
     return 0
 

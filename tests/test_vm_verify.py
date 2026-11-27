@@ -14,6 +14,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -167,18 +169,23 @@ print(TABLE.get("%d/%s" % (vcpus, identity)) or hashlib.sha384(("%d|" % vcpus + 
 
 @pytest.fixture
 def files(tmp_path: Path) -> dict:
-    """Per family: the vector bundle directory. Also identity a, a fake sev-snp-measure and a KDS cache."""
+    """Per family: the vector bundle directory. Also identity a, the customer's key pair files
+    (--ssh-key and its .pub, the key identity a names), a fake sev-snp-measure and a KDS cache."""
     table = {f"{m['vcpus']}/{IDS[m['identity']]['identity_sha256']}": m["expected_measurement"]
              for m in VEC["measurements"]}
     tool = tmp_path / "fake-sev-snp-measure"
     tool.write_text(FAKE_TOOL.format(python=sys.executable, table=table))
     tool.chmod(0o755)
+    # The vector key has no private half, and no test runs a real ssh: the private file is a
+    # placeholder, and its .pub is the key identity a names, as the customer's would be.
     key = tmp_path / "id_ed25519"
-    key.write_text("not a key: the fake guest never reads it\n")
+    key.write_text("placeholder private key: only a real ssh would read it\n")
+    create_key = IDS["a"]["ssh_key_line"] + "\n"
+    Path(str(key) + ".pub").write_text(create_key)
     return {"genoa": support.materialize(VEC, tmp_path / "bundle-genoa", "genoa"),
             "turin": support.materialize(VEC, tmp_path / "bundle-turin", "turin"),
             "identity": IDS["a"]["identity_utf8"].encode("ascii"), "tool": str(tool), "key": str(key),
-            "cache": tmp_path / "kds"}
+            "create_key": create_key, "cache": tmp_path / "kds"}
 
 
 class Guest:
@@ -205,7 +212,8 @@ class Guest:
 
 
 def run(files: dict, family: str, guest, **override) -> dict:
-    kwargs = {"bundle": files[family], "identity_raw": files["identity"], "vcpus": 4, "cpu_family": family,
+    kwargs = {"bundle": files[family], "identity_raw": files["identity"], "create_key": files["create_key"],
+              "vcpus": 4, "cpu_family": family,
               "ark_sha256": ark_pin(family), "host": "203.0.113.10", "port": 22001, "user": "cathedral",
               "ssh_key": files["key"], "floor": vv.floor_for(family, None), "cache": str(files["cache"]),
               "ark_crl": crl(family), "tool": files["tool"], "exchange": guest}
@@ -239,6 +247,34 @@ def test_pass_on_both_families_and_report_versions_3_to_5(files, family, version
     challenge = guest.seen[0][4]
     assert len(challenge) == 32 and result["challenge_hex"] == challenge.hex()
     assert result["chip_id_pin"] == "not_checked"
+    key = " ".join(IDS["a"]["ssh_key_line"].split()[:2])
+    assert result["identity_key"]["key"] == key == json.loads(files["identity"])["ssh_public_key"]
+
+
+def test_identity_key_fingerprint_is_the_one_ssh_keygen_prints(files):
+    keygen = shutil.which("ssh-keygen")
+    if keygen is None:
+        pytest.skip("ssh-keygen is not installed")
+    shown = subprocess.run([keygen, "-l", "-E", "sha256", "-f", files["key"] + ".pub"], capture_output=True,
+                           text=True, check=True).stdout.split()[1]
+    assert vv.identity_key(files["identity"], files["create_key"])["sha256"] == shown
+
+
+def test_identity_naming_another_key_is_refused_before_any_connection(files):
+    """The host wrote an identity naming its own key (vector identity b's), then added the
+    customer's key in the guest: the report would match that identity, so only this stops it."""
+    guest = Guest("genoa", files["cache"], identity="b")
+    exc = refused(files, "genoa", guest, identity_raw=IDS["b"]["identity_utf8"].encode("ascii"))
+    assert exc.code == "identity_key_mismatch" and exc.exit_code == 1 and guest.seen == []
+    exc = refused(files, "genoa", guest, create_key=IDS["b"]["ssh_key_line"])
+    assert exc.code == "identity_key_mismatch" and guest.seen == []
+
+
+@pytest.mark.parametrize("create_key", ["", "ssh-ed25519 not-base64", "two\nlines\n", "ssh-dss AAAA"])
+def test_unreadable_create_key_cannot_be_checked(files, create_key):
+    guest = Guest("genoa", files["cache"])
+    exc = refused(files, "genoa", guest, create_key=create_key)
+    assert isinstance(exc, vv.CannotCheck) and exc.code == "create_key" and guest.seen == []
 
 
 def test_each_run_draws_a_new_challenge(files):
@@ -522,6 +558,38 @@ def test_cli_ssh_failure_exits_2(cli, monkeypatch):
     code, result = cli()
     assert code == 2 and result["verdict"] == "ERROR" and result["code"] == "ssh_failed"
     assert "Connection refused" in result["reason"]
+
+
+def test_cli_reads_the_create_key_beside_the_ssh_key_by_default(cli):
+    code, result = cli()
+    assert code == 0 and result["identity_key"]["key"] == " ".join(IDS["a"]["ssh_key_line"].split()[:2])
+
+
+def test_cli_without_a_create_key_cannot_check_and_connects_to_nothing(cli, files, tmp_path):
+    lone = tmp_path / "lone" / "id_ed25519"
+    lone.parent.mkdir()
+    lone.write_text(Path(files["key"]).read_text())
+    code, result = cli("--ssh-key", str(lone))
+    assert code == 2 and result["verdict"] == "ERROR" and result["code"] == "create_key"
+    assert not cli.argv_file.exists()
+
+
+def test_cli_create_key_other_than_the_identitys_is_refused_before_ssh(cli, tmp_path):
+    other = tmp_path / "other.pub"
+    other.write_text(IDS["b"]["ssh_key_line"] + "\n")
+    code, result = cli("--create-key", str(other))
+    assert code == 1 and result["verdict"] == "FAIL" and result["code"] == "identity_key_mismatch"
+    assert not cli.argv_file.exists()
+
+
+def test_cli_unexpected_exception_is_could_not_check(cli, monkeypatch):
+    def broken(*args, **kwargs):
+        raise TypeError("the ARK public key is not RSA")
+
+    monkeypatch.setattr(vv.vr, "verify_amd", broken)
+    code, result = cli()
+    assert code == 2 and result["verdict"] == "ERROR" and result["code"] == "unexpected_error"
+    assert result["reason"].startswith("TypeError: ")
 
 
 def test_cli_pin_is_reserved(capsys):
