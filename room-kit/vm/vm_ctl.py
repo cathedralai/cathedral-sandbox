@@ -494,6 +494,45 @@ def paid_refusal(a: dict, now: int) -> Refusal | None:
     return None
 
 
+# ---- pre-launch gates (spec r2 8.3, #788) ---------------------------------------------
+
+GATE_WAIT = 90  # gate 13 reads every bundle file; the broker gives start 2 min in all
+
+
+def gates_command() -> str:
+    # VM_GATES stands in for the entry in tests, as PATH does for systemctl.
+    return os.environ.get("VM_GATES") or str(KIT / "vm-gates.sh")
+
+
+def gate_refusal(name: str) -> Refusal | None:
+    """`vm-gates.sh check <name>`: None when every gate passes, else the start refusal.
+
+    A gate's error and exit code (10 to 18, vm_gates.EXIT) pass through unchanged, so
+    sev_platform_changed is exit 17 and sev_state_unavailable exit 18. The broker answers every
+    exit but 3 and 4 with 502 vm_host_refused and keeps the VM stopped. Anything else (1
+    internal, 2 usage, a crash, a timeout, an answer that does not match its code) refuses as
+    gates_failed, exit 1: no gate result fails open."""
+    import vm_gates
+    try:
+        p = subprocess.run([gates_command(), "check", name], capture_output=True, text=True,
+                           timeout=GATE_WAIT)
+    except subprocess.TimeoutExpired:
+        return Refusal("gates_failed", f"the pre-launch gates did not answer in {GATE_WAIT} s", 1)
+    except OSError as e:
+        return Refusal("gates_failed", f"the pre-launch gates did not run: {type(e).__name__}", 1)
+    if p.returncode == 0:
+        return None
+    try:
+        doc = json.loads(p.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        doc = None
+    doc = doc if isinstance(doc, dict) else {}
+    error, code = doc.get("error"), p.returncode
+    if code in vm_gates.EXIT.values() and vm_gates.EXIT.get(error) == code:
+        return Refusal(error, " ".join(str(doc.get("detail", "")).split())[:400], code)
+    return Refusal("gates_failed", f"the pre-launch gates refused (exit {code})", 1)
+
+
 # ---- execution history (AB#992) -------------------------------------------------------
 
 HISTORY_DIR_NAME = ".history"  # a leading dot can never match NAME_RE, so no VM name can collide
@@ -995,14 +1034,15 @@ def unit_mounts(d: Path, env: dict) -> tuple[list[str], list[str], list[str]]:
 
 
 def unit_text(name: str, d: Path, env: dict) -> str:
-    ctl, net, launch = KIT / "vm-ctl.sh", KIT / "vm-net.sh", KIT / "launch-vm.py"
+    ctl, net, launch, gates = KIT / "vm-ctl.sh", KIT / "vm-net.sh", KIT / "launch-vm.py", KIT / "vm-gates.sh"
     vm_env, user = d / "vm.env", env["VM_USER"]
     hidden, read_only, read_write = unit_mounts(d, env)
     tmpfs = "".join(f"TemporaryFileSystem={h}\n" for h in hidden)
     mem = int(env["VM_MEM_GIB"]) + MEM_OVERHEAD_GIB
     # The dedicated unit (D 5.8) as the VM's own user, never root and no -runas. The '+' steps
-    # run as root outside the sandbox: KVM, the credit check, the link with a tap the VM user
-    # owns, stale QMP sockets. Restart: a guest reset exits 75 and relaunches in the same
+    # run as root outside the sandbox: KVM, the credit check, the pre-launch gates (8.3, so a
+    # host boot, a crash restart and a guest reboot pass them too), the link with a tap the VM
+    # user owns, stale QMP sockets. Restart: a guest reset exits 75 and relaunches in the same
     # generation (check-paid needs its start line and no close line, so no new charge); a
     # poweroff exits 0 and stays down; a refused launch exits 78 and stays down.
     return f"""[Unit]
@@ -1020,6 +1060,7 @@ Environment=VM_ROOT={root()}
 ExecStartPre=+-/sbin/modprobe -q kvm_amd
 ExecStartPre=+/bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
 ExecStartPre=+{ctl} check-paid {name}
+ExecStartPre=+{gates} check {name}
 ExecStartPre=+{net} up {vm_env}
 ExecStartPre=+/bin/rm -f {d}/run/qmp.sock {d}/run/events.sock
 ExecStart=/usr/bin/python3 -I {launch} {d}
@@ -1121,7 +1162,7 @@ def sync_selection(name: str, d: Path) -> None:
 def ensure_enforce_timer() -> None:
     svc, timer = unit_dir() / "cathedral-vm-enforce.service", unit_dir() / "cathedral-vm-enforce.timer"
     write_atomic(svc, f"""[Unit]
-Description=Cathedral customer VMs: stop any VM past paid_through
+Description=Cathedral customer VMs: stop any VM past paid_through, compare the SEV status
 [Service]
 Type=oneshot
 Environment=VM_ROOT={root()}
@@ -1129,6 +1170,9 @@ Environment=VM_ROOT={root()}
 # service: a wedged pass would end every later credit cutoff. The pass bounds its own history I/O.
 TimeoutStartSec=180
 ExecStart={KIT / 'vm-ctl.sh'} enforce
+# The SEV status against its baseline (8.3, D 5.9): a change refuses new starts and leaves running
+# VMs alone; its journal line is the alert. '-': the credit cutoff above never depends on it.
+ExecStart=-{KIT / 'vm-gates.sh'} enforce
 """, 0o644)
     write_atomic(timer, """[Unit]
 Description=Cathedral customer VMs: credit cutoff every 30 s
@@ -1306,9 +1350,9 @@ def cmd_start(args: list[str]) -> dict:
         begin(name, d)
         sync_selection(name, d)  # before any gate or launch reads VM_BUNDLE (rebundle cut)
         check_generation(opts, auth_of(d))
-        refusal = paid_refusal(auth_of(d), int(time.time()))
+        refusal = paid_refusal(auth_of(d), int(time.time())) or gate_refusal(name)
         if refusal:
-            raise refusal
+            raise refusal  # a gate refusal leaves no start line, so nothing is billed (8.3)
         # H2: the start line is durable before anything can launch the run.
         g = auth_of(d)["generation"]
         h = read_history(name)
@@ -1451,7 +1495,9 @@ def cmd_reboot(args: list[str]) -> dict:
         if not running and not resume:
             pending.unlink(missing_ok=True)
             raise Refusal("not_running", f"VM {name} is not running", 5)
-        refusal = paid_refusal(a, int(time.time()))
+        # The relaunch passes the gates in ExecStartPre; ask first, so a host that would refuse
+        # it leaves the running VM alone instead of powering it down (8.3).
+        refusal = paid_refusal(a, int(time.time())) or gate_refusal(name)
         if refusal:
             raise refusal
         write_atomic(pending, json.dumps({"generation": g, "at": int(time.time())}) + "\n")

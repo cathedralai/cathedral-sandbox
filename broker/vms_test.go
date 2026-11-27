@@ -1225,3 +1225,33 @@ func TestVMsCreateSkipsHostWithoutSNPAndRefusesNamedOne(t *testing.T) {
 		t.Fatalf("named non-SNP host: %d %v", code, doc)
 	}
 }
+
+// Spec r2 8.3 (#788 gates, wired in vm_ctl start): a gate refusal is the gate's exit code,
+// 17 sev_platform_changed or 18 sev_state_unavailable. The broker answers 502 vm_host_refused,
+// keeps the VM stopped and the authorization, and a later start can still run.
+func TestVMsGateRefusedStartIsHostRefusedAndStaysStopped(t *testing.T) {
+	for _, gate := range []struct {
+		code  int
+		error string
+	}{{17, "sev_platform_changed"}, {18, "sev_state_unavailable"}} {
+		tb := newVMTestBroker(t, true)
+		id := tb.create(t, nil)["id"].(string)
+		base := "/v1/broker/vms/" + id
+		tb.call(t, "operator-key", "POST", base+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 1})
+		tb.host.answer = func([]string) ([]byte, int, error) {
+			return []byte(`{"error":"` + gate.error + `","detail":"x"}` + "\n"), gate.code, nil
+		}
+		st, doc := tb.call(t, "operator-key", "POST", base+"/start", nil)
+		if st != 502 || vmErrCode(doc) != "vm_host_refused" {
+			t.Fatalf("gate %d on start: %d %v", gate.code, st, doc)
+		}
+		tb.host.answer = func([]string) ([]byte, int, error) { return nil, 0, errors.New("down") }
+		if _, one := tb.call(t, "operator-key", "GET", base, nil); one["desired_state"] == "running" || one["desired_state"] == "starting" {
+			t.Fatalf("after gate %d refusal: %v", gate.code, one)
+		}
+		tb.host.answer = nil
+		if st, doc := tb.call(t, "operator-key", "POST", base+"/start", map[string]any{"generation": 1}); st != 200 || doc["desired_state"] != "running" {
+			t.Fatalf("start after the gate passes: %d %v", st, doc)
+		}
+	}
+}

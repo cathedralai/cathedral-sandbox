@@ -20,6 +20,7 @@ and lists the VM's bundle.
 | `vm-ctl.sh` (`vm_ctl.py`) | The control command. One JSON line on stdout per call. |
 | `launch-vm.py` | `ExecStart` of `cathedral-vm-<name>.service`, as the VM's user: QEMU in the foreground, exit 75 on a guest reset, 0 on a poweroff. `--print` shows the argv. |
 | `snp_qemu.py` | The SEV-SNP argv lines and their property check, shared with `ops/custom-guest/launch-custom-guest.py`. |
+| `vm-gates.sh` (`vm_gates.py`) | Pre-launch gates and the host change gate (spec 8.3): `check <name>` before every start and launch, `enforce` on the enforce tick. Exit codes in `vm_gates.py`. |
 | `vm-net.sh up\|down\|check vm.env` | Tap /30 owned by the VM user, NAT out, SSH port forward, isolation. |
 | `vm.env.example` | What `create` writes per VM. |
 | `vm_mailbox.py` | The mailbox disk layout and its strict record, offer and answer parsers (re-wrap). |
@@ -63,7 +64,8 @@ by the exit code alone.
   `/dev/sev`).
 - `cathedral-vm-<name>.service` (spec r2 8.2, the dedicated unit's confinement): root
   steps (`+`) load KVM, wait for `/dev/kvm`, check `paid_through` and the start line,
-  bring the link up with a tap the VM user owns. `TemporaryFileSystem=/srv:ro` (and
+  run the pre-launch gates (`vm-gates.sh check`), bring the link up with a tap the VM
+  user owns. `TemporaryFileSystem=/srv:ro` (and
   `$VM_ROOT` when it is elsewhere) hides every other VM and kit; `BindReadOnlyPaths`
   gives back the kit code, the bundle, `vm.env` and `vm-identity.json`, `BindPaths` the
   two disks and `run/`. `Restart=on-failure`, at most 5 starts in 15 min,
@@ -78,6 +80,15 @@ by the exit code alone.
   listens for QMP events, so no poweroff or reset goes unseen.
 - Root's QMP commands (`stop`, `reboot`, the unit's `ExecStop`) connect as the VM's
   user from inside `run/`, so a link put there reaches nothing that user cannot.
+- Pre-launch gates (`vm-gates.sh check`): `start` runs them after the paid check and
+  before the start line, so a refused start bills nothing; the unit runs them again, so
+  a host boot, a crash restart and a guest reboot pass them too; `reboot` runs them
+  before the powerdown, so a host that would refuse the relaunch leaves the VM running.
+  A gate refusal is the gate's own error and exit code (10 to 18; 17
+  `sev_platform_changed`, 18 `sev_state_unavailable`), which the broker answers with 502
+  `vm_host_refused`, the VM kept stopped. Any other gate answer refuses as
+  `gates_failed`, exit 1. The enforce service runs `vm-gates.sh enforce` after the
+  credit cutoff: a SEV change refuses new starts and leaves running VMs alone.
 - Network: guest `.2` on its own /30 in 10.216.0.0/16, NAT to the internet,
   no access to private ranges or to this host, and one way in: the host's
   `--ssh-port` forwarded to guest port 22.
@@ -248,5 +259,5 @@ Each region is empty or one record (`CVMMBX1\0`, kind, length, sha256, canonical
 
 ## Not here yet
 
-Admission across VMs and kits (VM4), the pre-launch gates and host change gate (VM5),
-the guest side of re-wrap (VM1b, VM2), resize, snapshots.
+Admission across VMs and kits (VM4), the guest side of re-wrap (VM1b, VM2), resize,
+snapshots.
