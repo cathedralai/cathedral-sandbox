@@ -1,6 +1,6 @@
 // Customer VMs on VM hosts (AB#991). Operator key only; off by default.
 //
-//	POST   /v1/broker/vms                  {"account", "vcpus", "mem_gib", "disk_gib", "ssh_public_key", optional "host"}
+//	POST   /v1/broker/vms                  {"account", "vcpus", "mem_gib", "disk_gib", "ssh_public_key", optional "host", optional "request_id"}
 //	GET    /v1/broker/vms                  every VM, merged with its host's list
 //	GET    /v1/broker/vms/{id}             one VM, merged with its host's status
 //	POST   /v1/broker/vms/{id}/authorize   {"paid_through": <unix seconds>, "generation": n}
@@ -39,6 +39,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -102,6 +103,7 @@ var (
 	vmIDRE         = regexp.MustCompile(`^vm-[0-9a-f]{12}$`)
 	vmAccountRE    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 	vmKeyCommentRE = regexp.MustCompile(`^[A-Za-z0-9@._+:=-]{1,100}$`)
+	vmRequestIDRE  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 )
 
 // vmKeyTypes are the SSH public key types a customer may give.
@@ -184,6 +186,11 @@ type vmRecord struct {
 	// LastError: the last host call whose outcome is unknown (timeout,
 	// connection). Cleared by the next confirmed call.
 	LastError string `json:"last_error,omitempty"`
+	// RequestID is the optional create idempotency key (Idempotency-Key header
+	// or request_id body field); RequestHash is the sha256 of the create body
+	// it came with. Both are saved with the record, so they survive a restart.
+	RequestID   string `json:"request_id,omitempty"`
+	RequestHash string `json:"request_hash,omitempty"`
 }
 
 type vmsFileDoc struct {
@@ -702,8 +709,24 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 		DiskGiB      int    `json:"disk_gib"`
 		SSHPublicKey string `json:"ssh_public_key"`
 		Host         string `json:"host"`
+		RequestID    string `json:"request_id"`
 	}
 	if !readVMBody(w, r, &req, false) {
+		return
+	}
+	// Optional idempotency key: the Idempotency-Key header (as the compat
+	// create takes it, compat.go compatIdemLimit) and/or request_id. Both must
+	// agree when both are sent.
+	reqID := req.RequestID
+	if h := r.Header.Get("Idempotency-Key"); h != "" {
+		if reqID != "" && reqID != h {
+			writeErr(w, 400, "invalid_request_id", "Idempotency-Key and request_id differ")
+			return
+		}
+		reqID = h
+	}
+	if reqID != "" && !vmRequestIDRE.MatchString(reqID) {
+		writeErr(w, 400, "invalid_request_id", "request id must be 1 to 128 of letters, digits and _.:-")
 		return
 	}
 	if !vmAccountRE.MatchString(req.Account) {
@@ -727,7 +750,32 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	reqHash := ""
+	if reqID != "" {
+		sum := sha256.Sum256([]byte(strings.Join([]string{req.Account, strconv.Itoa(req.VCPUs), strconv.Itoa(req.MemGiB),
+			strconv.Itoa(req.DiskGiB), key, req.Host}, "\x00")))
+		reqHash = hex.EncodeToString(sum[:])
+	}
+
 	s.mu.Lock()
+	if reqID != "" {
+		for _, old := range s.recs {
+			if old.RequestID != reqID {
+				continue
+			}
+			defer s.mu.Unlock()
+			if old.RequestHash != reqHash {
+				writeErr(w, 409, "idempotency_key_reused", "this request id was used for a different create")
+				return
+			}
+			if s.busy[old.ID] {
+				writeErr(w, 409, "vm_busy", "the create for this request id is still in flight")
+				return
+			}
+			writeJSON(w, 200, s.view(old)) // a replay: the same VM, no second host call, no second hold
+			return
+		}
+	}
 	h, port, ok := s.placeLocked(req.Host, req.VCPUs, req.MemGiB, req.DiskGiB)
 	if !ok {
 		s.mu.Unlock()
@@ -739,7 +787,7 @@ func (b *broker) createVM(w http.ResponseWriter, r *http.Request) {
 		id = s.newID()
 	}
 	rec := &vmRecord{ID: id, Account: req.Account, Host: h.ID, SSHPort: port, VCPUs: req.VCPUs, MemGiB: req.MemGiB, DiskGiB: req.DiskGiB,
-		DesiredState: vmStateCreating, CreatedAt: s.now().Unix()}
+		DesiredState: vmStateCreating, CreatedAt: s.now().Unix(), RequestID: reqID, RequestHash: reqHash}
 	s.recs[id] = rec // holds the port and the capacity while the host works
 	if err := s.saveLocked(); err != nil {
 		delete(s.recs, id)

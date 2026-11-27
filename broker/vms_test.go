@@ -137,6 +137,11 @@ func loadVMTestBroker(t *testing.T, path string) *vmTestBroker {
 
 func (tb *vmTestBroker) call(t *testing.T, key, method, path string, body any) (int, map[string]any) {
 	t.Helper()
+	return tb.callH(t, key, method, path, body, nil)
+}
+
+func (tb *vmTestBroker) callH(t *testing.T, key, method, path string, body any, hdr map[string]string) (int, map[string]any) {
+	t.Helper()
 	var rd *bytes.Reader
 	switch v := body.(type) {
 	case nil:
@@ -150,6 +155,9 @@ func (tb *vmTestBroker) call(t *testing.T, key, method, path string, body any) (
 	req := httptest.NewRequest(method, path, rd)
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
 	tb.b.ServeHTTP(rec, req)
@@ -988,5 +996,134 @@ func TestVMsLostStopOfARunThatRanKeepsItsReceipt(t *testing.T) {
 	}
 	if st, _ := tb.call(t, "operator-key", "POST", "/v1/broker/vms/"+id+"/authorize", map[string]any{"paid_through": tb.now.Unix() + 300, "generation": 2}); st != 200 {
 		t.Fatalf("next run after the receipt: %d", st)
+	}
+}
+
+func vmCreateBody(extra map[string]any) map[string]any {
+	req := map[string]any{"account": "acct-1", "vcpus": 2, "mem_gib": 4, "disk_gib": 20, "ssh_public_key": testED25519Key()}
+	for k, v := range extra {
+		req[k] = v
+	}
+	return req
+}
+
+func countHostCalls(tb *vmTestBroker, cmd string) int {
+	tb.host.mu.Lock()
+	defer tb.host.mu.Unlock()
+	n := 0
+	for _, c := range tb.host.calls {
+		if c[1] == cmd {
+			n++
+		}
+	}
+	return n
+}
+
+// A retried create after a lost reply returns the same VM: no second host
+// create, no second hold of capacity or port (AB#991 S4).
+func TestVMsCreateIdempotentReplayHoldsCapacityOnce(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	hdr := map[string]string{"Idempotency-Key": "req-1"}
+	st, first := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	if st != 201 {
+		t.Fatalf("first create: %d %v", st, first)
+	}
+	st, again := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	if st != 200 || again["id"] != first["id"] || again["ssh_port"] != first["ssh_port"] {
+		t.Fatalf("replay: %d %v want %v", st, again, first)
+	}
+	if n := countHostCalls(tb, "create"); n != 1 {
+		t.Fatalf("host create calls: %d", n)
+	}
+	st, list := tb.call(t, "operator-key", "GET", "/v1/broker/vms", nil)
+	if st != 200 || len(list["vms"].([]any)) != 1 {
+		t.Fatalf("list after replay: %d %v", st, list)
+	}
+	// request_id in the body is the same key; a third VM still gets the next port.
+	st, viaBody := tb.call(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(map[string]any{"request_id": "req-1"}))
+	if st != 200 || viaBody["id"] != first["id"] {
+		t.Fatalf("body request_id replay: %d %v", st, viaBody)
+	}
+	other := tb.create(t, nil)
+	if other["ssh_port"] != float64(22001) {
+		t.Fatalf("second VM port %v: the replay held a port", other["ssh_port"])
+	}
+}
+
+func TestVMsCreateIdempotencyConflicts(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	hdr := map[string]string{"Idempotency-Key": "req-2"}
+	if st, doc := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr); st != 201 {
+		t.Fatalf("create: %d %v", st, doc)
+	}
+	for name, body := range map[string]map[string]any{
+		"size":    {"vcpus": 1},
+		"account": {"account": "acct-2"},
+		"host":    {"host": "vmh-b"},
+	} {
+		st, doc := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(body), hdr)
+		if st != 409 || vmErrCode(doc) != "idempotency_key_reused" {
+			t.Fatalf("%s: %d %v", name, st, doc)
+		}
+	}
+	if n := countHostCalls(tb, "create"); n != 1 {
+		t.Fatalf("host create calls: %d", n)
+	}
+	// header and body disagree, or the id is malformed: 400, nothing created.
+	if st, doc := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(map[string]any{"request_id": "other"}), hdr); st != 400 || vmErrCode(doc) != "invalid_request_id" {
+		t.Fatalf("differing ids: %d %v", st, doc)
+	}
+	if st, doc := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), map[string]string{"Idempotency-Key": "bad key"}); st != 400 || vmErrCode(doc) != "invalid_request_id" {
+		t.Fatalf("bad id: %d %v", st, doc)
+	}
+}
+
+// Without a key, create behaves as before: every call is a new VM.
+func TestVMsCreateWithoutKeyIsNotIdempotent(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	a, b := tb.create(t, nil), tb.create(t, nil)
+	if a["id"] == b["id"] || countHostCalls(tb, "create") != 2 {
+		t.Fatalf("two creates: %v %v", a, b)
+	}
+}
+
+func TestVMsCreateIdempotencyKeySurvivesRestart(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	hdr := map[string]string{"Idempotency-Key": "req-3"}
+	_, first := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	tb2 := loadVMTestBroker(t, tb.cfg)
+	st, again := tb2.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	if st != 200 || again["id"] != first["id"] {
+		t.Fatalf("replay after restart: %d %v want %v", st, again, first)
+	}
+	if n := countHostCalls(tb2, "create"); n != 0 {
+		t.Fatalf("host create after restart: %d", n)
+	}
+	if st, doc := tb2.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(map[string]any{"mem_gib": 2}), hdr); st != 409 {
+		t.Fatalf("conflict after restart: %d %v", st, doc)
+	}
+}
+
+// A create whose host call outcome is unknown stays creating and holds its
+// port; the retry with the same key returns that record instead of a second.
+func TestVMsCreateIdempotentRetryAfterLostHostReply(t *testing.T) {
+	tb := newVMTestBroker(t, true)
+	tb.host.answer = func(args []string) ([]byte, int, error) {
+		if args[0] == "create" {
+			return nil, 0, errors.New("ssh timeout")
+		}
+		return []byte(`{"ok":true}` + "\n"), 0, nil
+	}
+	hdr := map[string]string{"Idempotency-Key": "req-4"}
+	st, doc := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	if st != 502 {
+		t.Fatalf("lost reply: %d %v", st, doc)
+	}
+	st, again := tb.callH(t, "operator-key", "POST", "/v1/broker/vms", vmCreateBody(nil), hdr)
+	if st != 200 || again["desired_state"] != "creating" {
+		t.Fatalf("retry: %d %v", st, again)
+	}
+	if n := countHostCalls(tb, "create"); n != 1 {
+		t.Fatalf("host create calls: %d", n)
 	}
 }
