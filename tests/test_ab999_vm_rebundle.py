@@ -492,12 +492,20 @@ def test_a_sync_failure_after_the_commit_exits_21_and_the_same_op_id_finishes_it
 def test_create_status_and_list_carry_the_exact_identity_document(host):
     """verify_vm.py recomputes the measurement from vm-identity.json, salt included, so the host
     serves its exact text; never a file other than the one launch.json's identity_sha256 names."""
+    site = Site(host)
     code, vm = host.create()
     assert code == 0, vm
     d = host.root / "vm1"
     raw = (d / "vm-identity.json").read_bytes()
     launch = json.loads((d / "launch.json").read_text())
-    for answer in (vm, host.ctl("status", "vm1")[1], host.ctl("list")[1]["vms"][0]):
+    answers = [vm, host.ctl("status", "vm1")[1], host.ctl("list")[1]["vms"][0]]
+    site.ran_once()  # run 1 started and stopped, then run 2 starts: the same document each time
+    answers.append(host.ctl("status", "vm1")[1])
+    assert host.ctl("authorize", "vm1", str(2**33), "2")[0] == 0
+    assert host.ctl("start", "vm1", "--generation", "2")[0] == 0
+    answers.append(host.ctl("status", "vm1")[1])
+    assert [a["state"] for a in answers[-2:]] == ["stopped", "running"]
+    for answer in answers:
         text = answer["identity_document"]
         assert text.encode("ascii") == raw
         assert hashlib.sha256(text.encode("ascii")).hexdigest() == answer["identity_sha256"] \
