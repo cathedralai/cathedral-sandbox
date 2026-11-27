@@ -6,8 +6,8 @@ root.raw, mailbox.raw, authorization.json, stop.json, run/), one system user
 cvm-<slot> and one systemd unit cathedral-vm-<name>.service that runs the SEV-SNP
 guest as that user (launch-vm.py; VM runtime spec r2 6.3, 7.1, 8.1, 8.2).
 Every command prints one JSON line on stdout; a refusal prints {"error": ...} and exits nonzero:
-  2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or exists,
-  1 anything else.
+  2 invalid request, 3 authorization refused, 4 unpaid, 5 no such VM or exists, or
+  {"error": "host_capacity", "resource": ...} from create and start (vm_capacity.py), 1 anything else.
 
 Credit cutoff (polariscomputer#2290 rules 3, 5, 6) is enforced here, on the host,
 so it holds with the API and the broker down:
@@ -31,6 +31,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -51,6 +52,18 @@ KIT = Path(__file__).resolve().parent
 sys.path.insert(0, str(KIT))
 import vm_measure  # noqa: E402
 
+
+def capacity():
+    """vm_capacity.py, loaded on first use. Only create, start and capacity load it, so stop and
+    enforce (the credit cutoff) never depend on it. Loaded by path: vm-ctl.sh runs python3 -I,
+    which keeps this directory off sys.path."""
+    mod = sys.modules.get("vm_capacity")
+    if mod is None:
+        spec = importlib.util.spec_from_file_location("vm_capacity", KIT / "vm_capacity.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod  # dataclasses look the module up while the class is made
+        spec.loader.exec_module(mod)
+    return mod
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 # Entries of $VM_ROOT that are not VMs: no VM may take their name.
 RESERVED_NAMES = (".history", "bundles")
@@ -88,9 +101,9 @@ HISTORY_SWEEP_BUDGET = float(os.environ.get("VM_HISTORY_SWEEP_BUDGET", "15"))
 
 
 class Refusal(Exception):
-    def __init__(self, error: str, detail: str = "", code: int = 2):
+    def __init__(self, error: str, detail: str = "", code: int = 2, **extra):
         super().__init__(detail or error)
-        self.error, self.detail, self.code = error, detail, code
+        self.error, self.detail, self.code, self.extra = error, detail, code, extra
 
 
 def root() -> Path:
@@ -243,6 +256,24 @@ class Lock:
 def global_lock() -> Lock:
     root().mkdir(parents=True, exist_ok=True, mode=0o700)
     return Lock(root() / ".lock")
+
+
+# ---- host admission (AB#999 VM spec r2 section 9, vm_capacity.py) ---------------------
+
+def admit(check, *args) -> None:
+    try:
+        check(*args)
+    except capacity().CapacityRefusal as e:
+        raise Refusal("host_capacity", e.detail, 5, resource=e.resource) from None
+
+
+def hold_capacity_lock(stack: contextlib.ExitStack) -> None:
+    """The host capacity lock until the stack closes. Only create and start take it, never stop,
+    enforce, cancel or delete, so the credit cutoff never waits on it."""
+    try:
+        stack.enter_context(capacity().capacity_lock())
+    except capacity().CapacityBusy as e:
+        raise Refusal("busy", str(e), 1) from None
 
 
 def vm_dir(name: str) -> Path:
@@ -1039,13 +1070,19 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
     except vm_measure.Refusal as e:
         raise Refusal("launch_values", str(e), 1) from None
     launch["vm_id"] = vm_id
-    with global_lock():
+    with global_lock(), contextlib.ExitStack() as admission:
         d = root() / name
         if d.exists() or d.is_symlink():
             raise Refusal("exists", f"VM {name} exists", 5)
         if history_path(name).exists():
             raise Refusal("exists", f"name {name} was used before: its history is kept, pick a new name", 5)
         slot = allocate(port)
+        admit(capacity().refuse_custom_guest_host)
+        if capacity().enforced():
+            # Check and record under one hold: vm.env, written below, is this VM's line in the
+            # ledger. The lock is released when create returns.
+            hold_capacity_lock(admission)
+            admit(capacity().check_create, vcpus, mem, disk, d)
         base = int(NET.network_address) + 4 * slot
         user = vm_user(slot)
         env = {
@@ -1154,7 +1191,7 @@ def cmd_start(args: list[str]) -> dict:
     opts = parse_opts(args, {"--generation"}, 1)
     name = check_name(opts["_"][0])
     d = vm_dir(name)
-    with Lock(d / ".lock"):
+    with Lock(d / ".lock"), contextlib.ExitStack() as admission:
         begin(name, d)
         check_generation(opts, auth_of(d))
         refusal = paid_refusal(auth_of(d), int(time.time())) or gate_refusal(name)
@@ -1165,11 +1202,17 @@ def cmd_start(args: list[str]) -> dict:
         h = read_history(name)
         if h["corrupt"]:
             raise Refusal("history_corrupt", f"the history journal of {name} is corrupt: no launch", 3)
+        if capacity().enforced():
+            # Before the start line, so a refused start leaves no line and bills nothing.
+            hold_capacity_lock(admission)
+            admit(capacity().check_start, name)
         if is_tracked(h, g) and not event_of(h, "start", g):
             history_append(name, {"event": "start", "generation": g, **stamp()})
         (d / "started").touch()
         # Enabled while it should run, so it comes back after a host reboot.
         systemctl("enable", "-q", unit_name(name))
+        # The enabled unit is this start's record in the ledger: the next start counts it.
+        admission.close()
         systemctl("reset-failed", unit_name(name), check=False)
         systemctl("start", unit_name(name))
     return status_of(name)
@@ -1480,6 +1523,18 @@ def cmd_list(args: list[str]) -> dict:
     return {"vms": [status_of(n) for n in all_vms()]}
 
 
+CAPACITY_FLAGS = {"--broker-max-vcpus": "max_vcpus", "--broker-max-mem-gib": "max_mem_gib",
+                  "--broker-max-disk-gib": "max_disk_gib"}
+
+
+def cmd_capacity(args: list[str]) -> dict:
+    """Read only, no lock: the host ledger. Given the broker's maxima for this host, it also checks
+    that they stay within the VM share left after the kits (spec section 9, an operator rule)."""
+    opts = parse_opts(args, set(CAPACITY_FLAGS), 0)
+    broker = {key: check_int(opts[flag], key, 0, 2**31) for flag, key in CAPACITY_FLAGS.items() if flag in opts}
+    return capacity().report(broker or None)
+
+
 def begin_best_effort(name: str, d: Path) -> None:
     """The credit cutoff must never depend on history I/O: a failure here is logged, not raised."""
     try:
@@ -1620,13 +1675,17 @@ def main(argv: list[str]) -> int:
         }
         if cmd == "create":
             out(cmd_create(rest, key_text))
+        elif cmd == "capacity":
+            doc = cmd_capacity(rest)
+            out(doc)
+            return 0 if doc.get("broker_check", {}).get("ok", True) else 1
         elif cmd in handlers:
             out(handlers[cmd](rest))
         else:
             raise Refusal("unknown_command", "unknown subcommand")
         return 0
     except Refusal as e:
-        out({"error": e.error, "detail": e.detail})
+        out({"error": e.error, "detail": e.detail, **e.extra})
         return e.code
     except Exception as e:  # one JSON line, even on a bug
         out({"error": "internal", "detail": f"{type(e).__name__}: {e}"[:400]})
