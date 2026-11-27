@@ -2,8 +2,8 @@
  "about": "Shared vectors for vm_measure.py (AB#999, VM runtime spec r2 6.3) and any other implementation (the VM init of PR VM1b, the verifier of PR VM2). Files come from recipes in tests/vm_measure_support.py; they are not bootable and base_root_verity is a placeholder. Measurements are sev-snp-measure 0.0.12 --mode snp over those files.",
  "bundles": {
   "genoa": {
-   "bundle_id": "6e948528cc672c55f7976b087ad204fb7fabe7ff7d064ac238ceb2bb423d54ea",
-   "manifest_utf8": "{\"base_root_data_bytes\":8192,\"base_root_verity\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"bytes\":{\"OVMF.amdsev.fd\":65536,\"base-root.packages.lock\":93,\"base-root.raw\":12288,\"initrd.cpio.zst\":20000,\"kernel.packages.lock\":109,\"vmlinuz\":12288},\"cmdline_template\":\"console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no systemd.getty_auto=0 systemd.mask=getty@.service systemd.mask=serial-getty@.service systemd.mask=autovt@.service systemd.mask=console-getty.service systemd.mask=emergency.service systemd.mask=rescue.service systemd.mask=debug-shell.service systemd.mask=qemu-guest-agent.service cathedral.vm={identity_sha256}\",\"cpu_family\":\"genoa\",\"cpu_model\":\"EPYC-Genoa-v1\",\"initrd_version\":\"vm1-test\",\"kernel_release\":\"6.8.0-1-generic\",\"label\":\"test-genoa\",\"ovmf_source\":\"test:synthetic-ovmf-v1\",\"policy\":\"0x30000\",\"qemu_version\":\"10.2.1\",\"schema\":\"cathedral.vm.bundle/v1\",\"sev_snp_measure\":\"0.0.12\",\"sha256\":{\"OVMF.amdsev.fd\":\"91ef139c788da83cfea35fdf698a413746410706a6a67b0cb509c9b9f2b6136c\",\"base-root.packages.lock\":\"12089d58e53256b9d8aebe288da6db563566614ed71db1f3cda9d729b027d11a\",\"base-root.raw\":\"4b7faaeab7f95d2f006deb05875c61da082601899cbd5d53cc7f5285a30d249a\",\"initrd.cpio.zst\":\"0794f564e1717815f753c917132492b774218cfe74748e7608dd71fa7a711d12\",\"kernel.packages.lock\":\"79e9da806c4c163e40d8ca0684ef33db92d914648df20194ad735fbbe1c805b3\",\"vmlinuz\":\"3a493a21b0cbe5a36a1787b097c6d0b080a13ef3aadbc05bc8fdf163bfb3ad0f\"},\"snapshot\":\"20261101T000000Z\",\"version\":1}"
+   "bundle_id": "f56a1359b5efef9cdc93389cce2582df68caa2701bed4531730aaa7eb55e2e30",
+   "manifest_utf8": "{\"base_root_data_bytes\":8192,\"base_root_verity\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"bytes\":{\"OVMF.amdsev.fd\":65536,\"base-root.packages.lock\":93,\"base-root.raw\":12288,\"initrd.cpio.zst\":20000,\"kernel.packages.lock\":109,\"vmlinuz\":12288},\"cmdline_template\":\"console=ttyS0 loglevel=4 panic=-1 systemd.import_credentials=no systemd.getty_auto=0 systemd.mask=getty@.service systemd.mask=serial-getty@.service systemd.mask=autovt@.service systemd.mask=console-getty.service systemd.mask=emergency.service systemd.mask=rescue.service systemd.mask=debug-shell.service systemd.mask=qemu-guest-agent.service cathedral.vm={identity_sha256}\",\"cpu_family\":\"genoa\",\"cpu_model\":\"EPYC-v4\",\"initrd_version\":\"vm1-test\",\"kernel_release\":\"6.8.0-1-generic\",\"label\":\"test-genoa\",\"ovmf_source\":\"test:synthetic-ovmf-v1\",\"policy\":\"0x30000\",\"qemu_version\":\"10.2.1\",\"schema\":\"cathedral.vm.bundle/v1\",\"sev_snp_measure\":\"0.0.12\",\"sha256\":{\"OVMF.amdsev.fd\":\"91ef139c788da83cfea35fdf698a413746410706a6a67b0cb509c9b9f2b6136c\",\"base-root.packages.lock\":\"12089d58e53256b9d8aebe288da6db563566614ed71db1f3cda9d729b027d11a\",\"base-root.raw\":\"4b7faaeab7f95d2f006deb05875c61da082601899cbd5d53cc7f5285a30d249a\",\"initrd.cpio.zst\":\"0794f564e1717815f753c917132492b774218cfe74748e7608dd71fa7a711d12\",\"kernel.packages.lock\":\"79e9da806c4c163e40d8ca0684ef33db92d914648df20194ad735fbbe1c805b3\",\"vmlinuz\":\"3a493a21b0cbe5a36a1787b097c6d0b080a13ef3aadbc05bc8fdf163bfb3ad0f\"},\"snapshot\":\"20261101T000000Z\",\"version\":1}"
   },
   "turin": {
    "bundle_id": "0c65b84f56ed91c519ba8c9dcb50d5bbdd1f4027a3ae5351e32ce0db87ba7e3d",
@@ -74,8 +74,8 @@
  "measurements": [
   {
    "cpu_family": "genoa",
-   "cpu_model": "EPYC-Genoa-v1",
-   "expected_measurement": "6243a755112878bc7f7e57fafa8bd97aece30afc18718741784359f10bf2641f4fa7667acea2fff78f632a64e15277d4",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "6507d3bb72b9acbd3d5087fd3cdf0db7b322d1e85fc2cba9f85fa2f522874d1bd83af7b5ee6035635739970169e260e8",
    "identity": "a",
    "vcpus": 4
   },
@@ -88,15 +88,15 @@
   },
   {
    "cpu_family": "genoa",
-   "cpu_model": "EPYC-Genoa-v1",
-   "expected_measurement": "c67bc8c6748e9ba61d87bd4617c5cd3eea1710de37cfef4225d47d03ccee90f25bdb3bc13167e9728a9cc8d288983834",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "f7a0530c20a111b1bb2fabfacf4ed07e05706a1aaed5fd8bd1ccdcec9ce09e3843247072d184e56f7e1f1eb351cfa17d",
    "identity": "a",
    "vcpus": 2
   },
   {
    "cpu_family": "genoa",
-   "cpu_model": "EPYC-Genoa-v1",
-   "expected_measurement": "cc6e614b546dfeeefdc475520b986aa4b9ae4d8a0f9c4ff9d12785c0b9f8164c5e1b3fd53b431564342b8103c4833a65",
+   "cpu_model": "EPYC-v4",
+   "expected_measurement": "f00bff34fd417d1da9fa6e51032d99be767e0c5bbeddd87a43d70eefd48509a9ff4111109df14b086dcd9bd9b719a07c",
    "identity": "b",
    "vcpus": 4
   },

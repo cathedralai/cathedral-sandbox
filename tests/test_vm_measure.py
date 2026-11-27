@@ -227,8 +227,9 @@ def _manifest(family="genoa") -> dict:
 @pytest.mark.parametrize("doc", [
     {**_manifest(), "extra": "x"},
     {k: v for k, v in _manifest().items() if k != "ovmf_source"},
-    {**_manifest(), "cpu_model": "EPYC-v4"},
+    {**_manifest(), "cpu_model": "EPYC-Genoa-v1"},
     {**_manifest("turin"), "cpu_model": "EPYC-Genoa-v1"},
+    {**_manifest(), "cpu_model": "EPYC-v1"},   # same signature as EPYC-v4, still not the accepted name
     {**_manifest(), "cpu_family": "milan"},
     {**_manifest(), "cmdline_template": _manifest()["cmdline_template"].replace("loglevel=4", "loglevel=7")},
     {**_manifest(), "policy": "0xB0000"},
@@ -261,8 +262,8 @@ def test_check_bundle_refuses_a_changed_or_linked_file(bundle):
 # ---- expected measurement --------------------------------------------------------
 
 def test_measure_argv_is_the_install_sealed_form():
-    assert vm.measure_argv("T", 4, "EPYC-Genoa-v1", "o", "k", "i", "a b") == [
-        "T", "--mode", "snp", "--vcpus", "4", "--vcpu-type", "EPYC-Genoa-v1",
+    assert vm.measure_argv("T", 4, "EPYC-v4", "o", "k", "i", "a b") == [
+        "T", "--mode", "snp", "--vcpus", "4", "--vcpu-type", "EPYC-v4",
         "--ovmf", "o", "--kernel", "k", "--initrd", "i", "--append", "a b"]
 
 
@@ -305,10 +306,19 @@ def test_an_identity_change_changes_the_measurement(bundle, tool):
     assert got not in (_vector("a", "genoa", 4), _vector("b", "genoa", 4))
 
 
-def test_genoa_and_turin_differ_and_so_do_vcpu_counts():
-    assert _vector("a", "genoa", 4) != _vector("a", "turin", 4)
+def test_every_vm_runs_epyc_v4_until_the_tool_supports_turin():
+    # Toby, 27 Nov 12:19Z: EPYC-v4 is the default and the only accepted model.
+    assert vm.CPU_MODEL == "EPYC-v4" and set(vm.CPU_MODELS.values()) == {"EPYC-v4"}
+    assert {m["cpu_model"] for m in VEC["measurements"]} == {"EPYC-v4"}
+    assert {json.loads(b["manifest_utf8"])["cpu_model"] for b in VEC["bundles"].values()} == {"EPYC-v4"}
+    # One model, so a Genoa and a Turin bundle of the same files measure the same.
+    assert _vector("a", "genoa", 4) == _vector("a", "turin", 4)
+
+
+def test_vcpu_counts_and_identities_change_the_measurement():
     assert _vector("a", "genoa", 4) != _vector("a", "genoa", 2)
-    assert len({m["expected_measurement"] for m in VEC["measurements"]}) == len(VEC["measurements"])
+    by_input = {(m["identity"], m["vcpus"]): m["expected_measurement"] for m in VEC["measurements"]}
+    assert len(set(by_input.values())) == len(by_input)
 
 
 def _direct(tool: str, d: Path, cpu: list[str], line: str, vcpus: int = 4) -> str:

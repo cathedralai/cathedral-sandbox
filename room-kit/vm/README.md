@@ -167,8 +167,9 @@ cmdline and HOST_DATA from the identity on every launch.
 - **HOST_DATA:** `sha256(b"cathedral-vm-v1\0" || sha256(vm-identity.json))`: 64 hex in a
   report, base64 for QEMU `host-data=`.
 - **Measurement:** `sev-snp-measure 0.0.12 --mode snp` (requirements/vm-measure.txt) over
-  digest-checked private copies. CPU family `genoa` runs QEMU `-cpu EPYC-Genoa-v1`,
-  `turin` runs `EPYC-v4`. Only the model's CPUID signature (family, model, stepping) is
+  digest-checked private copies. Every VM runs QEMU `-cpu EPYC-v4`, on Genoa and Turin
+  alike (Toby, 27 Nov 12:19Z: until the tool supports Turin); a manifest naming another
+  model is refused. Only the model's CPUID signature (family, model, stepping) is
   measured, not its feature set: EPYC-v1 and EPYC-v4 give one digest. The guest checks
   its features itself (VM1b).
 

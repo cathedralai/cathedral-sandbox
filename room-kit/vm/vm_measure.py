@@ -98,13 +98,17 @@ CMDLINE_MAX = 2033
 # signature measure the same: EPYC-v1 and EPYC-v4 give one digest. The measurement
 # therefore proves the signature below, not the model name; checking the CPU features
 # in the guest before any key is released is the VM init's job (PR VM1b).
-# Genoa uses the kit default (guest-constants.sh:72). Turin uses EPYC-v4, the model the
-# kit runs on our Turin host, whose expected value matched its live report;
-# sev-snp-measure 0.0.12 knows no Turin model name.
-CPU_MODELS = {"genoa": "EPYC-Genoa-v1", "turin": "EPYC-v4"}
-# The measured signature of each model as family:model:stepping in hex, the form of
-# verify_guest_report.py --expected-cpuid (sev-snp-measure vcpu_types.py).
-CPU_SIGNATURES = {"EPYC-Genoa-v1": "19:11:00", "EPYC-v4": "17:01:02"}
+# Decision (Toby, 27 Nov 12:19Z): every sealed VM runs EPYC-v4 until the measurement tool
+# supports Turin. It is the model the kit runs on our Turin host, whose expected value
+# matched its live report; sev-snp-measure 0.0.12 knows no Turin model name. So EPYC-v4
+# is the only model a manifest may name, on either family. The family stays in the
+# manifest because the verifier (VM2) picks the AMD chain and TCB floor by it.
+CPU_MODEL = "EPYC-v4"
+CPU_MODELS = {"genoa": CPU_MODEL, "turin": CPU_MODEL}
+# The measured signature of each model, family:model:stepping in hex (sev-snp-measure
+# vcpu_types.py). It is the guest vCPU signature in every VMSA, not the chip CPUID a
+# report carries (a Turin report says 1a:02:01 whatever the guest model).
+CPU_SIGNATURES = {"EPYC-v4": "17:01:02"}
 POLICY = "0x30000"
 SEV_SNP_MEASURE_VERSION = "0.0.12"
 # Same bounds as vm_ctl.py create (--vcpus 1..64) and the broker (vmMaxVCPUs).
@@ -298,7 +302,7 @@ def parse_manifest(raw: bytes) -> dict:
         _int(doc["bytes"][name], 1, FILE_MAX, f"manifest bytes {name}")
     _check_template(doc["cmdline_template"])
     need(doc["cpu_family"] in CPU_MODELS, "manifest cpu_family: genoa or turin")
-    need(doc["cpu_model"] == CPU_MODELS[doc["cpu_family"]], "manifest cpu_model: not the model of its cpu_family")
+    need(doc["cpu_model"] == CPU_MODEL, "manifest cpu_model: must be EPYC-v4 (the one accepted model)")
     need(doc["policy"] == POLICY, "manifest policy: must be 0x30000")
     need(doc["sev_snp_measure"] == SEV_SNP_MEASURE_VERSION, "manifest sev_snp_measure: must be 0.0.12")
     _match(VERSION_RE, doc["qemu_version"], "manifest qemu_version")
@@ -370,8 +374,7 @@ def write_manifest(bundle: Path, **fields: object) -> str:
     doc = {"version": 1, "schema": BUNDLE_SCHEMA, "sha256": sha, "bytes": size,
            "cmdline_template": CMDLINE_TEMPLATE_V1, "policy": POLICY,
            "sev_snp_measure": SEV_SNP_MEASURE_VERSION, **fields}
-    if "cpu_family" in fields:
-        doc.setdefault("cpu_model", CPU_MODELS.get(str(fields["cpu_family"]), ""))
+    doc.setdefault("cpu_model", CPU_MODEL)
     raw = canonical(doc)
     parse_manifest(raw)
     with open(bundle / "manifest.json", "xb") as f:
