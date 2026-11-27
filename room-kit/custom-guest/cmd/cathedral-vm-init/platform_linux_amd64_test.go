@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -44,6 +46,9 @@ func TestManifest(t *testing.T) {
 func TestModuleList(t *testing.T) {
 	p := "usr/lib/modules/" + release + "/"
 	good := p + "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst\n" + p + "kernel/drivers/md/dm-crypt.ko\n"
+	if _, err := parseModules([]byte(many(p, 256)), release); err != nil {
+		t.Fatalf("256 modules: %v", err)
+	}
 	list, err := parseModules([]byte(good), release)
 	if err != nil || len(list) != 2 || list[1] != p+"kernel/drivers/md/dm-crypt.ko" {
 		t.Fatalf("%v %v", list, err)
@@ -58,11 +63,21 @@ func TestModuleList(t *testing.T) {
 		"blank line":       good + "\n",
 		"duplicate":        good + p + "kernel/drivers/md/dm-crypt.ko\n",
 		"double slash":     p + "kernel//dm-crypt.ko\n",
+		"257 modules":      many(p, 257),
+		"no prefix":        "kernel/drivers/md/dm-crypt.ko\n",
 	} {
 		if _, err := parseModules([]byte(raw), release); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
+}
+
+func many(prefix string, n int) string {
+	var b strings.Builder
+	for i := range n {
+		b.WriteString(prefix + "kernel/m" + strconv.Itoa(i) + ".ko\n")
+	}
+	return b.String()
 }
 
 func writeEntry(t *testing.T, dir, name string, raw []byte, size int) {
@@ -132,5 +147,66 @@ func TestFindDisks(t *testing.T) {
 		if _, err := findDisks(setup(t, disks)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestOpenDiskRefusesANonBlockNode(t *testing.T) {
+	sys, dev := t.TempDir(), t.TempDir()
+	os.WriteFile(filepath.Join(dev, "vda"), make([]byte, 4096), 0600)
+	os.Symlink(filepath.Join(dev, "vda"), filepath.Join(dev, "vdb"))
+	// 0:0 is a regular file's st_rdev, so only the file type check refuses it.
+	for _, name := range []string{"vda", "vdb"} {
+		for _, num := range []string{"253:0", "0:0"} {
+			os.MkdirAll(filepath.Join(sys, name), 0700)
+			os.WriteFile(filepath.Join(sys, name, "dev"), []byte(num+"\n"), 0600)
+			if f, _, err := openDisk(sys, dev, name, os.O_RDONLY); err == nil {
+				f.Close()
+				t.Fatalf("%s (%s), not a block device, was opened as the disk", name, num)
+			}
+		}
+	}
+}
+
+// As root (vm-init.yml), on a loop device: the right major:minor opens,
+// another one is refused.
+func TestOpenDiskChecksTheDeviceNumber(t *testing.T) {
+	if os.Getenv("VMDISK_ROOT_TESTS") != "1" || os.Geteuid() != 0 {
+		t.Skip("root loop-device test (vm-init.yml)")
+	}
+	img := filepath.Join(t.TempDir(), "disk.raw")
+	os.WriteFile(img, nil, 0600)
+	os.Truncate(img, 1<<20)
+	out, err := exec.Command("losetup", "--find", "--show", img).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := strings.TrimSpace(string(out))
+	defer exec.Command("losetup", "--detach", loop).Run()
+	name := filepath.Base(loop)
+	devNum, err := os.ReadFile("/sys/block/" + name + "/dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sys := t.TempDir()
+	os.MkdirAll(filepath.Join(sys, name), 0700)
+	os.WriteFile(filepath.Join(sys, name, "dev"), devNum, 0600)
+	f, size, err := openDisk(sys, "/dev", name, os.O_RDONLY)
+	if err != nil || size != 1<<20 {
+		t.Fatalf("the loop device: %d %v", size, err)
+	}
+	f.Close()
+	// A link to the right device is refused too: the init opens no link.
+	dev := t.TempDir()
+	os.Symlink(loop, filepath.Join(dev, name))
+	if f, _, err := openDisk(sys, dev, name, os.O_RDONLY); err == nil {
+		f.Close()
+		t.Fatal("a link to the device was followed")
+	}
+	var major, minor int
+	fmt.Sscanf(strings.TrimSpace(string(devNum)), "%d:%d", &major, &minor)
+	os.WriteFile(filepath.Join(sys, name, "dev"), []byte(fmt.Sprintf("%d:%d\n", major, minor+1)), 0600)
+	if f, _, err := openDisk(sys, "/dev", name, os.O_RDONLY); err == nil {
+		f.Close()
+		t.Fatal("a node of another device number was opened")
 	}
 }

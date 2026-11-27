@@ -174,7 +174,8 @@ func readFwCfg(root string) (identity, link []byte, err error) {
 }
 
 // findDisks maps each serial to its block device name. There must be
-// exactly the launcher's three virtio disks, one per serial.
+// exactly the launcher's three virtio disks and each serial present, so no
+// serial names two disks.
 func findDisks(root string) (map[string]string, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -191,11 +192,7 @@ func findDisks(root string) (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		serial := strings.TrimSpace(string(raw))
-		if _, dup := out[serial]; dup {
-			return nil, fmt.Errorf("two disks with serial %q", serial)
-		}
-		out[serial] = e.Name()
+		out[strings.TrimSpace(string(raw))] = e.Name()
 	}
 	for _, s := range []string{serialRoot, serialBase, serialMailbox} {
 		if _, ok := out[s]; !ok {
@@ -212,8 +209,8 @@ const blkGetSize64 = 0x80081272
 
 // openDisk opens /dev/<name> and requires it to be the block device sysfs
 // names, so a stale or planted node is refused.
-func openDisk(name string, flags int) (*os.File, int64, error) {
-	raw, err := readBounded(sysBlock+"/"+name+"/dev", 32)
+func openDisk(sysRoot, devRoot, name string, flags int) (*os.File, int64, error) {
+	raw, err := readBounded(sysRoot+"/"+name+"/dev", 32)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -221,20 +218,22 @@ func openDisk(name string, flags int) (*os.File, int64, error) {
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(raw)), "%d:%d", &major, &minor); err != nil {
 		return nil, 0, fmt.Errorf("%s dev unreadable", name)
 	}
-	f, err := os.OpenFile("/dev/"+name, flags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(devRoot+"/"+name, flags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, 0, err
 	}
 	var st syscall.Stat_t
-	if err := syscall.Fstat(int(f.Fd()), &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFBLK ||
+	// No separate file type check: BLKGETSIZE64 below answers only for a
+	// block device, and a regular file's 0:0 is no disk's number.
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil ||
 		uint64(st.Rdev) != ((minor&0xff)|(major<<8)|((minor&^0xff)<<12)) {
 		f.Close()
-		return nil, 0, fmt.Errorf("/dev/%s is not the block device sysfs names", name)
+		return nil, 0, fmt.Errorf("%s/%s is not the block device sysfs names", devRoot, name)
 	}
 	var size uint64
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), blkGetSize64, uintptr(unsafe.Pointer(&size))); errno != 0 {
 		f.Close()
-		return nil, 0, errno
+		return nil, 0, fmt.Errorf("%s/%s is not a block device: %w", devRoot, name, errno)
 	}
 	return f, int64(size), nil
 }
@@ -350,13 +349,13 @@ func (p *linuxPlatform) Devices() (Devices, error) {
 		return Devices{}, err
 	}
 	var d Devices
-	if d.Root, d.RootBytes, err = openDisk(names[serialRoot], os.O_RDWR); err != nil {
+	if d.Root, d.RootBytes, err = openDisk(sysBlock, "/dev", names[serialRoot], os.O_RDWR); err != nil {
 		return Devices{}, err
 	}
-	if d.Base, d.BaseBytes, err = openDisk(names[serialBase], os.O_RDONLY); err != nil {
+	if d.Base, d.BaseBytes, err = openDisk(sysBlock, "/dev", names[serialBase], os.O_RDONLY); err != nil {
 		return Devices{}, err
 	}
-	if d.Mailbox, d.MailboxSize, err = openDisk(names[serialMailbox], os.O_RDWR); err != nil {
+	if d.Mailbox, d.MailboxSize, err = openDisk(sysBlock, "/dev", names[serialMailbox], os.O_RDWR); err != nil {
 		return Devices{}, err
 	}
 	return d, nil

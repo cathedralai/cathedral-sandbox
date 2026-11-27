@@ -147,6 +147,9 @@ func (r fakeRoot) FirstBoot(context.Context, *os.File, Base, vmidentity.Identity
 }
 func (r fakeRoot) Start(_ context.Context, fs *os.File, link []byte, ready func() error) error {
 	r.f.call("start")
+	if !bytes.Equal(r.f.gotConfig.Passphrase, make([]byte, 32)) {
+		r.f.t.Error("the root started with the disk key still in memory")
+	}
 	if r.f.startErr != nil {
 		return r.f.startErr
 	}

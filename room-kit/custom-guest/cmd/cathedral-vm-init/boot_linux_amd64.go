@@ -174,9 +174,6 @@ func boot(ctx context.Context, p platform) error {
 	// Step 5: the root, the status record, switch_root.
 	p.Log("vm-init: root disk " + out.State.String() + ", meta ready; starting the root")
 	return p.Root().Start(ctx, out.FSArea, link, func() error {
-		if out.Meta.State != vmdisk.StateReady {
-			return errors.New("root disk not ready")
-		}
 		if err := writeStatus(); err != nil {
 			return fmt.Errorf("status: %w", err)
 		}

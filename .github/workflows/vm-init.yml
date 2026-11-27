@@ -61,6 +61,7 @@ jobs:
           go vet ./... && go vet -tags vmcuttest ./...
           go test -c -o "$RUNNER_TEMP/vmdisk.test" ./internal/vmdisk
           go test -c -tags vmcuttest -o "$RUNNER_TEMP/vmdisk-cut.test" ./internal/vmdisk
+          go test -c -o "$RUNNER_TEMP/vm-init.test" ./cmd/cathedral-vm-init
 
       - name: VM init packages as a user (fake chip, fake platform, untagged-build hook check)
         working-directory: room-kit/custom-guest
@@ -73,6 +74,7 @@ jobs:
         run: |
           sudo -n env VMDISK_ROOT_TESTS=1 VMDISK_CRYPTSETUP="$VMDISK_CRYPTSETUP" \
             "$RUNNER_TEMP/vmdisk.test" -test.v -test.run '^TestRoot' -test.timeout 15m
+          sudo -n env VMDISK_ROOT_TESTS=1 "$RUNNER_TEMP/vm-init.test" -test.v -test.short -test.run '^TestOpenDisk'
 
       - name: T5 first-boot cuts (root, vmcuttest build)
         working-directory: room-kit/custom-guest/internal/vmdisk
