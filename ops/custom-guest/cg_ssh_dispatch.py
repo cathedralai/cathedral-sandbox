@@ -114,10 +114,13 @@ def trusted(tool: str, root: str, owner: int) -> None:
 
 
 def refuse(reason: str, cmd: str | None) -> int:
-    # host_call reads the RESULT line, so a refusal reads as a code, not a lost answer.
+    # host_call reads the RESULT line, so a refusal reads as a code, not a lost answer. The request goes back too:
+    # sshd drops a subsystem session's stderr, so stdout is the only place an sftp refusal can be read.
+    request = repr(cmd)[:300]
     print("RESULT " + json.dumps({"ok": False, "error_code": "custom_guest_request_invalid",
-                                  "detail": f"cathedral-cg-dispatch refused: {reason}"}), flush=True)
-    line = f"cathedral-cg-dispatch: refused: {reason}: {repr(cmd)[:300]}"
+                                  "detail": f"cathedral-cg-dispatch refused: {reason}", "request": request}),
+          flush=True)
+    line = f"cathedral-cg-dispatch: refused: {reason}: {request}"
     print(line, file=sys.stderr, flush=True)
     try:
         import syslog
