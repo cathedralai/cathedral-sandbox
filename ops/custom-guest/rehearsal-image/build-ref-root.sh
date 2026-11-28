@@ -48,12 +48,11 @@ case "$variant" in
   stock-systemd)
     INCLUDE=$INCLUDE,dbus,udev
     recipe=("$here/stock_systemd.py")
-    # Unpinned until its first two-lane build: the lanes must agree, and the values it
-    # prints are pinned here next.
-    EXPECTED_BASE_SHA256=
-    EXPECTED_ROOT_SHA256=
-    EXPECTED_ROOT_VERITY=
-    EXPECTED_ROOT_DATA_BYTES=
+    # The first two-lane build of this variant (#836, CI run 46145641488, at cb5dcea0).
+    EXPECTED_BASE_SHA256=0a5b09478e1c9d87a4184f9bef481de127bcbffda5fc49aff8b09823f2f7ca67
+    EXPECTED_ROOT_SHA256=2d33e12e031a9a6b203cdea0199d33cb739c547a9d8983dbf9dfe7a73c9d2dbc
+    EXPECTED_ROOT_VERITY=897cbbd1ec7ce1f88d27bb9c110e01915b6471741f78978cce750b2b5e17c582
+    EXPECTED_ROOT_DATA_BYTES=76357632
     ;;
   *) echo "variant is v1 or stock-systemd, not $variant" >&2; exit 1 ;;
 esac
