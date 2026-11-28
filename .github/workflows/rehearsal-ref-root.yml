@@ -10,6 +10,7 @@ on:
   pull_request:
     paths:
       - "ops/custom-guest/rehearsal-image/build-ref-root.sh"
+      - "ops/custom-guest/rehearsal-image/check_stock_root.py"
       - "scripts/build_custom_guest_root.py"
       - "room-kit/custom_guest_initrd.py"
       - ".github/workflows/rehearsal-ref-root.yml"
@@ -54,6 +55,11 @@ jobs:
           name: ref-root-${{ matrix.lane }}
           path: ${{ runner.temp }}/ref-root/
           if-no-files-found: error
+      - name: Stock-systemd root check (run 7b)
+        # Run 7b needs a root in which reference initrd v2 can show dbus and networkd active:
+        # dbus, udev and networkd enabled and the guest network written at boot, with
+        # cathedral-attest and the sshd rules kept. The v1 root has no dbus and masks networkd.
+        run: python3 -I ops/custom-guest/rehearsal-image/check_stock_root.py "$RUNNER_TEMP/ref-root/root.raw"
 
   compare:
     name: Both lanes identical
