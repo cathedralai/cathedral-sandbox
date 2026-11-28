@@ -10,6 +10,9 @@
 # Runs on a GitHub-hosted Ubuntu 26.04 runner: it installs pinned packages and runs
 # mmdebstrap with sudo. Never on a hotel host.
 set -euo pipefail
+# The recipe makes some directories with a plain mkdir, and their modes go into root.raw.
+# Ubuntu's default user umask is 0002, so fix it here or a rebuild gives other bytes.
+umask 022
 attest=$(readlink -f "${1:?cathedral-attest from reference-build run 46063612613}")
 out=$(readlink -m "${2:?new output directory}")
 here=$(cd "$(dirname "$0")" && pwd)
@@ -20,12 +23,19 @@ mkdir -p "$out"
 ATTEST_SHA256=44824e132fc3529c0aff01ba1f2a093d2844beb82a3478613a26b11f012f4f29
 SNAPSHOT=http://snapshot.debian.org/archive/debian/20261127T000000Z
 SUITE=bookworm
-# sha256 of that snapshot's dists/bookworm/InRelease. apt checks its signature and every
-# package against it, so this one digest fixes the whole package set.
+# sha256 of that snapshot's dists/bookworm/InRelease, as curl fetches it below. apt inside
+# mmdebstrap fetches its own copy and checks only the Debian signature, so the base pin
+# below is what fixes the package set.
 INRELEASE_SHA256=77737fa4b34f2693e982cc9ee35736816c35a7778fc2d326cc1bbf5b301fe1aa
 INCLUDE=systemd-sysv,openssh-server,iproute2,e2fsprogs,ca-certificates
 BASE_EPOCH=1795737600   # 2026-11-27T00:00:00Z, the snapshot time
 ROOT_EPOCH=1795770000   # the reference recipe's epoch
+# The published outputs (#816, CI run 46089051536). Any drift fails the build; a change that
+# moves them re-pins them here on purpose.
+EXPECTED_BASE_SHA256=a39b08f1ec14291957a22b6d417e2c7a70b4f4f6123700cceea9bcfa7512075a
+EXPECTED_ROOT_SHA256=e674d5a55bc8ffdce0a04ec291ac70793e730d4f7428d403d46a9f380f36fdf9
+EXPECTED_ROOT_VERITY=fe5b4acc14779ae720f9cbefddee6e177c08cce5804c74fdc2be359451114b1e
+EXPECTED_ROOT_DATA_BYTES=71532544
 
 sha() { sha256sum "$1" | cut -d ' ' -f 1; }
 [ "$(sha "$attest")" = "$ATTEST_SHA256" ] || { echo "cathedral-attest is not $ATTEST_SHA256" >&2; exit 1; }
@@ -68,6 +78,7 @@ sudo -n env SOURCE_DATE_EPOCH="$BASE_EPOCH" mmdebstrap --mode=root --variant=min
 sudo -n chown "$(id -u):$(id -g)" "$out/base.tar"
 base_sha=$(sha "$out/base.tar")
 tar -tf "$out/base.tar" | LC_ALL=C sort > "$out/base-files.txt"
+[ "$base_sha" = "$EXPECTED_BASE_SHA256" ] || { echo "base.tar is $base_sha, expected $EXPECTED_BASE_SHA256" >&2; exit 1; }
 
 # The reference root recipe, twice from the same base: the two roots must be identical.
 for lane in first second; do
@@ -81,5 +92,11 @@ mv "$out/root-first.raw" "$out/root.raw"
 rm "$out/root-second.raw" "$out/root-build-second.json"
 mv "$out/root-build-first.json" "$out/root-build.json"
 ( cd "$out" && sha256sum base.tar root.raw InRelease > SHA256SUMS )
+root_sha=$(sha "$out/root.raw")
+read -r root_verity root_data_bytes < <(python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["root_verity"], d["root_data_bytes"])' "$out/root-build.json")
+[ "$root_sha" = "$EXPECTED_ROOT_SHA256" ] || { echo "root.raw is $root_sha, expected $EXPECTED_ROOT_SHA256" >&2; exit 1; }
+[ "$root_verity" = "$EXPECTED_ROOT_VERITY" ] || { echo "root_verity is $root_verity, expected $EXPECTED_ROOT_VERITY" >&2; exit 1; }
+[ "$root_data_bytes" = "$EXPECTED_ROOT_DATA_BYTES" ] || { echo "root_data_bytes is $root_data_bytes, expected $EXPECTED_ROOT_DATA_BYTES" >&2; exit 1; }
+echo "root.raw, root_verity and root_data_bytes match the published values"
 cat "$out/root-build.json"
 cat "$out/SHA256SUMS"
