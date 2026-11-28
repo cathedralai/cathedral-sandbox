@@ -297,7 +297,8 @@ func (m *Mounted) Finish(cfg FinishConfig) error {
 // SwitchRoot moves the kernel mounts into the root, makes it the root and executes /sbin/init.
 // It copies bootstate.(*ReadyRoot).Exec (runtime_linux_amd64.go:177-233), with the dedicated
 // token replaced by ready: a function that returns nil only when the disk package has read the
-// meta as ready. Nothing moves before it returns nil. It never returns on success.
+// meta as ready, and with /proc and /sys made read-write before they move. Nothing is remounted
+// or moved before ready returns nil. It never returns on success.
 func (m *Mounted) SwitchRoot(ready func() error) error {
 	if ready == nil {
 		return errors.New("switch_root needs a ready check")
@@ -333,6 +334,15 @@ func (m *Mounted) SwitchRoot(ready func() error) error {
 		return err
 	}
 	defer base.Close()
+	// bootstate.PrepareKernelViews mounts /proc and /sys read-only for the init's own stages, and a
+	// move keeps a mount's flags. The customer's systemd keeps the API mounts it finds and needs
+	// both writable: each unit's OOMScoreAdjust=, udev's uevent writes, networkd's sysctls. A plain
+	// remount (not MS_BIND) clears the superblock's read-only flag as well as the mount's.
+	for _, name := range []string{"/sys", "/proc"} {
+		if err := syscall.Mount("", name, "", syscall.MS_REMOUNT|syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""); err != nil {
+			return fmt.Errorf("remount %s read-write: %w", name, err)
+		}
+	}
 	// proc moves last: descriptorPath itself uses procfs in the old root.
 	for i, name := range []string{"dev", "sys", "proc"} {
 		if err := syscall.Mount("/"+name, descriptorPath(targets[i]), "", syscall.MS_MOVE, ""); err != nil {

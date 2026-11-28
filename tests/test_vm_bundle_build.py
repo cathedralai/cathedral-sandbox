@@ -265,6 +265,16 @@ def test_initrd_check_boots_the_published_initrd_and_runs_the_real_disk_step():
     # The real platform's Disk, so the init's own /run step is what makes the lock path.
     assert "out, err := p.Disk(ctx, vmdisk.Config{" in check
     assert "if _, err := os.Lstat(lockParent); !errors.Is(err, os.ErrNotExist) {" in check
+    # B3's Ubuntu got read-only /proc and /sys from switch_root: the check switches with the
+    # platform's own Root into a check root on the base disk, and only that root's init passes.
+    assert "err = p.Root().Start(ctx, out.FSArea, []byte(checkLink), func() error {" in check
+    assert 'install -m 0755 "$RUNNER_TEMP/check/vm-initrd-check" "$RUNNER_TEMP/check-root/sbin/init"' in job
+    assert 'mkfs.ext4 -q -F -L check-root -d "$RUNNER_TEMP/check-root" "$RUNNER_TEMP/base.raw"' in job
+    assert "if os.Getpid() == 1 && len(os.Args) == 1 && os.Args[0] == checkRootInit {" in check
+    assert 'writeKernelFile("/proc/self/oom_score_adj", "-250\\n")' in check
+    assert 'writeKernelFile("/sys/devices/virtual/mem/null/uevent", "change\\n")' in check
+    assert 'mountsWritable(info, map[string]string{"/proc": "proc", "/sys": "sysfs"})' in check
+    assert check.count("fmt.Println(initrdCheckPass)") == 1
 
 
 def test_toolchains_compare_without_the_runner_image_line():
