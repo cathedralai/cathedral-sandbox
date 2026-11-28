@@ -8,7 +8,8 @@ name: Reference guest build
 # prints the digests and uploads the set the site publishes. Every download is checked
 # against a sha256 in scripts/reference_build_inputs.json or
 # scripts/custom_guest_verity_inputs.json. GitHub-hosted only: never a hotel or Contabo.
-# This builds; it does not boot or qualify a guest.
+# This builds; it does not qualify a guest. The hand-off check boots the built kernel and
+# initrd in plain QEMU (no SNP) only to check cathedral-init's hand-off into an owner root.
 
 on:
   workflow_dispatch:
@@ -188,3 +189,49 @@ jobs:
           name: reference-build
           path: ${{ runner.temp }}/reference/
           if-no-files-found: error
+
+  handoff-check:
+    # The reference kernel and initrd this run built, booted in plain QEMU (no SNP) with a check
+    # binary added as one more cpio: internal/bootstate TestReferenceHandoffCheck runs as PID 1,
+    # makes cathedral-init's kernel views with their real mounts, builds a read-only check root at
+    # the verified root's path and hands off with the real ReadyRoot.Exec. The check root's
+    # /sbin/init is the check binary again: it writes the kernel files an owner's systemd writes and
+    # requires /proc and /sys read-write. The VM init's B3 boot gave Ubuntu both read-only, and
+    # cathedral-init hands off the same way (AB#1027). The published bytes are not changed.
+    name: Reference hand-off check (QEMU, no SNP)
+    needs: summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reference-build
+          path: ${{ runner.temp }}/reference
+      - name: Boot the reference kernel and initrd and hand off into a check root
+        run: |
+          python3 scripts/fetch_reference_build_inputs.py --out "$RUNNER_TEMP/inputs" --group go
+          sudo -n apt-get update -q
+          sudo -n apt-get install -y -q --no-install-recommends qemu-system-x86 cpio
+          mkdir "$RUNNER_TEMP/go-root" "$RUNNER_TEMP/check"
+          tar -xzf "$RUNNER_TEMP/inputs/go/go1.26.11.linux-amd64.tar.gz" -C "$RUNNER_TEMP/go-root"
+          (cd room-kit/custom-guest && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+            "$RUNNER_TEMP/go-root/go/bin/go" test -c -trimpath -o "$RUNNER_TEMP/check/handoff-check" ./internal/bootstate)
+          # The check binary first, uncompressed, then the reference initrd: the kernel unpacks both
+          # into one rootfs. The initrd's own files are untouched.
+          (cd "$RUNNER_TEMP/check" && echo handoff-check | cpio --quiet -o -H newc -R 0:0) > "$RUNNER_TEMP/check.cpio"
+          cat "$RUNNER_TEMP/check.cpio" "$RUNNER_TEMP/reference/cathedral-custom-initrd-$INITRD_VERSION.cpio.zst" > "$RUNNER_TEMP/initrd-check.img"
+          accel=(-accel tcg -cpu max)
+          if [ -e /dev/kvm ] && sudo -n chmod 0666 /dev/kvm; then accel=(-accel kvm -cpu host); fi
+          echo "accelerator: ${accel[*]}"
+          set +e
+          timeout 600 qemu-system-x86_64 -machine q35 -m 1024 -smp 2 "${accel[@]}" -nodefaults -no-reboot -display none \
+            -serial "file:$RUNNER_TEMP/check-serial.log" \
+            -kernel "$RUNNER_TEMP/reference/vmlinuz" -initrd "$RUNNER_TEMP/initrd-check.img" \
+            -append "console=ttyS0 panic=-1 rdinit=/handoff-check CATHEDRAL_HANDOFF_CHECK=1 -- -test.v -test.run=^TestReferenceHandoffCheck\$"
+          rc=$?
+          set -e
+          tr -d '\r' < "$RUNNER_TEMP/check-serial.log" > "$RUNNER_TEMP/check-serial.txt"
+          tail -n 100 "$RUNNER_TEMP/check-serial.txt"
+          [ "$rc" = 0 ] || { echo "qemu exit $rc" >&2; exit 1; }
+          grep -qx 'HANDOFF-CHECK: PASS' "$RUNNER_TEMP/check-serial.txt" || { echo "the hand-off check did not pass in the guest's check root" >&2; exit 1; }
