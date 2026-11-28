@@ -321,8 +321,12 @@ jobs:
     # The published kernel and initrd, booted in plain QEMU (no SNP) with a check binary added as
     # one more cpio: cmd/cathedral-vm-init TestInitrdDiskCheck runs as PID 1 and drives the real
     # platform from the module list to Disk, so the initrd's own cryptsetup formats and opens a
-    # virtio disk in the initramfs the init boots in. B2's boot 2 failed there at F3 (no /run for
-    # cryptsetup's lock) after every runner test had passed. The bundle bytes are not changed.
+    # virtio disk in the initramfs the init boots in. Then step 5: the platform's Root mounts the
+    # file system area and switches into it with vmroot's switch_root. The base disk carries the
+    # check root, whose /sbin/init is the check binary again: it writes the kernel files systemd
+    # writes and requires /proc and /sys read-write. B2's boot 2 failed at F3 (no /run for
+    # cryptsetup's lock) and B3's Ubuntu got read-only /proc and /sys, each after every runner
+    # test had passed. The bundle bytes are not changed.
     name: Initrd disk check (QEMU, no SNP)
     needs: summary
     runs-on: ubuntu-26.04
@@ -335,12 +339,12 @@ jobs:
         with:
           name: vm-bundle
           path: ${{ runner.temp }}/vm-bundle
-      - name: Boot the bundle's kernel and initrd and run the VM disk's first boot in it
+      - name: Boot the bundle's kernel and initrd, run the VM disk's first boot and switch_root in it
         run: |
           if [ ! -f "$RUNNER_TEMP/vm-bundle/initrd.cpio.zst" ]; then echo "closure unpinned: no initrd to boot"; exit 0; fi
           python3 -I scripts/fetch_vm_bundle_inputs.py --out "$RUNNER_TEMP/inputs" --group go
           sudo -n apt-get update -q
-          sudo -n apt-get install -y -q --no-install-recommends qemu-system-x86 cpio
+          sudo -n apt-get install -y -q --no-install-recommends qemu-system-x86 cpio e2fsprogs
           mkdir "$RUNNER_TEMP/go-root" "$RUNNER_TEMP/check"
           tar -xzf "$RUNNER_TEMP/inputs/go/go1.26.11.linux-amd64.tar.gz" -C "$RUNNER_TEMP/go-root"
           (cd room-kit/custom-guest && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
@@ -349,8 +353,14 @@ jobs:
           # into one rootfs (as an early microcode cpio). The init's own files are untouched.
           (cd "$RUNNER_TEMP/check" && echo vm-initrd-check | cpio --quiet -o -H newc -R 0:0) > "$RUNNER_TEMP/check.cpio"
           cat "$RUNNER_TEMP/check.cpio" "$RUNNER_TEMP/vm-bundle/initrd.cpio.zst" > "$RUNNER_TEMP/initrd-check.img"
-          truncate -s 96M "$RUNNER_TEMP/root.raw"
-          truncate -s 4M "$RUNNER_TEMP/base.raw"
+          # The check root on the base disk: the check binary as /sbin/init and the directories
+          # vmroot's Finish and switch_root require. The check copies it into the file system area.
+          mkdir -p "$RUNNER_TEMP/check-root/sbin" "$RUNNER_TEMP/check-root/dev" "$RUNNER_TEMP/check-root/proc" \
+            "$RUNNER_TEMP/check-root/sys" "$RUNNER_TEMP/check-root/run"
+          install -m 0755 "$RUNNER_TEMP/check/vm-initrd-check" "$RUNNER_TEMP/check-root/sbin/init"
+          truncate -s "$(( $(stat -c %s "$RUNNER_TEMP/check/vm-initrd-check") / 1048576 + 16 ))M" "$RUNNER_TEMP/base.raw"
+          mkfs.ext4 -q -F -L check-root -d "$RUNNER_TEMP/check-root" "$RUNNER_TEMP/base.raw"
+          truncate -s 160M "$RUNNER_TEMP/root.raw"
           truncate -s 1M "$RUNNER_TEMP/mailbox.raw"
           accel=(-accel tcg -cpu max)
           if [ -e /dev/kvm ] && sudo -n chmod 0666 /dev/kvm; then accel=(-accel kvm -cpu host); fi
@@ -368,4 +378,4 @@ jobs:
           tr -d '\r' < "$RUNNER_TEMP/check-serial.log" > "$RUNNER_TEMP/check-serial.txt"
           tail -n 150 "$RUNNER_TEMP/check-serial.txt"
           [ "$rc" = 0 ] || { echo "qemu exit $rc" >&2; exit 1; }
-          grep -qx 'INITRD-CHECK: PASS' "$RUNNER_TEMP/check-serial.txt" || { echo "the initrd disk check did not pass in the guest" >&2; exit 1; }
+          grep -qx 'INITRD-CHECK: PASS' "$RUNNER_TEMP/check-serial.txt" || { echo "the initrd check did not pass in the guest's check root" >&2; exit 1; }
