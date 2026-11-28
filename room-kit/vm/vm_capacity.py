@@ -8,11 +8,14 @@ install-sealed.sh calls `vm_capacity.py assess-kit <sealed.env>` in its assess s
 
 What it counts:
 - Kits: every room-sealed-<name>.service unit file in the systemd unit directory, enabled or not,
-  except the -net check units, and the env file named on its ExecStart line
-  (`<SEALED_DIR>/launch-guest.sh <SEALED_DIR>/sealed.env`, write-units.sh). No directory glob:
-  SEALED_DIR is configurable. A -net check unit is skipped only when it is exactly what
-  write-units.sh writes (oneshot, `host-net.sh check <env>`); any other unit is a kit and must
-  parse. Plus the kits being installed, from /var/lib/cathedral-snp/kits/<name>.<install id>.json
+  except the -net check units and the escape slot supervisors, and the env file named on its
+  ExecStart line (`<SEALED_DIR>/launch-guest.sh <SEALED_DIR>/sealed.env`, write-units.sh). No
+  directory glob: SEALED_DIR is configurable. A -net check unit is skipped only when it is exactly
+  what write-units.sh writes (oneshot, `host-net.sh check <env>`), and an escape supervisor only
+  when it is exactly what scripts/escape_slots/write-escape-units.sh writes (simple,
+  `/usr/bin/python3 -I <SEALED_DIR>/escape-slot/supervise_escape_slot.py --sealed-env
+  <SEALED_DIR>/sealed.env`); any other unit is a kit and must parse. Plus the kits being
+  installed, from /var/lib/cathedral-snp/kits/<name>.<install id>.json
   (below). The union is taken by kit name, each size the larger of the unit and every record.
 - Kit records: one per install, kits/<name>.<install id>.json. install-sealed.sh holds the kit's
   install lock from its assess step to its exit (one install of a kit at a time), writes its
@@ -260,6 +263,27 @@ def is_net_helper(name: str, text: str) -> bool:
             and argv[1] == "check" and argv[2].startswith("/"))
 
 
+def is_escape_supervisor(name: str, text: str) -> bool:
+    """Exactly the fresh slot supervisor write-escape-units.sh writes (AB#683, #496):
+    room-sealed-<X>-escape.service, Type=simple and no other Type, one ExecStart
+    `/usr/bin/python3 -I <dir>/escape-slot/supervise_escape_slot.py --sealed-env <dir>/sealed.env`.
+    It runs no guest: it stops and starts kit X through X's own unit, which is counted as a kit.
+    A damaged unit with that name, or any other command, is not one."""
+    if not name.endswith("-escape.service"):
+        return False
+    if re.findall(r"^\s*Type\s*=\s*(\S*)\s*$", text, re.M) != ["simple"]:
+        return False
+    try:
+        argv = exec_start(text)
+    except ValueError:
+        return False
+    if len(argv) != 5 or argv[:2] != ["/usr/bin/python3", "-I"] or argv[3] != "--sealed-env":
+        return False
+    env = argv[4]
+    sealed_dir = env[:-len("/sealed.env")] if env.endswith("/sealed.env") else ""
+    return sealed_dir.startswith("/") and argv[2] == f"{sealed_dir}/escape-slot/supervise_escape_slot.py"
+
+
 def kit_units() -> tuple[list[Kit], list[dict]]:
     kits, bad = [], []
     if not unit_dir().is_dir():
@@ -271,9 +295,10 @@ def kit_units() -> tuple[list[Kit], list[dict]]:
         except (OSError, UnicodeDecodeError) as e:
             bad.append({"unit": path.name, "name": name, "detail": f"unit file unreadable: {type(e).__name__}"})
             continue
-        # Skipped only when it is exactly a -net check unit. A kit whose own name ends in -net has
-        # the same file name pattern, and a damaged unit of either kind is a kit that must parse.
-        if is_net_helper(path.name, text):
+        # Skipped only when it is exactly a -net check unit or an escape supervisor. A kit whose own
+        # name ends in -net or -escape has the same file name pattern, and a damaged unit of any of
+        # these kinds is a kit that must parse.
+        if is_net_helper(path.name, text) or is_escape_supervisor(path.name, text):
             continue
         try:
             argv = exec_start(text)

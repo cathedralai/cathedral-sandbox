@@ -27,6 +27,7 @@ REPO = Path(__file__).resolve().parents[1]
 KIT = REPO / "room-kit" / "vm"
 SEALED = REPO / "room-kit" / "sealed"
 CTL = KIT / "vm-ctl.sh"
+ESCAPE_UNITS = REPO / "scripts" / "escape_slots" / "write-escape-units.sh"
 GIB = 1 << 30
 MIB = 1 << 20
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHoDtpqWFYgHInGUaI+YzF7+kVPelQqOMZroOCQpu3bE user@laptop"
@@ -152,6 +153,15 @@ class Host:
         assert p.returncode == 0, p.stderr
         self.set_unit(f"room-sealed-{name}.service", active)
         return env
+
+    def escape_slot(self, name, active=True, **kw):
+        """A fresh slot kit (AB#683): its kit units, then the supervisor write-escape-units.sh writes."""
+        env = self.kit(name, active=active, extra="SEALED_ESCAPE_SLOT=1\nSEALED_BROKER_URL=https://broker.example\n", **kw)
+        p = subprocess.run(["bash", str(ESCAPE_UNITS), str(env)], capture_output=True, text=True,
+                           env={"PATH": "/usr/bin:/bin", "ROOM_DESTDIR": str(self.destdir)}, timeout=30)
+        assert p.returncode == 0, p.stderr
+        self.set_unit(f"room-sealed-{name}-escape.service", active)
+        return self.units / f"room-sealed-{name}-escape.service"
 
     def vm(self, name, vcpus=2, mem=4, disk=20, alloc_mib=None, active=False, enabled=None):
         """A VM directory as vm_ctl.py create writes it (vm.env), optionally with a sparse root.raw."""
@@ -337,6 +347,64 @@ def test_only_an_exact_net_check_unit_is_skipped(host, cap, damage):
         net.write_text(text.replace("host-net.sh check", "host-net.sh up"))
     assert [b["unit"] for b in cap.snapshot().unaccounted] == ["room-sealed-alpha-net.service"]
     assert refused(cap, cap.check_create, 1, 1, 4, host.vms / "vm1") == "kit_unaccounted"
+
+
+def test_an_escape_slot_supervisor_is_not_a_kit(host, cap):
+    """A fresh slot host: kit chi-escape and its #496 supervisor room-sealed-chi-escape-escape.service.
+    The supervisor runs no guest (it stops and starts room-sealed-chi-escape.service), so the kit
+    counts once and VM creates go on."""
+    unit = host.escape_slot("chi-escape", vcpus=4, mem=16, scratch=20)
+    text = unit.read_text()
+    assert "Description=Escape fresh slot chi-escape supervisor (AB#683, #496)" in text
+    assert cap.is_escape_supervisor(unit.name, text)
+    host.vm("vm1")
+    kits, bad = cap.kit_units()
+    assert bad == [] and [k.name for k in kits] == ["chi-escape"]
+    cap.check_create(1, 1, 4, host.vms / "vm2")
+    cap.check_start("vm1")
+
+
+@pytest.mark.parametrize("damage", ["truncated", "not_simple", "two_types", "other_script", "extra_argument",
+                                    "tool_outside_sealed_dir", "relative_env", "no_isolation", "env_not_sealed_env"])
+def test_only_an_exact_escape_supervisor_is_skipped(host, cap, damage):
+    unit = host.escape_slot("chi-escape")
+    text = unit.read_text()
+    tool = f"{host.tmp}/srv/sealed-hotel-chi-escape/escape-slot/supervise_escape_slot.py"
+    env = f"{host.tmp}/srv/sealed-hotel-chi-escape/sealed.env"
+    assert f"ExecStart=/usr/bin/python3 -I {tool} --sealed-env {env}" in text
+    broken = {
+        "truncated": text[:80],
+        "not_simple": text.replace("Type=simple", "Type=forking"),
+        "two_types": text.replace("Type=simple", "Type=simple\nType=forking"),
+        "other_script": text.replace("supervise_escape_slot.py --sealed-env", "start_guest.py --sealed-env"),
+        "extra_argument": text.replace(f"--sealed-env {env}", f"--sealed-env {env} --guest"),
+        "tool_outside_sealed_dir": text.replace(f"-I {tool}", "-I /tmp/escape-slot/supervise_escape_slot.py"),
+        "relative_env": text.replace(f"--sealed-env {env}", "--sealed-env sealed.env"),
+        "no_isolation": text.replace("python3 -I ", "python3 "),
+        "env_not_sealed_env": text.replace(f"--sealed-env {env}", f"--sealed-env {env}.bak"),
+    }[damage]
+    assert broken != text
+    unit.write_text(broken)
+    assert not cap.is_escape_supervisor(unit.name, broken)
+    assert [b["unit"] for b in cap.snapshot().unaccounted] == ["room-sealed-chi-escape-escape.service"]
+    assert refused(cap, cap.check_create, 1, 1, 4, host.vms / "vm1") == "kit_unaccounted"
+
+
+def test_a_kit_whose_own_name_ends_in_escape_is_still_a_kit(host, cap):
+    """Kit beta-escape: room-sealed-beta-escape.service runs launch-guest.sh, so it is counted."""
+    host.kit("beta-escape", vcpus=2, mem=8, scratch=10)
+    kits, bad = cap.kit_units()
+    assert bad == [] and [(k.name, k.mem_gib) for k in kits] == [("beta-escape", 8)]
+    assert not cap.is_escape_supervisor("room-sealed-beta-escape.service",
+                                        (host.units / "room-sealed-beta-escape.service").read_text())
+
+
+def test_net_check_units_are_still_skipped_beside_an_escape_supervisor(host, cap):
+    host.escape_slot("chi-escape")
+    net = host.units / "room-sealed-chi-escape-net.service"
+    assert cap.is_net_helper(net.name, net.read_text())
+    assert not cap.is_escape_supervisor(net.name, net.read_text())
+    assert cap.snapshot().unaccounted == []
 
 
 def test_a_vm_env_that_does_not_parse_refuses_create(host, cap):
