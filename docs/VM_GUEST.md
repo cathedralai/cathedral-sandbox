@@ -206,6 +206,10 @@ later bundle (a kernel or init fix) shares it and a VM can `rebundle` to it; ano
   (`recipe_sha256`) is not the pin's. The byte check is the gate.
 - The pin today: base root `0a200cc3`, verity `45044764`, of bundle `a9585311` (run 46095917678,
   rebuilt byte for byte by run 46103583234 at another commit).
+- Bundle B2 `c95300cb` (run 46114654444) replaces B1 `a9585311` and shares its base root. Its firmware is
+  `ovmf-amdsev` 2025.11-3ubuntu7.3 (`OVMF.amdsev.fd` `ac27e626`, the sealed kits' firmware), in place of
+  noble `ovmf` 2024.02-2ubuntu0.10 (`a50b4bca`). Under SEV-SNP on the proof host, B1's firmware stopped at
+  the APIC page before any serial output. A B1 VM can `rebundle` to B2.
 - **Take only the `vm-bundle` artifact.** The lanes upload `bundle-first` and `bundle-second`
   before the summary checks the pin, so a run that fails the pin still leaves lane artifacts with a
   base root that is not the pin's.
