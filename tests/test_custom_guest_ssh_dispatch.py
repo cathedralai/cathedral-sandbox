@@ -298,14 +298,14 @@ def sshd(tmp_path, request):
         "AcceptEnv CG_*", f"Subsystem sftp {request.param}", ""]))
     Path("/run/sshd").mkdir(exist_ok=True)
     p = subprocess.Popen([SSHD, "-D", "-e", "-f", str(d / "sshd_config")], stderr=open(d / "sshd.log", "w"))
+    # Wait on the log, not a probe connection: OpenSSH 10's PerSourcePenalties defers a source that drops a connection.
     for _ in range(100):
-        with socket.socket() as s:
-            if s.connect_ex(("localhost", port)) == 0:
-                break
+        if "Server listening on" in (d / "sshd.log").read_text():
+            break
         time.sleep(0.1)
     base = ["-F", "/dev/null", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null", "-i", str(d / "key")]
-    yield {"d": d, "port": port, "base": base, "tool": tool, "srv": srv}
+    yield {"d": d, "port": port, "base": base, "tool": tool, "srv": srv, "subsystem": request.param}
     p.terminate()
     p.wait(timeout=10)
 
@@ -324,8 +324,11 @@ def test_behind_sshd_a_shell_command_and_sftp_are_refused(sshd):
     p = subprocess.run(["sftp", *sshd["base"], "-P", str(sshd["port"]), "-b", "-", "root@localhost"],
                        input="ls /\n", capture_output=True, text=True, timeout=60)
     assert p.returncode != 0 and "etc" not in p.stdout, (p.stdout, p.stderr)
+    # The sftp request reached the forced command, with the configured subsystem command as SSH_ORIGINAL_COMMAND.
+    assert f"cathedral-cg-dispatch: refused: not the host tool of this install: {sshd['subsystem']!r}" in p.stderr, \
+        p.stderr
     log = (sshd["d"] / "sshd.log").read_text()
-    assert "subsystem request for sftp" in log, log[-2000:]
+    assert log.count("Starting session: forced-command (key-option)") == 3 and "subsystem 'sftp'" not in log, log[-3000:]
 
 
 @sshd_tests
