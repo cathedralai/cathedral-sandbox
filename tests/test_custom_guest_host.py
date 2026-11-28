@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from custom_guest_support import CG, HOTEL, LAUNCH, Host, load_host_module
+from custom_guest_support import CG, HOST, HOTEL, LAUNCH, Host, load_host_module
 
 
 @pytest.fixture
@@ -620,3 +620,27 @@ def test_facts_report_the_folders_bytes_while_it_waits(host):
     _launch_folder(host)
     rc, r = host.phase("facts")
     assert rc == 0 and r["launch_dir"] is True and r["launch_dir_bytes"] >= 4096 + 8192, r
+
+
+def test_folders_lists_every_launch_folder_without_a_launch_id(host):
+    """Q5 check: the operator compares these with the API's list; a link named like a launch is listed, not followed."""
+    _launch_folder(host)
+    base = host.root / f"srv/custom-guest/{HOTEL}"
+    (base / "cg-bbbbbbbbbbbb").mkdir()
+    (base / "inbox").mkdir(exist_ok=True)  # not a launch folder
+    os.symlink("/etc", base / "cg-cccccccccccc")
+    argv = ["bash", str(HOST), "folders", "--hotel", HOTEL]
+    p = subprocess.run(argv, capture_output=True, text=True, env=host.env, timeout=60)
+    r = json.loads([ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")][-1][7:])
+    assert p.returncode == 0 and r["ok"], (r, p.stderr)
+    got = {f["launch_id"]: f for f in r["folders"]}
+    assert set(got) == {LAUNCH, "cg-bbbbbbbbbbbb", "cg-cccccccccccc"}
+    assert got[LAUNCH]["plain_dir"] is True and got[LAUNCH]["bytes"] >= 4096 + 8192
+    assert got["cg-cccccccccccc"]["plain_dir"] is False
+
+
+def test_only_folders_runs_without_a_launch_id(host):
+    p = subprocess.run(["bash", str(HOST), "facts", "--hotel", HOTEL], capture_output=True, text=True, env=host.env,
+                       timeout=60)
+    r = json.loads([ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")][-1][7:])
+    assert p.returncode == 1 and r["error_code"] == "custom_guest_request_invalid", r

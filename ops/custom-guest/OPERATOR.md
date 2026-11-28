@@ -18,10 +18,12 @@
 1. **Create the user and the folders:**
 
    ```sh
-   useradd --system --user-group --home-dir /var/lib/cathedral-custom-guest --shell /usr/sbin/nologin cathedral-cg
+   useradd --system --user-group --groups systemd-journal --home-dir /var/lib/cathedral-custom-guest --shell /usr/sbin/nologin cathedral-cg
    install -d -m 0755 /opt/cathedral-custom-guest
    install -d -m 0750 -g cathedral-cg /etc/cathedral/custom-guest-operator
    ```
+
+   `systemd-journal` lets `check`, run as `cathedral-cg`, read the units' lines in the system journal. On a machine where the user already exists, add it with `usermod -aG systemd-journal cathedral-cg`. Without it, `check` alerts `custom_guest_journal_unreadable`.
 
 2. **Put the checkout in place.** Clone this repository at the commit recorded with `record-versions`:
 
@@ -55,7 +57,7 @@
    systemctl enable --now cathedral-custom-guest-reconcile@<hotel>.timer cathedral-custom-guest-wipe@<hotel>.timer
    ```
 
-6. **Check it** (step "Heartbeat check" below). The timers must show `active`, and the first runs must leave no `OPS-ALERT` line.
+6. **Check it** (step "Heartbeat check" below), after the wipe timer's first tick (it runs at :00, :15, :30 and :45). The timers must show `active`, both units must have a run line, and the first runs must leave no `OPS-ALERT` line. This is the positive control for the journal read: a check that reads nothing alerts.
 
 **Gate:** no customer launch begins on a hotel until steps 1 to 6 are done for that hotel on the operator machine.
 
@@ -79,10 +81,12 @@ Run this on the operator machine (`cg` as above):
 cg check --hotel <hotel> --since-min 16
 ```
 
-It sends nothing. It checks three things and prints one `OPS-ALERT` line for each finding:
+It sends nothing. It reads the API's list, the host's launch folders (one read-only `folders` call over SSH), the timers and the journal. It prints one `OPS-ALERT` line for each finding:
 
 - each launch the API marks `wipe_overdue`;
+- each launch folder on the host that the API does not list (`custom_guest_folder_unlisted`): no sweep wipes it;
 - each sweeper timer that is not `active`;
+- a journal that `cathedral-cg` cannot read (`custom_guest_journal_unreadable`), or a unit that wrote no run line in the window (`custom_guest_sweeper_silent`). An empty read never passes as a quiet one;
 - each `OPS-ALERT` line the two units wrote in the last 16 minutes.
 
 It exits 2 when it prints any alert, and 0 when there is none.
@@ -104,3 +108,13 @@ Each line reads `OPS-ALERT custom_guest hotel=<hotel> launch=<launch> <code>: <d
   - It never follows a link inside the folder.
 - **The API marks the wipe overdue** an hour after the later of the return and the time the wipe was allowed. `reconcile` and `check` alert on it.
 - **While the folder is there, the host takes no VM** (the VM capacity check refuses any VM on a custom-guest host) and no other custom launch.
+- **Keep the hotel and the owner listed until `wiped_at`.** The sweeper and the wipe route find a launch only while `CATHEDRAL_CUSTOM_GUEST_HOTELS` lists its hotel and `CATHEDRAL_CUSTOM_GUEST_SCOPES` lists its owner. Take either off only after the launch's record shows `wiped_at`. `check` alerts on a folder left behind.
+- **The waiver counts only after the stop.** The owner sends `waive_notice: true` after the guest's last stop and before (or with) the return. A waiver sent while the guest still runs does not allow the wipe, and the folder waits the 72 h.
+- **The host tool must be from Q5 on.** `return` refuses R15 (`custom_guest_hold_unsupported`, "deploy the host tool first") when the host's facts carry no `launch_dir_bytes`: an older host tool would remove the folder at R15, and the API would record a wipe that never waited. Deploy the host tool, then `resume`.
+
+## The hold and a live room
+
+A hold drains the hotel (H2), then fences it (H3). The broker refuses the fence (409 `rooms_active`) while any room still runs on the hotel. The operator retries for `CG_FENCE_WAIT` seconds (1800 by default), and all that time **the hotel stays drained**: it takes no new room. Then the hold aborts with `custom_guest_barrier_failed` and restores the drain. The room is not touched.
+
+- For a hold you watch, set `CG_FENCE_WAIT` lower (E2E route 1 used 30 for the live-room test).
+- Before a hold, check the broker's `rooms_in_use` is 0. If not, wait or ask the owner to end the rooms first.
