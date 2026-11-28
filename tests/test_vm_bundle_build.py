@@ -200,20 +200,66 @@ def test_base_root_lock_has_no_kernel_bootloader_or_guest_agent():
     assert not [e[0] for e in _lock("base-root.packages.lock") if e[0].startswith(forbidden)]
 
 
-def test_closure_is_pinned_to_the_locked_kernel_with_the_boot_modules_only():
+def test_closure_is_pinned_to_the_locked_kernel_with_the_whole_module_tree():
     closure = json.loads(CLOSURE.read_text())
     release = _workflow_env("VM_BUNDLE_KERNEL_RELEASE")
     assert closure["status"] == "pinned" and closure["kernel_release"] == release
     prefix = f"usr/lib/modules/{release}/"
-    files = sorted(p.removeprefix(prefix) for p in closure["modules"] if p.endswith(".ko.zst"))
-    assert files == ["kernel/drivers/firmware/qemu_fw_cfg.ko.zst", "kernel/drivers/md/dm-bufio.ko.zst",
-                     "kernel/drivers/md/dm-crypt.ko.zst", "kernel/drivers/md/dm-verity.ko.zst",
-                     "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst", "kernel/drivers/virt/coco/tsm.ko.zst"]
-    assert all(p.startswith(prefix + "modules.") for p in closure["modules"] if not p.endswith(".ko.zst"))
+    files = {p.removeprefix(prefix) for p in closure["modules"]}
+    boot = {"kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst", "kernel/drivers/virt/coco/tsm.ko.zst",
+            "kernel/drivers/firmware/qemu_fw_cfg.ko.zst", "kernel/drivers/md/dm-verity.ko.zst",
+            "kernel/drivers/md/dm-bufio.ko.zst", "kernel/drivers/md/dm-crypt.ko.zst",
+            "kernel/arch/x86/crypto/aesni-intel.ko.zst", "kernel/crypto/crypto_simd.ko.zst",
+            "kernel/crypto/cryptd.ko.zst"}
+    assert boot <= files and "modules.dep" in files
+    # The customer root keeps linux-modules whole (overlay, nf_tables, wireguard for Docker and
+    # firewalls); extra adds only the boot set, so nothing from its wireless tree is here.
+    assert {"kernel/fs/overlayfs/overlay.ko.zst", "kernel/net/netfilter/nf_tables.ko.zst",
+            "kernel/drivers/net/wireguard/wireguard.ko.zst"} <= files
+    assert len([f for f in files if f.endswith(".ko.zst")]) > 900
+    assert not [f for f in files if f.startswith("kernel/drivers/net/wireless/")]
     assert set(closure["executables"]) == {"init", "usr/lib/cathedral/cathedral-vm",
                                            "usr/lib/cathedral/cathedral-vm-attest", "usr/lib/cathedral/cryptsetup",
                                            "usr/lib/cathedral/mke2fs", "usr/lib/cathedral/resize2fs",
                                            "usr/lib/cathedral/veritysetup"}
+
+
+def test_closure_boots_the_modules_the_kernel_step_checks_in_order():
+    closure = json.loads(CLOSURE.read_text())
+    build = (REPO / "room-kit" / "vm" / "build-bundle.sh").read_text()
+    line = next(l for l in build.splitlines() if l.startswith("KERNEL_MODULES="))
+    assert closure["boot_modules"] == line.split("=", 1)[1].strip('"').split()
+    assert "aesni_intel" in closure["boot_modules"]
+    assert 'if closure["boot_modules"] != names:' in WORKFLOW.read_text()
+
+
+def test_toolchains_compare_without_the_runner_image_line():
+    sys.path.insert(0, str(REPO / "scripts"))
+    import vm_bundle_build_summary as summary
+    assert summary.same_toolchain("image: ubuntu26 1\ngo 1.26.11\n", "image: ubuntu26 2\ngo 1.26.11\n")
+    assert not summary.same_toolchain("image: ubuntu26 1\ngo 1.26.11\n", "image: ubuntu26 1\ngo 1.26.12\n")
+
+
+def test_summary_records_the_built_commit_event_ref_and_epoch(tmp_path):
+    _lanes(tmp_path / "lanes")
+    for lane in ("first", "second"):
+        (tmp_path / "lanes" / f"bundle-{lane}" / "source-date-epoch").write_text("1795823010\n")
+    env = dict(os.environ, SOURCE_SHA="57ef14113bb9d6e989b41dbbf28b60d7a4e46459", GITHUB_SHA="bb20398",
+               GITHUB_EVENT_NAME="pull_request", GITHUB_REF="refs/pull/817/merge")
+    r = subprocess.run([sys.executable, str(SUMMARY), "compare", "--lanes", str(tmp_path / "lanes"),
+                        "--out", str(tmp_path / "out")], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert summary["source_commit"] == "57ef14113bb9d6e989b41dbbf28b60d7a4e46459"
+    assert (summary["event"], summary["ref"], summary["source_date_epoch"]) == \
+        ("pull_request", "refs/pull/817/merge", "1795823010")
+
+
+def test_workflow_builds_the_head_commit_on_pinned_runners():
+    text = WORKFLOW.read_text()
+    assert "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in text
+    assert text.count("ref: ${{ env.SOURCE_SHA }}") == 3
+    assert "ubuntu-latest" not in text
 
 
 def test_workflow_builds_against_the_committed_locks():

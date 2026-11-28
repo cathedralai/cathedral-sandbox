@@ -141,6 +141,14 @@ def measurement_line(measurement):
             f"identity sha256 `{measurement.get('identity_sha256', '')}`")
 
 
+def same_toolchain(first, second):
+    """Toolchains compared without the runner image line: lanes may land on two image versions
+    during a rollout, and the bytes are compared anyway."""
+    def strip(text):
+        return [line for line in text.splitlines() if not line.startswith("image:")]
+    return strip(first) == strip(second)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -172,7 +180,12 @@ def main():
     measurement_path = first["bundle"] / "measurement.json"
     summary = {
         "schema": "cathedral.vm.bundle-build-summary/v1",
-        "source_commit": os.environ.get("GITHUB_SHA", ""),
+        # The commit the lanes built (on a pull request its head, not the test merge) and the
+        # epoch every timestamp in the base root and the module tar is set to.
+        "source_commit": os.environ.get("SOURCE_SHA", ""),
+        "source_date_epoch": read(first["bundle"], "source-date-epoch"),
+        "event": os.environ.get("GITHUB_EVENT_NAME", ""),
+        "ref": os.environ.get("GITHUB_REF", ""),
         "run": f"{os.environ.get('GITHUB_RUN_ID', '')}/{os.environ.get('GITHUB_RUN_ATTEMPT', '')}",
         "snapshot": os.environ.get("VM_BUNDLE_SNAPSHOT", ""),
         "kernel_release": read(first["bundle"], "kernel-release"),
@@ -185,7 +198,10 @@ def main():
         "measurement": json.loads(measurement_path.read_text()) if measurement_path.is_file() else None,
         "files": files,
         "lanes_byte_identical": True,
-        "toolchains_identical": all(toolchains[f"{kind}-first"] == toolchains[f"{kind}-second"] for kind in KINDS),
+        "toolchains_identical": all(same_toolchain(toolchains[f"{kind}-first"], toolchains[f"{kind}-second"])
+                                    for kind in KINDS),
+        "runner_images": sorted({line for text in toolchains.values() for line in text.splitlines()
+                                 if line.startswith("image:")}),
         "boot_verified": False,
     }
     for name, text in toolchains.items():
@@ -202,7 +218,8 @@ def main():
         f"- Base root verity: `{summary['base_root_verity']}`, data bytes {summary['base_root_data_bytes']}\n"
         f"- Bundle id (sha256 of manifest.json): `{summary['bundle_id'] or 'not built (closure unpinned)'}`\n"
         f"- Fixture identity a, 2 vCPU, genoa: {measurement_line(summary['measurement'])}\n"
-        f"- Source commit: `{summary['source_commit']}`\n"
+        f"- Source commit: `{summary['source_commit']}` ({summary['event']} {summary['ref']}), "
+        f"SOURCE_DATE_EPOCH {summary['source_date_epoch']}\n"
         "- Both lanes byte-identical: yes. Boot verified: no (this run builds; it does not boot).\n"
         f"- Toolchains identical across lanes: {'yes' if summary['toolchains_identical'] else 'no (see toolchain-*.txt)'}\n\n"
         "### Boot modules (module file or built in)\n\n" + module_rows +
