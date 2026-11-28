@@ -239,5 +239,8 @@ func (r *ReadyRoot) Exec() error {
 	}
 	base.Close()
 	root.Close()
+	// PrepareKernelViews sets umask 0077 for this init's own stages. The owner's init starts with
+	// the usual one (systemd resets its own; another init might not).
+	syscall.Umask(0o022)
 	return syscall.Exec("/sbin/init", []string{"/sbin/init"}, []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "TERM=linux"})
 }
