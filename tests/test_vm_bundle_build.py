@@ -24,6 +24,9 @@ def test_every_input_has_an_https_url_and_a_sha256():
     pins = fetch.plan()
     assert set(pins["host"]) == {"mmdebstrap_1.5.7-3_all.deb"}
     assert set(pins["ovmf"]) == {"ovmf-amdsev_2025.11-3ubuntu7.3_all.deb"}
+    # The deb that holds OVMF.amdsev.fd ac27e626 (the workflow checks the extracted file too).
+    assert pins["ovmf"]["ovmf-amdsev_2025.11-3ubuntu7.3_all.deb"][1] == \
+        "f2a54db678d98ce1a5ac27155cb037cbf6e3efc918d11a35af1ca4606a290d29"
     assert set(pins["go"]) == {"go1.26.11.linux-amd64.tar.gz"}
     # The same Go as the reference build (#808), from go.dev's published sha256.
     assert pins["go"]["go1.26.11.linux-amd64.tar.gz"][1] == \
