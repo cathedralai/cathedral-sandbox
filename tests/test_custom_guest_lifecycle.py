@@ -32,6 +32,20 @@ MEASUREMENT = "ab" * 48
 G0, REF0 = 7, "order-ref-0"
 
 
+# The upload as the hotel's forced command sees it with scp -O: `scp -t <path>` (N2).
+FAKE_SCP = r'''import os, sys
+sys.path.insert(0, os.environ["FAKE_DISPATCH_DIR"])
+import cg_ssh_dispatch
+path = sys.argv[-1].split(":", 1)[1]
+try:
+    cg_ssh_dispatch.check("scp -t " + path, os.environ["FAKE_HOTEL"], os.environ["FAKE_TOOL"])
+except cg_ssh_dispatch.Refused as e:
+    open(os.environ["FAKE_REFUSED"], "a").write(f"{e}: scp {path!r}\n")
+    sys.exit(1)
+open(sys.argv[0] + ".log", "a").write(sys.argv[-1] + "\n")
+'''
+
+
 def iso(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
@@ -40,6 +54,14 @@ def iso(t: float) -> str:
 
 FAKE_SSH = r'''#!/usr/bin/env python3
 import fcntl, json, os, shlex, sys, time, uuid
+# The hotel's forced command sees exactly this string: refuse here what it would refuse there (N2).
+sys.path.insert(0, os.environ["FAKE_DISPATCH_DIR"])
+import cg_ssh_dispatch
+try:
+    cg_ssh_dispatch.check(sys.argv[2], os.environ["FAKE_HOTEL"], os.environ["FAKE_TOOL"])
+except cg_ssh_dispatch.Refused as e:
+    open(os.environ["FAKE_REFUSED"], "a").write(f"{e}: {sys.argv[2]!r}\n")
+    sys.exit(1)
 path = os.environ["FAKE_HOST"]
 lock = open(path + ".lock", "w")
 fcntl.flock(lock, fcntl.LOCK_EX)
@@ -255,7 +277,8 @@ class World:
         self.returned_at: float | None = None
         self.launch_dir_bytes: int | None = None
         self.old_api = False         # an API before the stop clock: no wipe fields in the record, no wipe route
-        self.unlisted = False        # the hotel or the owner scope taken off the custom guest lists: the list 404s
+        self.unlisted = False        # the hotel or the owner scope taken off the custom guest lists: an empty list
+        self.lane_off = False        # CATHEDRAL_CUSTOM_GUEST_ENABLED off: every custom guest route is a plain 404
         self.nonce = 0
         self.calls: list[str] = []
         self.refused: list[str] = []
@@ -689,9 +712,11 @@ class World:
         return moved("the read-back after the PATCH shows none of the expected states")
 
     def handle(self, method: str, path: str, body: dict | None) -> tuple[int, dict]:
+        if self.lane_off and path.startswith(ADMIN):
+            return 404, {"detail": "Not Found"}  # FastAPI's own 404 body: no code in it
         if method == "GET" and path == f"{ADMIN}?hotel={HOTEL}":
             if self.unlisted:
-                return 404, {"error": "not_found"}
+                return 200, {"launches": []}  # list_for_admin filters by the listed hotels and scopes
             return 200, {"launches": [self.record_view()]}
         if method == "PATCH" and path == f"{ADMIN}/{LAUNCH}":
             return self.patch(body)
@@ -763,7 +788,7 @@ class Rig:
         for k in ("admin-key", "operator-key"):
             (self.home / k).write_text("test-key\n")
         (tmp / "fake_ssh.py").write_text(FAKE_SSH)
-        (tmp / "fake_scp.py").write_text("import sys\nopen(sys.argv[0] + '.log', 'a').write(sys.argv[-1] + '\\n')\n")
+        (tmp / "fake_scp.py").write_text(FAKE_SCP)
         self.host_path = tmp / "host.json"
         self.world.host_path = self.host_path
         now = int(time.time())
@@ -785,7 +810,9 @@ class Rig:
         env.update(CG_HOME=str(self.home), CG_API_URL=url, CG_BROKER_URL=url, CG_SSH=f"{sys.executable} {self.tmp}/fake_ssh.py",
                    CG_SCP=f"{sys.executable} {self.tmp}/fake_scp.py",
                    CG_POLL="0.02", CG_FENCE_WAIT="2", CG_H7_WAIT="2", CG_ADMIT_WAIT="1", FAKE_HOST=str(self.host_path),
-                   FAKE_LAUNCH=LAUNCH, NO_PROXY="*")
+                   FAKE_LAUNCH=LAUNCH, NO_PROXY="*", FAKE_DISPATCH_DIR=str(REPO / "ops" / "custom-guest"),
+                   FAKE_HOTEL=HOTEL, FAKE_TOOL=f"{REPO}/ops/custom-guest/custom-guest-host.sh",
+                   FAKE_REFUSED=str(self.tmp / "dispatch-refused.log"))
         env.update(extra)
         return env
 
@@ -820,6 +847,8 @@ def rig(tmp_path):
     r = Rig(tmp_path)
     yield r
     r.close()
+    refused = tmp_path / "dispatch-refused.log"
+    assert not refused.exists(), "the hotel's forced command would refuse: " + refused.read_text()
 
 
 def assert_held(rig: Rig) -> None:
@@ -1312,6 +1341,18 @@ def test_check_alerts_when_a_sweeper_unit_wrote_no_run_line(rig):
     returned_with_folder(rig)
     code, alerts = check_alerts(rig, **fake_tools(rig, "active", "a quiet line\n"))
     assert code == 2 and sum("custom_guest_sweeper_silent" in a for a in alerts) == 2, alerts
+
+
+def test_check_and_sweep_name_the_lane_off_404(rig):
+    """With the lane off the API answers 404 {"detail": "Not Found"}; the alert must say custom_guest_not_found,
+    not unknown (error_code finds no code in that body, so an `or` fallback never fired)."""
+    returned_with_folder(rig)
+    rig.world.lane_off = True
+    code, alerts = check_alerts(rig, **fake_tools(rig, "active", RUNS))
+    assert code == 2 and any("custom_guest_not_found: API list 404" in a for a in alerts), alerts
+    assert not any(" unknown:" in a for a in alerts), alerts
+    rc, out = rig.run("sweep", "--what", "reconcile", launch=False)
+    assert rc == 1 and out["error_code"] == "custom_guest_not_found", out
 
 
 def test_check_alerts_on_a_folder_the_api_does_not_list(rig):
