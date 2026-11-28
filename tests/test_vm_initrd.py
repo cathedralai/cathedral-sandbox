@@ -45,7 +45,9 @@ MODULE_FILES = {
         "kernel/drivers/md/dm-crypt.ko.zst:\n"
         "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst:\n"
     ),
-    "modules.builtin": "kernel/drivers/md/dm-verity.ko\nkernel/drivers/firmware/qemu_fw_cfg.ko\nkernel/drivers/net/virtio_net.ko\n",
+    # aesni_intel built in here (a module file in the reference kernel), so the checked-in boot list fits.
+    "modules.builtin": "kernel/drivers/md/dm-verity.ko\nkernel/drivers/firmware/qemu_fw_cfg.ko\nkernel/drivers/net/virtio_net.ko\n"
+                       "kernel/arch/x86/crypto/aesni-intel.ko\n",
     "kernel/drivers/virtio/virtio.ko.zst": "m1",
     "kernel/drivers/virtio/virtio_ring.ko.zst": "m2",
     "kernel/drivers/block/virtio_blk.ko.zst": "m3",
@@ -79,9 +81,13 @@ def test_a_testdata_main_is_refused_in_a_production_closure(monkeypatch):
 
 
 def unpinned_closure() -> dict:
+    """The checked-in recipe (mains, tools, boot modules) with its pins taken off."""
     closure = json.loads((KIT / "vm" / "vm_initrd_closure.json").read_text())
     closure["go_mains"]["init"] = "./testdata/vm-init-stub"
     closure["kernel_release"] = RELEASE
+    closure["status"] = "unpinned"
+    closure["executables"] = {name: None for name in closure["executables"]}
+    closure["modules"] = {}
     return closure
 
 
@@ -122,13 +128,21 @@ def elf(interp=False, needed=False) -> bytes:
     return header + ph + struct.pack("<qQ", 1 if needed else 0, 0)
 
 
-def test_the_checked_in_closure_is_unpinned_and_refused():
+def test_the_checked_in_closure_is_pinned():
+    # Pinned from the reference build (.github/workflows/vm-bundle-build.yml), whose lanes check
+    # the initrd they build against it; tests/test_vm_bundle_build.py checks it against the locks.
     closure = recipe.load_closure(KIT / "vm" / "vm_initrd_closure.json")
-    assert closure["status"] == "unpinned"
-    with pytest.raises(ValueError, match="unpinned"):
-        recipe.require_pinned(closure)
+    assert closure["status"] == "pinned"
+    recipe.require_pinned(closure)
+    assert all(recipe.HEX64_RE.fullmatch(d) for d in closure["executables"].values())
     with pytest.raises(ValueError):
         recipe.build_raw({}, closure)
+
+
+def test_an_unpinned_closure_is_refused():
+    closure = unpinned_closure()
+    with pytest.raises(ValueError, match="unpinned"):
+        recipe.require_pinned(closure)
 
 
 def test_archive_roundtrip_load_order_and_generated_files(staged):

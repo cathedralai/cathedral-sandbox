@@ -488,6 +488,168 @@ def test_mkfs_runs_with_source_date_epoch_after_the_floor():
     text = BUILD.read_text()
     base = text[text.index("build_base_root() {"):text.index("# ---------------------------------------------------------------- kernel")]
     assert base.index("e2fsprogs_floor") < base.index("pinned_root base-root")
-    mkfs = next(line for line in base.splitlines() if "mkfs.ext4" in line)
+    mkfs = next(line for line in base.splitlines() if '"$MKE2FS" -t ext4' in line)
     assert "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" in mkfs and "LC_ALL=C" in mkfs
+    # No host /etc/mke2fs.conf: the compiled-in defaults of the pinned mke2fs.
+    assert "MKE2FS_CONFIG=$B/no-mke2fs.conf" in mkfs
     assert "E2FSPROGS_FAKE_TIME=" not in base
+
+
+def test_both_roots_take_all_three_pockets_of_one_snapshot():
+    text = BUILD.read_text()
+    root = text[text.index("pinned_root() {"):text.index("# ---------------------------------------------------------------- base root")]
+    assert 'for pocket in "$SUITE" "$SUITE-updates" "$SUITE-security"; do' in root
+    assert 'sources+=("deb [signed-by=$KEYRING] $MIRROR $pocket main universe")' in root
+    assert '"${sources[@]}"' in root and "--components" not in root
+    assert "MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT" in text
+
+
+def _host_leaks(tmp_path, files):
+    text = BUILD.read_text()
+    block = text[text.index("host_leaks() {"):text.index("# ---------------------------------------------------------------- base root")]
+    root = tmp_path / "root"
+    for rel, data in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+    (root / "var").mkdir(exist_ok=True)
+    script = 'die() { echo "$*" >&2; exit 1; }\n' + block + f'\nhost_leaks {root} && echo clean'
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def test_host_leaks_passes_a_root_without_host_files(tmp_path):
+    r = _host_leaks(tmp_path, {"etc/hostname": b"cathedral-vm\n", "etc/os-release": b"NAME=Ubuntu\n"})
+    assert r.returncode == 0 and "clean" in r.stdout, r.stderr
+
+
+def test_host_leaks_refuses_a_copy_of_the_host_resolv_conf(tmp_path):
+    host = Path("/etc/resolv.conf")
+    if not host.is_file() or host.stat().st_size == 0:
+        pytest.skip("this host has no resolv.conf")
+    r = _host_leaks(tmp_path, {"etc/.resolv.conf.systemd-resolved.bak": host.read_bytes()})
+    assert r.returncode != 0
+    assert "copy of a build host file: etc/.resolv.conf.systemd-resolved.bak" in r.stderr
+
+
+def test_base_root_removes_the_resolved_backup_before_the_image():
+    text = BUILD.read_text()
+    base = text[text.index("build_base_root() {"):text.index("# ---------------------------------------------------------------- kernel")]
+    assert 'rm -f "$R/etc/.resolv.conf.systemd-resolved.bak"' in base
+    assert base.index("host_leaks") < base.index('"$MKE2FS" -t ext4')
+
+
+def test_kernel_step_takes_the_extra_modules_of_the_named_release():
+    assert _assignment("KERNEL_EXTRA_PKG") == "linux-modules-extra"
+    text = BUILD.read_text()
+    kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]
+    assert 'pinned_root kernel "$KERNEL_PKGS,$KERNEL_EXTRA_PKG-$KERNEL_RELEASE"' in kernel
+    assert '[ "$kver" = "$KERNEL_RELEASE" ]' in kernel
+
+
+def _module_cut_script() -> str:
+    text = BUILD.read_text()
+    start = text.index("\n", text.index('python3 -I - "$tree" "$B/boot-modules.txt"')) + 1
+    start = text.index("\n", start) + 1  # the "|| die" line
+    return text[start:text.index("\nEOF\n", start) + 1]
+
+
+RELEASE_DIR = "6.8.0-151-generic"
+# linux-modules (the whole tree ships) and linux-modules-extra (only the boot set ships).
+PACKAGE_FILES = {
+    "kernel/drivers/md/dm-verity.ko.zst": "kernel/drivers/md/dm-bufio.ko.zst",
+    "kernel/drivers/md/dm-bufio.ko.zst": "",
+    "kernel/drivers/md/dm-crypt.ko.zst": "",
+    "kernel/arch/x86/crypto/aesni-intel.ko.zst": "kernel/crypto/crypto_simd.ko.zst kernel/crypto/cryptd.ko.zst",
+    "kernel/crypto/crypto_simd.ko.zst": "kernel/crypto/cryptd.ko.zst",
+    "kernel/crypto/cryptd.ko.zst": "",
+    "kernel/fs/overlayfs/overlay.ko.zst": "",
+    "kernel/net/netfilter/nf_tables.ko.zst": "",
+}
+EXTRA_FILES = {
+    "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst": "kernel/drivers/virt/coco/tsm.ko.zst",
+    "kernel/drivers/virt/coco/tsm.ko.zst": "",
+    "kernel/drivers/firmware/qemu_fw_cfg.ko.zst": "",
+    "kernel/drivers/net/wireless/foo.ko.zst": "kernel/sound/core/snd.ko.zst",
+    "kernel/sound/core/snd.ko.zst": "",
+}
+BOOT_LISTING = ("sev-guest module kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst\n"
+                "dm-verity module kernel/drivers/md/dm-verity.ko.zst\n"
+                "aesni_intel module kernel/arch/x86/crypto/aesni-intel.ko.zst\n"
+                "dm-crypt module kernel/drivers/md/dm-crypt.ko.zst\n"
+                "qemu_fw_cfg module kernel/drivers/firmware/qemu_fw_cfg.ko.zst\n"
+                "virtio_blk built-in\nvirtio_net built-in\n")
+
+
+def _cut(tmp_path, listing=BOOT_LISTING):
+    tree = tmp_path / "usr/lib/modules" / RELEASE_DIR
+    files = {**PACKAGE_FILES, **EXTRA_FILES}
+    for rel in files:
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_bytes(b"ko")
+    (tree / "modules.dep").write_text("".join(f"{rel}: {needs}".rstrip() + "\n" for rel, needs in files.items()))
+    (tree / "modules.order").write_text("".join(rel.removesuffix(".zst") + "\n" for rel in files))
+    for index in ("modules.builtin", "modules.builtin.modinfo", "modules.alias", "modules.dep.bin"):
+        (tree / index).write_text("x\n")
+    (tree / "vdso" / ".build-id" / "3e").mkdir(parents=True)
+    (tree / "vdso" / "vdso64.so").write_bytes(b"elf")
+    os.symlink("../../vdso64.so", tree / "vdso" / ".build-id" / "3e" / "e2.debug")
+    # dpkg's list of linux-modules: its files, its directories and its one link, under /lib.
+    shipped = list(PACKAGE_FILES) + ["modules.builtin", "modules.builtin.modinfo", "modules.order",
+                                     "vdso", "vdso/vdso64.so", "vdso/.build-id/3e/e2.debug", "kernel"]
+    package = tmp_path / f"linux-modules-{RELEASE_DIR}.list"
+    package.write_text("".join(f"/lib/modules/{RELEASE_DIR}/{rel}\n" for rel in shipped) + "/boot/vmlinuz\n")
+    boot = tmp_path / "boot-modules.txt"
+    boot.write_text(listing)
+    r = subprocess.run([sys.executable, "-I", "-", str(tree), str(boot), str(package)], input=_module_cut_script(),
+                       capture_output=True, text=True)
+    return r, tree
+
+
+def test_module_cut_ships_the_package_tree_and_only_the_boot_set_of_extra(tmp_path):
+    r, tree = _cut(tmp_path)
+    assert r.returncode == 0, r.stderr
+    left = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file() or p.is_symlink())
+    extra_kept = ["kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst", "kernel/drivers/virt/coco/tsm.ko.zst",
+                  "kernel/drivers/firmware/qemu_fw_cfg.ko.zst"]
+    # The depmod outputs go too (depmod rebuilds them), and so do the links.
+    assert left == sorted(list(PACKAGE_FILES) + extra_kept +
+                          ["modules.builtin", "modules.builtin.modinfo", "modules.order", "vdso/vdso64.so"])
+    assert not (tree / "kernel/sound").exists() and not (tree / "vdso/.build-id").exists()
+    kept = set(PACKAGE_FILES) | set(extra_kept)
+    assert (tree / "modules.order").read_text().splitlines() == \
+        [rel.removesuffix(".zst") for rel in {**PACKAGE_FILES, **EXTRA_FILES} if rel in kept]
+
+
+def test_module_cut_refuses_a_boot_module_modules_dep_does_not_know(tmp_path):
+    r, _ = _cut(tmp_path, "vfio module kernel/drivers/vfio/vfio.ko.zst\n")
+    assert r.returncode != 0 and "modules.dep has no entry" in r.stderr
+
+
+def test_module_cut_refuses_a_package_list_of_another_tree(tmp_path):
+    r, tree = _cut(tmp_path)
+    assert r.returncode == 0
+    tree2 = tmp_path / "other" / "6.8.0-152-generic"
+    tree2.mkdir(parents=True)
+    (tree2 / "modules.dep").write_text("")
+    (tree2 / "modules.order").write_text("")
+    boot = tmp_path / "empty-boot.txt"
+    boot.write_text("virtio_blk built-in\n")
+    r = subprocess.run([sys.executable, "-I", "-", str(tree2), str(boot), str(tmp_path / f"linux-modules-{RELEASE_DIR}.list")],
+                       input=_module_cut_script(), capture_output=True, text=True)
+    assert r.returncode != 0 and "lists no file of this tree" in r.stderr
+
+
+def test_kernel_step_requires_aes_ni_for_dm_crypt():
+    modules = _assignment("KERNEL_MODULES").strip('"').split()
+    assert modules.index("aesni_intel") < modules.index("dm-crypt")
+    assert "CRYPTO_AES_NI_INTEL" in _assignment("KERNEL_CONFIG_YM")
+    text = BUILD.read_text()
+    kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]
+    assert "grep -qx 'CONFIG_CRYPTO_AES_NI_INTEL=y'" in kernel and "grep -q '^aesni_intel module '" in kernel
+    assert _assignment("KERNEL_TREE_PKG") == "linux-modules"
+
+
+def test_kernel_step_records_built_in_boot_modules():
+    text = BUILD.read_text()
+    kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]
+    assert "modules.builtin" in kernel and '"$B/boot-modules.txt"' in kernel
+    assert "build/boot-modules.txt" in text[text.index("step_outputs() {"):]

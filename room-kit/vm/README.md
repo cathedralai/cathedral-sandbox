@@ -250,7 +250,10 @@ cmdline and HOST_DATA from the identity on every launch.
   (schema `cathedral.vm.bundle/v1`, canonical JSON, every file's sha256 and size, the
   cmdline template, CPU family and model, policy `0x30000`, QEMU, kernel and initrd
   versions, snapshot, verity root hash). `build-bundle.sh` builds the base root and the
-  kernel from one pinned snapshot, then writes the manifest.
+  kernel from one pinned snapshot (its release, `-updates` and `-security` pockets), then
+  writes the manifest. The reference build is `.github/workflows/vm-bundle-build.yml`:
+  two lanes on fresh hosted runners, with the pinned static `mke2fs` and `veritysetup`,
+  and a summary that publishes only when every file is byte-identical across the lanes.
 - **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random
   salt, the first-boot SSH key and the bundle's base root hash. Written once at create.
   `create`'s answer, `status` and `list` carry it as `identity_document`, the file's exact

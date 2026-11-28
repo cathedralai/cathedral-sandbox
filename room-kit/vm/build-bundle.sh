@@ -1,7 +1,9 @@
 #!/bin/bash
 # Build the files of one sealed customer VM bundle (AB#999, VM runtime spec r2 6.1 and 7.3).
-# Run as root on a build host with mmdebstrap, e2fsprogs 1.47.1 or later, veritysetup
-# (cryptsetup-bin) and kmod.
+# Run as root on an Ubuntu build host with mmdebstrap, e2fsprogs 1.47.1 or later, veritysetup
+# (cryptsetup-bin) and kmod. VM_BUNDLE_TOOLS names a directory with the pinned static mke2fs
+# and veritysetup (scripts/build_vm_initrd_tools.py); the reference build
+# (.github/workflows/vm-bundle-build.yml) uses it so the image bytes do not follow the host.
 #
 #   build-bundle.sh base-root bundle.env [--verify-reproducible]
 #       the customer's base root: ext4 image + dm-verity tree
@@ -15,7 +17,7 @@
 #
 # The VM initrd (PR VM1b) is built between kernel and manifest: it packs the module
 # tree from $VM_BUNDLE_OUT/build/modules-<release>.tar. Both package sets come from one
-# pinned snapshot.ubuntu.com id and must equal their packages.lock (packages_lock.py, as
+# pinned snapshot.ubuntu.com id (its release, -updates and -security pockets) and must equal their packages.lock (packages_lock.py, as
 # build-guest.sh's pinned base). Output in $VM_BUNDLE_OUT, all digested by the manifest:
 #   OVMF.amdsev.fd vmlinuz initrd.cpio.zst base-root.raw base-root.packages.lock
 #   kernel.packages.lock manifest.json
@@ -34,10 +36,20 @@ BASE_PKGS=systemd,systemd-sysv,systemd-resolved,systemd-timesyncd,udev,kmod,dbus
 # Stock Ubuntu kernel, the package the kit boots (build-guest.sh PKGS). Only its vmlinuz
 # and module tree leave this root.
 KERNEL_PKGS=linux-image-virtual
-# Loaded or built in; the VM init (7.2) needs each one before it can open the disks.
-KERNEL_MODULES="sev-guest dm-verity dm-crypt qemu_fw_cfg virtio_blk virtio_net"
+# The customer root gets this package's whole module tree (read-only, from the initrd), so
+# Docker, nft, ufw, WireGuard and overlay work as on a stock Ubuntu VM.
+KERNEL_TREE_PKG=linux-modules
+# sev-guest (with tsm, which it needs) and qemu_fw_cfg are only in linux-modules-extra, which
+# is versioned: bundle.env names the release (VM_BUNDLE_KERNEL_RELEASE) and the build stops
+# unless linux-image-virtual resolves to the same one in the snapshot.
+KERNEL_EXTRA_PKG=linux-modules-extra
+# Loaded or built in; the VM init (7.2) needs each one before it can open the disks. The
+# order is the closure's boot_modules order. aesni_intel gives dm-crypt the AES-NI xts(aes):
+# without it dm-crypt takes the generic T-table AES, which is slow and whose key-dependent
+# memory accesses the host can see through the cache.
+KERNEL_MODULES="sev-guest dm-verity aesni_intel dm-crypt qemu_fw_cfg virtio_blk virtio_net"
 KERNEL_CONFIG_Y="AMD_MEM_ENCRYPT EFI_STUB BLK_DEV_INITRD RD_ZSTD"
-KERNEL_CONFIG_YM="SEV_GUEST DM_VERITY DM_CRYPT VIRTIO_BLK VIRTIO_NET"
+KERNEL_CONFIG_YM="SEV_GUEST DM_VERITY DM_CRYPT VIRTIO_BLK VIRTIO_NET CRYPTO_AES_NI_INTEL"
 
 usage() { echo "usage: build-bundle.sh base-root|kernel bundle.env [--verify-reproducible] | manifest bundle.env" >&2; exit 2; }
 [ $# = 2 ] || [ $# = 3 ] || usage
@@ -60,12 +72,23 @@ SNAPSHOT=${VM_BUNDLE_SNAPSHOT:-}
 SNAPSHOT_EPOCH=$(python3 "$LOCK_TOOL" snapshot-epoch "$SNAPSHOT") \
   || die "VM_BUNDLE_SNAPSHOT must be a snapshot.ubuntu.com id such as 20261101T000000Z: a bundle builds only from a pinned snapshot"
 SUITE=${VM_BUNDLE_SUITE:-noble}
+KERNEL_RELEASE=${VM_BUNDLE_KERNEL_RELEASE:-}
+if [ "$CMD" = kernel ] && ! [[ "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9]+$ ]]; then
+  die "VM_BUNDLE_KERNEL_RELEASE must name the kernel release the snapshot resolves, such as 6.8.0-151-generic"
+fi
 [[ "$SUITE" =~ ^[a-z]{2,20}$ ]] || die "VM_BUNDLE_SUITE must be an Ubuntu suite name"
 MIRROR=https://snapshot.ubuntu.com/ubuntu/$SNAPSHOT
+KEYRING=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 OUT=${VM_BUNDLE_OUT:-}
 [[ "$OUT" = /* ]] || die "VM_BUNDLE_OUT must be an absolute directory"
 B=$OUT/build
 LOCK_UPDATE=${VM_BUNDLE_LOCK_UPDATE:-0}
+TOOLS=${VM_BUNDLE_TOOLS:-}
+if [ -n "$TOOLS" ] && ! { [ -x "$TOOLS/mke2fs" ] && [ -x "$TOOLS/veritysetup" ]; }; then
+  die "VM_BUNDLE_TOOLS must hold executable mke2fs and veritysetup"
+fi
+MKE2FS=${TOOLS:+$TOOLS/}mke2fs
+VERITYSETUP=${TOOLS:+$TOOLS/}veritysetup
 case "$LOCK_UPDATE" in 0|1) ;; *) die "VM_BUNDLE_LOCK_UPDATE must be 0 or 1" ;; esac
 # The kit commit time, so the same kit gives the same bytes on any build host.
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$KIT" log -1 --format=%ct 2>/dev/null || echo 0)}
@@ -89,7 +112,7 @@ clamp() { find "$1" -mindepth 1 -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +; }
 E2FSPROGS_MIN=1.47.1
 e2fsprogs_floor() {
   local have
-  have=$(mke2fs -V 2>&1 | awk 'NR == 1 && $1 == "mke2fs" { print $2 }')
+  have=$("${MKE2FS:-mke2fs}" -V 2>&1 | awk 'NR == 1 && $1 == "mke2fs" { print $2 }')
   python3 -c 'import re, sys
 have, want = sys.argv[1], sys.argv[2]
 m = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", have)
@@ -100,18 +123,24 @@ sys.exit(0 if m and tuple(int(x or 0) for x in m.groups()) >= tuple(map(int, wan
 
 # pinned_root NAME PACKAGES EXPECTED_LOCK: mmdebstrap NAME from the snapshot into $B/NAME and
 # write $OUT/NAME.packages.lock; stop unless it equals EXPECTED_LOCK (or LOCK_UPDATE=1).
+# The release, -updates and -security pockets all come from the one snapshot id, so the
+# kernel and every security fix are what that snapshot resolves, on any day it is built.
 pinned_root() {
-  local name=$1 pkgs=$2 want=$3 root=$B/$1
+  local name=$1 pkgs=$2 want=$3 root=$B/$1 pocket sources=()
   [ "$LOCK_UPDATE" = 1 ] || [ -f "$want" ] \
     || die "$name: set its expected packages.lock in bundle.env, or VM_BUNDLE_LOCK_UPDATE=1 to make one"
+  [ -f "$KEYRING" ] || die "no Ubuntu archive keyring at $KEYRING"
+  for pocket in "$SUITE" "$SUITE-updates" "$SUITE-security"; do
+    sources+=("deb [signed-by=$KEYRING] $MIRROR $pocket main universe")
+  done
   rm -rf "${root:?}" "$root.packages.lock.tmp"
-  log "mmdebstrap $SUITE $name from snapshot $SNAPSHOT"
+  log "mmdebstrap $SUITE $name from snapshot $SNAPSHOT ($SUITE, $SUITE-updates, $SUITE-security)"
   # The hook runs on the build host before mmdebstrap removes the apt lists, which hold
   # the sha256 of every .deb (packages_lock.py emit).
   ( export SOURCE_DATE_EPOCH=$SNAPSHOT_EPOCH
-    mmdebstrap --variant=minbase --aptopt='APT::Install-Recommends "false"' --components=main,universe \
+    mmdebstrap --variant=minbase --aptopt='APT::Install-Recommends "false"' \
       --customize-hook="python3 $(printf '%q' "$LOCK_TOOL") emit \"\$1\" > $(printf '%q' "$root.packages.lock.tmp")" \
-      --include="$pkgs" "$SUITE" "$root" "$MIRROR" )
+      --include="$pkgs" "$SUITE" "$root" "${sources[@]}" )
   mv "$root.packages.lock.tmp" "$OUT/$name.packages.lock"
   python3 "$LOCK_TOOL" check "$root" "$OUT/$name.packages.lock" || die "$name does not match its packages.lock"
   if [ "$LOCK_UPDATE" = 1 ]; then
@@ -120,6 +149,30 @@ pinned_root() {
     diff -u "$want" "$OUT/$name.packages.lock" | head -40 >&2 || true
     die "$name: resolved packages differ from $want; set VM_BUNDLE_LOCK_UPDATE=1 to accept a new lock"
   fi
+}
+
+# host_leaks ROOT: stop if ROOT's etc or var holds a copy of the build host's resolv.conf,
+# hostname, hosts or machine-id, or names its hostname or DNS search domain. mmdebstrap copies
+# the host's resolv.conf and hostname in, and package scripts can keep copies of them (the
+# systemd-resolved backup); such a file differs per build host and is not the customer's.
+host_leaks() {
+  local root=$1 f s found=0 sums=() marks=()
+  for f in /etc/resolv.conf /etc/hostname /etc/hosts /etc/machine-id; do
+    [ -s "$f" ] && sums+=("$(sha256sum < "$f" | cut -d' ' -f1)")
+  done
+  s=$(hostname 2>/dev/null || true)
+  [ ${#s} -ge 8 ] && marks+=("$s")
+  for s in $(awk '$1 == "search" || $1 == "domain" { for (i = 2; i <= NF; i++) print $i }' /etc/resolv.conf 2>/dev/null); do
+    [ ${#s} -ge 8 ] && [[ "$s" = *.* ]] && marks+=("$s")
+  done
+  while IFS= read -r -d '' f; do
+    s=$(sha256sum < "$f" | cut -d' ' -f1)
+    if [[ " ${sums[*]} " = *" $s "* ]]; then echo "[vm-bundle] copy of a build host file: ${f#"$root"/}" >&2; found=1; fi
+  done < <(find "$root/etc" "$root/var" -type f -print0)
+  for s in "${marks[@]}"; do
+    if grep -rlF --no-messages -- "$s" "$root/etc" "$root/var" >&2; then found=1; fi
+  done
+  [ "$found" = 0 ] || die "the base root holds files from this build host (listed above)"
 }
 
 # ---------------------------------------------------------------- base root (7.3)
@@ -150,6 +203,8 @@ PermitRootLogin no
 EOF
   # The network file comes from the init at every boot (/run/systemd/network, from the link).
   ln -sfn ../run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
+  # systemd-resolved's postinst keeps the build host's resolv.conf here.
+  rm -f "$R/etc/.resolv.conf.systemd-resolved.bak"
   in_root systemctl enable -q ssh.service systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
   in_root systemctl mask -q ssh.socket
   in_root passwd -l root >/dev/null
@@ -186,6 +241,7 @@ EOF
   rm -rf "${R:?}"/var/cache/apt/archives/*.deb "${R:?}"/var/lib/apt/lists/* "${R:?}"/tmp/* "${R:?}"/var/tmp/*
   rm -f "$R/var/cache/ldconfig/aux-cache"   # holds inode numbers and times of this build
   find "$R/var/log" -type f -delete
+  host_leaks "$R"
   clamp "$R"
 
   # ext4 image of the root. The init copies it into the file system area of the LUKS
@@ -198,8 +254,9 @@ EOF
   size_mib=$(( (size_mib + 3) / 4 * 4 ))
   rm -f "$B/base-root.ext4"
   # SOURCE_DATE_EPOCH (not E2FSPROGS_FAKE_TIME) is what turns on the clamping; LC_ALL=C
-  # fixes the name order mke2fs -d adds files in (scandir with alphasort).
-  LC_ALL=C SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH mkfs.ext4 -q -F -b 4096 -L cathedral-root \
+  # fixes the name order mke2fs -d adds files in (scandir with alphasort). MKE2FS_CONFIG
+  # names no file, so mke2fs takes its compiled-in defaults, not the host's /etc/mke2fs.conf.
+  LC_ALL=C SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH MKE2FS_CONFIG=$B/no-mke2fs.conf "$MKE2FS" -t ext4 -q -F -b 4096 -L cathedral-root \
     -U "$(uuid_of "cathedral-vm-base-root-fs $lock_sha")" \
     -E "hash_seed=$(uuid_of "cathedral-vm-base-root-hash $lock_sha"),root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0,nodiscard" \
     -d "$R" "$B/base-root.ext4" "${size_mib}M"
@@ -211,12 +268,12 @@ EOF
   [ $(( data_bytes % 4096 )) = 0 ] || die "the base root image is not 4 KiB aligned"
   salt=$(sha256sum < "$B/base-root.ext4" | cut -d' ' -f1)
   cp "$B/base-root.ext4" "$B/base-root.raw.tmp"
-  veritysetup format "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" --data-block-size=4096 --hash-block-size=4096 \
+  "$VERITYSETUP" format "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" --data-block-size=4096 --hash-block-size=4096 \
     --data-blocks=$(( data_bytes / 4096 )) --hash-offset="$data_bytes" --salt="$salt" \
     --uuid="$(uuid_of "cathedral-vm-base-root-verity $salt")" > "$B/base-root.verity.txt"
   root_hash=$(awk -F: '/^Root hash:/ { gsub(/[ \t]/, "", $2); print $2 }' "$B/base-root.verity.txt")
   [[ "$root_hash" =~ ^[0-9a-f]{64}$ ]] || die "veritysetup gave no root hash"
-  veritysetup verify "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" "$root_hash" --hash-offset="$data_bytes" \
+  "$VERITYSETUP" verify "$B/base-root.raw.tmp" "$B/base-root.raw.tmp" "$root_hash" --hash-offset="$data_bytes" \
     || die "the base root fails its own verity check"
   mv "$B/base-root.raw.tmp" "$OUT/base-root.raw"
   echo "$root_hash" > "$B/base-root.verity"
@@ -226,9 +283,11 @@ EOF
 
 # ---------------------------------------------------------------- kernel and modules (6.1)
 build_kernel() {
-  pinned_root kernel "$KERNEL_PKGS" "${VM_BUNDLE_KERNEL_LOCK:-}"
+  pinned_root kernel "$KERNEL_PKGS,$KERNEL_EXTRA_PKG-$KERNEL_RELEASE" "${VM_BUNDLE_KERNEL_LOCK:-}"
   local K=$B/kernel kver opt m
   kver=$(python3 "$LOCK_TOOL" kernel "$OUT/kernel.packages.lock")
+  [ "$kver" = "$KERNEL_RELEASE" ] \
+    || die "linux-image-virtual resolves to $kver in snapshot $SNAPSHOT, but VM_BUNDLE_KERNEL_RELEASE is $KERNEL_RELEASE"
   [ -f "$K/boot/vmlinuz-$kver" ] && [ -f "$K/boot/config-$kver" ] && [ -d "$K/lib/modules/$kver" ] \
     || die "kernel $kver: vmlinuz, config or module tree missing"
   for opt in $KERNEL_CONFIG_Y; do
@@ -239,13 +298,80 @@ build_kernel() {
   done
   # A built-in cmdline would add kernel parameters outside the measured template.
   ! grep -qx 'CONFIG_CMDLINE_BOOL=y' "$K/boot/config-$kver" || die "kernel $kver: CONFIG_CMDLINE_BOOL must be off"
+  # Each boot module is a module file or built in. A built-in one must be listed in the
+  # package's modules.builtin; the VM initrd recipe then ships no file for it and the init
+  # loads none (build-vm-initrd.py load_order). build/boot-modules.txt records which is which.
+  local file key tree
+  tree=$(readlink -f "$K/lib/modules/$kver")
+  : > "$B/boot-modules.txt"
   for m in $KERNEL_MODULES; do
-    modinfo -b "$K" -k "$kver" -F name "$m" >/dev/null 2>&1 || die "kernel $kver: module $m is missing"
+    file=$(modinfo -b "$K" -k "$kver" -F filename "$m" 2>/dev/null) || die "kernel $kver: module $m is missing"
+    key=${m//-/_}
+    if [ "$file" = "(builtin)" ]; then
+      awk -v k="$key" '{ n = $0; sub(/.*\//, "", n); sub(/\.ko$/, "", n); gsub(/-/, "_", n); if (n == k) found = 1 }
+        END { exit !found }' "$K/lib/modules/$kver/modules.builtin" \
+        || die "kernel $kver: modinfo says $m is built in, but modules.builtin does not list it"
+      echo "$m built-in" >> "$B/boot-modules.txt"
+    else
+      file=$(readlink -f "$file")
+      [[ "$file" = "$tree/"* ]] && [ -f "$file" ] || die "kernel $kver: module $m is outside its module tree"
+      echo "$m module ${file#"$tree/"}" >> "$B/boot-modules.txt"
+    fi
   done
+  # The one crypto guard: AES-NI built in, or loaded by the init before any disk opens.
+  grep -qx 'CONFIG_CRYPTO_AES_NI_INTEL=y' "$K/boot/config-$kver" || grep -q '^aesni_intel module ' "$B/boot-modules.txt" \
+    || die "kernel $kver: aesni_intel is neither built in nor a boot module, so dm-crypt would run the generic AES"
   install -m 0644 "$K/boot/vmlinuz-$kver" "$OUT/vmlinuz"
   install -m 0644 "$K/boot/config-$kver" "$B/config-$kver"
   # The module tree for the VM initrd (VM1b), which bind-mounts it read-only at
-  # /lib/modules/<release> in the customer root (6.1).
+  # /lib/modules/<release> in the customer root (6.1). It holds every file $KERNEL_TREE_PKG
+  # ships there, and from linux-modules-extra only the boot modules and what modules.dep says
+  # they need. Links go (the vdso .build-id debug links; the initrd recipe takes no link),
+  # modules.order is cut to the kept files, and the depmod of this root (its pinned kmod)
+  # rebuilds the indexes for that set. The init still loads only the boot modules.
+  python3 -I - "$tree" "$B/boot-modules.txt" "$K/var/lib/dpkg/info/$KERNEL_TREE_PKG-$kver.list" <<'EOF' \
+    || die "kernel $kver: cannot cut the module tree"
+import sys
+from pathlib import Path
+tree, listing, package = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+dep = {}
+for line in (tree / "modules.dep").read_text().splitlines():
+    name, _, needs = line.partition(":")
+    dep[name] = needs.split()
+keep = set()
+for line in listing.read_text().splitlines():
+    fields = line.split()
+    if fields[1] == "module":
+        if fields[2] not in dep:
+            sys.exit(f"modules.dep has no entry for {fields[2]}")
+        keep.add(fields[2])
+        keep.update(dep[fields[2]])
+boot = len(keep)
+prefixes = (f"/lib/modules/{tree.name}/", f"/usr/lib/modules/{tree.name}/")
+for line in package.read_text().splitlines():
+    for prefix in prefixes:
+        if line.startswith(prefix) and (tree / line[len(prefix):]).is_file() \
+                and not (tree / line[len(prefix):]).is_symlink():
+            keep.add(line[len(prefix):])
+if len(keep) == boot:
+    sys.exit(f"{package.name} lists no file of this tree")
+indexes = {"modules.builtin", "modules.builtin.modinfo", "modules.order"}
+for path in sorted(tree.rglob("*"), reverse=True):
+    rel = path.relative_to(tree).as_posix()
+    if path.is_symlink() or not path.is_dir():
+        if rel not in keep and rel not in indexes:
+            path.unlink()
+    elif not any(path.iterdir()):
+        path.rmdir()
+order = tree / "modules.order"
+kept = [line for line in order.read_text().splitlines() if line in keep or line + ".zst" in keep]
+order.write_text("".join(line + "\n" for line in kept))
+print(f"kept {len(keep)} files: the {package.name.removesuffix('.list')} tree and {boot} boot module files")
+EOF
+  chroot "$K" depmod -a "$kver"
+  for m in $KERNEL_MODULES; do
+    modinfo -b "$K" -k "$kver" -F filename "$m" >/dev/null 2>&1 || die "kernel $kver: module $m is missing after the cut"
+  done
   clamp "$K/lib/modules/$kver"
   tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner --format=gnu \
     -C "$K/lib/modules" -cf "$B/modules-$kver.tar" "$kver"
@@ -282,7 +408,7 @@ build_manifest() {
 step_outputs() {
   case "$CMD" in
     base-root) echo base-root.raw base-root.packages.lock build/base-root.verity build/base-root.data-bytes ;;
-    kernel) echo vmlinuz kernel.packages.lock build/kernel-release "build/config-$(cat "$B/kernel-release")" \
+    kernel) echo vmlinuz kernel.packages.lock build/kernel-release build/boot-modules.txt "build/config-$(cat "$B/kernel-release")" \
                  "build/modules-$(cat "$B/kernel-release").tar" ;;
   esac
 }
