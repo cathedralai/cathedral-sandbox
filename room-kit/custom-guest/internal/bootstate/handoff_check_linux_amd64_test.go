@@ -7,7 +7,8 @@ package bootstate
 // root at the verified root's path, as PrepareVerifiedRuntime leaves it, and hands off with the
 // real ReadyRoot.Exec. The check root's /sbin/init is this binary again. There it checks the
 // kernel views an owner's systemd needs (AB#1027): the VM init's B3 boot gave Ubuntu read-only
-// /proc and /sys, and cathedral-init hands off the same way.
+// /proc and /sys, and cathedral-init hands off the same way. It also requires the owner's init to
+// start with umask 0022, not the 0077 PrepareKernelViews sets for this init's own stages.
 
 import (
 	"fmt"
@@ -133,7 +134,23 @@ func checkHandoffViews() error {
 	if err != nil {
 		return err
 	}
-	return mountsWritable(info, map[string]string{"/proc": "proc", "/sys": "sysfs"})
+	if err := mountsWritable(info, map[string]string{"/proc": "proc", "/sys": "sysfs"}); err != nil {
+		return err
+	}
+	// The owner's init starts with the usual umask, not this init's 0077.
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(status), "\nUmask:\t0022\n") {
+		for _, line := range strings.Split(string(status), "\n") {
+			if strings.HasPrefix(line, "Umask:") {
+				return fmt.Errorf("the owner's init does not start with umask 0022: %q", line)
+			}
+		}
+		return fmt.Errorf("the owner's init does not start with umask 0022: no Umask line")
+	}
+	return nil
 }
 
 // writeKernelFile writes value as systemd writes a kernel file: an existing file, write-only.
