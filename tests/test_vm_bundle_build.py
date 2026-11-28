@@ -23,7 +23,7 @@ WORKFLOW = REPO / ".github" / "workflows" / "vm-bundle-build.yml"
 def test_every_input_has_an_https_url_and_a_sha256():
     pins = fetch.plan()
     assert set(pins["host"]) == {"mmdebstrap_1.5.7-3_all.deb"}
-    assert set(pins["ovmf"]) == {"ovmf_2024.02-2ubuntu0.10_all.deb"}
+    assert set(pins["ovmf"]) == {"ovmf-amdsev_2025.11-3ubuntu7.3_all.deb"}
     assert set(pins["go"]) == {"go1.26.11.linux-amd64.tar.gz"}
     # The same Go as the reference build (#808), from go.dev's published sha256.
     assert pins["go"]["go1.26.11.linux-amd64.tar.gz"][1] == \
