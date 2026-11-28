@@ -2,6 +2,8 @@ name: Custom guest unit
 
 # The generated custom guest unit under a real systemd, with stub scripts in place of QEMU (tests/test_custom_guest_unit_systemd.py).
 # It catches what the fake systemctl of the other tests cannot: what a `+` hook sees inside the unit's mount namespace.
+# It also puts the operator key's forced command (cg_ssh_dispatch.py) behind a real sshd: sftp, a shell command and
+# plain scp must be refused, the operator's forms must run with a fixed environment.
 
 on:
   push:
@@ -9,11 +11,13 @@ on:
     paths:
       - "ops/custom-guest/**"
       - "tests/test_custom_guest_unit_systemd.py"
+      - "tests/test_custom_guest_ssh_dispatch.py"
       - ".github/workflows/custom-guest-unit.yml"
   pull_request:
     paths:
       - "ops/custom-guest/**"
       - "tests/test_custom_guest_unit_systemd.py"
+      - "tests/test_custom_guest_ssh_dispatch.py"
       - ".github/workflows/custom-guest-unit.yml"
 
 concurrency:
@@ -46,6 +50,11 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install -q pytest
       - name: Run the unit test as root
         run: sudo env CG_SYSTEMD_TESTS=1 "$RUNNER_TEMP/venv/bin/python" -m pytest -v -s tests/test_custom_guest_unit_systemd.py
+      - name: The operator key's forced command behind a real sshd (root)
+        run: |
+          [ -x /usr/sbin/sshd ] && [ -x /usr/lib/openssh/sftp-server ] || { sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server; }
+          /usr/sbin/sshd -V 2>&1 | head -1 || true
+          sudo env CG_SSHD_TESTS=1 "$RUNNER_TEMP/venv/bin/python" -m pytest -v -rs tests/test_custom_guest_ssh_dispatch.py -k sshd
       - name: Journal on failure
         if: failure()
         run: sudo journalctl --no-pager -n 120 -o cat || true

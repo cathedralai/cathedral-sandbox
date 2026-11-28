@@ -61,7 +61,8 @@ ADMIN_KEY_FILE = os.path.expanduser(os.environ.get("CG_ADMIN_KEY_FILE", os.path.
 OPERATOR_KEY_FILE = os.path.expanduser(os.environ.get("CG_OPERATOR_KEY_FILE", os.path.join(HOME, "operator-key")))
 PLATFORM_GUEST = os.environ.get("CG_PLATFORM_GUEST", "cathedral-customer-sealed")
 SSH = shlex.split(os.environ.get("CG_SSH", "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"))
-SCP = shlex.split(os.environ.get("CG_SCP", "scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes"))
+# -O: the legacy protocol. Plain scp asks for the sftp subsystem, which the hotel's forced command refuses.
+SCP = shlex.split(os.environ.get("CG_SCP", "scp -q -O -o BatchMode=yes -o StrictHostKeyChecking=yes"))
 FENCE_WAIT = float(os.environ.get("CG_FENCE_WAIT", "1800"))
 H7_WAIT = float(os.environ.get("CG_H7_WAIT", "600"))
 ADMIT_WAIT = float(os.environ.get("CG_ADMIT_WAIT", "1800"))
@@ -1432,7 +1433,7 @@ def list_launches(hotel: str) -> list[dict]:
     except Transport as e:
         raise Blocked("custom_guest_journal_behind", f"the API did not answer: {e}")
     if status != 200:
-        raise Blocked(error_code(doc) or "custom_guest_not_found", f"API list {status}")
+        raise Blocked(error_code(doc) if status != 404 else "custom_guest_not_found", f"API list {status}")
     items = doc if isinstance(doc, list) else doc.get("launches") or doc.get("items") or doc.get("records") or []
     return [r for r in items if isinstance(r, dict) and isinstance(r.get("launch_id"), str)]
 

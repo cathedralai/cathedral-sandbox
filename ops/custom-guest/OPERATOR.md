@@ -49,7 +49,12 @@
    - Copy each one into `/etc/cathedral/custom-guest-operator/` as `cathedral-cg`, with mode 0600.
    - Keys are file paths only: never put a key value in the env file, a unit or a command line.
    - Copy a key file to file: send it on stdin, as in `ssh <operator> 'install -m 0600 -o cathedral-cg -g cathedral-cg /dev/stdin <path>' < <file>`. Then compare the sha256 of the source file with the sha256 of the copy (`sha256sum < <path>` on the operator machine), and print only OK or FAIL. Never print the key.
-   - **The host SSH key is made on the operator machine** and never leaves it: `ssh-keygen -t ed25519 -N '' -f /etc/cathedral/custom-guest-operator/host.key`, then `chown cathedral-cg:cathedral-cg` and mode 0600 on both files. Only its public half goes to the host. Add it to root's `authorized_keys` there as `from="<operator address>",restrict <public key>`.
+   - **The host SSH key is made on the operator machine** and never leaves it: `ssh-keygen -t ed25519 -N '' -f /etc/cathedral/custom-guest-operator/host.key`, then `chown cathedral-cg:cathedral-cg` and mode 0600 on both files. Only its public half goes to the host, behind a forced command:
+     - On the host, check sshd and install the dispatcher from the host checkout, in one line so a failed check installs nothing: `python3 -I <repo dir on the host>/ops/custom-guest/cg_ssh_dispatch.py --check-sshd --addr <operator address> && install -m 0755 -o root -g root <repo dir on the host>/ops/custom-guest/cg_ssh_dispatch.py /usr/local/sbin/cathedral-cg-dispatch`.
+     - The check reads `sshd -T` for a root login from the operator address, Match blocks included. No `AcceptEnv` pattern may match `LD_*`, `BASH_ENV`, `ENV`, `PATH`, `BASH_FUNC_*` or `SHELLOPTS` (so no `*`), and `PermitUserEnvironment` must be `no`. It prints `OK sshd` or one `FAIL sshd` line per problem. sshd hands the variables it accepts to root's shell, which runs before the dispatcher, so the dispatcher's fixed environment cannot undo them. Run the check again after any sshd config change.
+     - Add the key to root's `authorized_keys` there as `command="/usr/local/sbin/cathedral-cg-dispatch <hotel> <sha7>",from="<operator address>",restrict <public key>`. `<sha7>` is the host checkout's (`/opt/cathedral/cathedral-sandbox-cg-<sha7>`, as in `hosts.conf`).
+     - The key then runs only that checkout's host tool, with the phases and options `custom-guest.sh` sends, and the intake upload (`scp -t` into the launch's inbox). Everything else is refused with one line, exit 1, including a login shell and sftp: sshd runs the forced command in place of the sftp subsystem too. The tool runs with a fixed environment, nothing from the client.
+     - When the host checkout changes, update `<sha7>` in the line (and reinstall the dispatcher from the new checkout).
    - **Take the host's key for `known_hosts` over a session you already trust**, for example `cat /etc/ssh/ssh_host_ed25519_key.pub` on the host. Do not use `ssh-keyscan` from the operator machine. Write the line as `<host address> ssh-ed25519 AAAA...`: it starts with the same host address as `hosts.conf`, and the `.pub` file's trailing comment is dropped.
 4. **Write `/etc/cathedral/custom-guest-operator.env` and `hosts.conf`.** The env file is root, 0644, paths and URLs only. Quote the values: systemd and a shell read the same file.
 
@@ -61,7 +66,7 @@
    CG_OPERATOR_KEY_FILE=/etc/cathedral/custom-guest-operator/operator.key
    CG_PLATFORM_GUEST=cathedral-customer-sealed
    CG_SSH="ssh -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/cathedral/custom-guest-operator/known_hosts -i /etc/cathedral/custom-guest-operator/host.key"
-   CG_SCP="scp -q -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/cathedral/custom-guest-operator/known_hosts -i /etc/cathedral/custom-guest-operator/host.key"
+   CG_SCP="scp -q -O -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/cathedral/custom-guest-operator/known_hosts -i /etc/cathedral/custom-guest-operator/host.key"
    ```
 
    Then write `/var/lib/cathedral-custom-guest/hosts.conf` (`cathedral-cg`, 0600), one line per hotel:
@@ -70,7 +75,7 @@
    <hotel> root@<host address> <repo dir on the host> <public host>
    ```
 
-   The repo dir is a checkout of this repository on the host, at the same commit. **Keep it on the host as long as the timers run:** `check` calls its `folders` phase on every heartbeat, and the wipe and the return's R15 need it.
+   The repo dir is a checkout of this repository on the host, at the same commit, at `/opt/cathedral/cathedral-sandbox-cg-<sha7>` (the forced command runs only that path). Make it root's alone: `chown -R root:root /opt/cathedral/cathedral-sandbox-cg-<sha7>`, then `chmod -R go-w /opt/cathedral/cathedral-sandbox-cg-<sha7>` (a `git archive` extracted as root keeps its 0775 and 0664 modes), and `/opt/cathedral` itself root-owned and not group- or other-writable. On every call the forced command checks the whole checkout, since root runs the Python tool, its siblings, the kit scripts and the `snp_qemu.py` link into `room-kit`. One file or folder owned by another user or writable by group or others, or a link out of the checkout, refuses every phase, and the refusal names the path. `CG_SCP` keeps `-O`: plain scp asks for sftp, which the forced command refuses. **Keep it on the host as long as the timers run:** `check` calls its `folders` phase on every heartbeat, and the wipe and the return's R15 need it.
 
 5. **Install the units and start the timers for the hotel.** Start them only once the lane is on: `CATHEDRAL_CUSTOM_GUEST_ENABLED`, with the hotel and the owner listed. While the lane is off, the API's list answers 404, so every reconcile tick alerts. Keep the lane on until the last launch's `wiped_at`.
 
