@@ -45,6 +45,8 @@ UPLOADS = [f"scp -t {INBOX}/{n}" for n in ("vmlinuz", "initrd", "root.raw")]
 REFUSED = {
     "no command": None,
     "empty": "",
+    "one space": " ",
+    "spaces only": "   ",
     "shell command": "true",
     "a shell": "bash",
     "sh -c": "sh -c id",
@@ -211,7 +213,7 @@ def test_the_upload_runs_scp_with_a_fixed_environment_only(tmp_path):
 
 def test_a_refusal_is_one_coded_result_line_and_exit_1(tmp_path):
     root, tool = checkout(tmp_path)
-    for cmd in (None, "/usr/lib/openssh/sftp-server", "internal-sftp", f"{tool} facts --hotel \"{HOTEL}",
+    for cmd in (None, " ", "/usr/lib/openssh/sftp-server", "internal-sftp", f"{tool} facts --hotel \"{HOTEL}",
                 f"{tool} tick --hotel {HOTEL} --launch-id {LAUNCH}"):
         p = dispatch(root, cmd)
         r = result(p)
@@ -318,8 +320,84 @@ def test_the_default_scp_uses_the_legacy_protocol():
     assert "-O" in json.loads(p.stdout), (p.stdout, p.stderr)
 
 
+# ---------------------------------------------------------------- the install-time sshd guard
+
+GOOD_PUE = "permituserenvironment no\n"
+SSHD_DUMPS = {
+    # What the dedicated hotel's sshd -T shows today.
+    "LANG LC_* COLORTERM NO_COLOR, one per line": (
+        "acceptenv LANG\nacceptenv LC_*\nacceptenv COLORTERM\nacceptenv NO_COLOR\n" + GOOD_PUE, True),
+    "LANG LC_* COLORTERM NO_COLOR, one line": ("acceptenv LANG LC_* COLORTERM NO_COLOR\n" + GOOD_PUE, True),
+    "no acceptenv": (GOOD_PUE, True),
+    "CG_*": ("acceptenv CG_*\n" + GOOD_PUE, True),
+    "*": ("acceptenv LANG *\n" + GOOD_PUE, False),
+    "L*": ("acceptenv L*\n" + GOOD_PUE, False),
+    "LD_PRELOAD": ("acceptenv LD_PRELOAD\n" + GOOD_PUE, False),
+    "LD_*": ("acceptenv LD_*\n" + GOOD_PUE, False),
+    "LD_BIND_NOW": ("acceptenv LD_BIND_NOW\n" + GOOD_PUE, False),
+    "BASH_ENV": ("acceptenv BASH_ENV\n" + GOOD_PUE, False),
+    "B*": ("acceptenv B*\n" + GOOD_PUE, False),
+    "ENV": ("acceptenv ENV\n" + GOOD_PUE, False),
+    "E??": ("acceptenv E??\n" + GOOD_PUE, False),
+    "PATH": ("acceptenv PATH\n" + GOOD_PUE, False),
+    "P?TH": ("acceptenv P?TH\n" + GOOD_PUE, False),
+    "BASH_FUNC_*": ("acceptenv BASH_FUNC_*\n" + GOOD_PUE, False),
+    "SHELLOPTS": ("acceptenv SHELLOPTS\n" + GOOD_PUE, False),
+    "permituserenvironment yes": ("acceptenv LANG\npermituserenvironment yes\n", False),
+    "permituserenvironment a list": ("acceptenv LANG\npermituserenvironment LANG,LC_*\n", False),
+    "permituserenvironment missing": ("acceptenv LANG\n", False),
+    "empty dump": ("", False),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SSHD_DUMPS))
+def test_the_sshd_guard_refuses_variables_root_s_shell_reads(name):
+    """sshd hands accepted variables to root's shell, which runs before the dispatcher: the fixed env can't undo
+    them."""
+    dump, ok = SSHD_DUMPS[name]
+    problems = load().sshd_env_problems(dump)
+    assert (problems == []) is ok, problems
+
+
+def fake_sshd(tmp: Path, dump: str, rc: int = 0) -> Path:
+    f = tmp / "fake-sshd"
+    f.write_text(f"#!{sys.executable} -I\nimport json, sys\n"
+                 "open(sys.argv[0] + '.args', 'w').write(json.dumps(sys.argv[1:]))\n"
+                 f"sys.stdout.write({dump!r})\nsys.exit({rc})\n")
+    f.chmod(0o755)
+    return f
+
+
+def check_sshd(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-I", str(DISPATCH), "--check-sshd", *args], capture_output=True,
+                          text=True, env={"PATH": "/usr/bin:/bin", "LD_PRELOAD": "x"}, timeout=60)
+
+
+def test_the_sshd_guard_reads_sshd_for_a_root_login_from_the_operator(tmp_path):
+    f = fake_sshd(tmp_path, SSHD_DUMPS["LANG LC_* COLORTERM NO_COLOR, one per line"][0])
+    p = check_sshd("--sshd", str(f), "--addr", "192.0.2.10")
+    assert p.returncode == 0 and p.stdout.startswith("OK sshd"), (p.stdout, p.stderr)
+    args = json.loads((tmp_path / "fake-sshd.args").read_text())
+    assert args == ["-T", "-C", "user=root,host=192.0.2.10,addr=192.0.2.10"], args
+
+
+@pytest.mark.parametrize("dump,rc", [("acceptenv BASH_ENV\n" + GOOD_PUE, 0), (GOOD_PUE, 255), ("", 0)])
+def test_the_sshd_guard_fails_closed(tmp_path, dump, rc):
+    p = check_sshd("--sshd", str(fake_sshd(tmp_path, dump, rc)), "--addr", "192.0.2.10")
+    assert p.returncode == 1 and p.stdout.startswith("FAIL sshd"), (p.stdout, p.stderr)
+
+
+@pytest.mark.parametrize("args", [["--addr", "192.0.2.10,user=x"], ["--addr"], ["--port", "22"]])
+def test_the_sshd_guard_takes_only_its_own_arguments(tmp_path, args):
+    p = check_sshd("--sshd", str(fake_sshd(tmp_path, GOOD_PUE)), *args)
+    assert p.returncode == 1 and p.stdout.startswith("FAIL sshd"), (p.stdout, p.stderr)
+    assert not (tmp_path / "fake-sshd.args").exists()
+
+
 def test_the_guide_installs_the_forced_command():
     text = (REPO / "ops" / "custom-guest" / "OPERATOR.md").read_text()
+    assert ("cg_ssh_dispatch.py --check-sshd --addr <operator address> && install -m 0755 -o root -g root"
+            in text)
     assert "chown -R root:root /opt/cathedral/cathedral-sandbox-cg-<sha7>" in text
     assert "chmod -R go-w /opt/cathedral/cathedral-sandbox-cg-<sha7>" in text
     assert 'command="/usr/local/sbin/cathedral-cg-dispatch <hotel> <sha7>",from="<operator address>",restrict' in text
@@ -437,3 +515,17 @@ def test_behind_sshd_a_group_writable_python_file_refuses_every_phase(sshd):
     assert p.returncode == 1 and r["ok"] is False and "argv" not in r and "custom_guest_host.py" in r["detail"], r
     py.chmod(0o755)
     assert result(ssh(sshd, f"{sshd['tool']} folders --hotel {HOTEL}"))["ok"] is True
+
+
+@sshd_tests
+def test_behind_sshd_the_install_guard_reads_the_real_sshd(sshd):
+    """sshd -T on a real config: the test sshd passes (CG_* is not a risk); a risky AcceptEnv, globally or in a
+    Match block for the operator's address, or PermitUserEnvironment yes, fails."""
+    base = (sshd["d"] / "sshd_config").read_text()
+    for name, extra, ok in (("as is", "", True), ("global", "AcceptEnv BASH_ENV\n", False),
+                            ("user env", "PermitUserEnvironment yes\n", False),
+                            ("match", "Match Address 192.0.2.10\n    AcceptEnv LD_PRELOAD\n", False)):
+        cfg = sshd["d"] / f"sshd_config.{name.replace(' ', '-')}"
+        cfg.write_text(extra + base if not extra.startswith("Match") else base + extra)
+        p = check_sshd("--sshd", SSHD, "--config", str(cfg), "--addr", "192.0.2.10")
+        assert (p.returncode == 0 and p.stdout.startswith("OK sshd")) is ok, (name, p.stdout, p.stderr)
