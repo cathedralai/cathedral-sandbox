@@ -3,7 +3,7 @@
 # custom-guest.sh runs one phase per SSH call:
 #   custom-guest-host.sh <phase> --hotel H --launch-id L [options] < input.json
 # Lock phases (inbox, intake, measure, discard, hold-stop, unhold, hold-baseline,
-# boot, verify-disks, stop, return-kit, return-finish) run under their deadline
+# boot, verify-disks, stop, return-kit, return-finish, wipe) run under their deadline
 # and hold /run/lock/cathedral-snp-host.lock for the whole phase. tick tries the
 # lock and skips while a phase holds it. The unit hooks (check-start, exited),
 # boot-record and facts never take it. See custom_guest_host.py.

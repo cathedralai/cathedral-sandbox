@@ -11,7 +11,9 @@ Steps (each one verify-before-act; a rerun resumes from the journal):
   abort       holding -> approved   (only while the kit never stopped)
   boot        held|stopped -> booting -> running (or stopped, boot_failed)
   stop        running -> stopping -> stopped
-  return      held|stopped -> returning -> returned (R0 to R15)
+  return      held|stopped -> returning -> returned (R0 to R15; the owner's folder is wiped now only on a
+              waiver sent after the stop, else by `wipe`)
+  wipe        returned: remove the owner's launch folder once the API allows it (72 h after the stop, Q5)
   resume      rerun the open step of this launch (R15 of an open return whatever the API says)
   reconcile   read both journals, systemd and the record; project exits; watch the hold; alert
   cancel      requested|staged|measured|approved -> cancelled (staged files deleted)
@@ -45,6 +47,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 HOME = os.path.expanduser(os.environ.get("CG_HOME", "~/.cathedral-custom-guest"))
 API = os.environ.get("CG_API_URL", "https://api.polaris.computer").rstrip("/")
@@ -65,7 +68,6 @@ ADMIN = "/api/admin/cathedral/dedicated/custom-guest"
 HOLD_PHASES = ("intent", "drained", "fenced", "inventoried", "kit_stopping", "kit_stopped", "kit_down_set", "baselined")
 HOST_DEADLINE = {"intake": 7200, "hold-baseline": 5400, "verify-disks": 5400, "return-kit": 5400, "measure": 1800,
                  "return-finish": 1800}
-NOTICE_SECONDS = 72 * 3600
 
 
 DETAIL_MAX = 300
@@ -99,6 +101,22 @@ class Transport(Exception):
 def utc(stamp: str) -> float:
     """Seconds since the epoch of a YYYY-MM-DDTHH:MM:SSZ stamp, whatever the local zone."""
     return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def wipe_pending(rec: dict) -> bool:
+    """Q5: the API allows the folder wipe (wipe_ok, on its clock), or a wipe already started; not yet done."""
+    return not rec.get("wiped_at") and (rec.get("wipe_ok") is True or bool(rec.get("wipe_started_at")))
+
+
+def wipe_overdue(rec: dict) -> bool:
+    """The API allowed the wipe over an hour ago (by its due time), and the sweeper has not done it."""
+    if not wipe_pending(rec):
+        return False
+    due = rec.get("wipe_due_at")
+    try:
+        return due is None or time.time() > datetime.fromisoformat(due).timestamp() + 3600
+    except (TypeError, ValueError):
+        return True
 
 
 def now_iso() -> str:
@@ -1108,25 +1126,12 @@ class Op:
         self.end(step, gen)
 
     # ================================================================ return (11.6)
-    def notice_ok(self, rec: dict) -> bool:
-        for r in reversed(rec.get("owner_requests") or []):
-            if r.get("action") == "return":
-                if r.get("waive_notice"):
-                    return True
-                break  # no waiver: the 72 h notice decides
-        if self.o.notice_sent_at:
-            t = utc(self.o.notice_sent_at)
-            return time.time() - t >= NOTICE_SECONDS
-        return False
-
     def step_return(self) -> None:
         step = "return"
         rec = self.record()
         if not self.open_step(step):
             if rec["state"] not in ("held", "stopped"):
                 raise Blocked("custom_guest_state_conflict", f"return needs held or stopped, the record is {rec['state']}")
-            if not self.notice_ok(rec):
-                raise Blocked("custom_guest_state_conflict", "no owner waiver and no notice 72 h old (--notice-sent-at)")
         self.begin(step)
         if self.record()["state"] == "returned":
             self.return_finish(step)
@@ -1191,9 +1196,45 @@ class Op:
     def return_finish(self, step: str) -> None:
         def done() -> bool:
             f = self.facts()
-            return f.get("marker") is None and not f.get("launch_dir") and f.get("custom_unit") is None
+            return f.get("marker") is None and f.get("custom_unit") is None
 
         self.sub(step, "R15", done, lambda seq: self.host_ok("return-finish", {"record_state": self.record()["state"]}))
+        # Q5: the kit is back; the owner's launch folder stays until the API allows the wipe. A waiver sent after
+        # the stop allows it now; otherwise `wipe` removes it 72 h after the stop. An API without wipe_ok keeps it.
+        if wipe_pending(self.record()):
+            self.wipe_folder(step)
+
+    # ================================================================ wipe (Q5)
+    def wipe_call(self, to: str) -> None:
+        status, doc = self.api.call("POST", f"{ADMIN}/{self.launch}/wipe", {"to": to})
+        if status != 200:
+            raise Blocked(error_code(doc) or "custom_guest_wipe_failed",
+                          f"POST wipe {to}: {status} {str(doc.get('message', ''))[:200]}")
+
+    def wipe_folder(self, step: str) -> None:
+        """W1 ask the API (its clock decides), W2 remove the folder on the host, W3 record it. Each resumes."""
+        self.sub(step, "W1", lambda: self.record().get("wipe_started_at") is not None,
+                 lambda seq: self.wipe_call("started"))
+        self.sub(step, "W2", lambda: not self.facts().get("launch_dir"),
+                 lambda seq: self.host_ok("wipe", {"record_state": self.record()["state"]}))
+        self.sub(step, "W3", lambda: self.record().get("wiped_at") is not None, lambda seq: self.wipe_call("done"))
+
+    def step_wipe(self) -> bool:
+        """The sweeper: run by the operator's timer after each reconcile. Nothing to do until the API says so."""
+        rec = self.record()
+        if rec["state"] != "returned":
+            raise Blocked("custom_guest_state_conflict", f"wipe needs returned, the record is {rec['state']}")
+        if "wipe_ok" not in rec:
+            raise Blocked("custom_guest_notice_pending",
+                          "the API record has no wipe_ok (an API before the Q5 stop clock): deploy the API first")
+        if not rec.get("wiped_at") and wipe_pending(rec):
+            self.begin("wipe")
+            self.wipe_folder("wipe")
+            self.end("wipe")
+            rec = self.record()
+        print(json.dumps({"ok": True, "state": rec["state"], "wiped_at": rec.get("wiped_at"),
+                          "wipe_due_at": rec.get("wipe_due_at")}))
+        return False
 
     # ================================================================ cancel, resume, reconcile
     def step_cancel(self) -> None:
@@ -1235,7 +1276,8 @@ class Op:
         # The options the step began with (--path, --dedicated-since, --h5-ok, ...) carry over unless given now.
         argv = (self.j.find(self.launch, step, "begin")[-1].get("detail") or {}).get("argv") or []
         try:
-            saved = parser().parse_args(argv)
+            # parse_known_args: a step begun by an older script may carry an option since removed (--notice-sent-at).
+            saved = parser().parse_known_args(argv)[0]
         except SystemExit:
             saved = None
         for k in RESUMED_OPTIONS:
@@ -1245,7 +1287,7 @@ class Op:
             return self.step_boot(bound=int(step.split("#", 1)[1]))
         return {"intake": self.step_intake, "measure": self.step_measure, "hold": self.step_hold,
                 "abort": self.step_abort, "stop": self.step_stop, "return": self.step_return,
-                "cancel": self.step_cancel}[kind]()
+                "cancel": self.step_cancel, "wipe": self.step_wipe}[kind]()
 
     def step_reconcile(self) -> int:
         """Reads only, and projects host facts forward into the record. Starts nothing (5.4)."""
@@ -1266,8 +1308,11 @@ class Op:
             if hold.get("launch") != self.launch or (want_down and hold.get("kit_down") is not True):
                 alerts.append(f"custom_guest_hold_lost: operator view shows {hold or None}; send "
                               f"fence {'kit_down' if want_down else 'fenced'} again")
-        if st == "returned" and (f.get("marker") or f.get("launch_dir")):
-            alerts.append("R15 open: the marker or the launch folder is still on the host; run resume")
+        if st == "returned" and f.get("marker"):
+            alerts.append("R15 open: the marker is still on the host; run resume")
+        if st == "returned" and wipe_overdue(rec):
+            alerts.append(f"custom_guest_wipe_overdue: the launch folder was due for wiping at {rec.get('wipe_due_at')}; "
+                          f"run wipe")
         for ev in ("sev_platform_changed", "kit_data_changed", "reboot_required"):
             if self.hj(f, ev):
                 alerts.append(f"host journal: {ev}")
@@ -1298,8 +1343,7 @@ class Op:
         return 2 if alerts else 0
 
 
-RESUMED_OPTIONS = ("toby_go", "path", "direct_guest", "order", "dedicated_since", "h5_ok", "h5_holder",
-                   "notice_sent_at", "reason")
+RESUMED_OPTIONS = ("toby_go", "path", "direct_guest", "order", "dedicated_since", "h5_ok", "h5_holder", "reason")
 
 
 def step_record_versions(hotel: str, where: list[str], commits: list[str]) -> None:
@@ -1313,7 +1357,7 @@ def step_record_versions(hotel: str, where: list[str], commits: list[str]) -> No
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="custom-guest.sh", description=__doc__.splitlines()[0])
     ap.add_argument("step", choices=["fetch", "intake", "measure", "hold", "abort", "boot", "stop", "return", "resume",
-                                     "reconcile", "cancel", "record-versions"])
+                                     "reconcile", "cancel", "wipe", "record-versions"])
     ap.add_argument("--hotel", required=True)
     ap.add_argument("--launch-id")
     ap.add_argument("--toby-go", help="message ref of Toby's written go for a customer image (4.1)")
@@ -1323,7 +1367,6 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--dedicated-since", help="H5: time of the reservation change, YYYY-MM-DDTHH:MM:SSZ")
     ap.add_argument("--h5-ok", help="H5: message ref of Toby's OK for an earlier holder's leftovers")
     ap.add_argument("--h5-holder", help="H5: the earlier holder Toby's OK names")
-    ap.add_argument("--notice-sent-at", help="return: when the 72 h notice went out, YYYY-MM-DDTHH:MM:SSZ")
     ap.add_argument("--reason", help="abort: the error code to record")
     ap.add_argument("--where", action="append", default=[])
     ap.add_argument("--commit", action="append", default=[])

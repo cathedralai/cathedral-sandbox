@@ -520,3 +520,40 @@ def test_facts_show_inbox_and_staging_and_discard_clears_them(host):
     assert host.phase("discard")[0] == 0
     f = host.phase("facts")[1]
     assert not (f["inbox_dir"] or f["staging_dir"] or f["launch_dir"])
+
+
+# ---------------------------------------------------------------- Q5: the owner's folder is wiped after the return
+
+def _launch_folder(host):
+    d = host.root / f"srv/custom-guest/{HOTEL}/{LAUNCH}"
+    (d / "images").mkdir(parents=True, exist_ok=True)
+    (d / "images/root.raw").write_bytes(b"x" * 4096)
+    return d
+
+
+def _hold_marker(host):
+    (host.sealed / "custom-guest.hold").write_text(json.dumps({"launch_id": LAUNCH, "state": "kit_start"}))
+
+
+def test_return_finish_keeps_the_owners_folder_for_the_wipe(host):
+    d = _launch_folder(host)
+    _hold_marker(host)
+    rc, r = host.phase("return-finish", {"record_state": "returned"})
+    assert rc == 0 and r["ok"], r
+    assert not (host.sealed / "custom-guest.hold").exists() and d.is_dir()
+
+
+def test_the_wipe_runs_only_after_the_return_and_r15_and_is_idempotent(host):
+    d = _launch_folder(host)
+    rc, r = host.phase("wipe", {"record_state": "returning"})
+    assert rc != 0 and r["error_code"] == "custom_guest_journal_behind" and d.is_dir(), r
+    _hold_marker(host)
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc != 0 and "R15" in r["detail"] and d.is_dir(), r
+    (host.sealed / "custom-guest.hold").unlink()
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc == 0 and r["ok"] and not d.exists(), r
+    rc, r = host.phase("wipe", {"record_state": "returned"})  # again, as after a lost answer or a reboot
+    assert rc == 0 and r["ok"], r
+    wiped = [e for e in host.journal() if e.get("sub") == "launch_wiped" and e.get("state") == "done"]
+    assert len(wiped) == 2  # observed done both times; the folder was removed once

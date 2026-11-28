@@ -71,7 +71,7 @@ PHASES = {
     "inbox": ("lock", 300), "intake": ("lock", 7200), "measure": ("lock", 1800), "discard": ("lock", 600),
     "hold-stop": ("lock", 900), "unhold": ("lock", 300), "hold-baseline": ("lock", 5400),
     "boot": ("lock", 600), "verify-disks": ("lock", 5400), "stop": ("lock", 300),
-    "return-kit": ("lock", 5400), "return-finish": ("lock", 1800), "tick": ("try", 300),
+    "return-kit": ("lock", 5400), "return-finish": ("lock", 1800), "wipe": ("lock", 1800), "tick": ("try", 300),
     "check-start": ("none", 0), "exited": ("none", 0), "boot-record": ("none", 0), "facts": ("none", 0),
 }
 
@@ -1608,7 +1608,7 @@ def ph_return_kit(ctx: Ctx) -> dict:
 
 
 def ph_return_finish(ctx: Ctx) -> dict:
-    """R15: after the terminal commit only."""
+    """R15: after the terminal commit only. The owner's launch folder stays: `wipe` removes it (Q5)."""
     if ctx.data.get("record_state") != "returned":
         raise Halt("custom_guest_journal_behind", "R15 runs only after the record is returned")
     doc = marker_doc(ctx)
@@ -1617,7 +1617,6 @@ def ph_return_finish(ctx: Ctx) -> dict:
     if doc and doc.get("state") != "kit_start":
         raise Halt("custom_guest_journal_behind", "the marker never reached the R7 boundary")
     sub(ctx, "marker_removed", lambda: marker_doc(ctx) is None, lambda: os.remove(ctx.marker))
-    sub(ctx, "launch_wiped", lambda: not os.path.exists(ctx.d), lambda: shutil.rmtree(ctx.d))
     names = [ctx.unit, ctx.timer, ctx.timer_service, ctx.boot_record]
 
     def units_act() -> None:
@@ -1632,6 +1631,21 @@ def ph_return_finish(ctx: Ctx) -> dict:
     sub(ctx, "units_removed", lambda: not any(os.path.exists(f"{ctx.unit_dir}/{n}") for n in names), units_act)
     if not ctx.last("return_finished"):
         ctx.log("return_finished")
+    return {"ok": True}
+
+
+def ph_wipe(ctx: Ctx) -> dict:
+    """Q5: remove the owner's launch folder after the return, once the operator has the API's go (wipe started).
+
+    The kit never mounts the folder; until this runs it stays as R15 left it. Idempotent: a rerun after a reboot
+    or a lost answer finishes the removal.
+    """
+    if ctx.data.get("record_state") != "returned":
+        raise Halt("custom_guest_journal_behind", "the launch folder is wiped only after the record is returned")
+    doc = marker_doc(ctx)
+    if doc and doc.get("launch_id") == ctx.launch:
+        raise Halt("custom_guest_journal_behind", "the marker still names this launch: finish R15 first")
+    sub(ctx, "launch_wiped", lambda: not os.path.exists(ctx.d), lambda: shutil.rmtree(ctx.d))
     return {"ok": True}
 
 
@@ -1691,7 +1705,8 @@ def ph_boot_record(ctx: Ctx) -> dict:
 FUNCS = {"facts": ph_facts, "inbox": ph_inbox, "intake": ph_intake, "measure": ph_measure, "discard": ph_discard,
          "hold-stop": ph_hold_stop, "unhold": ph_unhold, "hold-baseline": ph_hold_baseline, "boot": ph_boot,
          "verify-disks": ph_verify_disks, "stop": ph_stop, "return-kit": ph_return_kit,
-         "return-finish": ph_return_finish, "tick": ph_tick, "check-start": ph_check_start, "exited": ph_exited,
+         "return-finish": ph_return_finish, "wipe": ph_wipe, "tick": ph_tick, "check-start": ph_check_start,
+         "exited": ph_exited,
          "boot-record": ph_boot_record}
 
 
@@ -1783,7 +1798,7 @@ def main(argv: list[str]) -> int:
     return 0 if result.get("ok") else 1
 
 
-STDIN_PHASES = ("intake", "measure", "boot", "return-finish")
+STDIN_PHASES = ("intake", "measure", "boot", "return-finish", "wipe")
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
