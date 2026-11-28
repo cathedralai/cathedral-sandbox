@@ -59,8 +59,12 @@ def tree(root):
             else:
                 kind, payload = "s", f"rdev={st.st_rdev}"
             rel = path.relative_to(root).as_posix()
+            # A directory's size is the build host's: its file system grows a directory as
+            # entries are made and removed, and never shrinks it. mke2fs -d builds each
+            # directory afresh, so that size is not in the image; it is left out here.
+            size = "-" if kind == "d" else st.st_size
             out.write(f"{kind} {stat.S_IMODE(st.st_mode):04o} {st.st_uid}:{st.st_gid} {int(st.st_mtime)} "
-                      f"{st.st_nlink} {st.st_size} {payload} {json.dumps(rel)}\n")
+                      f"{st.st_nlink} {size} {payload} {json.dumps(rel)}\n")
 
 
 def listing(directory):
@@ -195,6 +199,7 @@ def main():
         "closure_digests": closure_rows(pinned),
         "closure_module_files": len(pinned.get("modules", {})),
         "bundle_id": agreed["bundle"].get("manifest.json", ""),
+        "initrd_bytes": files.get("initrd.cpio.zst", {}).get("bytes"),
         "measurement": json.loads(measurement_path.read_text()) if measurement_path.is_file() else None,
         "files": files,
         "lanes_byte_identical": True,
@@ -218,6 +223,7 @@ def main():
         f"- Base root verity: `{summary['base_root_verity']}`, data bytes {summary['base_root_data_bytes']}\n"
         f"- Bundle id (sha256 of manifest.json): `{summary['bundle_id'] or 'not built (closure unpinned)'}`\n"
         f"- Fixture identity a, 2 vCPU, genoa: {measurement_line(summary['measurement'])}\n"
+        f"- Initrd: {summary['initrd_bytes'] if summary['initrd_bytes'] is not None else 'not built'} bytes\n"
         f"- Source commit: `{summary['source_commit']}` ({summary['event']} {summary['ref']}), "
         f"SOURCE_DATE_EPOCH {summary['source_date_epoch']}\n"
         "- Both lanes byte-identical: yes. Boot verified: no (this run builds; it does not boot).\n"

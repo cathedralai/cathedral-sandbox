@@ -131,6 +131,8 @@ def test_tree_lists_links_without_following_them(tmp_path):
     r = subprocess.run([sys.executable, str(SUMMARY), "tree", str(root)], capture_output=True, text=True, check=True)
     lines = r.stdout.splitlines()
     assert lines[0].startswith("d ") and lines[0].endswith('"etc"')
+    # No directory size: it follows the build host's history, not the image.
+    assert lines[0].split()[5] == "-"
     assert any(line.startswith("l ") and '"/etc/shadow" "etc/link"' in line for line in lines)
     assert any(line.startswith("f 0") and '"etc/hostname"' in line for line in lines)
 
@@ -212,10 +214,13 @@ def test_closure_is_pinned_to_the_locked_kernel_with_the_whole_module_tree():
             "kernel/arch/x86/crypto/aesni-intel.ko.zst", "kernel/crypto/crypto_simd.ko.zst",
             "kernel/crypto/cryptd.ko.zst"}
     assert boot <= files and "modules.dep" in files
-    # The customer root keeps linux-modules whole (overlay, nf_tables, wireguard for Docker and
-    # firewalls); extra adds only the boot set, so nothing from its wireless tree is here.
+    # The customer root keeps linux-modules whole: Docker needs overlay, veth and bridge, and
+    # nft, ufw and WireGuard need nf_tables and wireguard. The cut once left only the boot set;
+    # this keeps that gap from coming back. Extra adds only the boot set, so none of its
+    # wireless tree is here.
     assert {"kernel/fs/overlayfs/overlay.ko.zst", "kernel/net/netfilter/nf_tables.ko.zst",
-            "kernel/drivers/net/wireguard/wireguard.ko.zst"} <= files
+            "kernel/drivers/net/veth.ko.zst", "kernel/drivers/net/wireguard/wireguard.ko.zst",
+            "kernel/net/bridge/bridge.ko.zst"} <= files
     assert len([f for f in files if f.endswith(".ko.zst")]) > 900
     assert not [f for f in files if f.startswith("kernel/drivers/net/wireless/")]
     assert set(closure["executables"]) == {"init", "usr/lib/cathedral/cathedral-vm",
@@ -282,3 +287,12 @@ def test_a_pinned_run_reports_the_committed_closure(tmp_path):
     assert summary["closure_digests"]["init"] == closure["executables"]["init"]
     assert summary["closure_module_files"] == len(closure["modules"])
     assert "ab" * 48 in (tmp_path / "out" / "summary.md").read_text()
+
+
+def test_summary_reports_the_initrd_size(tmp_path):
+    _lanes(tmp_path / "lanes", {"initrd.cpio.zst": b"z" * 1234})
+    (tmp_path / "lanes" / "bundle-first" / "initrd.cpio.zst").write_bytes(b"z" * 1234)
+    r = _compare(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert json.loads((tmp_path / "out" / "summary.json").read_text())["initrd_bytes"] == 1234
+    assert "- Initrd: 1234 bytes" in (tmp_path / "out" / "summary.md").read_text()
