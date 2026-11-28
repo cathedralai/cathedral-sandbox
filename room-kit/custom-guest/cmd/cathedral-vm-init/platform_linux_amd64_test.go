@@ -151,6 +151,40 @@ func TestFindDisks(t *testing.T) {
 	}
 }
 
+// B2 boot 2 powered off at F3: the initrd has no /run, so cryptsetup's LUKS2
+// lock (/run/cryptsetup) failed luksFormat. Disk makes /run first.
+func TestLockParent(t *testing.T) {
+	if lockParent != "/run" {
+		t.Fatalf("lock parent %q: cryptsetup 2.8.4 locks in /run/cryptsetup", lockParent)
+	}
+	dir := filepath.Join(t.TempDir(), "run")
+	for i := 0; i < 2; i++ {
+		if err := makeLockParent(dir); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		fi, err := os.Lstat(dir)
+		if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755&^umask() {
+			t.Fatalf("call %d: %v %v", i, fi, err)
+		}
+	}
+	file := filepath.Join(t.TempDir(), "run")
+	os.WriteFile(file, nil, 0600)
+	if err := makeLockParent(file); err == nil {
+		t.Fatal("a file at the lock parent was accepted")
+	}
+	link := filepath.Join(t.TempDir(), "run")
+	os.Symlink(t.TempDir(), link)
+	if err := makeLockParent(link); err == nil {
+		t.Fatal("a link at the lock parent was accepted")
+	}
+}
+
+func umask() os.FileMode {
+	old := syscall.Umask(0)
+	syscall.Umask(old)
+	return os.FileMode(old)
+}
+
 func TestOpenDiskRefusesANonBlockNode(t *testing.T) {
 	sys, dev := t.TempDir(), t.TempDir()
 	os.WriteFile(filepath.Join(dev, "vda"), make([]byte, 4096), 0600)

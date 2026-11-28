@@ -251,6 +251,25 @@ def test_closure_boots_the_modules_the_kernel_step_checks_in_order():
     assert 'if closure["boot_modules"] != names:' in WORKFLOW.read_text()
 
 
+def test_initrd_check_boots_the_published_initrd_and_runs_the_real_disk_step():
+    # B2's boot 2 failed at F3 in the initramfs (no /run for cryptsetup's lock) after every runner
+    # test had passed: the check runs the initrd's own cryptsetup where the init runs it.
+    text = WORKFLOW.read_text()
+    job = text.split("\n  initrd-check:\n", 1)[1]
+    assert "    needs: summary\n" in job and "name: vm-bundle\n" in job
+    assert '"$RUNNER_TEMP/vm-bundle/vmlinuz"' in job and '"$RUNNER_TEMP/vm-bundle/initrd.cpio.zst"' in job
+    assert "rdinit=/vm-initrd-check CATHEDRAL_INITRD_CHECK=1 -- -test.v -test.run=^TestInitrdDiskCheck\\$" in job
+    for serial in ("cathedral-root", "cathedral-base", "cathedral-mailbox"):
+        assert f"serial={serial}" in job
+    assert "grep -qx 'INITRD-CHECK: PASS'" in job
+    check = (REPO / "room-kit" / "custom-guest" / "cmd" / "cathedral-vm-init" / "initrd_check_linux_amd64_test.go").read_text()
+    assert "func TestInitrdDiskCheck(t *testing.T) {" in check
+    assert 'initrdCheckPass = "INITRD-CHECK: PASS"' in check
+    # The real platform's Disk, so the init's own /run step is what makes the lock path.
+    assert "out, err := p.Disk(ctx, vmdisk.Config{" in check
+    assert "if _, err := os.Lstat(lockParent); !errors.Is(err, os.ErrNotExist) {" in check
+
+
 def test_toolchains_compare_without_the_runner_image_line():
     sys.path.insert(0, str(REPO / "scripts"))
     import vm_bundle_build_summary as summary
@@ -275,7 +294,7 @@ def test_summary_records_the_built_commit_event_ref_and_epoch(tmp_path):
 def test_workflow_builds_the_head_commit_on_pinned_runners():
     text = WORKFLOW.read_text()
     assert "SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in text
-    assert text.count("ref: ${{ env.SOURCE_SHA }}") == 3
+    assert text.count("ref: ${{ env.SOURCE_SHA }}") == 4
     assert "ubuntu-latest" not in text
 
 

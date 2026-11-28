@@ -44,6 +44,12 @@ const (
 	serialBase    = "cathedral-base"
 	serialMailbox = "cathedral-mailbox"
 	diskWait      = 15 * time.Second
+
+	// cryptsetup takes its LUKS2 metadata lock in /run/cryptsetup (its
+	// compiled-in lock path, lib/utils_device_locking.c open_resource) and
+	// fails every LUKS2 format, open and dump when /run is missing. The initrd
+	// archive holds only init and usr, so the init makes /run before vm-disk.
+	lockParent = "/run"
 )
 
 var (
@@ -367,8 +373,29 @@ func (p *linuxPlatform) Devices() (Devices, error) {
 }
 
 func (p *linuxPlatform) Disk(ctx context.Context, cfg vmdisk.Config) (vmdisk.Outcome, error) {
+	if err := makeLockParent(lockParent); err != nil {
+		return vmdisk.Outcome{}, err
+	}
 	cfg.Cryptsetup = p.cryptsetup
 	return vmdisk.Run(ctx, cfg)
+}
+
+// makeLockParent makes the directory cryptsetup makes its lock directory in.
+// A plain directory on the initramfs root is enough: the locks only order
+// this init's own cryptsetup runs, and vmroot gives the customer root its own
+// /run. An existing directory is kept; anything else there is refused.
+func makeLockParent(path string) error {
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("make %s for the cryptsetup locks: %w", path, err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("make %s for the cryptsetup locks: %w", path, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("make %s for the cryptsetup locks: not a directory", path)
+	}
+	return nil
 }
 
 func (p *linuxPlatform) Root() Root       { return newRootAdapter(p.manifest) }
