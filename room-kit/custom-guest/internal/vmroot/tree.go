@@ -125,7 +125,7 @@ func addUser(root *os.Root, o TreeOptions) error {
 			return err
 		}
 	}
-	if err := root.MkdirAll("home/"+userName+"/.ssh", 0o700); err != nil {
+	if err := mkdirAllMode(root, "home/"+userName+"/.ssh", 0o700); err != nil {
 		return err
 	}
 	for _, dir := range []string{"home/" + userName, "home/" + userName + "/.ssh"} {
@@ -145,13 +145,44 @@ func addUser(root *os.Root, o TreeOptions) error {
 	}
 	// The old cloud-init config gave the user sudo without a password (f7b3ed3 vm_ctl.py make_seed);
 	// verify_vm.py runs `sudo -n cathedral-attest`.
-	if err := root.MkdirAll("etc/sudoers.d", 0o750); err != nil {
+	if err := mkdirAllMode(root, "etc/sudoers.d", 0o750); err != nil {
 		return err
 	}
 	return writeNew(root, "etc/sudoers.d/90-cathedral", []byte(userName+" ALL=(ALL) NOPASSWD:ALL\n"), 0o440)
 }
 
 // writeNew creates name and fails if it exists: a pristine base never has these files.
+// mkdirAllMode makes name in root with mode, and any missing parent with 0755. The VM init runs
+// under bootstate.PrepareKernelViews' umask 0077, which MkdirAll applies to every directory it
+// makes: B4's guest got a root-only /run/systemd, so every non-root service failed. A directory
+// that exists is left as it is.
+func mkdirAllMode(root *os.Root, name string, mode os.FileMode) error {
+	parts := strings.Split(name, "/")
+	for i := range parts {
+		dir, want := strings.Join(parts[:i+1], "/"), os.FileMode(0o755)
+		if i == len(parts)-1 {
+			want = mode
+		}
+		info, err := root.Stat(dir)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("%s is not a directory", dir)
+			}
+			continue
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if err := root.Mkdir(dir, want); err != nil {
+			return err
+		}
+		if err := root.Chmod(dir, want); err != nil { // the umask must not narrow it
+			return err
+		}
+	}
+	return nil
+}
+
 func writeNew(root *os.Root, name string, data []byte, mode os.FileMode) error {
 	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
@@ -173,7 +204,7 @@ func writeNew(root *os.Root, name string, data []byte, mode os.FileMode) error {
 // writeHostKey removes any host key the base shipped (a shared key would be one key for every VM)
 // and makes this VM's Ed25519 key, the only one sshd is told to load.
 func writeHostKey(root *os.Root, o TreeOptions) error {
-	if err := root.MkdirAll("etc/ssh/sshd_config.d", 0o755); err != nil {
+	if err := mkdirAllMode(root, "etc/ssh/sshd_config.d", 0o755); err != nil {
 		return err
 	}
 	dir, err := root.Open("etc/ssh")
@@ -213,7 +244,7 @@ func writeHostKey(root *os.Root, o TreeOptions) error {
 // boot calls it and so does every later boot (7.2 step 5), so the customer cannot leave cloud-init
 // on across a restart by deleting the marker. A datasource from SMBIOS or a seed disk then does nothing.
 func AssertCloudInitOff(root *os.Root) error {
-	if err := root.MkdirAll("etc/cloud", 0o755); err != nil {
+	if err := mkdirAllMode(root, "etc/cloud", 0o755); err != nil {
 		return err
 	}
 	const marker = "etc/cloud/cloud-init.disabled"
@@ -244,7 +275,7 @@ func WriteRecovery(root *os.Root, o TreeOptions) (vmrecovery.Record, error) {
 		return vmrecovery.Record{}, err
 	}
 	defer clear(raw)
-	if err := root.MkdirAll("var/lib/cathedral-vm", 0o700); err != nil {
+	if err := mkdirAllMode(root, "var/lib/cathedral-vm", 0o700); err != nil {
 		return vmrecovery.Record{}, err
 	}
 	if err := root.Chmod("var/lib/cathedral-vm", 0o700); err != nil {
@@ -262,7 +293,7 @@ func WriteNetwork(run *os.Root, linkRaw []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := run.MkdirAll("systemd/network", 0o755); err != nil {
+	if err := mkdirAllMode(run, "systemd/network", 0o755); err != nil {
 		return err
 	}
 	if err := run.Remove("systemd/network/10-uplink.network"); err != nil && !errors.Is(err, fs.ErrNotExist) {
