@@ -3,7 +3,8 @@
 
 Install on the hotel (OPERATOR.md, install step 3), after the sshd check passes:
 
-    python3 -I <checkout>/ops/custom-guest/cg_ssh_dispatch.py --check-sshd --addr <operator address> &&
+    python3 -I <checkout>/ops/custom-guest/cg_ssh_dispatch.py --check-sshd --addr <operator address> \
+        --laddr <host address> &&
     install -m 0755 -o root -g root <checkout>/ops/custom-guest/cg_ssh_dispatch.py /usr/local/sbin/cathedral-cg-dispatch
 
 and give the operator key this line in root's authorized_keys:
@@ -29,7 +30,7 @@ broker's commands): there is no shell and no quote handling to get wrong.
 """
 from __future__ import annotations
 
-import fnmatch
+import ipaddress
 import json
 import os
 import re
@@ -55,12 +56,10 @@ PHASES: dict[str, dict[str, str]] = {
 UPLOAD_NAMES = r"(vmlinuz|initrd|root\.raw)"
 FIXED_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 # sshd hands the variables it accepts to root's shell, which runs the forced command, so they act before this
-# program can drop them: LD_* loads code into the shell, BASH_ENV and ENV make it source a file, BASH_FUNC_*
-# defines functions, SHELLOPTS changes how it runs and PATH picks its programs. --check-sshd refuses an install
-# where a client could set any of them.
-RISKY_ENV = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "BASH_ENV", "ENV", "PATH", "BASH_FUNC_x%%", "SHELLOPTS")
-RISKY_PREFIXES = ("LD_", "BASH_FUNC_")
-IP_RE = re.compile(r"[0-9A-Fa-f.:]{2,45}")
+# program can drop them (LD_* loads code into the shell, BASH_ENV makes it source a file, GCONV_PATH and LOCPATH
+# point glibc at other files, and so on). --check-sshd allows an install only when sshd accepts these patterns
+# alone, exactly as written: the locale, the terminal's colours and the time zone.
+ALLOWED_ENV = ("LANG", "LC_*", "COLORTERM", "NO_COLOR", "TZ")
 
 
 class Refused(Exception):
@@ -164,7 +163,7 @@ def install_args(argv: list[str]) -> dict:
 
 
 def sshd_env_problems(dump: str) -> list[str]:
-    """What in an `sshd -T` dump would let a client set a variable root's shell reads. Empty means sound."""
+    """What in an `sshd -T` dump lets a client set a variable outside ALLOWED_ENV. Empty means sound."""
     accept: list[str] = []
     user_env = None
     for line in dump.splitlines():
@@ -173,26 +172,43 @@ def sshd_env_problems(dump: str) -> list[str]:
             accept += w[1:]
         elif w and w[0].lower() == "permituserenvironment":
             user_env = " ".join(w[1:])
-    problems = [f"acceptenv {p} lets a client set a variable root's shell reads" for p in accept
-                if p.startswith(RISKY_PREFIXES) or any(fnmatch.fnmatchcase(n, p) for n in RISKY_ENV)]
+    problems = [f"acceptenv {p} is not one of {' '.join(ALLOWED_ENV)}" for p in accept if p not in ALLOWED_ENV]
     if user_env != "no":
         problems.append(f"permituserenvironment is {user_env or 'not in the dump'}, not no")
     return problems
 
 
-def check_sshd(argv: list[str]) -> int:
-    """--check-sshd [--addr <operator address>] [--sshd PATH] [--config FILE]: OK sshd and 0, or FAIL sshd and 1."""
-    a = {"--sshd": "/usr/sbin/sshd", "--config": None, "--addr": None}
+def _ip(value: str, flag: str) -> str:
     try:
-        if len(argv) % 2 or any(k not in a for k in argv[::2]):
-            raise ValueError("usage: --check-sshd [--addr <operator address>] [--sshd PATH] [--config FILE]")
-        a.update(zip(argv[::2], argv[1::2]))
-        if a["--addr"] is not None and not IP_RE.fullmatch(a["--addr"]):
-            raise ValueError("--addr takes the operator's IP address")
-        cmd = [a["--sshd"], "-T"] + (["-f", a["--config"]] if a["--config"] else [])
-        if a["--addr"]:
-            # The settings for this key's own login, Match blocks included.
-            cmd += ["-C", f"user=root,host={a['--addr']},addr={a['--addr']}"]
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        raise ValueError(f"{flag} takes an IP address, not {value!r}") from None
+
+
+def check_sshd(argv: list[str]) -> int:
+    """--check-sshd --addr <operator address> --laddr <host address> [--lport 22] [--rdomain NAME]
+    [--sshd PATH] [--config FILE]: OK sshd and 0, or FAIL sshd and 1."""
+    usage = ("usage: --check-sshd --addr <operator address> --laddr <host address> [--lport 22] [--rdomain NAME] "
+             "[--sshd PATH] [--config FILE]")
+    a = {"--sshd": "/usr/sbin/sshd", "--config": None, "--addr": None, "--laddr": None, "--lport": "22",
+         "--rdomain": None}
+    try:
+        keys = argv[::2]
+        if len(argv) % 2 or any(k not in a for k in keys) or len(set(keys)) != len(keys):
+            raise ValueError(usage)
+        a.update(zip(keys, argv[1::2]))
+        if a["--addr"] is None or a["--laddr"] is None:
+            raise ValueError(usage)
+        addr, laddr = _ip(a["--addr"], "--addr"), _ip(a["--laddr"], "--laddr")
+        if not re.fullmatch(r"[1-9][0-9]{0,4}", a["--lport"]) or int(a["--lport"]) > 65535:
+            raise ValueError("--lport takes a port, 1 to 65535")
+        if a["--rdomain"] is not None and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", a["--rdomain"]):
+            raise ValueError("--rdomain takes a routing domain name")
+        # The settings for this key's own login: every Match criterion sshd can evaluate gets the connection's value.
+        spec = f"user=root,host={addr},addr={addr},laddr={laddr},lport={a['--lport']}"
+        if a["--rdomain"]:
+            spec += f",rdomain={a['--rdomain']}"
+        cmd = [a["--sshd"], "-T"] + (["-f", a["--config"]] if a["--config"] else []) + ["-C", spec]
         p = subprocess.run(cmd, capture_output=True, text=True, env=dict(FIXED_ENV), timeout=60)
         if p.returncode != 0:
             raise ValueError(f"sshd -T exit {p.returncode}: {p.stderr.strip()[-300:]}")
