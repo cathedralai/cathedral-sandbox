@@ -1,0 +1,9 @@
+[Unit]
+Description=Custom guest folder wipe of hotel %i, every 15 minutes (Q5)
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

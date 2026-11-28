@@ -520,3 +520,103 @@ def test_facts_show_inbox_and_staging_and_discard_clears_them(host):
     assert host.phase("discard")[0] == 0
     f = host.phase("facts")[1]
     assert not (f["inbox_dir"] or f["staging_dir"] or f["launch_dir"])
+
+
+# ---------------------------------------------------------------- Q5: the owner's folder is wiped after the return
+
+def _launch_folder(host, guest_uid=None):
+    """The folder as intake leaves it: root's (here the test user's) 0755, the guest's disks/ and run/ in it."""
+    d = host.root / f"srv/custom-guest/{HOTEL}/{LAUNCH}"
+    (d / "images").mkdir(parents=True, exist_ok=True)
+    (d / "images/root.raw").write_bytes(b"x" * 4096)
+    for name in ("disks", "run"):
+        (d / name).mkdir(mode=0o700, exist_ok=True)
+    (d / "disks/data.raw").write_bytes(b"d" * 8192)
+    d.chmod(0o755)
+    uid = os.getuid() if guest_uid is None else guest_uid
+    (host.bin / "getent").write_text(
+        f'#!/bin/sh\n[ "$1 $2" = "passwd cg-{HOTEL}" ] && echo "cg-{HOTEL}:x:{uid}:{uid}::/nonexistent:/bin/false"\n'
+        'exit 0\n')
+    return d
+
+
+def _hold_marker(host):
+    (host.sealed / "custom-guest.hold").write_text(json.dumps({"launch_id": LAUNCH, "state": "kit_start"}))
+
+
+def test_return_finish_keeps_the_owners_folder_for_the_wipe(host):
+    d = _launch_folder(host)
+    _hold_marker(host)
+    rc, r = host.phase("return-finish", {"record_state": "returned"})
+    assert rc == 0 and r["ok"], r
+    assert not (host.sealed / "custom-guest.hold").exists() and d.is_dir()
+
+
+def test_the_wipe_runs_only_after_the_return_and_r15_and_is_idempotent(host):
+    d = _launch_folder(host)
+    rc, r = host.phase("wipe", {"record_state": "returning"})
+    assert rc != 0 and r["error_code"] == "custom_guest_journal_behind" and d.is_dir(), r
+    _hold_marker(host)
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc != 0 and "R15" in r["detail"] and d.is_dir(), r
+    (host.sealed / "custom-guest.hold").unlink()
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc == 0 and r["ok"] and not d.exists(), r
+    rc, r = host.phase("wipe", {"record_state": "returned"})  # again, as after a lost answer or a reboot
+    assert rc == 0 and r["ok"], r
+    wiped = [e for e in host.journal() if e.get("sub") == "launch_wiped" and e.get("state") == "done"]
+    assert len(wiped) == 2  # observed done both times; the folder was removed once
+
+
+def _victim(host):
+    v = host.tmp / "victim"
+    v.mkdir()
+    (v / "keep").write_text("not the launch's\n")
+    return v
+
+
+def test_the_wipe_never_follows_a_link_planted_in_the_folder(host):
+    d = _launch_folder(host)
+    victim = _victim(host)
+    (d / "disks/escape").symlink_to(victim)
+    (d / "run/file-link").symlink_to(victim / "keep")
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc == 0 and r["ok"], r
+    assert not d.exists() and (victim / "keep").read_text() == "not the launch's\n"
+
+
+@pytest.mark.parametrize("where", ["launch", "hotel"])
+def test_the_wipe_refuses_a_folder_that_is_a_link(host, where):
+    victim = _victim(host)
+    (victim / LAUNCH).mkdir()
+    base = host.root / f"srv/custom-guest/{HOTEL}"
+    base.mkdir(parents=True, exist_ok=True)
+    if where == "launch":
+        (base / LAUNCH).symlink_to(victim)
+    else:  # the hotel folder itself is swapped for a link to elsewhere
+        os.rename(base, host.tmp / "hotel-was")
+        base.symlink_to(victim)
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc != 0 and r["error_code"] == "custom_guest_wipe_unsafe", r
+    assert (victim / "keep").exists() and (victim / LAUNCH).is_dir()
+
+
+def test_the_wipe_refuses_guest_folders_another_user_owns(host):
+    d = _launch_folder(host, guest_uid=os.getuid() + 1)
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc != 0 and r["error_code"] == "custom_guest_wipe_unsafe" and "cg-" in r["detail"], r
+    assert d.is_dir()
+
+
+def test_the_wipe_refuses_a_group_writable_folder(host):
+    d = _launch_folder(host)
+    d.chmod(0o775)
+    rc, r = host.phase("wipe", {"record_state": "returned"})
+    assert rc != 0 and r["error_code"] == "custom_guest_wipe_unsafe", r
+    assert d.is_dir()
+
+
+def test_facts_report_the_folders_bytes_while_it_waits(host):
+    _launch_folder(host)
+    rc, r = host.phase("facts")
+    assert rc == 0 and r["launch_dir"] is True and r["launch_dir_bytes"] >= 4096 + 8192, r

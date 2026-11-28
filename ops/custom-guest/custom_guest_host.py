@@ -71,7 +71,7 @@ PHASES = {
     "inbox": ("lock", 300), "intake": ("lock", 7200), "measure": ("lock", 1800), "discard": ("lock", 600),
     "hold-stop": ("lock", 900), "unhold": ("lock", 300), "hold-baseline": ("lock", 5400),
     "boot": ("lock", 600), "verify-disks": ("lock", 5400), "stop": ("lock", 300),
-    "return-kit": ("lock", 5400), "return-finish": ("lock", 1800), "tick": ("try", 300),
+    "return-kit": ("lock", 5400), "return-finish": ("lock", 1800), "wipe": ("lock", 1800), "tick": ("try", 300),
     "check-start": ("none", 0), "exited": ("none", 0), "boot-record": ("none", 0), "facts": ("none", 0),
 }
 
@@ -921,6 +921,7 @@ def ph_facts(ctx: Ctx) -> dict:
             "kit_absent": kit_absent(ctx), "kit_net_timer": {"active": active(ctx.kit_net_timer),
                                                              "enabled": enabled(ctx.kit_net_timer)},
             "custom_unit": custom, "marker": marker_doc(ctx), "launch_dir": os.path.isdir(ctx.d),
+            "launch_dir_bytes": tree_bytes(ctx.d) if os.path.isdir(ctx.d) else 0,
             "inbox_dir": os.path.isdir(f"{ctx.base}/inbox/{ctx.launch}"),
             "staging_dir": os.path.isdir(f"{ctx.base}/staging/{ctx.launch}"),
             "journal": [e for e in ctx.entries() if e.get("event") != "sub"], "boot_id": boot_id(),
@@ -1608,7 +1609,7 @@ def ph_return_kit(ctx: Ctx) -> dict:
 
 
 def ph_return_finish(ctx: Ctx) -> dict:
-    """R15: after the terminal commit only."""
+    """R15: after the terminal commit only. The owner's launch folder stays: `wipe` removes it (Q5)."""
     if ctx.data.get("record_state") != "returned":
         raise Halt("custom_guest_journal_behind", "R15 runs only after the record is returned")
     doc = marker_doc(ctx)
@@ -1617,7 +1618,6 @@ def ph_return_finish(ctx: Ctx) -> dict:
     if doc and doc.get("state") != "kit_start":
         raise Halt("custom_guest_journal_behind", "the marker never reached the R7 boundary")
     sub(ctx, "marker_removed", lambda: marker_doc(ctx) is None, lambda: os.remove(ctx.marker))
-    sub(ctx, "launch_wiped", lambda: not os.path.exists(ctx.d), lambda: shutil.rmtree(ctx.d))
     names = [ctx.unit, ctx.timer, ctx.timer_service, ctx.boot_record]
 
     def units_act() -> None:
@@ -1632,6 +1632,82 @@ def ph_return_finish(ctx: Ctx) -> dict:
     sub(ctx, "units_removed", lambda: not any(os.path.exists(f"{ctx.unit_dir}/{n}") for n in names), units_act)
     if not ctx.last("return_finished"):
         ctx.log("return_finished")
+    return {"ok": True}
+
+
+def tree_bytes(path: str) -> int:
+    """Blocks a folder holds on its file system (what the disk ledger loses to it), never following a link."""
+    total = 0
+    for top, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            try:
+                total += os.lstat(os.path.join(top, name)).st_blocks * 512
+            except OSError:
+                pass
+    try:
+        total += os.lstat(path).st_blocks * 512
+    except OSError:
+        pass
+    return total
+
+
+def uid_of(name: str) -> int | None:
+    r = run(["getent", "passwd", name])
+    fields = r.stdout.strip().split(":") if r.returncode == 0 else []
+    return int(fields[2]) if len(fields) > 2 and fields[0] == name and fields[2].isdigit() else None
+
+
+def wipe_target(ctx: Ctx) -> str | None:
+    """The one folder `wipe` may remove: /srv/custom-guest/<hotel>/<launch> exactly, as intake made it.
+
+    Every part of the path is a real directory (no link anywhere, and its real path is the fixed one), the folder
+    belongs to this tool's user (root on a host) and is not group or world writable, and the guest's folders in it
+    belong to cg-<hotel>. None: nothing is there. shutil.rmtree then removes it without following a link inside
+    (its fd-based walk; refused where the platform lacks one).
+    """
+    parts = ["srv", "custom-guest", ctx.hotel, ctx.launch]
+    for i in range(1, len(parts) + 1):
+        path = p("/" + "/".join(parts[:i]))
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise Halt("custom_guest_wipe_unsafe", f"{path} is not a plain directory (a link or a file)")
+    fixed = os.path.join(os.path.realpath(ROOT or "/"), *parts)
+    if os.path.realpath(ctx.d) != fixed:
+        raise Halt("custom_guest_wipe_unsafe", f"{ctx.d} resolves to {os.path.realpath(ctx.d)}, not {fixed}")
+    st = os.lstat(ctx.d)
+    if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise Halt("custom_guest_wipe_unsafe", f"{ctx.d} is not this tool's folder (uid {st.st_uid}, mode "
+                                               f"{stat.S_IMODE(st.st_mode):o})")
+    guest = uid_of(ctx.user)
+    for name in ("disks", "run"):
+        try:
+            sub_st = os.lstat(f"{ctx.d}/{name}")
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(sub_st.st_mode) or sub_st.st_uid != guest:
+            raise Halt("custom_guest_wipe_unsafe", f"{ctx.d}/{name} is not a directory of {ctx.user} "
+                                                   f"(uid {sub_st.st_uid}, {ctx.user} is {guest})")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise Halt("custom_guest_wipe_unsafe", "this platform's rmtree can follow a link swapped in mid-walk")
+    return ctx.d
+
+
+def ph_wipe(ctx: Ctx) -> dict:
+    """Q5: remove the owner's launch folder after the return, once the operator has the API's go (wipe started).
+
+    The kit never mounts the folder; until this runs it stays as R15 left it. Idempotent: a rerun after a reboot
+    or a lost answer finishes the removal.
+    """
+    if ctx.data.get("record_state") != "returned":
+        raise Halt("custom_guest_journal_behind", "the launch folder is wiped only after the record is returned")
+    doc = marker_doc(ctx)
+    if doc and doc.get("launch_id") == ctx.launch:
+        raise Halt("custom_guest_journal_behind", "the marker still names this launch: finish R15 first")
+    target = wipe_target(ctx)
+    sub(ctx, "launch_wiped", lambda: not os.path.lexists(ctx.d), lambda: shutil.rmtree(target))
     return {"ok": True}
 
 
@@ -1691,7 +1767,8 @@ def ph_boot_record(ctx: Ctx) -> dict:
 FUNCS = {"facts": ph_facts, "inbox": ph_inbox, "intake": ph_intake, "measure": ph_measure, "discard": ph_discard,
          "hold-stop": ph_hold_stop, "unhold": ph_unhold, "hold-baseline": ph_hold_baseline, "boot": ph_boot,
          "verify-disks": ph_verify_disks, "stop": ph_stop, "return-kit": ph_return_kit,
-         "return-finish": ph_return_finish, "tick": ph_tick, "check-start": ph_check_start, "exited": ph_exited,
+         "return-finish": ph_return_finish, "wipe": ph_wipe, "tick": ph_tick, "check-start": ph_check_start,
+         "exited": ph_exited,
          "boot-record": ph_boot_record}
 
 
@@ -1783,7 +1860,7 @@ def main(argv: list[str]) -> int:
     return 0 if result.get("ok") else 1
 
 
-STDIN_PHASES = ("intake", "measure", "boot", "return-finish")
+STDIN_PHASES = ("intake", "measure", "boot", "return-finish", "wipe")
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

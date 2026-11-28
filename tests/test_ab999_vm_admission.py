@@ -587,6 +587,21 @@ def test_a_returned_launch_journal_alone_is_not_a_custom_guest_host(host, cap):
     cap.refuse_custom_guest_host()
 
 
+def test_the_ledger_shows_a_returned_launchs_folder_until_the_wipe(host, cap):
+    """Q5: the folder waits 72 h after the return; its bytes are listed against their file system."""
+    d = host.root / "srv" / "custom-guest" / "hotel-x" / "cg-0123456789ab"
+    (d / "disks").mkdir(parents=True)
+    (d / "disks" / "data.raw").write_bytes(os.urandom(1 << 20))
+    (d / "disks" / "escape").symlink_to(host.tmp)  # never followed
+    out = cap.report()
+    [folder] = out["custom_guest_folders"]
+    assert (folder["hotel"], folder["launch"]) == ("hotel-x", "cg-0123456789ab") and folder["bytes"] >= 1 << 20
+    [fs] = [f for f in out["filesystems"] if f["custom_guest_mib"]]
+    assert fs["custom_guest_mib"] == folder["bytes"] // (1 << 20)
+    shutil.rmtree(d)
+    assert cap.report()["custom_guest_folders"] == []
+
+
 # ---------------------------------------------------------------- install-sealed.sh assess step
 
 
