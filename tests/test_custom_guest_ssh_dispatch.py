@@ -140,14 +140,25 @@ print("RESULT " + json.dumps({{"ok": True, "argv": sys.argv, "env": dict(os.envi
 
 
 def checkout(tmp: Path, sha7: str = SHA7) -> tuple[Path, Path]:
+    """A checkout shaped like the real one where it matters: root runs more than the .sh (the Python tool, its
+    siblings, a kit script), and snp_qemu.py is a link into room-kit."""
     root = Path(os.path.realpath(tmp)) / "opt"
-    here = root / f"cathedral-sandbox-cg-{sha7}" / "ops" / "custom-guest"
-    here.mkdir(parents=True)
+    top = root / f"cathedral-sandbox-cg-{sha7}"
+    here = top / "ops" / "custom-guest"
+    for d in (here / "systemd", top / "room-kit" / "vm", top / "room-kit" / "sealed"):
+        d.mkdir(parents=True)
     tool = here / "custom-guest-host.sh"
     tool.write_text(FAKE_TOOL.format(py=sys.executable))
+    files = {here / "custom_guest_host.py": 0o755, here / "sev_status.py": 0o755, here / "custom-net.sh": 0o755,
+             here / "systemd" / "cathedral-custom-guest@.service": 0o644,
+             top / "room-kit" / "vm" / "snp_qemu.py": 0o644,
+             top / "room-kit" / "sealed" / "write-units.sh": 0o755}
+    for f, mode in files.items():
+        f.write_text("# code root runs\n")
+        f.chmod(mode)
+    (here / "snp_qemu.py").symlink_to("../../room-kit/vm/snp_qemu.py")
     tool.chmod(0o755)
-    (here / "custom_guest_host.py").write_text("# the real tool's code\n")
-    for d in (here, here.parent, here.parent.parent, root):
+    for d in [root, *[p for p in top.rglob("*") if p.is_dir() and not p.is_symlink()], top]:
         d.chmod(0o755)
     return root, tool
 
@@ -218,22 +229,74 @@ def test_only_the_installed_checkout_runs(tmp_path):
     assert p.returncode == 1 and "not the host tool of this install" in result(p)["detail"]
 
 
-@pytest.mark.parametrize("weak", ["tool", "sibling", "folder", "link"])
+# Each weak spot, and the path the refusal must name.
+WEAK = {"tool": "ops/custom-guest/custom-guest-host.sh is",
+        "group-writable python": "ops/custom-guest/custom_guest_host.py is",
+        "other-writable python": "ops/custom-guest/sev_status.py is", "folder": "/ops is", "link": "link",
+        "link target": "room-kit/vm/snp_qemu.py is", "kit script": "room-kit/sealed/write-units.sh is",
+        "unit file in a subfolder": "systemd/cathedral-custom-guest@.service is", "subfolder": "room-kit/sealed is",
+        "link out of the checkout": "ops/custom-guest/snp_qemu.py links outside", "install root": "/opt is"}
+
+
+@pytest.mark.parametrize("weak", sorted(WEAK))
 def test_a_checkout_others_could_change_is_refused(tmp_path, weak):
+    """The whole pinned checkout counts, not just the .sh: root runs the Python tool and what it calls."""
     root, tool = checkout(tmp_path)
-    here = tool.parent
+    here, top = tool.parent, tool.parents[2]
     if weak == "tool":
         tool.chmod(0o775)
-    elif weak == "sibling":
-        (here / "custom_guest_host.py").chmod(0o666)
+    elif weak == "group-writable python":
+        (here / "custom_guest_host.py").chmod(0o775)
+    elif weak == "other-writable python":
+        (here / "sev_status.py").chmod(0o757)
     elif weak == "folder":
         here.parent.chmod(0o777)
+    elif weak == "link":
+        real = top.with_name("elsewhere")
+        top.rename(real)
+        top.symlink_to(real)
+    elif weak == "link target":
+        (top / "room-kit" / "vm" / "snp_qemu.py").chmod(0o664)
+    elif weak == "kit script":
+        (top / "room-kit" / "sealed" / "write-units.sh").chmod(0o775)
+    elif weak == "unit file in a subfolder":
+        (here / "systemd" / "cathedral-custom-guest@.service").chmod(0o664)
+    elif weak == "subfolder":
+        (top / "room-kit" / "sealed").chmod(0o775)
+    elif weak == "link out of the checkout":
+        outside = tmp_path / "outside.py"
+        outside.write_text("# not in the checkout\n")
+        (here / "snp_qemu.py").unlink()
+        (here / "snp_qemu.py").symlink_to(outside)
     else:
-        real = here.parent.parent.with_name("elsewhere")
-        here.parent.parent.rename(real)
-        here.parent.parent.symlink_to(real)
+        root.chmod(0o775)
     p = dispatch(root, f"{tool} folders --hotel {HOTEL}")
-    assert p.returncode == 1 and result(p)["ok"] is False and "argv" not in result(p), p.stdout
+    r = result(p)
+    assert p.returncode == 1 and r["ok"] is False and "argv" not in r, p.stdout
+    assert WEAK[weak] in r["detail"], r["detail"]
+
+
+def test_a_sound_checkout_with_its_link_runs(tmp_path):
+    root, tool = checkout(tmp_path)
+    p = dispatch(root, f"{tool} folders --hotel {HOTEL}")
+    assert p.returncode == 0 and result(p)["ok"] is True, (p.stdout, p.stderr)
+
+
+@pytest.mark.skipif(not (REPO / ".git").exists() or not shutil.which("git"), reason="needs a git checkout")
+def test_this_commit_installed_as_the_guide_says_passes_the_check(tmp_path):
+    """The real tree (git archive, as the host checkout is made), after the guide's chown and chmod, is trusted;
+    the same tree with one group-writable Python file is not."""
+    d = load()
+    root = Path(os.path.realpath(tmp_path)) / "opt"
+    top = root / f"cathedral-sandbox-cg-{SHA7}"
+    top.mkdir(parents=True)
+    archive = subprocess.run(["git", "-C", str(REPO), "archive", "HEAD"], capture_output=True, check=True).stdout
+    subprocess.run(["tar", "-x", "-C", str(top)], input=archive, check=True)
+    subprocess.run(["chmod", "-R", "go-w", str(root)], check=True)
+    d.trusted(str(top), str(root), os.getuid())
+    (top / "ops" / "custom-guest" / "custom_guest_host.py").chmod(0o775)
+    with pytest.raises(d.Refused):
+        d.trusted(str(top), str(root), os.getuid())
 
 
 @pytest.mark.parametrize("args", [["Bad_Hotel", SHA7], [HOTEL, "xyz"], [HOTEL], [HOTEL, SHA7, "--path", "/tmp"]])
@@ -249,14 +312,16 @@ def test_a_bad_command_line_in_authorized_keys_refuses_everything(tmp_path, args
 def test_the_default_scp_uses_the_legacy_protocol():
     """Without -O, scp asks for the sftp subsystem, which the forced command refuses: the upload would fail."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("CG_")}
-    p = subprocess.run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import custom_guest as g; "
-                        "print(g.SCP)", str(REPO / "ops" / "custom-guest")], capture_output=True, text=True, env=env,
-                       timeout=60)
-    assert "-O" in eval(p.stdout), (p.stdout, p.stderr)
+    code = "import json, sys; sys.path.insert(0, sys.argv[1]); import custom_guest as g; print(json.dumps(g.SCP))"
+    p = subprocess.run([sys.executable, "-I", "-c", code, str(REPO / "ops" / "custom-guest")], capture_output=True,
+                       text=True, env=env, timeout=60)
+    assert "-O" in json.loads(p.stdout), (p.stdout, p.stderr)
 
 
 def test_the_guide_installs_the_forced_command():
     text = (REPO / "ops" / "custom-guest" / "OPERATOR.md").read_text()
+    assert "chown -R root:root /opt/cathedral/cathedral-sandbox-cg-<sha7>" in text
+    assert "chmod -R go-w /opt/cathedral/cathedral-sandbox-cg-<sha7>" in text
     assert 'command="/usr/local/sbin/cathedral-cg-dispatch <hotel> <sha7>",from="<operator address>",restrict' in text
     assert "install -m 0755 -o root -g root" in text and "/usr/local/sbin/cathedral-cg-dispatch" in text
     scp = [ln for ln in text.splitlines() if ln.strip().startswith("CG_SCP=")]
@@ -283,9 +348,6 @@ def sshd(tmp_path, request):
     d = Path(os.path.realpath(tmp_path))
     d.chmod(0o755)
     root, tool = checkout(d)
-    # As P1 installs it: git archive (tar.umask 002) extracted as root gives root:root 0775/0664.
-    for f in tool.parent.iterdir():
-        f.chmod(f.stat().st_mode | 0o020)
     srv = d / "srv"
     (srv / HOTEL / "inbox" / LAUNCH).mkdir(parents=True)
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / "hostkey")], check=True)
@@ -338,7 +400,8 @@ def test_behind_sshd_a_shell_command_and_sftp_are_refused(sshd):
     assert r["request"] in (repr(sshd["subsystem"]), repr(sshd["subsystem"] + " ")), r
     assert "not the host tool of this install" in r["detail"], r
     log = (sshd["d"] / "sshd.log").read_text()
-    assert log.count("Starting session: forced-command (key-option)") == 4 and "subsystem 'sftp'" not in log, log[-3000:]
+    assert log.count("Starting session: forced-command (key-option)") == 4, log[-3000:]
+    assert "subsystem 'sftp'" not in log, log[-3000:]
 
 
 @sshd_tests
@@ -362,3 +425,15 @@ def test_behind_sshd_only_the_legacy_upload_to_the_inbox_works(sshd):
         p = subprocess.run([*scp, *extra, str(src), f"root@localhost:{target}"], capture_output=True, text=True,
                            timeout=60)
         assert p.returncode != 0 and not Path(target).exists(), (target, p.stderr)
+
+
+@sshd_tests
+def test_behind_sshd_a_group_writable_python_file_refuses_every_phase(sshd):
+    """As root, on a root:root checkout: group write on a file root runs is refused too (git archive gives 0775)."""
+    py = sshd["tool"].parent / "custom_guest_host.py"
+    py.chmod(0o775)
+    p = ssh(sshd, f"{sshd['tool']} folders --hotel {HOTEL}")
+    r = result(p)
+    assert p.returncode == 1 and r["ok"] is False and "argv" not in r and "custom_guest_host.py" in r["detail"], r
+    py.chmod(0o755)
+    assert result(ssh(sshd, f"{sshd['tool']} folders --hotel {HOTEL}"))["ok"] is True
