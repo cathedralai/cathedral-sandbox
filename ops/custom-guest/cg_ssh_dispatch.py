@@ -18,7 +18,7 @@ Exactly two forms run, with a fixed environment (nothing from sshd or the client
 
 - `/opt/cathedral/cathedral-sandbox-cg-<sha7>/ops/custom-guest/custom-guest-host.sh <phase> --hotel <hotel> ...`:
   the installed checkout only (its sha7 is in the command= arguments), the 15 phases custom_guest.py sends over
-  SSH (host_call), and only their options;
+  SSH (host_call), and only their options; and only while the whole checkout is root's alone (trusted());
 - `scp -t /srv/custom-guest/<hotel>/inbox/cg-<12 hex>/<vmlinuz|initrd|root.raw>`: the intake upload, which the
   operator sends with `scp -O`.
 
@@ -57,7 +57,8 @@ class Refused(Exception):
     pass
 
 
-def check(cmd: str | None, hotel: str, tool: str, srv: str = "/srv/custom-guest", scp: str = "/usr/bin/scp") -> list[str]:
+def check(cmd: str | None, hotel: str, tool: str, srv: str = "/srv/custom-guest",
+          scp: str = "/usr/bin/scp") -> list[str]:
     """The argv to exec for this request (argv[0] is the program's path), or Refused. No file system, no env."""
     if not cmd:
         raise Refused("no command: a login shell is not offered")
@@ -88,29 +89,35 @@ def check(cmd: str | None, hotel: str, tool: str, srv: str = "/srv/custom-guest"
     raise Refused("not the host tool of this install")
 
 
-def trusted(tool: str, root: str, owner: int) -> None:
-    """The tool, the files beside it and each folder up to the install root: owned by `owner`, not writable by
-    others, no links. What runs as root is custom_guest_host.py and its siblings, so they count too. Group write is
-    allowed only for root's own group on a root-owned checkout: `git archive` writes 0775/0664 (tar.umask 002), and
-    a checkout extracted as root keeps those modes."""
-    if os.path.realpath(tool) != tool:
-        raise Refused("the tool path has a link in it")
-    here = os.path.dirname(tool)
-    paths = [os.path.join(here, n) for n in sorted(os.listdir(here))]
-    d = here
-    while True:
-        paths.append(d)
-        if d == root or len(d) <= len(root):
-            break
-        d = os.path.dirname(d)
-    if d != root:
-        raise Refused("the tool is not under the install root")
-    for p in paths:
-        st = os.lstat(p)
-        group_ok = owner == 0 and st.st_gid == 0
-        if stat.S_ISLNK(st.st_mode) or st.st_uid != owner or st.st_mode & stat.S_IWOTH \
-                or (st.st_mode & stat.S_IWGRP and not group_ok):
-            raise Refused(f"{p} is a link, not owned by uid {owner}, or writable by others")
+def _sound(p: str, st: os.stat_result, owner: int) -> None:
+    if st.st_uid != owner or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise Refused(f"{p} is not owned by uid {owner}, or is writable by group or others")
+
+
+def _walk_error(e: OSError) -> None:
+    raise e
+
+
+def trusted(checkout: str, root: str, owner: int) -> None:
+    """Every file and folder of the pinned checkout, the checkout and the install root: owned by `owner`, not
+    writable by group or others. Root runs much more than the .sh: custom_guest_host.py, sev_status.py,
+    custom-net.sh, room-kit/sealed/write-units.sh and snp_qemu.py (a link into room-kit), so the whole checkout
+    counts. A link may point only inside the checkout, where the walk checks its target too. A `git archive`
+    extracted as root keeps 0775/0664 (tar.umask 002): the guide's `chmod -R go-w` comes first."""
+    if os.path.realpath(checkout) != checkout or os.path.dirname(checkout) != root:
+        raise Refused("the checkout path has a link in it, or is not in the install root")
+    for d in (root, checkout):
+        _sound(d, os.lstat(d), owner)
+    for top, dirs, files in os.walk(checkout, onerror=_walk_error):
+        for name in dirs + files:
+            p = os.path.join(top, name)
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                target = os.path.realpath(p)
+                if os.path.commonpath([target, checkout]) != checkout or not os.path.exists(target):
+                    raise Refused(f"{p} links outside the checkout")
+                continue
+            _sound(p, st, owner)
 
 
 def refuse(reason: str, cmd: str | None) -> int:
@@ -148,10 +155,11 @@ def main(argv: list[str]) -> int:
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND")
     try:
         a = install_args(argv)
-        tool = f"{a['root']}/cathedral-sandbox-cg-{a['sha7']}/{TOOL_REL}"
+        checkout = f"{a['root']}/cathedral-sandbox-cg-{a['sha7']}"
+        tool = f"{checkout}/{TOOL_REL}"
         run = check(cmd, a["hotel"], tool, a["srv"], a["scp"])
         if run[0] == tool:
-            trusted(tool, a["root"], a["owner"])
+            trusted(checkout, a["root"], a["owner"])
     except (Refused, OSError, ValueError) as e:
         return refuse(str(e), cmd)
     os.execve(run[0], run, dict(FIXED_ENV))
