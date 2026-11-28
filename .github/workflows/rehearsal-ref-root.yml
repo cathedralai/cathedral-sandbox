@@ -1,0 +1,82 @@
+name: Rehearsal test root for reference initrd v1
+
+# REHEARSAL-ONLY (AB#1008). Builds the root disk of the test image that boots reference
+# initrd v1: ops/custom-guest/rehearsal-image/build-ref-root.sh with the cathedral-attest
+# of reference-build run 46063612613 (#808), on two fresh runners. Each lane fails unless
+# base.tar, root.raw, root_verity and root_data_bytes match the values pinned in the script,
+# and the compare job requires byte-identical outputs from both. GitHub-hosted only.
+
+on:
+  pull_request:
+    paths:
+      - "ops/custom-guest/rehearsal-image/build-ref-root.sh"
+      - "scripts/build_custom_guest_root.py"
+      - "room-kit/custom_guest_initrd.py"
+      - ".github/workflows/rehearsal-ref-root.yml"
+
+concurrency:
+  group: rehearsal-ref-root-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  root:
+    name: Rehearsal root (${{ matrix.lane }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [first, second]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reference-build
+          run-id: 46063612613
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/reference
+      - name: Build the base and the root (the root twice, identical)
+        run: |
+          bash ops/custom-guest/rehearsal-image/build-ref-root.sh "$RUNNER_TEMP/reference/cathedral-attest" "$RUNNER_TEMP/ref-root"
+          echo "image: $ImageOS $ImageVersion" >> "$RUNNER_TEMP/ref-root/tool-versions.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ref-root-${{ matrix.lane }}
+          path: ${{ runner.temp }}/ref-root/
+          if-no-files-found: error
+
+  compare:
+    name: Both lanes identical
+    needs: root
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ref-root-*
+          path: ${{ runner.temp }}/lanes
+      - name: Require byte-identical base.tar, root.raw and root-build.json
+        working-directory: ${{ runner.temp }}/lanes
+        run: |
+          for f in base.tar root.raw root-build.json base-files.txt InRelease; do
+            cmp "ref-root-first/$f" "ref-root-second/$f"
+          done
+          cat ref-root-first/root-build.json
+          echo
+          cat ref-root-first/SHA256SUMS
+          diff ref-root-first/tool-versions.txt ref-root-second/tool-versions.txt || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rehearsal-ref-root
+          path: ${{ runner.temp }}/lanes/ref-root-first/
+          if-no-files-found: error
