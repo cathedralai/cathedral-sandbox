@@ -14,7 +14,8 @@ name: VM bundle build
 # download is checked against a sha256 in scripts/vm_bundle_build_inputs.json,
 # scripts/vm_initrd_tools_inputs.json or requirements/vm-measure.txt, and both package sets
 # against the snapshot's signed indexes. GitHub-hosted only: never a hotel or Contabo.
-# This builds; it does not boot a VM.
+# The lanes build; they do not boot a VM. The initrd-check job then boots the published kernel and
+# initrd in plain QEMU (no SNP) and runs the VM disk's first boot in that initramfs.
 
 on:
   workflow_dispatch:
@@ -315,3 +316,56 @@ jobs:
           path: ${{ runner.temp }}/vm-bundle/
           if-no-files-found: error
           retention-days: 30
+
+  initrd-check:
+    # The published kernel and initrd, booted in plain QEMU (no SNP) with a check binary added as
+    # one more cpio: cmd/cathedral-vm-init TestInitrdDiskCheck runs as PID 1 and drives the real
+    # platform from the module list to Disk, so the initrd's own cryptsetup formats and opens a
+    # virtio disk in the initramfs the init boots in. B2's boot 2 failed there at F3 (no /run for
+    # cryptsetup's lock) after every runner test had passed. The bundle bytes are not changed.
+    name: Initrd disk check (QEMU, no SNP)
+    needs: summary
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vm-bundle
+          path: ${{ runner.temp }}/vm-bundle
+      - name: Boot the bundle's kernel and initrd and run the VM disk's first boot in it
+        run: |
+          if [ ! -f "$RUNNER_TEMP/vm-bundle/initrd.cpio.zst" ]; then echo "closure unpinned: no initrd to boot"; exit 0; fi
+          python3 -I scripts/fetch_vm_bundle_inputs.py --out "$RUNNER_TEMP/inputs" --group go
+          sudo -n apt-get update -q
+          sudo -n apt-get install -y -q --no-install-recommends qemu-system-x86 cpio
+          mkdir "$RUNNER_TEMP/go-root" "$RUNNER_TEMP/check"
+          tar -xzf "$RUNNER_TEMP/inputs/go/go1.26.11.linux-amd64.tar.gz" -C "$RUNNER_TEMP/go-root"
+          (cd room-kit/custom-guest && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+            "$RUNNER_TEMP/go-root/go/bin/go" test -c -trimpath -o "$RUNNER_TEMP/check/vm-initrd-check" ./cmd/cathedral-vm-init)
+          # The check binary first, uncompressed, then the published initrd: the kernel unpacks both
+          # into one rootfs (as an early microcode cpio). The init's own files are untouched.
+          (cd "$RUNNER_TEMP/check" && echo vm-initrd-check | cpio --quiet -o -H newc -R 0:0) > "$RUNNER_TEMP/check.cpio"
+          cat "$RUNNER_TEMP/check.cpio" "$RUNNER_TEMP/vm-bundle/initrd.cpio.zst" > "$RUNNER_TEMP/initrd-check.img"
+          truncate -s 96M "$RUNNER_TEMP/root.raw"
+          truncate -s 4M "$RUNNER_TEMP/base.raw"
+          truncate -s 1M "$RUNNER_TEMP/mailbox.raw"
+          accel=(-accel tcg -cpu max)
+          if [ -e /dev/kvm ] && sudo -n chmod 0666 /dev/kvm; then accel=(-accel kvm -cpu host); fi
+          echo "accelerator: ${accel[*]}"
+          set +e
+          timeout 900 qemu-system-x86_64 -machine q35 -m 2048 -smp 2 "${accel[@]}" -nodefaults -no-reboot -display none \
+            -serial "file:$RUNNER_TEMP/check-serial.log" \
+            -kernel "$RUNNER_TEMP/vm-bundle/vmlinuz" -initrd "$RUNNER_TEMP/initrd-check.img" \
+            -append "console=ttyS0 panic=-1 rdinit=/vm-initrd-check CATHEDRAL_INITRD_CHECK=1 -- -test.v -test.run=^TestInitrdDiskCheck\$" \
+            -drive "file=$RUNNER_TEMP/root.raw,format=raw,if=none,id=root" -device virtio-blk-pci,drive=root,serial=cathedral-root \
+            -drive "file=$RUNNER_TEMP/base.raw,format=raw,if=none,id=base,readonly=on" -device virtio-blk-pci,drive=base,serial=cathedral-base \
+            -drive "file=$RUNNER_TEMP/mailbox.raw,format=raw,if=none,id=mailbox" -device virtio-blk-pci,drive=mailbox,serial=cathedral-mailbox
+          rc=$?
+          set -e
+          tr -d '\r' < "$RUNNER_TEMP/check-serial.log" > "$RUNNER_TEMP/check-serial.txt"
+          tail -n 150 "$RUNNER_TEMP/check-serial.txt"
+          [ "$rc" = 0 ] || { echo "qemu exit $rc" >&2; exit 1; }
+          grep -qx 'INITRD-CHECK: PASS' "$RUNNER_TEMP/check-serial.txt" || { echo "the initrd disk check did not pass in the guest" >&2; exit 1; }
