@@ -190,6 +190,24 @@ mode fixed per artifact. It reuses `custom_guest_initrd.py` read-only.
   closure, review the pin output the lanes agree on, commit it. `build` and `check` refuse an unpinned
   closure.
 
+## Base root pin (AB#1022)
+
+`room-kit/vm/base_root_pin.json` (schema `cathedral.vm.base-root-pin/v1`) fixes the base root, so a
+later bundle (a kernel or init fix) shares it and a VM can `rebundle` to it; another base root is
+`base_root_differs`.
+
+- While it is `pinned`, both lanes build with its `source_date_epoch`, not the commit time.
+- The summary publishes only a base root whose `base-root.raw`, verity root, data bytes and lock are
+  the pin's. The `bundle.env` step also fails when the snapshot, the base lock or the recipe
+  (`recipe_sha256`) is not the pin's. The byte check is the gate.
+- The pin today: base root `0a200cc3`, verity `45044764`, of bundle `a9585311` (run 46095917678,
+  rebuilt byte for byte by run 46103583234 at another commit).
+- **Take only the `vm-bundle` artifact.** The lanes upload `bundle-first` and `bundle-second`
+  before the summary checks the pin, so a run that fails the pin still leaves lane artifacts with a
+  base root that is not the pin's.
+- A new base root (snapshot, lock or recipe) means a new pin and a new first bundle: set `status`
+  to `unpinned`, run the workflow, and commit the pin its summary prints.
+
 ## Static tools build
 
 `scripts/build_vm_initrd_tools.py` builds `cryptsetup` and `veritysetup` (cryptsetup 2.8.4) and
