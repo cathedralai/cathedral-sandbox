@@ -179,10 +179,15 @@ def sshd_env_problems(dump: str) -> list[str]:
 
 
 def _ip(value: str, flag: str) -> str:
+    # No scoped address: ipaddress keeps an IPv6 scope id as written ("2001:db8::1%x,user=nobody"), and it would
+    # carry its text into the -C spec. What goes into the spec is only digits, hex, dots and colons.
     try:
-        return str(ipaddress.ip_address(value))
+        ip = str(ipaddress.ip_address(value)) if "%" not in value else ""
     except ValueError:
-        raise ValueError(f"{flag} takes an IP address, not {value!r}") from None
+        ip = ""
+    if not re.fullmatch(r"[0-9a-f.:]+", ip):
+        raise ValueError(f"{flag} takes an unscoped IP address, not {value!r}")
+    return ip
 
 
 def check_sshd(argv: list[str]) -> int:
