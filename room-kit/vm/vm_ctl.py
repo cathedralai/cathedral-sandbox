@@ -1052,6 +1052,18 @@ def unit_mounts(d: Path, env: dict) -> tuple[list[str], list[str], list[str]]:
     return hidden, read_only, read_write
 
 
+# Every `+` hook of the VM unit runs in the host's mount namespace. systemd runs a `+` command with full
+# privileges, but (on systemd 255 and 259 alike) still inside the unit's own mount namespace, whose
+# TemporaryFileSystem=/srv:ro hides every VM directory. Seen from there, check-paid found no
+# authorization.json, read the default generation 0, and refused every start as generation_closed
+# (live VM proof, 28 Nov, systemd 259.5); launch.json, the history journal and the VM lock are hidden too.
+# `nsenter --mount=/proc/1/ns/mnt` puts only the hook, never QEMU, in PID 1's mount namespace, as the
+# custom guest unit does (#812). Chosen over binding the hooks' files into the unit: the VM user would
+# then see its billing state, and the list would grow with every hook.
+NSENTER = "/usr/bin/nsenter"
+HOST_NS = f"{NSENTER} --mount=/proc/1/ns/mnt --"
+
+
 def unit_text(name: str, d: Path, env: dict) -> str:
     ctl, net, launch, gates = KIT / "vm-ctl.sh", KIT / "vm-net.sh", KIT / "launch-vm.py", KIT / "vm-gates.sh"
     vm_env, user = d / "vm.env", env["VM_USER"]
@@ -1059,10 +1071,10 @@ def unit_text(name: str, d: Path, env: dict) -> str:
     tmpfs = "".join(f"TemporaryFileSystem={h}\n" for h in hidden)
     mem = int(env["VM_MEM_GIB"]) + MEM_OVERHEAD_GIB
     # The dedicated unit (D 5.8) as the VM's own user, never root and no -runas. The '+' steps
-    # run as root outside the sandbox: KVM, the credit check, the pre-launch gates (8.3, so a
-    # host boot, a crash restart and a guest reboot pass them too), the link with a tap the VM
-    # user owns, stale QMP sockets. Restart: a guest reset exits 75 and relaunches in the same
-    # generation (check-paid needs its start line and no close line, so no new charge); a
+    # run as root in the host's mount namespace (HOST_NS): KVM, the credit check, the pre-launch
+    # gates (8.3, so a host boot, a crash restart and a guest reboot pass them too), the link
+    # with a tap the VM user owns, stale QMP sockets. Restart: a guest reset exits 75 and
+    # relaunches in the same generation (check-paid needs its start line and no close line, so no new charge); a
     # poweroff exits 0 and stays down; a refused launch exits 78 and stays down.
     return f"""[Unit]
 Description=Cathedral sealed customer VM {name}
@@ -1076,15 +1088,15 @@ User={user}
 Group={user}
 SupplementaryGroups=kvm {SEV_GROUP}
 Environment=VM_ROOT={root()}
-ExecStartPre=+-/sbin/modprobe -q kvm_amd
-ExecStartPre=+/bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
-ExecStartPre=+{ctl} check-paid {name}
-ExecStartPre=+{gates} check {name}
-ExecStartPre=+{net} up {vm_env}
-ExecStartPre=+/bin/rm -f {d}/run/qmp.sock {d}/run/events.sock
+ExecStartPre=+-{HOST_NS} /sbin/modprobe -q kvm_amd
+ExecStartPre=+{HOST_NS} /bin/sh -c 'for i in $$(seq 1 120); do [ -c /dev/kvm ] && exit 0; sleep 1; done; echo "no /dev/kvm after 120 s" >&2; exit 1'
+ExecStartPre=+{HOST_NS} {ctl} check-paid {name}
+ExecStartPre=+{HOST_NS} {gates} check {name}
+ExecStartPre=+{HOST_NS} {net} up {vm_env}
+ExecStartPre=+{HOST_NS} /bin/rm -f {d}/run/qmp.sock {d}/run/events.sock
 ExecStart=/usr/bin/python3 -I {launch} {d}
-ExecStop=+{ctl} powerdown {name}
-ExecStopPost=+{net} down {vm_env}
+ExecStop=+{HOST_NS} {ctl} powerdown {name}
+ExecStopPost=+{HOST_NS} {net} down {vm_env}
 KillSignal=SIGTERM
 TimeoutStopSec=90
 TimeoutStartSec=180
