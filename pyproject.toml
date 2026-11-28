@@ -8,7 +8,7 @@ license = { text = "MIT" }
 dependencies = [
   # Public policy registries use audited Ed25519 primitives rather than a
   # project-local signature implementation.
-  "cryptography>=42.0",
+  "cryptography>=43.0",
 ]
 
 [project.optional-dependencies]
