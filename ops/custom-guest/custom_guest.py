@@ -306,6 +306,35 @@ def settled_by_read(rec: dict, pending: dict, view: dict) -> bool:
     return out == 0 or (target_live(rec, pending.get("to"), view) and (bool(pending.get("bumps")) or out == 1))
 
 
+def host_conf_of(hotel: str) -> tuple[str, str, str]:
+    path = os.path.join(HOME, "hosts.conf")
+    try:
+        for line in open(path):
+            w = line.split("#", 1)[0].split()
+            if len(w) == 4 and w[0] == hotel:
+                return w[1], w[2], w[3]
+    except OSError:
+        pass
+    raise Blocked("custom_guest_hold_failed", f"{path} has no line for {hotel}")
+
+
+def host_call(hotel: str, phase: str, launch_args: list[str], data: dict | None = None, **opts: str) -> dict:
+    """One host phase over SSH. ``launch_args`` is ["--launch-id", L], or [] for `folders` (all launches)."""
+    target, repo, _ = host_conf_of(hotel)
+    argv = [f"{repo}/ops/custom-guest/custom-guest-host.sh", phase, "--hotel", hotel, *launch_args]
+    for k, v in opts.items():
+        argv += [f"--{k.replace('_', '-')}", str(v)]
+    try:
+        p = subprocess.run([*SSH, target, shlex.join(argv)], input=json.dumps(data or {}), capture_output=True,
+                           text=True, timeout=HOST_DEADLINE.get(phase, 900) + 120)
+    except subprocess.TimeoutExpired:
+        raise Transport(f"host phase {phase} gave no answer")
+    lines = [ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")]
+    if not lines:
+        raise Transport(f"host phase {phase} gave no result (exit {p.returncode}): {p.stderr.strip()[-300:]}")
+    return json.loads(lines[-1][len("RESULT "):])
+
+
 class Op:
     def __init__(self, hotel: str, launch: str, opts: argparse.Namespace):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,58}", hotel) or not re.fullmatch(r"cg-[0-9a-f]{12}", launch):
@@ -367,30 +396,10 @@ class Op:
 
     # ---------------- host phases
     def host_conf(self) -> tuple[str, str, str]:
-        path = os.path.join(HOME, "hosts.conf")
-        try:
-            for line in open(path):
-                w = line.split("#", 1)[0].split()
-                if len(w) == 4 and w[0] == self.hotel:
-                    return w[1], w[2], w[3]
-        except OSError:
-            pass
-        raise Blocked("custom_guest_hold_failed", f"{path} has no line for {self.hotel}")
+        return host_conf_of(self.hotel)
 
     def host(self, phase: str, data: dict | None = None, **opts: str) -> dict:
-        target, repo, _ = self.host_conf()
-        argv = [f"{repo}/ops/custom-guest/custom-guest-host.sh", phase, "--hotel", self.hotel, "--launch-id", self.launch]
-        for k, v in opts.items():
-            argv += [f"--{k.replace('_', '-')}", str(v)]
-        try:
-            p = subprocess.run([*SSH, target, shlex.join(argv)], input=json.dumps(data or {}), capture_output=True,
-                               text=True, timeout=HOST_DEADLINE.get(phase, 900) + 120)
-        except subprocess.TimeoutExpired:
-            raise Transport(f"host phase {phase} gave no answer")
-        lines = [ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")]
-        if not lines:
-            raise Transport(f"host phase {phase} gave no result (exit {p.returncode}): {p.stderr.strip()[-300:]}")
-        return json.loads(lines[-1][len("RESULT "):])
+        return host_call(self.hotel, phase, ["--launch-id", self.launch], data, **opts)
 
     def host_ok(self, phase: str, data: dict | None = None, **opts: str) -> dict:
         """A host phase is idempotent: a lost answer is resolved by running it again."""
@@ -1228,7 +1237,15 @@ class Op:
             f = self.facts()
             return f.get("marker") is None and f.get("custom_unit") is None
 
-        self.sub(step, "R15", done, lambda seq: self.host_ok("return-finish", {"record_state": self.record()["state"]}))
+        def r15(seq: int) -> None:
+            # An older host tool removes the owner's folder in return-finish, and its facts lack launch_dir_bytes.
+            # Running it would record that removal as a wipe that never waited (Q5): stop before it.
+            if "launch_dir_bytes" not in self.facts():
+                raise Blocked("custom_guest_hold_unsupported", "the host tool reports no launch_dir_bytes, so its "
+                              "return-finish would remove the owner's folder now: deploy the host tool first, then resume")
+            self.host_ok("return-finish", {"record_state": self.record()["state"]})
+
+        self.sub(step, "R15", done, r15)
         # Q5: the kit is back; the owner's launch folder stays until the API allows the wipe. A waiver sent after
         # the stop allows it now; otherwise `wipe` removes it 72 h after the stop. An API without wipe_ok keeps it.
         if "wipe_ok" in self.record():
@@ -1458,32 +1475,71 @@ def step_sweep(o: argparse.Namespace) -> int:
         return 2 if bad else 0
 
 
+# Each unit prints one JSON line per run ({"ok": ..., "what": ...}); its timer period in minutes.
+SWEEP_PERIOD_MIN = {"reconcile": 1, "wipe": 15}
+JOURNAL_DENIED = ("insufficient permissions", "not seeing messages from other users", "permission denied")
+
+
 def step_check(o: argparse.Namespace) -> int:
-    """Read only, for a heartbeat: overdue wipes in the API, the two timers (where systemd runs), and the OPS-ALERT
-    lines of the sweeper's units in the last --since-min minutes (where journald runs). Sends nothing."""
+    """Read only, for a heartbeat: overdue wipes in the API, launch folders on the host that the API does not list,
+    the two timers (where systemd runs), and the sweeper units' journal in the last --since-min minutes (where
+    journald runs): its OPS-ALERT lines, and at least one run line per unit, so an unreadable journal cannot pass
+    as a quiet one. Sends nothing."""
     found, notes = [], []
+    alert = lambda launch, what: found.append(f"{ALERT_TAG} custom_guest hotel={o.hotel} launch={launch} {what}")
+    listed: set[str] = set()
     try:
         for r in list_launches(o.hotel):
+            listed.add(r["launch_id"])
             if r.get("wipe_overdue") is True:
-                found.append(f"{ALERT_TAG} custom_guest hotel={o.hotel} launch={r['launch_id']} custom_guest_wipe_overdue: "
-                             f"since {r.get('wipe_overdue_at')}, {r.get('launch_dir_bytes')} bytes on the host")
+                alert(r["launch_id"], f"custom_guest_wipe_overdue: since {r.get('wipe_overdue_at')}, "
+                                      f"{r.get('launch_dir_bytes')} bytes on the host")
     except Blocked as e:
-        found.append(f"{ALERT_TAG} custom_guest hotel={o.hotel} launch=- {e.code}: {e.detail}")
+        alert("-", f"{e.code}: {e.detail}")
+    # A folder whose launch the API no longer lists (its hotel or owner scope unlisted) is swept by nothing.
+    try:
+        h = host_call(o.hotel, "folders", [])
+        if not h.get("ok"):
+            raise Blocked(h.get("error_code") or "custom_guest_hold_failed", str(h.get("detail", ""))[:300])
+        for f in h.get("folders") or []:
+            if f.get("launch_id") not in listed:
+                alert(f.get("launch_id"), f"custom_guest_folder_unlisted: {f.get('bytes')} bytes on the host and the "
+                                          "API does not list the launch, so no sweep wipes it: list the hotel and the "
+                                          "owner scope again, then let the wipe run")
+    except (Blocked, Transport) as e:
+        code, detail = (e.code, e.detail) if isinstance(e, Blocked) else ("custom_guest_host_unreadable", str(e))
+        alert("-", f"{code}: the host's launch folders were not read: {detail}")
     units = [u.format(hotel=o.hotel) for u in SWEEP_UNITS]
     if shutil.which("systemctl"):
         for u in units:
             r = subprocess.run(["systemctl", "is-active", f"{u}.timer"], capture_output=True, text=True)
             if r.stdout.strip() != "active":
-                found.append(f"{ALERT_TAG} custom_guest hotel={o.hotel} launch=- custom_guest_sweeper_down: "
-                             f"{u}.timer is {r.stdout.strip() or 'unknown'}")
+                alert("-", f"custom_guest_sweeper_down: {u}.timer is {r.stdout.strip() or 'unknown'}")
     else:
         notes.append("no systemctl here: the timers were not checked (run this on the operator machine)")
     if shutil.which("journalctl"):
-        argv = ["journalctl", "--no-pager", "-o", "cat", "--since", f"-{o.since_min}min"]
         for u in units:
-            argv += ["-u", f"{u}.service"]
-        r = subprocess.run(argv, capture_output=True, text=True)
-        found += [ln for ln in r.stdout.splitlines() if ln.startswith(ALERT_TAG)]
+            what = u.split("@", 1)[0].rsplit("-", 1)[1]
+            r = subprocess.run(["journalctl", "--no-pager", "-o", "cat", "--since", f"-{o.since_min}min",
+                                "-u", f"{u}.service"], capture_output=True, text=True)
+            denied = [x for x in JOURNAL_DENIED if x in r.stderr.lower()]
+            if r.returncode != 0 or denied:
+                alert("-", f"custom_guest_journal_unreadable: journalctl -u {u}.service exit {r.returncode}"
+                           f"{', ' + denied[0] if denied else ''}: {one_line(r.stderr)[-200:]} (add the user to "
+                           "systemd-journal)")
+                continue
+            found.extend(ln for ln in r.stdout.splitlines() if ln.startswith(ALERT_TAG))
+            runs = 0
+            for ln in r.stdout.splitlines():
+                try:
+                    runs += json.loads(ln).get("what") == what
+                except (ValueError, AttributeError):
+                    pass
+            if o.since_min > SWEEP_PERIOD_MIN[what] and not runs:
+                alert("-", f"custom_guest_sweeper_silent: {u}.service wrote no run line in {o.since_min} min "
+                           f"(it runs every {SWEEP_PERIOD_MIN[what]} min)")
+            elif o.since_min <= SWEEP_PERIOD_MIN[what]:
+                notes.append(f"--since-min {o.since_min} is within {u}'s period: its runs were not counted")
     else:
         notes.append("no journalctl here: the sweeper's journal was not read")
     for line in found:

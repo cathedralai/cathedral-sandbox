@@ -62,6 +62,11 @@ elif phase == "facts":
          "marker": h["marker"], "launch_dir": h["launch_dir"], "launch_dir_bytes": 21 << 30 if h["launch_dir"] else 0,
          "journal": h["journal"], "boot_id": h["boot_id"],
          "inbox_dir": h["inbox"], "staging_dir": h["staging"]}
+    if h.get("old_host_tool"):
+        del r["launch_dir_bytes"]  # a host tool from before Q5
+elif phase == "folders":
+    r = {"ok": True, "folders": ([{"launch_id": os.environ["FAKE_LAUNCH"], "plain_dir": True, "bytes": 21 << 30}]
+                                 if h["launch_dir"] else []) + h.get("extra_folders", [])}
 elif phase == "inbox":
     h["inbox"] = True
     r = {"ok": True, "inbox": "/srv/custom-guest/inbox"}
@@ -250,6 +255,7 @@ class World:
         self.returned_at: float | None = None
         self.launch_dir_bytes: int | None = None
         self.old_api = False         # an API before the stop clock: no wipe fields in the record, no wipe route
+        self.unlisted = False        # the hotel or the owner scope taken off the custom guest lists: the list 404s
         self.nonce = 0
         self.calls: list[str] = []
         self.refused: list[str] = []
@@ -684,6 +690,8 @@ class World:
 
     def handle(self, method: str, path: str, body: dict | None) -> tuple[int, dict]:
         if method == "GET" and path == f"{ADMIN}?hotel={HOTEL}":
+            if self.unlisted:
+                return 404, {"error": "not_found"}
             return 200, {"launches": [self.record_view()]}
         if method == "PATCH" and path == f"{ADMIN}/{LAUNCH}":
             return self.patch(body)
@@ -1245,11 +1253,15 @@ def test_the_sweeper_skips_while_a_step_holds_the_lock_and_a_step_waits_for_it(r
     assert rig.run("reconcile")[0] == 0
 
 
-def fake_tools(rig: Rig, timers: str, journal: str) -> dict:
+RUNS = '{"ok": true, "what": "reconcile", "launches": []}\n{"ok": true, "what": "wipe", "launches": []}\n'
+
+
+def fake_tools(rig: Rig, timers: str, journal: str, rc: int = 0, err: str = "") -> dict:
     b = rig.tmp / "bin"
     b.mkdir(exist_ok=True)
     (b / "systemctl").write_text(f"#!/bin/sh\necho {timers}\n")
-    (b / "journalctl").write_text("#!/bin/sh\ncat <<'EOF'\n" + journal + "EOF\n")
+    (b / "journalctl").write_text("#!/bin/sh\ncat <<'EOF'\n" + journal + "EOF\n"
+                                  + (f"echo '{err}' >&2\n" if err else "") + f"exit {rc}\n")
     for t in ("systemctl", "journalctl"):
         (b / t).chmod(0o755)
     return {"PATH": f"{b}:{os.environ['PATH']}"}
@@ -1260,18 +1272,77 @@ def test_check_is_read_only_and_reports_overdue_wipes_timers_and_tagged_lines(ri
     rig.world.record["owner_requests"] = []
     assert rig.run("return")[0] == 0
     calls = len(rig.host()["calls"])
-    rc, out = rig.run("check", launch=False, **fake_tools(rig, "active", "a quiet line\n"))
+    rc, out = rig.run("check", launch=False, **fake_tools(rig, "active", "a quiet line\n" + RUNS))
     assert rc == 0 and out["alerts"] == 0 and out["notes"] == [], (out, rig.stderr)
     rig.world.skew = 73 * 3600 + 300
     line = f"OPS-ALERT custom_guest hotel={HOTEL} launch={LAUNCH} custom_guest_wipe_unsafe: x\n"
     p = subprocess.run([sys.executable, str(OP), "check", "--hotel", HOTEL], capture_output=True, text=True,
-                       env=rig.env(**fake_tools(rig, "inactive", line)), timeout=60)
+                       env=rig.env(**fake_tools(rig, "inactive", line + RUNS)), timeout=60)
     lines = p.stdout.splitlines()
     assert p.returncode == 2, p.stdout
     assert any("custom_guest_wipe_overdue" in x for x in lines if x.startswith("OPS-ALERT"))
     assert any("custom_guest_sweeper_down" in x for x in lines if x.startswith("OPS-ALERT"))
     assert line.strip() in lines
-    assert len(rig.host()["calls"]) == calls and rig.host()["launch_dir"] is True  # sent nothing anywhere
+    new = rig.host()["calls"][calls:]
+    assert new == ["folders", "folders"] and rig.host()["launch_dir"] is True  # read the folder list, sent nothing
+
+
+def returned_with_folder(rig: Rig) -> None:
+    held(rig)
+    rig.world.record["owner_requests"] = []  # no waiver: the folder waits 72 h
+    assert rig.run("return")[0] == 0 and rig.host()["launch_dir"] is True
+
+
+def check_alerts(rig: Rig, **tools) -> tuple[int, list[str]]:
+    p = subprocess.run([sys.executable, str(OP), "check", "--hotel", HOTEL], capture_output=True, text=True,
+                       env=rig.env(**tools), timeout=60)
+    return p.returncode, [x for x in p.stdout.splitlines() if x.startswith("OPS-ALERT")]
+
+
+@pytest.mark.parametrize("rc,err", [(1, "No journal files were opened due to insufficient permissions."),
+                                    (0, "Hint: You are currently not seeing messages from other users and the system.")])
+def test_check_alerts_when_the_journal_cannot_be_read(rig, rc, err):
+    """F1: the timers' user outside systemd-journal reads nothing; that must never pass as a quiet journal."""
+    returned_with_folder(rig)
+    code, alerts = check_alerts(rig, **fake_tools(rig, "active", "", rc=rc, err=err))
+    assert code == 2 and sum("custom_guest_journal_unreadable" in a for a in alerts) == 2, alerts
+
+
+def test_check_alerts_when_a_sweeper_unit_wrote_no_run_line(rig):
+    returned_with_folder(rig)
+    code, alerts = check_alerts(rig, **fake_tools(rig, "active", "a quiet line\n"))
+    assert code == 2 and sum("custom_guest_sweeper_silent" in a for a in alerts) == 2, alerts
+
+
+def test_check_alerts_on_a_folder_the_api_does_not_list(rig):
+    """F2: a folder whose launch dropped off the API list (hotel or owner unlisted) is swept by nothing."""
+    returned_with_folder(rig)
+    rig.set_host(extra_folders=[{"launch_id": "cg-bbbbbbbbbbbb", "plain_dir": True, "bytes": 4096}])
+    code, alerts = check_alerts(rig, **fake_tools(rig, "active", RUNS))
+    assert code == 2 and [a for a in alerts if "custom_guest_folder_unlisted" in a] == [
+        a for a in alerts if "launch=cg-bbbbbbbbbbbb" in a], alerts
+    assert len(alerts) == 1, alerts
+    rig.world.unlisted = True  # now the hotel itself is off the list: its own launch's folder alerts too
+    code, alerts = check_alerts(rig, **fake_tools(rig, "active", RUNS))
+    unlisted = {a.split()[3] for a in alerts if "custom_guest_folder_unlisted" in a}
+    assert code == 2 and unlisted == {f"launch={LAUNCH}", "launch=cg-bbbbbbbbbbbb"}, alerts
+    assert rig.host()["launch_dir"] is True
+
+
+def test_the_return_stops_before_r15_with_a_host_tool_from_before_q5(rig):
+    """F3: an older host tool's return-finish removes the folder at once; that must not be recorded as a wipe."""
+    held(rig)
+    rig.world.record["owner_requests"] = []
+    rig.set_host(old_host_tool=True)
+    rc, out = rig.run("return")
+    assert rc == 1 and out["error_code"] == "custom_guest_hold_unsupported", out
+    assert "deploy the host tool first" in out["detail"]
+    assert "return-finish" not in rig.host()["calls"] and rig.host()["launch_dir"] is True
+    assert rig.world.wiped_at is None and rig.world.launch_dir_bytes is None
+    rig.set_host(old_host_tool=False)
+    rc, out = rig.run("resume")
+    assert rc == 0, out
+    assert rig.host()["launch_dir"] is True and rig.world.launch_dir_bytes == 21 << 30
 
 
 def test_the_notice_sent_at_option_is_gone(rig):

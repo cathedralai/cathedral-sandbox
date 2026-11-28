@@ -73,6 +73,7 @@ PHASES = {
     "boot": ("lock", 600), "verify-disks": ("lock", 5400), "stop": ("lock", 300),
     "return-kit": ("lock", 5400), "return-finish": ("lock", 1800), "wipe": ("lock", 1800), "tick": ("try", 300),
     "check-start": ("none", 0), "exited": ("none", 0), "boot-record": ("none", 0), "facts": ("none", 0),
+    "folders": ("none", 0),
 }
 
 
@@ -1695,6 +1696,24 @@ def wipe_target(ctx: Ctx) -> str | None:
     return ctx.d
 
 
+def ph_folders(ctx: Ctx) -> dict:
+    """Read only, no lock, no launch: every launch folder left on the hotel, for the operator's check to compare with
+    the API's list. A folder the API stopped listing (the hotel or the owner unlisted) is never swept (Q5)."""
+    out = []
+    try:
+        names = sorted(os.listdir(ctx.base))
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        if not re.fullmatch(r"cg-[0-9a-f]{12}", name):
+            continue
+        path = f"{ctx.base}/{name}"
+        st = os.lstat(path)
+        plain = stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+        out.append({"launch_id": name, "plain_dir": plain, "bytes": tree_bytes(path) if plain else st.st_blocks * 512})
+    return {"ok": True, "folders": out}
+
+
 def ph_wipe(ctx: Ctx) -> dict:
     """Q5: remove the owner's launch folder after the return, once the operator has the API's go (wipe started).
 
@@ -1768,7 +1787,7 @@ FUNCS = {"facts": ph_facts, "inbox": ph_inbox, "intake": ph_intake, "measure": p
          "hold-stop": ph_hold_stop, "unhold": ph_unhold, "hold-baseline": ph_hold_baseline, "boot": ph_boot,
          "verify-disks": ph_verify_disks, "stop": ph_stop, "return-kit": ph_return_kit,
          "return-finish": ph_return_finish, "wipe": ph_wipe, "tick": ph_tick, "check-start": ph_check_start,
-         "exited": ph_exited,
+         "exited": ph_exited, "folders": ph_folders,
          "boot-record": ph_boot_record}
 
 
@@ -1827,7 +1846,9 @@ def main(argv: list[str]) -> int:
     result: dict
     owner_path = None
     try:
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,58}", hotel) or not re.fullmatch(r"cg-[0-9a-f]{12}", launch):
+        # `folders` is the one phase without a launch: it lists them all.
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,58}", hotel) or not (
+                re.fullmatch(r"cg-[0-9a-f]{12}", launch) or (phase == "folders" and launch == "")):
             raise Halt("custom_guest_request_invalid", "bad --hotel or --launch-id")
         mode, deadline = PHASES[phase]
         if mode != "none" and os.environ.get("CG_DEADLINE") != phase:
@@ -1835,7 +1856,7 @@ def main(argv: list[str]) -> int:
             env = dict(os.environ, CG_DEADLINE=phase)
             os.execvpe("timeout", ["timeout", "--kill-after=30s", f"{deadline}s", sys.executable, "-I",
                                    os.path.realpath(__file__), *argv], env)
-        if phase not in ("check-start", "exited", "boot-record") and not allowed(hotel):
+        if phase not in ("check-start", "exited", "boot-record", "folders") and not allowed(hotel):
             raise Halt("custom_guest_hold_unsupported", "/etc/cathedral/custom-guest.allow does not list this hotel")
         data = {}
         if phase in STDIN_PHASES:
