@@ -1,16 +1,16 @@
 {
   "schema": "cathedral.vm.bundle-build-inputs/v1",
-  "note": "Downloads for .github/workflows/vm-bundle-build.yml beyond the static tools lock (scripts/vm_initrd_tools_inputs.json) and sev-snp-measure (requirements/vm-measure.txt). host is mmdebstrap for the hosted Ubuntu 26.04 image; ovmf is the AmdSev firmware package of the bundle's own snapshot. Each deb sha256 equals the SHA256 line of the signed Packages index of snapshot 20261126T000000Z (resolute universe for mmdebstrap, noble-updates and noble-security main for ovmf). The Go and python-zstandard sha256 are the ones go.dev and PyPI publish. Every file is checked against its sha256 before use.",
+  "note": "Downloads for .github/workflows/vm-bundle-build.yml beyond the static tools lock (scripts/vm_initrd_tools_inputs.json) and sev-snp-measure (requirements/vm-measure.txt). host is mmdebstrap for the hosted Ubuntu 26.04 image; ovmf is the AmdSev firmware package the sealed kits boot under the same QEMU (ovmf-amdsev 2025.11-3ubuntu7.3; its OVMF.amdsev.fd is sha256 ac27e626...). The noble ovmf 2024.02 build stopped at the APIC page under SEV-SNP on the proof host. Each deb sha256 equals the SHA256 line of the signed Packages index of snapshot 20261126T000000Z (resolute universe for mmdebstrap, resolute-security main for ovmf-amdsev). The Go and python-zstandard sha256 are the ones go.dev and PyPI publish. Every file is checked against its sha256 before use.",
   "files": {
     "mmdebstrap_1.5.7-3_all.deb": {
       "group": "host",
       "sha256": "d4acfd32c9761ef219383630eb665523617ccc3c87309140a23beffdcc6b5b82",
       "url": "https://snapshot.ubuntu.com/ubuntu/20261126T000000Z/pool/universe/m/mmdebstrap/mmdebstrap_1.5.7-3_all.deb"
     },
-    "ovmf_2024.02-2ubuntu0.10_all.deb": {
+    "ovmf-amdsev_2025.11-3ubuntu7.3_all.deb": {
       "group": "ovmf",
-      "sha256": "78a6a3a4ffa666f1cb25e9069e4ec9270b5ceac7987b6eefc2674bd3f58a1473",
-      "url": "https://snapshot.ubuntu.com/ubuntu/20261126T000000Z/pool/main/e/edk2/ovmf_2024.02-2ubuntu0.10_all.deb"
+      "sha256": "f2a54db678d98ce1a5ac27155cb037cbf6e3efc918d11a35af1ca4606a290d29",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20261126T000000Z/pool/main/e/edk2/ovmf-amdsev_2025.11-3ubuntu7.3_all.deb"
     },
     "go1.26.11.linux-amd64.tar.gz": {
       "group": "go",

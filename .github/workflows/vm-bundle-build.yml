@@ -71,7 +71,7 @@ env:
   VM_BUNDLE_CPU_FAMILY: genoa
   VM_BUNDLE_QEMU_VERSION: 10.2.1
   VM_BUNDLE_INITRD_VERSION: vm1-0
-  VM_BUNDLE_OVMF_SOURCE: ovmf=2024.02-2ubuntu0.10
+  VM_BUNDLE_OVMF_SOURCE: ovmf-amdsev=2025.11-3ubuntu7.3
   # Both roots must resolve to room-kit/vm/locks/*.packages.lock exactly. A new snapshot
   # means new locks: build once with "1", review the two locks the lanes agree on, commit them.
   VM_BUNDLE_LOCK_UPDATE: "0"
@@ -142,8 +142,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/inputs/go/go1.26.11.linux-amd64.tar.gz" -C "$RUNNER_TEMP/go-root"
           echo "$RUNNER_TEMP/go-root/go/bin" >> "$GITHUB_PATH"
           /usr/bin/python3 -I -m zipfile -e "$RUNNER_TEMP"/inputs/python/zstandard-0.25.0-*.whl "$RUNNER_TEMP/pylib"
-          dpkg-deb -x "$RUNNER_TEMP/inputs/ovmf/ovmf_2024.02-2ubuntu0.10_all.deb" "$RUNNER_TEMP/ovmf"
-          test -f "$RUNNER_TEMP/ovmf/usr/share/ovmf/OVMF.amdsev.fd"
+          dpkg-deb -x "$RUNNER_TEMP/inputs/ovmf/ovmf-amdsev_2025.11-3ubuntu7.3_all.deb" "$RUNNER_TEMP/ovmf"
+          # The firmware the sealed kits boot under the same QEMU (the noble 2024.02 build stopped at the APIC page).
+          echo "ac27e626b097cf6f9eae09b79fc87fc2d3fb6e99c8d97b27f0603993c06a28bb  $RUNNER_TEMP/ovmf/usr/share/ovmf/OVMF.amdsev.fd" | sha256sum -c -
           /usr/bin/python3 -m venv "$RUNNER_TEMP/vm-measure"
           "$RUNNER_TEMP/vm-measure/bin/pip" install -q --no-deps --require-hashes -r requirements/vm-measure.txt
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
