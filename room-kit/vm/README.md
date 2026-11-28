@@ -173,8 +173,12 @@ and `install-sealed.sh` behaves as before).
 
 - **Kits:** every `room-sealed-<name>.service` unit file, enabled or not, and the env file on its
   `ExecStart` line, wherever `SEALED_DIR` is. A `-net` unit is skipped only when it is exactly the
-  check unit `write-units.sh` writes (`Type=oneshot`, `ExecStart=<dir>/host-net.sh check <env>`);
-  any other unit, whatever its name, is a kit and must parse. Plus the kits being installed:
+  check unit `write-units.sh` writes (`Type=oneshot`, `ExecStart=<dir>/host-net.sh check <env>`),
+  and a `-escape` unit only when it is exactly the fresh slot supervisor
+  `scripts/escape_slots/write-escape-units.sh` writes (`Type=simple`, `ExecStart=/usr/bin/python3 -I
+  <SEALED_DIR>/escape-slot/supervise_escape_slot.py --sealed-env <SEALED_DIR>/sealed.env`): it runs
+  no guest, only stops and starts its kit's own unit, which is counted. Any other unit, whatever
+  its name, is a kit and must parse. Plus the kits being installed:
   each install of a kit records `/var/lib/cathedral-snp/kits/<name>.<install id>.json` before
   its build. Counted by name, each size the larger of the unit and every open record. A kit that
   is removed must have its records removed too. A unit, env file or record that cannot be read (missing, a line that is not
