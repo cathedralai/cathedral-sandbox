@@ -416,6 +416,71 @@ def test_delete_needs_confirm_with_the_name(host):
     assert code == 0 and out == {"name": "vm1", "deleted": True, "existed": False}
 
 
+# The guest formats root.raw as LUKS2 from offset 0 with its volume at 16 MiB (vmdisk.LUKSDataOffset):
+# the header and keyslots, the only place the volume key is wrapped, are the first 16 MiB.
+LUKS_HEADER_BYTES = 16 << 20
+
+
+def test_the_erased_header_size_is_the_guest_luks_data_offset():
+    layout = (KIT.parent / "custom-guest" / "internal" / "vmdisk" / "layout.go").read_text()
+    assert re.search(r"\n\tLUKSDataOffset = 16 \* MiB\n", layout)
+
+
+def write_luks_like_header(disk: Path) -> None:
+    """LUKS2 magics at the primary and a secondary header, keyslot bytes up to the last header
+    byte, and ciphertext from 16 MiB on: what a guest leaves in root.raw."""
+    with open(disk, "r+b") as f:
+        f.write(b"LUKS\xba\xbe")
+        f.seek(0x4000)
+        f.write(b"SKUL\xba\xbe")
+        f.seek(1 << 20)
+        f.write(os.urandom(1 << 20))
+        f.seek(LUKS_HEADER_BYTES - 4096)
+        f.write(b"\xff" * 4096)
+        f.seek(LUKS_HEADER_BYTES)
+        f.write(b"CIPHERTEXT")
+
+
+def test_delete_erases_the_luks_header_before_it_removes_the_disk(host):
+    """Unlinking root.raw frees its blocks with the LUKS2 keyslots still in them, readable by anyone
+    who later reads the host's storage. Delete overwrites the header first: a second link to the
+    same inode, made before the delete, sees the bytes the delete leaves behind."""
+    host.create()
+    disk = host.root / "vm1" / "root.raw"
+    size = disk.stat().st_size
+    write_luks_like_header(disk)
+    kept = host.root.parent / "root.raw.kept"
+    os.link(disk, kept)
+    code, out = host.ctl("delete", "vm1", "--confirm", "vm1")
+    assert code == 0 and out == {"name": "vm1", "deleted": True}, out
+    assert not (host.root / "vm1").exists()
+    with open(kept, "rb") as f:
+        head = f.read(LUKS_HEADER_BYTES)
+        tail = f.read(10)
+    first = len(head) - len(head.lstrip(b"\0"))
+    assert first == LUKS_HEADER_BYTES, f"LUKS header byte {first} not erased"
+    assert tail == b"CIPHERTEXT"  # only the header: the volume is ciphertext with no key left
+    assert kept.stat().st_size == size
+
+
+def test_delete_keeps_the_vm_when_it_cannot_erase_the_header(host):
+    """A root.raw that is not a regular file is never written through or removed unerased: the
+    delete refuses and the VM directory stays, so a retry after the operator looks erases it."""
+    host.create()
+    d = host.root / "vm1"
+    target = host.root.parent / "elsewhere.raw"
+    target.write_bytes(b"LUKS\xba\xbe" + bytes(4090))
+    (d / "root.raw").unlink()
+    (d / "root.raw").symlink_to(target)
+    code, out = host.ctl("delete", "vm1", "--confirm", "vm1")
+    assert code != 0 and out["error"] == "erase_failed", out
+    assert (d / "root.raw").is_symlink() and target.read_bytes().startswith(b"LUKS")
+    (d / "root.raw").unlink()  # a create cut before the disk: nothing to erase, delete completes
+    code, out = host.ctl("delete", "vm1", "--confirm", "vm1")
+    assert code == 0 and out == {"name": "vm1", "deleted": True}, out
+    assert not d.exists()
+
+
 def test_reboot_needs_a_running_vm(host):
     host.create()
     code, out = host.ctl("reboot", "vm1")
