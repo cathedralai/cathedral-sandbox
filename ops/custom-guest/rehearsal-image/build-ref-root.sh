@@ -57,10 +57,13 @@ curl -fsSL --retry 3 -o "$out/InRelease" "$SNAPSHOT/dists/$SUITE/InRelease"
 
 # The base, as docs/CUSTOM_GUEST_FOUNDATION.md prepares it, from the snapshot instead of
 # the live mirror. Root mode, because the image restricts unprivileged user namespaces.
+# mmdebstrap copies the runner's /etc/hostname and /etc/resolv.conf into the base and
+# leaves them there, so two runners gave different base.tar bytes; the root recipe writes
+# its own of both, so the base carries neither.
 sudo -n env SOURCE_DATE_EPOCH="$BASE_EPOCH" mmdebstrap --mode=root --variant=minbase \
   --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
   --aptopt='Acquire::Check-Valid-Until "false"' \
-  --customize-hook='rm -f "$1"/etc/ssh/ssh_host_* "$1"/var/lib/systemd/random-seed' \
+  --customize-hook='rm -f "$1"/etc/ssh/ssh_host_* "$1"/var/lib/systemd/random-seed "$1"/etc/hostname "$1"/etc/resolv.conf' \
   --include="$INCLUDE" "$SUITE" "$out/base.tar" "deb $SNAPSHOT $SUITE main"
 sudo -n chown "$(id -u):$(id -g)" "$out/base.tar"
 base_sha=$(sha "$out/base.tar")
