@@ -54,3 +54,39 @@ The operator's configuration declares it, and only for the rehearsal:
 - The request names `"initrd": {"reference": "rehearsal-test-v1", ...}`.
 
 Remove both entries when the rehearsal ends.
+
+## Stock-systemd root (run 7b)
+
+**REHEARSAL ONLY.** A second root for the reference initrd v2 test image, so a rehearsal can show v2 handing off to a root where dbus and systemd-networkd are active. The v1 root (`e674d5a5`, runs 6 and 7) has no dbus and masks networkd, so it cannot show either.
+
+- **Build:** `build-ref-root.sh <cathedral-attest> <out dir> stock-systemd`. This is v1's snapshot, InRelease pin and epochs, plus `dbus` and `udev` in the base, through `stock_systemd.py`. That is the reference recipe with its `customize` hook; the recipe itself passes no hook.
+- **What `customize()` changes:**
+  - networkd's service and socket are unmasked and enabled;
+  - `cathedral-network.service` runs `/usr/lib/cathedral/write-network`, which writes `/run/systemd/network/10-cathedral.network` from `network.env` at boot. A networkd drop-in orders networkd after it;
+  - `99-default.link` is masked;
+  - dbus.socket and udev's sockets and coldplug trigger are enabled where the packages did not;
+  - `/var/lib/systemd/linger` ships empty.
+- **Kept byte for byte:** cathedral-attest, the sshd config and unit, and every other mask.
+- **Checks in `.github/workflows/rehearsal-ref-root.yml`:**
+  - `check_stock_root.py` passes on this root, and fails on v1 on dbus and networkd;
+  - both lanes are byte-identical;
+  - `boot-smoke.sh` boots it under QEMU (no SNP) behind a shim that hands off as v2 does. Over SSH, dbus, udevd, networkd and cathedral-sshd must be active, eth0 routable (configured), and the system running with no failed unit.
+  - The smoke's shim is a test-only busybox initrd, not reference initrd v2. cathedral-init's verity mount, kernel views and hand-off into this root are not exercised in CI; the live run covers them.
+- **The workflow artifact** is `rehearsal-ref-root-stock-systemd`.
+
+| File | Value |
+|---|---|
+| `base.tar` | `0a5b09478e1c9d87a4184f9bef481de127bcbffda5fc49aff8b09823f2f7ca67` |
+| `root.raw` | `2d33e12e031a9a6b203cdea0199d33cb739c547a9d8983dbf9dfe7a73c9d2dbc` |
+| `root_verity` | `897cbbd1ec7ce1f88d27bb9c110e01915b6471741f78978cce750b2b5e17c582` |
+| `root_data_bytes` | `76357632` |
+
+A launch with this root has its own cmdline (`cathedral.root_verity`, `cathedral.root_data_bytes`) and so its own measurement. Compute it from these files, as for v1.
+
+### Root requirements found
+
+These hold for any owner root under reference initrd v2, not only this one:
+
+- **(a) A root that uses systemd-networkd needs udev, or eth0 stays pending.** v2 hands the root a read-write /sys, and then systemd's networkd waits for udev to initialize each link (systemd v252 `udev_available()`). udev's coldplug trigger must run too: the NIC exists before udevd starts.
+- **(b) With udev present, configs must not assume eth0 unless `99-default.link` is masked.** udev's default policy renames interfaces, and `network.env` names the one the initrd saw.
+- **(c) A read-only root must pre-create every `StateDirectory=` its enabled units need, or give /var a writable mount.** systemd cannot create the directory at boot. Pre-created with the unit's owner and mode, it needs no write. Once dbus is installed, bookworm's systemd-logind fails with 238/STATE_DIRECTORY without `/var/lib/systemd/linger` (root, 0755).

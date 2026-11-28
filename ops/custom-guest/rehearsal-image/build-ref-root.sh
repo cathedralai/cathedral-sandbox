@@ -6,7 +6,11 @@
 # on a Debian bookworm base from a fixed snapshot, with the cathedral-attest of
 # reference-build run 46063612613. Never offered to customers.
 #
-# Usage: build-ref-root.sh CATHEDRAL_ATTEST NEW_OUT_DIR
+# VARIANT v1 (the default) is the root above. VARIANT stock-systemd (run 7b, AB#1027) adds
+# dbus and udev to the base and runs stock_systemd.py, which hands the guest network to
+# systemd-networkd; check_stock_root.py checks it. Both use the same snapshot and epochs.
+#
+# Usage: build-ref-root.sh CATHEDRAL_ATTEST NEW_OUT_DIR [VARIANT]
 # Runs on a GitHub-hosted Ubuntu 26.04 runner: it installs pinned packages and runs
 # mmdebstrap with sudo. Never on a hotel host.
 set -euo pipefail
@@ -15,6 +19,7 @@ set -euo pipefail
 umask 022
 attest=$(readlink -f "${1:?cathedral-attest from reference-build run 46063612613}")
 out=$(readlink -m "${2:?new output directory}")
+variant=${3:-v1}
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../../.." && pwd)
 [ ! -e "$out" ] || { echo "$out exists" >&2; exit 1; }
@@ -30,12 +35,28 @@ INRELEASE_SHA256=77737fa4b34f2693e982cc9ee35736816c35a7778fc2d326cc1bbf5b301fe1a
 INCLUDE=systemd-sysv,openssh-server,iproute2,e2fsprogs,ca-certificates
 BASE_EPOCH=1795737600   # 2026-11-27T00:00:00Z, the snapshot time
 ROOT_EPOCH=1795770000   # the reference recipe's epoch
-# The published outputs (#816, CI run 46089051536). Any drift fails the build; a change that
-# moves them re-pins them here on purpose.
-EXPECTED_BASE_SHA256=a39b08f1ec14291957a22b6d417e2c7a70b4f4f6123700cceea9bcfa7512075a
-EXPECTED_ROOT_SHA256=e674d5a55bc8ffdce0a04ec291ac70793e730d4f7428d403d46a9f380f36fdf9
-EXPECTED_ROOT_VERITY=fe5b4acc14779ae720f9cbefddee6e177c08cce5804c74fdc2be359451114b1e
-EXPECTED_ROOT_DATA_BYTES=71532544
+case "$variant" in
+  v1)
+    recipe=("$repo/scripts/build_custom_guest_root.py")
+    # The published outputs (#816, CI run 46089051536). Any drift fails the build; a change
+    # that moves them re-pins them here on purpose.
+    EXPECTED_BASE_SHA256=a39b08f1ec14291957a22b6d417e2c7a70b4f4f6123700cceea9bcfa7512075a
+    EXPECTED_ROOT_SHA256=e674d5a55bc8ffdce0a04ec291ac70793e730d4f7428d403d46a9f380f36fdf9
+    EXPECTED_ROOT_VERITY=fe5b4acc14779ae720f9cbefddee6e177c08cce5804c74fdc2be359451114b1e
+    EXPECTED_ROOT_DATA_BYTES=71532544
+    ;;
+  stock-systemd)
+    INCLUDE=$INCLUDE,dbus,udev
+    recipe=("$here/stock_systemd.py")
+    # The first two-lane build of this variant (#836, CI run 46145641488, at cb5dcea0).
+    EXPECTED_BASE_SHA256=0a5b09478e1c9d87a4184f9bef481de127bcbffda5fc49aff8b09823f2f7ca67
+    EXPECTED_ROOT_SHA256=2d33e12e031a9a6b203cdea0199d33cb739c547a9d8983dbf9dfe7a73c9d2dbc
+    EXPECTED_ROOT_VERITY=897cbbd1ec7ce1f88d27bb9c110e01915b6471741f78978cce750b2b5e17c582
+    EXPECTED_ROOT_DATA_BYTES=76357632
+    ;;
+  *) echo "variant is v1 or stock-systemd, not $variant" >&2; exit 1 ;;
+esac
+pinned() { [ -n "$EXPECTED_ROOT_SHA256" ]; }
 
 sha() { sha256sum "$1" | cut -d ' ' -f 1; }
 [ "$(sha "$attest")" = "$ATTEST_SHA256" ] || { echo "cathedral-attest is not $ATTEST_SHA256" >&2; exit 1; }
@@ -78,11 +99,13 @@ sudo -n env SOURCE_DATE_EPOCH="$BASE_EPOCH" mmdebstrap --mode=root --variant=min
 sudo -n chown "$(id -u):$(id -g)" "$out/base.tar"
 base_sha=$(sha "$out/base.tar")
 tar -tf "$out/base.tar" | LC_ALL=C sort > "$out/base-files.txt"
-[ "$base_sha" = "$EXPECTED_BASE_SHA256" ] || { echo "base.tar is $base_sha, expected $EXPECTED_BASE_SHA256" >&2; exit 1; }
+if pinned; then
+  [ "$base_sha" = "$EXPECTED_BASE_SHA256" ] || { echo "base.tar is $base_sha, expected $EXPECTED_BASE_SHA256" >&2; exit 1; }
+fi
 
 # The reference root recipe, twice from the same base: the two roots must be identical.
 for lane in first second; do
-  python3 "$repo/scripts/build_custom_guest_root.py" --base "$out/base.tar" --base-sha256 "$base_sha" \
+  python3 "${recipe[@]}" --base "$out/base.tar" --base-sha256 "$base_sha" \
     --helper "$attest" --helper-sha256 "$ATTEST_SHA256" --epoch "$ROOT_EPOCH" \
     --output "$out/root-$lane.raw" > "$out/root-build-$lane.json"
 done
@@ -94,9 +117,15 @@ mv "$out/root-build-first.json" "$out/root-build.json"
 ( cd "$out" && sha256sum base.tar root.raw InRelease > SHA256SUMS )
 root_sha=$(sha "$out/root.raw")
 read -r root_verity root_data_bytes < <(python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d["root_verity"], d["root_data_bytes"])' "$out/root-build.json")
-[ "$root_sha" = "$EXPECTED_ROOT_SHA256" ] || { echo "root.raw is $root_sha, expected $EXPECTED_ROOT_SHA256" >&2; exit 1; }
-[ "$root_verity" = "$EXPECTED_ROOT_VERITY" ] || { echo "root_verity is $root_verity, expected $EXPECTED_ROOT_VERITY" >&2; exit 1; }
-[ "$root_data_bytes" = "$EXPECTED_ROOT_DATA_BYTES" ] || { echo "root_data_bytes is $root_data_bytes, expected $EXPECTED_ROOT_DATA_BYTES" >&2; exit 1; }
-echo "root.raw, root_verity and root_data_bytes match the published values"
+if pinned; then
+  [ "$root_sha" = "$EXPECTED_ROOT_SHA256" ] || { echo "root.raw is $root_sha, expected $EXPECTED_ROOT_SHA256" >&2; exit 1; }
+  [ "$root_verity" = "$EXPECTED_ROOT_VERITY" ] || { echo "root_verity is $root_verity, expected $EXPECTED_ROOT_VERITY" >&2; exit 1; }
+  [ "$root_data_bytes" = "$EXPECTED_ROOT_DATA_BYTES" ] || { echo "root_data_bytes is $root_data_bytes, expected $EXPECTED_ROOT_DATA_BYTES" >&2; exit 1; }
+  echo "$variant: root.raw, root_verity and root_data_bytes match the published values"
+else
+  echo "$variant: UNPINNED. To pin it: EXPECTED_BASE_SHA256=$base_sha EXPECTED_ROOT_SHA256=$root_sha" \
+    "EXPECTED_ROOT_VERITY=$root_verity EXPECTED_ROOT_DATA_BYTES=$root_data_bytes"
+fi
+echo "$variant" > "$out/variant"
 cat "$out/root-build.json"
 cat "$out/SHA256SUMS"
