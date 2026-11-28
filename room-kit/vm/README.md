@@ -70,7 +70,9 @@ refusal by its exit code and `error` token together, per command.
 - `cathedral-vm-<name>.service` (spec r2 8.2, the dedicated unit's confinement): root
   steps (`+`) load KVM, wait for `/dev/kvm`, check `paid_through` and the start line,
   run the pre-launch gates (`vm-gates.sh check`), bring the link up with a tap the VM
-  user owns. `TemporaryFileSystem=/srv:ro` (and
+  user owns. Each runs through `nsenter --mount=/proc/1/ns/mnt`: a `+` step keeps the
+  unit's mount namespace, so without it `check-paid` sees no `authorization.json` and
+  refuses every start as `generation_closed`. `TemporaryFileSystem=/srv:ro` (and
   `$VM_ROOT` when it is elsewhere) hides every other VM and kit; `BindReadOnlyPaths`
   gives back the kit code, the bundle, `vm.env` and `vm-identity.json`, `BindPaths` the
   two disks and `run/`. `Restart=on-failure`, at most 5 starts in 15 min,
