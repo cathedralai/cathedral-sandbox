@@ -8,7 +8,9 @@ name: VM bundle build
 # difference it names the file (and the line or tar member inside it) and fails, never
 # picking a lane. While room-kit/vm/vm_initrd_closure.json is unpinned the lanes print the
 # closure this build resolves (build-vm-initrd.py pin) and stop there; once it is pinned they
-# also build the initrd, the manifest and the measurement of the fixture identity. Every
+# also build the initrd, the manifest and the measurement of the fixture identity. While
+# room-kit/vm/base_root_pin.json is pinned, both lanes take its epoch and the summary also
+# requires the base root to equal the pin byte for byte. Every
 # download is checked against a sha256 in scripts/vm_bundle_build_inputs.json,
 # scripts/vm_initrd_tools_inputs.json or requirements/vm-measure.txt, and both package sets
 # against the snapshot's signed indexes. GitHub-hosted only: never a hotel or Contabo.
@@ -166,9 +168,18 @@ jobs:
           } | tee "$RUNNER_TEMP/lane/toolchain.txt"
       - name: bundle.env
         run: |
-          # The checked-out commit's time, the same in both lanes; sudo would not see git's safe directory.
-          epoch=$(git log -1 --format=%ct)
           [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ] || { echo "checked out $(git rev-parse HEAD), not $SOURCE_SHA" >&2; exit 1; }
+          # A pinned base root (room-kit/vm/base_root_pin.json) gives the epoch, so every commit
+          # builds the same base root and two bundles can share it (spec r3 7.5 rebundle, AB#1022);
+          # the step fails if the snapshot, the base lock or the recipe is not the pin's.
+          # Unpinned, it is the checked-out commit's time. Either way the same in both lanes;
+          # sudo would not see git's safe directory.
+          pin=$(/usr/bin/python3 -I scripts/vm_bundle_build_summary.py epoch --snapshot "$VM_BUNDLE_SNAPSHOT" \
+            --lock room-kit/vm/locks/base-root.packages.lock)
+          read -r pin_status epoch <<< "$pin"
+          if [ "$pin_status" = unpinned ]; then epoch=$(git log -1 --format=%ct); fi
+          [[ "$epoch" =~ ^[1-9][0-9]*$ ]] || { echo "no epoch (base root pin: $pin)" >&2; exit 1; }
+          echo "base root $pin_status, SOURCE_DATE_EPOCH $epoch"
           echo "$epoch" > "$RUNNER_TEMP/lane/source-date-epoch"
           cat > "$RUNNER_TEMP/bundle.env" <<EOF
           VM_BUNDLE_OUT=$RUNNER_TEMP/bundle
