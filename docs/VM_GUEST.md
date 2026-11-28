@@ -98,8 +98,9 @@ keeps polling.
 
 **Vectors:** `tests/fixtures/vm_rewrap_answer_v2.json` and `tests/fixtures/vm_ssh_key_shapes_v1.json`,
 made by `scripts/make_vm_rewrap_answer_vectors.py` (`--check` fails if either file differs). All
-signatures are deterministic, from test keys that protect nothing. Each case carries the refusal
-code the guest must give (from the generator's reference verifier, `null` when valid) and, where
+signatures are deterministic, from test keys: never a real private key; the fixture's test keys
+are public by design and must never be used as an identity. Each case carries the refusal code
+the guest must give (from the generator's reference verifier, `null` when valid) and, where
 known, `openssh_accepts`: `tests/test_vm_rewrap_answer_vectors.py` runs `ssh-keygen -Y
 check-novalidate` over those cases, and `ssh-keygen -Y sign` makes the Ed25519 and RSA vectors byte
 for byte. Both OpenSSH tests skip on a machine without `ssh-keygen` and fail in CI without it.

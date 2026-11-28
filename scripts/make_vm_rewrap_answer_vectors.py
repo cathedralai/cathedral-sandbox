@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# WARNING: never a real private key here. The fixture's test keys are public by design (the RSA
+# primes are in the fixture, the other keys come from the fixed seeds below) and must never be
+# used as an identity: anyone can sign a re-wrap answer with them.
 """Make tests/fixtures/vm_rewrap_answer_v2.json and tests/fixtures/vm_ssh_key_shapes_v1.json
 (AB#1022, spec r3 7.5 with the r4 erratum): the signed re-wrap answer and the key shape that
 VM create allows, as shared vectors for the guest init, the host, the broker and verify_vm.py.
@@ -12,8 +15,8 @@ identity's ssh_public_key:
 
 and the signature over D per key type (docs/VM_GUEST.md "Re-wrap answer v2"). Every signature
 here is deterministic (Ed25519, RSA PKCS#1 v1.5, ECDSA with RFC 6979), so --check compares
-bytes. The keys are test keys and protect nothing: the RSA primes are kept in the fixture so
-it can be made again; the others come from fixed seeds.
+bytes. The keys are test keys, public by design: the RSA primes are kept in the fixture so it
+can be made again, and the others come from fixed seeds. Never use one as a VM identity.
 
 reference_verify() is the erratum 2.4 verifier in Python. It gives each case its expected
 refusal code (None for a valid answer); the Go guest must give the same. The test also runs
@@ -660,7 +663,8 @@ def build(kept: dict) -> tuple[dict, dict]:
         "sig_max_bytes": SIG_MAX,
         "largest_valid_body_bytes": max(c["body_bytes"] for c in valid),
         "cases": cases,
-        "test_keys": {"note": "test keys; they protect nothing. The RSA primes are kept so --check can rebuild the "
+        "test_keys": {"note": "never a real private key; the fixture's test keys are public by design and must "
+                              "never be used as an identity. The RSA primes are kept so --check can rebuild the "
                               "same bytes; the other keys come from fixed seeds in the generator.",
                       **{f"rsa-{bits}": primes[bits] for bits in (2048, 8192)}},
     }

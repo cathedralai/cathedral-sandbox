@@ -442,7 +442,7 @@
  "sig_max_bytes": 2400,
  "spec": "VM runtime spec r3 7.5 with the r4 erratum (AB#1022); docs/VM_GUEST.md \"Re-wrap answer v2\"",
  "test_keys": {
-  "note": "test keys; they protect nothing. The RSA primes are kept so --check can rebuild the same bytes; the other keys come from fixed seeds in the generator.",
+  "note": "never a real private key; the fixture's test keys are public by design and must never be used as an identity. The RSA primes are kept so --check can rebuild the same bytes; the other keys come from fixed seeds in the generator.",
   "rsa-2048": {
    "bits": 2048,
    "e": 65537,
