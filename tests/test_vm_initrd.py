@@ -79,9 +79,13 @@ def test_a_testdata_main_is_refused_in_a_production_closure(monkeypatch):
 
 
 def unpinned_closure() -> dict:
+    """The checked-in recipe (mains, tools, boot modules) with its pins taken off."""
     closure = json.loads((KIT / "vm" / "vm_initrd_closure.json").read_text())
     closure["go_mains"]["init"] = "./testdata/vm-init-stub"
     closure["kernel_release"] = RELEASE
+    closure["status"] = "unpinned"
+    closure["executables"] = {name: None for name in closure["executables"]}
+    closure["modules"] = {}
     return closure
 
 
@@ -122,13 +126,21 @@ def elf(interp=False, needed=False) -> bytes:
     return header + ph + struct.pack("<qQ", 1 if needed else 0, 0)
 
 
-def test_the_checked_in_closure_is_unpinned_and_refused():
+def test_the_checked_in_closure_is_pinned():
+    # Pinned from the reference build (.github/workflows/vm-bundle-build.yml), whose lanes check
+    # the initrd they build against it; tests/test_vm_bundle_build.py checks it against the locks.
     closure = recipe.load_closure(KIT / "vm" / "vm_initrd_closure.json")
-    assert closure["status"] == "unpinned"
-    with pytest.raises(ValueError, match="unpinned"):
-        recipe.require_pinned(closure)
+    assert closure["status"] == "pinned"
+    recipe.require_pinned(closure)
+    assert all(recipe.HEX64_RE.fullmatch(d) for d in closure["executables"].values())
     with pytest.raises(ValueError):
         recipe.build_raw({}, closure)
+
+
+def test_an_unpinned_closure_is_refused():
+    closure = unpinned_closure()
+    with pytest.raises(ValueError, match="unpinned"):
+        recipe.require_pinned(closure)
 
 
 def test_archive_roundtrip_load_order_and_generated_files(staged):

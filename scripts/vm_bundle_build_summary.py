@@ -25,6 +25,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parents[1]
+CLOSURE = REPO / "room-kit" / "vm" / "vm_initrd_closure.json"
 LANES = ("first", "second")
 KINDS = ("tools", "bundle")
 RECORD_ONLY = {"toolchain.txt"}
@@ -132,6 +134,13 @@ def closure_rows(pinned):
     return rows
 
 
+def measurement_line(measurement):
+    if not measurement:
+        return "not measured (closure unpinned)"
+    return (f"measurement `{measurement.get('expected_measurement', '')}`, "
+            f"identity sha256 `{measurement.get('identity_sha256', '')}`")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -156,8 +165,10 @@ def main():
             files[published] = {"sha256": digest, "bytes": (args.out / published).stat().st_size}
     toolchains = {f"{kind}-{lane}": read(args.lanes / f"{kind}-{lane}", "toolchain.txt")
                   for kind in KINDS for lane in LANES}
+    # An unpinned closure: the lanes' pin output. A pinned one: the committed closure, which the
+    # lanes' initrd build was checked against.
     pinned_path = first["bundle"] / "pinned-closure.json"
-    pinned = json.loads(pinned_path.read_text()) if pinned_path.is_file() else {}
+    pinned = json.loads((pinned_path if pinned_path.is_file() else CLOSURE).read_text())
     measurement_path = first["bundle"] / "measurement.json"
     summary = {
         "schema": "cathedral.vm.bundle-build-summary/v1",
@@ -190,6 +201,7 @@ def main():
         f"- Kernel release: `{summary['kernel_release']}`\n"
         f"- Base root verity: `{summary['base_root_verity']}`, data bytes {summary['base_root_data_bytes']}\n"
         f"- Bundle id (sha256 of manifest.json): `{summary['bundle_id'] or 'not built (closure unpinned)'}`\n"
+        f"- Fixture identity a, 2 vCPU, genoa: {measurement_line(summary['measurement'])}\n"
         f"- Source commit: `{summary['source_commit']}`\n"
         "- Both lanes byte-identical: yes. Boot verified: no (this run builds; it does not boot).\n"
         f"- Toolchains identical across lanes: {'yes' if summary['toolchains_identical'] else 'no (see toolchain-*.txt)'}\n\n"

@@ -67,8 +67,9 @@ env:
   VM_BUNDLE_QEMU_VERSION: 10.2.1
   VM_BUNDLE_INITRD_VERSION: vm1-0
   VM_BUNDLE_OVMF_SOURCE: ovmf=2024.02-2ubuntu0.10
-  # No committed packages.lock yet: the lanes write both and the summary requires them equal.
-  VM_BUNDLE_LOCK_UPDATE: "1"
+  # Both roots must resolve to room-kit/vm/locks/*.packages.lock exactly. A new snapshot
+  # means new locks: build once with "1", review the two locks the lanes agree on, commit them.
+  VM_BUNDLE_LOCK_UPDATE: "0"
 
 jobs:
   tools:
@@ -166,6 +167,8 @@ jobs:
           VM_BUNDLE_SUITE=$VM_BUNDLE_SUITE
           VM_BUNDLE_KERNEL_RELEASE=$VM_BUNDLE_KERNEL_RELEASE
           VM_BUNDLE_LOCK_UPDATE=$VM_BUNDLE_LOCK_UPDATE
+          VM_BUNDLE_BASE_LOCK=$GITHUB_WORKSPACE/room-kit/vm/locks/base-root.packages.lock
+          VM_BUNDLE_KERNEL_LOCK=$GITHUB_WORKSPACE/room-kit/vm/locks/kernel.packages.lock
           VM_BUNDLE_TOOLS=$RUNNER_TEMP/tools
           SOURCE_DATE_EPOCH=$epoch
           VM_BUNDLE_OVMF=$RUNNER_TEMP/ovmf/usr/share/ovmf/OVMF.amdsev.fd
@@ -270,6 +273,16 @@ jobs:
           /usr/bin/python3 -I scripts/vm_bundle_build_summary.py compare --lanes "$RUNNER_TEMP/lanes" --out "$RUNNER_TEMP/vm-bundle"
           cat "$RUNNER_TEMP/vm-bundle/summary.md" >> "$GITHUB_STEP_SUMMARY"
           cat "$RUNNER_TEMP/vm-bundle/SHA256SUMS"
+      - name: Fetch python-zstandard (sha256 checked)
+        run: python3 -I scripts/fetch_vm_bundle_inputs.py --out "$RUNNER_TEMP/inputs" --group python
+      - name: Consumer checks, the published files against the closure and the manifest
+        run: |
+          if [ ! -f "$RUNNER_TEMP/vm-bundle/manifest.json" ]; then echo "closure unpinned: no initrd or manifest to check"; exit 0; fi
+          mkdir "$RUNNER_TEMP/pylib"
+          /usr/bin/python3 -I -m zipfile -e "$RUNNER_TEMP"/inputs/python/zstandard-0.25.0-*.whl "$RUNNER_TEMP/pylib"
+          PYTHONPATH="$RUNNER_TEMP/pylib" /usr/bin/python3 room-kit/vm/build-vm-initrd.py check \
+            --closure room-kit/vm/vm_initrd_closure.json --archive "$RUNNER_TEMP/vm-bundle/initrd.cpio.zst"
+          /usr/bin/python3 -I room-kit/vm/vm_measure.py check-bundle "$RUNNER_TEMP/vm-bundle"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vm-bundle

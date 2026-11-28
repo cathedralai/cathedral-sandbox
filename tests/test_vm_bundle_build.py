@@ -161,3 +161,78 @@ def test_workflow_has_no_expression_inside_run_and_pins_actions_by_commit():
         if stripped.startswith("- uses:") or stripped.startswith("uses:"):
             ref = stripped.split("@", 1)[1].split()[0]
             assert len(ref) == 40 and all(c in "0123456789abcdef" for c in ref), line
+
+
+# ---- the pinned state (commit 2): closure, locks and workflow agree --------------------------
+
+LOCKS = REPO / "room-kit" / "vm" / "locks"
+CLOSURE = REPO / "room-kit" / "vm" / "vm_initrd_closure.json"
+
+
+def _workflow_env(name):
+    return next(line.split(":", 1)[1].strip().strip('"') for line in WORKFLOW.read_text().splitlines()
+                if line.strip().startswith(name + ":"))
+
+
+def _lock(name):
+    return [line.split(" ") for line in (LOCKS / name).read_text().splitlines()]
+
+
+def test_locks_have_the_lock_tool_shape():
+    for name in ("base-root.packages.lock", "kernel.packages.lock"):
+        entries = _lock(name)
+        assert entries and all(len(e) == 4 and len(e[3]) == 64 for e in entries), name
+        assert [e[0] for e in entries] == sorted(e[0] for e in entries), name
+
+
+def test_kernel_lock_holds_one_kernel_and_its_extra_modules_of_the_named_release():
+    release = _workflow_env("VM_BUNDLE_KERNEL_RELEASE")
+    names = {e[0]: e[1] for e in _lock("kernel.packages.lock")}
+    images = sorted(n for n in names if n.startswith("linux-image-") and n != "linux-image-virtual")
+    assert images == [f"linux-image-{release}"]
+    assert f"linux-modules-{release}" in names and f"linux-modules-extra-{release}" in names
+    assert names["linux-image-virtual"] == names[f"linux-image-{release}"]
+
+
+def test_base_root_lock_has_no_kernel_bootloader_or_guest_agent():
+    forbidden = ("linux-image-", "linux-modules-", "linux-headers-", "grub", "initramfs-tools", "cloud-init",
+                 "qemu-guest-agent")
+    assert not [e[0] for e in _lock("base-root.packages.lock") if e[0].startswith(forbidden)]
+
+
+def test_closure_is_pinned_to_the_locked_kernel_with_the_boot_modules_only():
+    closure = json.loads(CLOSURE.read_text())
+    release = _workflow_env("VM_BUNDLE_KERNEL_RELEASE")
+    assert closure["status"] == "pinned" and closure["kernel_release"] == release
+    prefix = f"usr/lib/modules/{release}/"
+    files = sorted(p.removeprefix(prefix) for p in closure["modules"] if p.endswith(".ko.zst"))
+    assert files == ["kernel/drivers/firmware/qemu_fw_cfg.ko.zst", "kernel/drivers/md/dm-bufio.ko.zst",
+                     "kernel/drivers/md/dm-crypt.ko.zst", "kernel/drivers/md/dm-verity.ko.zst",
+                     "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst", "kernel/drivers/virt/coco/tsm.ko.zst"]
+    assert all(p.startswith(prefix + "modules.") for p in closure["modules"] if not p.endswith(".ko.zst"))
+    assert set(closure["executables"]) == {"init", "usr/lib/cathedral/cathedral-vm",
+                                           "usr/lib/cathedral/cathedral-vm-attest", "usr/lib/cathedral/cryptsetup",
+                                           "usr/lib/cathedral/mke2fs", "usr/lib/cathedral/resize2fs",
+                                           "usr/lib/cathedral/veritysetup"}
+
+
+def test_workflow_builds_against_the_committed_locks():
+    text = WORKFLOW.read_text()
+    assert _workflow_env("VM_BUNDLE_LOCK_UPDATE") == "0"
+    assert "VM_BUNDLE_BASE_LOCK=$GITHUB_WORKSPACE/room-kit/vm/locks/base-root.packages.lock" in text
+    assert "VM_BUNDLE_KERNEL_LOCK=$GITHUB_WORKSPACE/room-kit/vm/locks/kernel.packages.lock" in text
+
+
+def test_a_pinned_run_reports_the_committed_closure(tmp_path):
+    _lanes(tmp_path / "lanes")
+    for lane in ("first", "second"):
+        (tmp_path / "lanes" / f"bundle-{lane}" / "pinned-closure.json").unlink()
+        (tmp_path / "lanes" / f"bundle-{lane}" / "measurement.json").write_text(
+            json.dumps({"expected_measurement": "ab" * 48, "identity_sha256": "cd" * 32}))
+    r = _compare(tmp_path)
+    assert r.returncode == 0, r.stderr
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    closure = json.loads(CLOSURE.read_text())
+    assert summary["closure_digests"]["init"] == closure["executables"]["init"]
+    assert summary["closure_module_files"] == len(closure["modules"])
+    assert "ab" * 48 in (tmp_path / "out" / "summary.md").read_text()

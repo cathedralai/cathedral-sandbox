@@ -117,9 +117,12 @@ mode fixed per artifact. It reuses `custom_guest_initrd.py` read-only.
   `build-bundle.sh` takes the archive through its existing `VM_BUNDLE_INITRD` hook.
 - The check refuses an extra file, a dynamic or non-ELF executable, a missing or changed module, a wrong
   digest, a file with another mode, and any executable that contains the `vmcuttest` build tag.
-- `vm_initrd_closure.json` is `unpinned` in this PR: its digests cannot exist before the tools build and
-  the kernel release are fixed. `pin` prints the digests of a real build for review; `build` and `check`
-  refuse an unpinned closure.
+- `vm_initrd_closure.json` is pinned to the reference build (`.github/workflows/vm-bundle-build.yml`,
+  kernel `6.8.0-151-generic` from snapshot `20261126T000000Z`): `pin` printed the digests of both lanes'
+  builds, which were identical, and they were committed with the two `room-kit/vm/locks/` files.
+  A new snapshot, kernel or tool changes them: build with `VM_BUNDLE_LOCK_UPDATE=1` and an unpinned
+  closure, review the pin output the lanes agree on, commit it. `build` and `check` refuse an unpinned
+  closure.
 
 ## Static tools build
 
