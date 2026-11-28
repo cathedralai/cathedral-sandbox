@@ -52,6 +52,71 @@ info string), which goes one step beyond "info = the string" of the 14:44Z decis
 The offer's REPORT_DATA is `sha512("cathedral-vm-rewrap/v1\0" || pubkey || nonce)`
 (`vmmailbox.RewrapReportData`).
 
+## Re-wrap answer v2 (AB#1022, spec r3 7.5 with the r4 erratum)
+
+**Why:** `OpenAnswer` proves only that an answer was sealed to the offer's public key, and anyone
+can seal to a public key. A host could therefore build a volume that names this VM's identity,
+with a recovery slot under a key it chose, and seal that key to the offer: the genuine init would
+add its measurement key to the host's header and boot the host's root. So the guest acts only on
+an answer signed by the identity's `ssh_public_key`. That key is measured (its sha256 is in the
+cmdline and in HOST_DATA), and it is already the VM's only login key, so the signature adds no new
+trust root.
+
+**The answer:** `{"schema":"cathedral.vm.rewrap-answer/v2","offer_sha256","epk","nonce","ct","sig"}`,
+canonical JSON, at most 4096 bytes. `offer_sha256`, `epk`, `nonce` and `ct` are the v1 envelope
+above, unchanged. `sig` is one SSHSIG blob (OpenSSH `PROTOCOL.sshsig`), unarmored, in strict
+canonical standard base64, at most 2400 bytes decoded. Every reader refuses v1.
+
+**What is signed:**
+
+```
+M = "cathedral.vm.rewrap-answer/v2\0" (30 bytes)
+    || offer_sha256 as 32 raw bytes || epk (32) || nonce (12) || ct (48)        154 bytes
+D = "SSHSIG" || string(namespace) || string("") || string("sha512") || string(SHA-512(M))
+```
+
+- namespace `vm-rewrap-answer-v2@cathedral.computer`; reserved empty; `hash_algorithm` `sha512` only.
+- `offer_sha256` binds the answer to one boot's offer (its key, nonce and report); `epk`, `nonce` and
+  `ct` bind the ciphertext, so a genuine signature cannot carry a host's sealed key.
+
+**The verifier (Go stdlib only, for every `keyTypes` entry):** the magic is `SSHSIG` and the version
+is 1; the five strings fit and nothing trails the blob; `publickey` equals the identity's key blob
+byte for byte; namespace, reserved and hash are as above; the signature string's fields lie inside
+it, nothing trails them, and its type is:
+
+| Key type | Signature | Check |
+|---|---|---|
+| `ssh-ed25519` | `ssh-ed25519`, 64 bytes | `ed25519.Verify(key, D, sig)` |
+| `ecdsa-sha2-nistp256`, `-nistp384`, `-nistp521` | the key's type; string(mpint r, mpint s) | the key's curve name matches its type; Q is uncompressed (0x04) and on the curve; r and s are minimal mpints in 1..n-1; `ecdsa.Verify(pub, SHA-256/384/512(D), r, s)` |
+| `ssh-rsa` | `rsa-sha2-512` only; `ssh-rsa` (SHA-1) and `rsa-sha2-256` are refused | the signature length equals the modulus length; `rsa.VerifyPKCS1v15(pub, crypto.SHA512, SHA-512(D), sig)` |
+| `sk-ssh-ed25519@openssh.com` | the type, 64 bytes, then byte flags and uint32 counter | flags bit 0 (user present) is set; `ed25519.Verify(key, SHA-256(application) \|\| flags \|\| counter \|\| SHA-256(D), sig)` |
+| `sk-ecdsa-sha2-nistp256@openssh.com` | the type, string(mpint r, mpint s), flags, counter | flags bit 0 is set; ECDSA P-256 over SHA-256(SHA-256(application) \|\| flags \|\| counter \|\| SHA-256(D)) |
+
+The counter is not checked: the guest keeps no state, and `offer_sha256` makes each signature
+single-use. The init verifies before `OpenAnswer`; a refused answer is logged once and the guest
+keeps polling.
+
+**Vectors:** `tests/fixtures/vm_rewrap_answer_v2.json` and `tests/fixtures/vm_ssh_key_shapes_v1.json`,
+made by `scripts/make_vm_rewrap_answer_vectors.py` (`--check` fails if either file differs). All
+signatures are deterministic, from test keys that protect nothing. Each case carries the refusal
+code the guest must give (from the generator's reference verifier, `null` when valid) and, where
+known, `openssh_accepts`: `tests/test_vm_rewrap_answer_vectors.py` runs `ssh-keygen -Y
+check-novalidate` over those cases, and `ssh-keygen -Y sign` makes the Ed25519 and RSA vectors byte
+for byte. The worst case is RSA 8192: 3173 bytes. OpenSSH accepts six cases the guest refuses
+(another key, `sha256`, `rsa-sha2-256`, a short RSA signature, a non-minimal mpint, and an sk
+signature without the user-present bit), so `verify_vm.py rewrap` checks those rules itself
+before it prints an answer.
+
+**Key shape at VM create only:** a key the guest could not verify within 4096 bytes is refused when
+the VM is made (`vm_ssh_key_shapes_v1.json`): a blob of at most 1100 bytes, an RSA modulus of 2048
+to 8192 bits with an odd e in 3..2^31-1, a 32-byte Ed25519 key, and an uncompressed point on the
+named curve. The identity parser that `start`, `rebundle`, `verify` and the init use does not
+change, so a VM made before the rule keeps booting; only its re-wrap is refused
+(`rewrap_key_unsupported`).
+
+**Customers:** never forward an agent that holds this key to a machine you do not control. A
+signing oracle is the only way a host could make an answer, the same exposure as the login key.
+
 ## Attest (6.4)
 
 `cathedral-attest CHALLENGE_HEX` hashes the ssh-ed25519 wire blob of
