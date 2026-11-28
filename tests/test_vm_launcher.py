@@ -433,12 +433,14 @@ def test_unit_confinement_and_restart_policy(host):  # noqa: F811
     assert props["NoNewPrivileges"] == ["yes"] and props["ProtectSystem"] == ["strict"]
     assert props["DevicePolicy"] == ["closed"]
     assert set(props["DeviceAllow"]) == {"/dev/kvm rw", "/dev/sev rw", "/dev/vhost-net rw", "/dev/net/tun rw"}
-    # Root steps run outside the sandbox with '+'; QEMU never does.
+    # Root steps run with '+' in the host's mount namespace (a '+' step alone keeps the unit's, live VM proof
+    # 28 Nov); QEMU never does.
+    host_ns = "/usr/bin/nsenter --mount=/proc/1/ns/mnt --"
     pre = props["ExecStartPre"]
-    assert all(p.startswith("+") for p in pre) and len(pre) == 6
+    assert all(p.startswith("+") and p.lstrip("+-").startswith(host_ns + " ") for p in pre) and len(pre) == 6
     assert any("check-paid vm1" in p for p in pre) and any("vm-net.sh up" in p for p in pre)
     # The pre-launch gates (8.3, #788): after the credit check, before the link comes up.
-    gates = [i for i, p in enumerate(pre) if p == f"+{KIT.resolve()}/vm-gates.sh check vm1"]
+    gates = [i for i, p in enumerate(pre) if p == f"+{host_ns} {KIT.resolve()}/vm-gates.sh check vm1"]
     paid = [i for i, p in enumerate(pre) if "check-paid vm1" in p]
     up = [i for i, p in enumerate(pre) if "vm-net.sh up" in p]
     assert len(gates) == 1 and paid[0] < gates[0] < up[0], pre
