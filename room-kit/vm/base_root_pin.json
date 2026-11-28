@@ -1,5 +1,13 @@
 {
-  "note": "Unpinned for the ssh.socket fix (AB#999): build_base_root changed, so the base root changes. The next commit pins the base root that this commit's VM bundle build summary prints (README \"Base root pin\").",
+  "base_root_data_bytes": 771751936,
+  "base_root_packages_lock_sha256": "e3c0957074fba5fc008cfd0d328f849f76737c409b0b728e204bcbe5b5401e6d",
+  "base_root_raw_sha256": "2097eece6f4d8ef6d782f9e7135683f24aae8961496b51bb3548db62327bdd4c",
+  "base_root_verity": "65059b4ce3c940b74580d1bd28662164713ccaa469fff660952d04be7452af5e",
+  "from_run": "46139434416",
+  "note": "The base root of bundle d232676b (VM bundle build run 46139434416 at 26917fa8), with ssh.socket disabled before its mask so sshd starts (AB#999). It replaces the base root of bundles a9585311 to f5389487, where ssh.service required the masked ssh.socket and never started. While pinned, both lanes build with this epoch and the summary publishes only a byte-identical base root, so later bundles share it and a VM can rebundle between them (spec r3 7.5, AB#1022). A new base root (lock, snapshot or recipe) needs a new pin and a new first bundle: see room-kit/vm/README.md.",
+  "recipe_sha256": "e332d7052df428f4cc99c38dcbd6dd0aaf1e89d59006bf9e49b9c2810c364e79",
   "schema": "cathedral.vm.base-root-pin/v1",
-  "status": "unpinned"
+  "snapshot": "20261126T000000Z",
+  "source_date_epoch": 1795864833,
+  "status": "pinned"
 }

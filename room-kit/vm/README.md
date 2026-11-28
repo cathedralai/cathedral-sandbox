@@ -269,7 +269,7 @@ cmdline and HOST_DATA from the identity on every launch.
   `build-bundle.sh` that build it, `BASE_PKGS`, the static tool inputs and mmdebstrap
   (`scripts/vm_bundle_build_summary.py recipe` prints each input). The byte check is the gate;
   the recipe check only fails earlier and names the input. The pin today is the base root of
-  bundle `a9585311` (run 46095917678). A new base root (new snapshot, lock or recipe) means a
+  bundle `d232676b` (run 46139434416), the first with sshd started at boot. A new base root (new snapshot, lock or recipe) means a
   new pin and a new first bundle: set `status` to `unpinned`, run the workflow, and commit
   the pin that its summary prints.
 - **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random

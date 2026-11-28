@@ -419,14 +419,14 @@ def _epoch(pin, snapshot="20261126T000000Z", lock=BASE_LOCK):
                            "--pin", str(pin)], capture_output=True, text=True)
 
 
-def test_the_committed_pin_is_bundle_a9585311s_base_root_and_matches_this_tree():
+def test_the_committed_pin_is_bundle_d232676bs_base_root_and_matches_this_tree():
     pin = summary_mod.load_pin(PIN)
     assert pin["status"] == "pinned"
-    # Run 46095917678 at main 82c964b4: its epoch is that commit's time.
+    # Run 46139434416 at 26917fa8 (the ssh.socket fix, unpinned): its epoch is that commit's time.
     assert (pin["source_date_epoch"], pin["snapshot"], pin["from_run"]) == \
-        (1795831236, "20261126T000000Z", "46095917678")
-    assert pin["base_root_raw_sha256"] == "0a200cc3d608a8dcbe04c3a4b7384fe311b94d88b50c62071bfcb968852368e9"
-    assert pin["base_root_verity"] == "4504476434ccff04fff2c167674f1e952f4772e4516acf621346db4763a2e7d4"
+        (1795864833, "20261126T000000Z", "46139434416")
+    assert pin["base_root_raw_sha256"] == "2097eece6f4d8ef6d782f9e7135683f24aae8961496b51bb3548db62327bdd4c"
+    assert pin["base_root_verity"] == "65059b4ce3c940b74580d1bd28662164713ccaa469fff660952d04be7452af5e"
     assert pin["base_root_data_bytes"] == 771751936
     assert pin["snapshot"] == _workflow_env("VM_BUNDLE_SNAPSHOT")
     assert pin["base_root_packages_lock_sha256"] == _sha(BASE_LOCK.read_bytes())
@@ -438,7 +438,7 @@ def test_the_committed_pin_is_bundle_a9585311s_base_root_and_matches_this_tree()
 def test_epoch_gives_the_pinned_epoch():
     r = _epoch(PIN)
     assert r.returncode == 0, r.stderr
-    assert r.stdout == "pinned 1795831236\n"
+    assert r.stdout == "pinned 1795864833\n"
 
 
 def test_epoch_unpinned_leaves_the_commit_time_to_the_workflow(tmp_path):
