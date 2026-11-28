@@ -234,6 +234,9 @@ func TestVMsRewrapAnswerOverTheRealSSHExecutor(t *testing.T) {
 // every case the reference refuses for its shape, and passes every other one on byte for byte.
 // The broker re-encodes, so length alone cannot refuse the 4097-byte case (a canonical body and
 // trailing spaces); its sig, padded to fill 4096 bytes, is over 2400 and refuses it.
+// The route takes the answer as a value inside a JSON request, so a client's spacing or key order
+// is not the answer's: the two non-canonical bodies come out as the canonical bytes the host reads
+// (the signature covers the fields, not the body bytes). Every other answer_schema case is refused.
 func TestVMsRewrapAnswerV2Vectors(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "tests", "fixtures", "vm_rewrap_answer_v2.json"))
 	if err != nil {
@@ -250,9 +253,23 @@ func TestVMsRewrapAnswerV2Vectors(t *testing.T) {
 		t.Fatalf("vectors: %v", err)
 	}
 	shape := map[string]bool{"answer_schema": true, "sig_encoding": true, "sig_too_long": true, "answer_too_long": true}
+	reencoded := map[string]bool{"body-not-canonical-space": false, "body-not-canonical-key-order": false}
 	for _, c := range f.Cases {
 		out, err := vmRewrapAnswer(json.RawMessage(c.Body))
 		switch {
+		case hasKey(reencoded, c.Name):
+			if c.Refusal == nil || *c.Refusal != "answer_schema" {
+				t.Fatalf("%s: the reference no longer refuses it as answer_schema", c.Name)
+			}
+			reencoded[c.Name] = true
+			var doc map[string]string
+			if json.Unmarshal([]byte(c.Body), &doc) != nil {
+				t.Fatalf("%s: not a JSON object of strings", c.Name)
+			}
+			want, _ := json.Marshal(doc) // sorted keys, no spaces
+			if err != nil || string(out) != string(want) || string(out) == c.Body {
+				t.Errorf("%s: want the canonical bytes %s, got %q, %v", c.Name, want, out, err)
+			}
 		case c.Refusal != nil && shape[*c.Refusal]:
 			if err == nil {
 				t.Errorf("%s: accepted an answer the reference refuses as %s", c.Name, *c.Refusal)
@@ -263,4 +280,14 @@ func TestVMsRewrapAnswerV2Vectors(t *testing.T) {
 			}
 		}
 	}
+	for name, seen := range reencoded {
+		if !seen {
+			t.Errorf("%s: no such answer_schema case in the vectors", name)
+		}
+	}
+}
+
+func hasKey(m map[string]bool, k string) bool {
+	_, ok := m[k]
+	return ok
 }
