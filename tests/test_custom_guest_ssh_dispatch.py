@@ -51,6 +51,9 @@ REFUSED = {
     # An sftp request arrives with the configured subsystem command; the forced command overrides it.
     "sftp server": "/usr/lib/openssh/sftp-server",
     "internal-sftp": "internal-sftp",
+    # As sshd passes them (the subsystem command plus its empty arguments).
+    "sftp server, as sshd sends it": "/usr/lib/openssh/sftp-server ",
+    "internal-sftp, as sshd sends it": "internal-sftp ",
     "sftp": "sftp",
     "host-only phase tick": f"{TOOL} tick --hotel {HOTEL} --launch-id {LAUNCH}",
     "host-only phase check-start": f"{TOOL} check-start --hotel {HOTEL} --launch-id {LAUNCH}",
@@ -331,7 +334,9 @@ def test_behind_sshd_a_shell_command_and_sftp_are_refused(sshd):
     p = ssh(sshd, "sftp", opts=("-s",))
     r = result(p)
     assert p.returncode == 1 and r["error_code"] == "custom_guest_request_invalid", (p.stdout, p.stderr)
-    assert r["request"] == repr(sshd["subsystem"]) and "not the host tool of this install" in r["detail"], r
+    # sshd passes the subsystem command with its (empty) arguments: OpenSSH 10.2 adds a trailing space.
+    assert r["request"] in (repr(sshd["subsystem"]), repr(sshd["subsystem"] + " ")), r
+    assert "not the host tool of this install" in r["detail"], r
     log = (sshd["d"] / "sshd.log").read_text()
     assert log.count("Starting session: forced-command (key-option)") == 4 and "subsystem 'sftp'" not in log, log[-3000:]
 
