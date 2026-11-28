@@ -1,16 +1,20 @@
-name: Rehearsal test root for reference initrd v1
+name: Rehearsal test roots for the reference initrds
 
-# REHEARSAL-ONLY (AB#1008). Builds the root disk of the test image that boots reference
-# initrd v1: ops/custom-guest/rehearsal-image/build-ref-root.sh with the cathedral-attest
-# of reference-build run 46063612613 (#808), on two fresh runners. Each lane fails unless
-# base.tar, root.raw, root_verity and root_data_bytes match the values pinned in the script,
-# and the compare job requires byte-identical outputs from both. GitHub-hosted only.
+# REHEARSAL-ONLY (AB#1008, AB#1027). Builds the root disks of the test images:
+# ops/custom-guest/rehearsal-image/build-ref-root.sh with the cathedral-attest of
+# reference-build run 46063612613 (#808), each variant on two fresh runners.
+# - v1: the root that boots reference initrd v1 and v2 (run 6, run 7). Each lane fails unless
+#   base.tar, root.raw, root_verity and root_data_bytes match the values pinned in the script.
+# - stock-systemd (run 7b): v1's base plus dbus and udev, with the guest network handed to
+#   systemd-networkd (stock_systemd.py). check_stock_root.py must pass on it and fail on v1.
+# The compare job requires byte-identical outputs from both lanes of a variant. GitHub-hosted only.
 
 on:
   pull_request:
     paths:
       - "ops/custom-guest/rehearsal-image/build-ref-root.sh"
       - "ops/custom-guest/rehearsal-image/check_stock_root.py"
+      - "ops/custom-guest/rehearsal-image/stock_systemd.py"
       - "scripts/build_custom_guest_root.py"
       - "room-kit/custom_guest_initrd.py"
       - ".github/workflows/rehearsal-ref-root.yml"
@@ -29,13 +33,16 @@ defaults:
 
 jobs:
   root:
-    name: Rehearsal root (${{ matrix.lane }})
+    name: Rehearsal root (${{ matrix.variant }}, ${{ matrix.lane }})
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        variant: [v1, stock-systemd]
         lane: [first, second]
+    env:
+      VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -48,41 +55,73 @@ jobs:
           path: ${{ runner.temp }}/reference
       - name: Build the base and the root (the root twice, identical)
         run: |
-          bash ops/custom-guest/rehearsal-image/build-ref-root.sh "$RUNNER_TEMP/reference/cathedral-attest" "$RUNNER_TEMP/ref-root"
+          bash ops/custom-guest/rehearsal-image/build-ref-root.sh "$RUNNER_TEMP/reference/cathedral-attest" "$RUNNER_TEMP/ref-root" "$VARIANT"
           echo "image: $ImageOS $ImageVersion" >> "$RUNNER_TEMP/ref-root/tool-versions.txt"
+      - name: The v1 root is unchanged by the stock-systemd variant
+        # The reference recipe's customize hook is unused for v1: its root must stay e674d5a5,
+        # the root of runs 6 and 7, byte for byte (build-ref-root.sh checks it too).
+        if: matrix.variant == 'v1'
+        run: |
+          echo "e674d5a55bc8ffdce0a04ec291ac70793e730d4f7428d403d46a9f380f36fdf9  $RUNNER_TEMP/ref-root/root.raw" | sha256sum -c -
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ref-root-${{ matrix.lane }}
+          name: ref-root-${{ matrix.variant }}-${{ matrix.lane }}
           path: ${{ runner.temp }}/ref-root/
           if-no-files-found: error
       - name: Stock-systemd root check (run 7b)
         # Run 7b needs a root in which reference initrd v2 can show dbus and networkd active:
         # dbus, udev and networkd enabled and the guest network written at boot, with
-        # cathedral-attest and the sshd rules kept. The v1 root has no dbus and masks networkd.
-        run: python3 -I ops/custom-guest/rehearsal-image/check_stock_root.py "$RUNNER_TEMP/ref-root/root.raw"
+        # cathedral-attest and the sshd rules kept. It must pass on stock-systemd. On v1, which
+        # has no dbus and masks networkd, it must fail on exactly that.
+        run: |
+          set +e
+          python3 -I ops/custom-guest/rehearsal-image/check_stock_root.py "$RUNNER_TEMP/ref-root/root.raw" > "$RUNNER_TEMP/rootcheck.txt"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/rootcheck.txt"
+          if [ "$VARIANT" = stock-systemd ]; then
+            [ "$rc" = 0 ] || { echo "the stock-systemd root must pass the check" >&2; exit 1; }
+            exit 0
+          fi
+          [ "$rc" = 1 ] || { echo "the v1 root must fail the check (exit $rc)" >&2; exit 1; }
+          for line in "ROOTCHECK: FAIL usr/bin/dbus-daemon: missing, so there is no system bus" \
+                      "ROOTCHECK: FAIL etc/systemd/system/systemd-networkd.service: masked"; do
+            grep -qxF "$line" "$RUNNER_TEMP/rootcheck.txt" || { echo "the v1 root must fail on: $line" >&2; exit 1; }
+          done
+          if grep -E '^ROOTCHECK: FAIL .*(cathedral-attest|report-helper|sshd|requires)' "$RUNNER_TEMP/rootcheck.txt"; then
+            echo "the v1 root fails a rule it must keep" >&2; exit 1
+          fi
+          echo "v1: fails on dbus and networkd, as expected"
 
   compare:
-    name: Both lanes identical
+    name: Both lanes identical (${{ matrix.variant }})
     needs: root
     runs-on: ubuntu-26.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [v1, stock-systemd]
+    env:
+      VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: ref-root-*
+          pattern: ref-root-${{ matrix.variant }}-*
           path: ${{ runner.temp }}/lanes
       - name: Require byte-identical base.tar, root.raw and root-build.json
         working-directory: ${{ runner.temp }}/lanes
         run: |
-          for f in base.tar root.raw root-build.json base-files.txt InRelease; do
-            cmp "ref-root-first/$f" "ref-root-second/$f"
+          for f in base.tar root.raw root-build.json base-files.txt InRelease variant; do
+            cmp "ref-root-$VARIANT-first/$f" "ref-root-$VARIANT-second/$f"
           done
-          cat ref-root-first/root-build.json
+          cat "ref-root-$VARIANT-first/root-build.json"
           echo
-          cat ref-root-first/SHA256SUMS
-          diff ref-root-first/tool-versions.txt ref-root-second/tool-versions.txt || true
+          cat "ref-root-$VARIANT-first/SHA256SUMS"
+          diff "ref-root-$VARIANT-first/tool-versions.txt" "ref-root-$VARIANT-second/tool-versions.txt" || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rehearsal-ref-root
-          path: ${{ runner.temp }}/lanes/ref-root-first/
+          # v1 keeps the artifact name runs 6 and 7 took their root from.
+          name: ${{ matrix.variant == 'v1' && 'rehearsal-ref-root' || 'rehearsal-ref-root-stock-systemd' }}
+          path: ${{ runner.temp }}/lanes/ref-root-${{ matrix.variant }}-first/
           if-no-files-found: error

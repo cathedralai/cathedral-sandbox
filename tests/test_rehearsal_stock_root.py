@@ -8,6 +8,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 CHECK = REPO / "ops" / "custom-guest" / "rehearsal-image" / "check_stock_root.py"
 
@@ -20,6 +22,7 @@ def _load(name, path):
 
 
 check = _load("check_stock_root", CHECK)
+stock = _load("stock_systemd", REPO / "ops" / "custom-guest" / "rehearsal-image" / "stock_systemd.py")
 recipe = _load("custom_root_recipe_for_check", REPO / "scripts" / "build_custom_guest_root.py")
 HELPER = b"helper"
 HELPER_SHA = hashlib.sha256(HELPER).hexdigest()
@@ -60,31 +63,24 @@ def _v1_root(tmp_path):
     return root
 
 
-def _stock_root(tmp_path):
-    """What the stock-systemd variant must leave: the v1 root plus dbus and udev, networkd
-    unmasked and enabled, and the network written at boot."""
-    root = _v1_root(tmp_path)
-    for unit in ("systemd-networkd.service", "systemd-networkd.socket"):
-        (root / ETC / unit).unlink()
+def _packages(root):
+    """What dbus and udev install in the base (vendor units and links, binaries, users)."""
     for unit in ("dbus.service", "dbus.socket", "systemd-udevd.service", "systemd-udevd-kernel.socket",
-                 "systemd-udevd-control.socket"):
+                 "systemd-udevd-control.socket", "systemd-udev-trigger.service"):
         _file(root, f"{LIB}/{unit}")
-    _link(root, f"{LIB}/sockets.target.wants/dbus.socket", "../dbus.socket")
     _link(root, f"{LIB}/sockets.target.wants/systemd-udevd-kernel.socket", "../systemd-udevd-kernel.socket")
     _file(root, "usr/bin/dbus-daemon", b"\x7fELFdbus", 0o755)
     _file(root, "usr/bin/udevadm", b"\x7fELFudev", 0o755)
     _link(root, "usr/lib/systemd/systemd-udevd", "../../bin/udevadm")
     with (root / "etc/passwd").open("a") as passwd:
         passwd.write("messagebus:x:100:101::/nonexistent:/usr/sbin/nologin\n")
-    _link(root, "etc/systemd/network/99-default.link", "/dev/null")
-    _link(root, f"{ETC}/multi-user.target.wants/systemd-networkd.service", "/lib/systemd/system/systemd-networkd.service")
-    _link(root, f"{ETC}/sockets.target.wants/systemd-networkd.socket", "/lib/systemd/system/systemd-networkd.socket")
-    _file(root, f"{ETC}/cathedral-network.service",
-          "[Unit]\nBefore=systemd-networkd.service cathedral-sshd.service\n\n[Service]\nType=oneshot\n"
-          "EnvironmentFile=/run/cathedral/network.env\n" + check.WRITER_EXEC + "\nRemainAfterExit=yes\n")
-    _file(root, "usr/lib/cathedral/write-network", "#!/bin/sh\n", 0o755)
-    _file(root, f"{ETC}/systemd-networkd.service.d/10-cathedral.conf",
-          "[Unit]\nWants=cathedral-network.service\nAfter=cathedral-network.service\n")
+
+
+def _stock_root(tmp_path):
+    """The v1 base plus the dbus and udev packages, through the recipe and customize()."""
+    root = _v1_root(tmp_path)
+    _packages(root)
+    stock.customize(root)
     return root
 
 
@@ -160,3 +156,60 @@ def test_another_attest_or_sshd_config_fails(tmp_path):
     lines = _run(root).stdout.splitlines()
     assert f"ROOTCHECK: FAIL usr/bin/cathedral-attest: not {HELPER_SHA}" in lines
     assert "ROOTCHECK: FAIL etc/ssh/cathedral_sshd_config: differs from the reference recipe's" in lines
+
+
+def test_customize_enables_what_the_packages_left_off_and_keeps_vendor_links(tmp_path):
+    root = _stock_root(tmp_path)
+    etc = root / ETC
+    # The package enabled the kernel socket in usr/lib: no second link in etc.
+    assert not (etc / "sockets.target.wants/systemd-udevd-kernel.socket").is_symlink()
+    for name, target in (("sockets.target.wants/dbus.socket", "/lib/systemd/system/dbus.socket"),
+                         ("sockets.target.wants/systemd-udevd-control.socket", "/lib/systemd/system/systemd-udevd-control.socket"),
+                         ("sysinit.target.wants/systemd-udev-trigger.service", "/lib/systemd/system/systemd-udev-trigger.service"),
+                         ("multi-user.target.wants/systemd-networkd.service", "/lib/systemd/system/systemd-networkd.service"),
+                         ("sockets.target.wants/systemd-networkd.socket", "/lib/systemd/system/systemd-networkd.socket"),
+                         ("dbus-org.freedesktop.network1.service", "/lib/systemd/system/systemd-networkd.service")):
+        assert os.readlink(etc / name) == target, name
+    assert os.readlink(root / "etc/systemd/network/99-default.link") == "/dev/null"
+    assert (root / "usr/lib/cathedral/write-network").stat().st_mode & 0o777 == 0o755
+
+
+def test_customize_refuses_a_base_without_dbus(tmp_path):
+    root = _v1_root(tmp_path)
+    with pytest.raises(ValueError, match="missing usr/bin/dbus-daemon"):
+        stock.customize(root)
+
+
+def _writer(tmp_path):
+    out = tmp_path / "run-network"
+    script = tmp_path / "write-network"
+    script.write_text(stock.WRITE_NETWORK.replace("dir=/run/systemd/network", f"dir={out}"))
+    return script, out
+
+
+def test_write_network_writes_the_guest_network_from_three_words(tmp_path):
+    script, out = _writer(tmp_path)
+    subprocess.run(["sh", str(script), "eth0", "10.217.0.2/30", "10.217.0.1"], check=True)
+    network = out / "10-cathedral.network"
+    assert network.read_text() == ("[Match]\nName=eth0\n\n[Link]\nRequiredForOnline=yes\n\n[Network]\n"
+                                   "Address=10.217.0.2/30\nGateway=10.217.0.1\nDHCP=no\n"
+                                   "LinkLocalAddressing=no\nIPv6AcceptRA=no\n")
+    assert network.stat().st_mode & 0o777 == 0o644
+    assert [p.name for p in out.iterdir()] == ["10-cathedral.network"]
+
+
+@pytest.mark.parametrize("args", [
+    ("eth0;x", "10.217.0.2/30", "10.217.0.1"),
+    ("eth0", "10.217.0.2/33", "10.217.0.1"),
+    ("eth0", "10.217.0.2", "10.217.0.1"),
+    ("eth0", "10.217.0.2/30/1", "10.217.0.1"),
+    ("eth0", "256.217.0.2/30", "10.217.0.1"),
+    ("eth0", "10.217.0.2/30", "10.217.0"),
+    ("eth0", "10.217.0.2/30", "10.217.0.1\nDNS=x"),
+    ("eth0", "10.217.0.2/30"),
+])
+def test_write_network_refuses_any_other_shape_and_writes_nothing(tmp_path, args):
+    script, out = _writer(tmp_path)
+    r = subprocess.run(["sh", str(script), *args], capture_output=True, text=True)
+    assert r.returncode == 2 and r.stderr.startswith("write-network: ")
+    assert not out.exists() or not any(out.iterdir())

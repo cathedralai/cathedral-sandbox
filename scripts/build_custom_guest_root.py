@@ -214,8 +214,9 @@ def pinned_binary(path, sha):
     return data
 
 
-def build(base, base_sha, helper_path, helper_sha, epoch, output, data=None, cryptsetup=None):
-    """data and cryptsetup are optional (path, sha256) pairs, given together for a data-disk image."""
+def build(base, base_sha, helper_path, helper_sha, epoch, output, data=None, cryptsetup=None, customize=None):
+    """data and cryptsetup are optional (path, sha256) pairs, given together for a data-disk image.
+    customize(root), if given, runs after configure() and before mksquashfs (rehearsal variants)."""
     checked(base, base_sha)
     helper = pinned_binary(helper_path, helper_sha)
     if (data is None) != (cryptsetup is None):
@@ -239,6 +240,8 @@ def build(base, base_sha, helper_path, helper_sha, epoch, output, data=None, cry
         checked(pinned_base, base_sha)
         extract(pinned_base, root)
         configure(root, helper, helper_sha, data_bytes, cryptsetup_bytes)
+        if customize is not None:
+            customize(root)
         image = scratch / 'root.raw'
         run(['mksquashfs', str(root), str(image), '-noappend', '-all-root', '-no-xattrs',
              '-comp', 'zstd', '-processors', '1', '-mkfs-time', str(epoch), '-all-time', str(epoch), '-no-progress'])

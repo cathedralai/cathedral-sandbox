@@ -206,7 +206,8 @@ def problems(root, attest_sha256=ATTEST_SHA256):
     # udev: networkd waits for it once /sys is read-write.
     if not elf(root, "usr/lib/systemd/systemd-udevd"):
         fail("usr/lib/systemd/systemd-udevd: missing, so networkd leaves every link pending udev")
-    for unit in ("systemd-udevd.service", "systemd-udevd-kernel.socket", "systemd-udevd-control.socket"):
+    for unit in ("systemd-udevd.service", "systemd-udevd-kernel.socket", "systemd-udevd-control.socket",
+                 "systemd-udev-trigger.service"):
         where = masked(root, unit)
         if where:
             fail(f"{where}/{unit}: masked")
@@ -214,6 +215,9 @@ def problems(root, attest_sha256=ATTEST_SHA256):
             fail(f"{LIB}/{unit}: missing")
     if not enabled(root, "systemd-udevd-kernel.socket", "sockets.target"):
         fail("sockets.target.wants/systemd-udevd-kernel.socket: missing, so udevd does not start at boot")
+    # eth0 appeared before udevd started: only the coldplug trigger gives it a udev entry.
+    if not enabled(root, "systemd-udev-trigger.service", "sysinit.target"):
+        fail("sysinit.target.wants/systemd-udev-trigger.service: missing, so links present at boot stay pending udev")
     if link_target(root / "etc/systemd/network/99-default.link") != "/dev/null":
         fail("etc/systemd/network/99-default.link: not masked, so udev may rename the interface network.env names")
 
