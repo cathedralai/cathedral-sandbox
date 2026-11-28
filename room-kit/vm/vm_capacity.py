@@ -690,6 +690,26 @@ def custom_guest_reasons() -> list[str]:
     return reasons
 
 
+def custom_guest_folders() -> list[dict]:
+    """Owner launch folders left on the host (Q5: a returned launch keeps its folder until the 72 h wipe).
+
+    Their blocks are already out of every file system's avail (statvfs), so each rule above counts them; no unit can
+    write the folder after the return's R15, so it has no growth to add. Listed so the ledger shows what holds the
+    space until the wipe.
+    """
+    out = []
+    for d in sorted(hp(CUSTOM_GUEST_ROOT).glob("*/cg-*")):
+        if d.is_symlink() or not d.is_dir():
+            continue
+        held = os.lstat(d).st_blocks * 512
+        for top, dirs, files in os.walk(d, followlinks=False):
+            for name in dirs + files:
+                with contextlib.suppress(OSError):
+                    held += os.lstat(os.path.join(top, name)).st_blocks * 512
+        out.append({"hotel": d.parent.name, "launch": d.name, "device": os.lstat(d).st_dev, "bytes": held})
+    return out
+
+
 def refuse_custom_guest_host() -> None:
     reasons = custom_guest_reasons()
     if reasons:
@@ -832,14 +852,20 @@ def report(broker: dict[str, int] | None = None) -> dict:
         by_dev.setdefault(device_of(f.path), []).append(f)
     vm_dev = device_of(vm_root())
     by_dev.setdefault(vm_dev, [])
+    folders = custom_guest_folders()
+    for f in folders:
+        by_dev.setdefault(f["device"], [])
     filesystems = []
     vm_disk_share = None
     for dev, files in sorted(by_dev.items()):
-        probe = files[0].path if files else vm_root()
+        held = [f for f in folders if f["device"] == dev]
+        probe = files[0].path if files else hp(CUSTOM_GUEST_ROOT) / held[0]["hotel"] if held else vm_root()
         avail, reserve = fs_avail(probe), led.reserve_bytes(dev)
         grow = sum(f.remaining() for f in files)
         filesystems.append({"device": dev, "avail_mib": mib(avail), "growth_mib": mib(grow),
                             "reserve_mib": mib(reserve), "left_mib": mib(avail - grow - reserve),
+                            # Already out of avail: shown, not subtracted twice.
+                            "custom_guest_mib": mib(sum(f["bytes"] for f in held)),
                             "files": [{"path": str(f.path), "owner": f.owner,
                                        "growth_mib": mib(f.remaining())} for f in files]})
         if dev == vm_dev:
@@ -877,6 +903,7 @@ def report(broker: dict[str, int] | None = None) -> dict:
         "filesystems": filesystems,
         "vm_share": share,
         "custom_guest_host": custom_guest_reasons(),
+        "custom_guest_folders": [{k: f[k] for k in ("hotel", "launch", "bytes")} for f in folders],
     }
     if broker:
         over = []

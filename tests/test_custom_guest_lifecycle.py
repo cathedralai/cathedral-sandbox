@@ -12,6 +12,7 @@ effect applied once: one kit stop, one tuple move per fence, one boot per
 generation."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -58,7 +59,8 @@ if fail:
     r = {"ok": False, "error_code": fail, "detail": "injected"}
 elif phase == "facts":
     r = {"ok": True, "kit_unit": dict(kit), "kit_absent": kit["state"] != "active", "custom_unit": h["custom_unit"],
-         "marker": h["marker"], "launch_dir": h["launch_dir"], "journal": h["journal"], "boot_id": h["boot_id"],
+         "marker": h["marker"], "launch_dir": h["launch_dir"], "launch_dir_bytes": 21 << 30 if h["launch_dir"] else 0,
+         "journal": h["journal"], "boot_id": h["boot_id"],
          "inbox_dir": h["inbox"], "staging_dir": h["staging"]}
 elif phase == "inbox":
     h["inbox"] = True
@@ -245,6 +247,8 @@ class World:
         self.stopped_at: float | None = None
         self.wipe_started_at: float | None = None
         self.wiped_at: float | None = None
+        self.returned_at: float | None = None
+        self.launch_dir_bytes: int | None = None
         self.old_api = False         # an API before the stop clock: no wipe fields in the record, no wipe route
         self.nonce = 0
         self.calls: list[str] = []
@@ -260,16 +264,24 @@ class World:
     def wipe_ok(self) -> bool:
         """The API's rule: the owner's last return request waives the notice and was sent at or after the stop,
         or 72 h passed since the stop. Requests a test writes by hand carry no "at" and count as sent after it."""
-        rec = self.record
-        if rec["state"] not in ("held", "stopped", "returning", "returned"):
+        if self.record["state"] not in ("held", "stopped", "returning", "returned"):
             return False
-        for r in reversed(rec.get("owner_requests") or []):
+        return self.waived() or (self.stopped_at is not None and self.clock() >= self.stopped_at + 72 * 3600)
+
+    def waived(self) -> bool:
+        for r in reversed(self.record.get("owner_requests") or []):
             if r.get("action") == "return":
-                if r.get("waive_notice") is True and (self.stopped_at is None or r.get("at") is None
-                                                      or r["at"] >= self.stopped_at):
-                    return True
-                break
-        return self.stopped_at is not None and self.clock() >= self.stopped_at + 72 * 3600
+                return r.get("waive_notice") is True and (self.stopped_at is None or r.get("at") is None
+                                                          or r["at"] >= self.stopped_at)
+        return False
+
+    def wipe_overdue_at(self) -> float | None:
+        """An hour after the later of the return and the first moment the wipe was allowed (the API's rule)."""
+        if self.record["state"] != "returned" or self.wiped_at is not None:
+            return None
+        starts = ([self.returned_at or 0.0] if self.waived() else []) + \
+                 ([self.stopped_at + 72 * 3600] if self.stopped_at is not None else [])
+        return max(min(starts), self.returned_at or 0.0) + 3600 if starts else None
 
     def record_view(self) -> dict:
         if self.old_api:
@@ -278,18 +290,27 @@ class World:
         def stamp(t: float | None) -> str | None:  # the API's isoformat
             return None if t is None else time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(t))
 
+        overdue_at = self.wipe_overdue_at()
         return {**self.record, "stopped_at": stamp(self.stopped_at), "wipe_due_at": stamp(due),
                 "wipe_ok": self.wipe_ok(), "wipe_started_at": stamp(self.wipe_started_at),
-                "wiped_at": stamp(self.wiped_at)}
+                "wiped_at": stamp(self.wiped_at), "returned_at": stamp(self.returned_at),
+                "launch_dir_bytes": self.launch_dir_bytes, "wipe_overdue_at": stamp(overdue_at),
+                "wipe_overdue": overdue_at is not None and self.clock() >= overdue_at}
 
     def wipe(self, body: dict) -> tuple[int, dict]:
         if self.old_api:
             return 404, {"error": "not_found"}
-        if not isinstance(body, dict) or set(body) != {"to"} or body["to"] not in ("started", "done"):
+        kept = isinstance(body, dict) and body.get("to") == "kept"
+        if not isinstance(body, dict) or set(body) != ({"to", "launch_dir_bytes"} if kept else {"to"}) \
+                or body["to"] not in ("kept", "started", "done"):
             return shape("wipe body")
         if self.record["state"] != "returned":
             return conflict(f"the launch is {self.record['state']}")
-        if body["to"] == "started":
+        if kept:
+            if self.wiped_at is not None:
+                return conflict("already wiped")
+            self.launch_dir_bytes = body["launch_dir_bytes"]
+        elif body["to"] == "started":
             if self.wipe_started_at is None:
                 if not self.wipe_ok():
                     return 409, {"error": "custom_guest_notice_pending", "message": "wipe not before the notice ends"}
@@ -299,6 +320,7 @@ class World:
                 return conflict("send started before done")
             if self.wiped_at is None:
                 self.wiped_at = self.clock()
+                self.launch_dir_bytes = 0
         return 200, {"changed": True, "launch": self.record_view()}
 
     def view(self) -> dict:
@@ -431,6 +453,8 @@ class World:
             self.stopped_at = self.clock()
         elif to == "booting" and frm != "booting":
             self.stopped_at = None
+        if to == "returned" and frm != "returned":
+            self.returned_at = self.clock()
         for k in ("error_code", "error_detail"):
             if k in fields:
                 rec[k] = fields[k]
@@ -1122,29 +1146,132 @@ def overdue(out: dict) -> bool:
     return any(a.startswith("custom_guest_wipe_overdue") for a in out.get("alerts", []))
 
 
-def test_reconcile_alerts_on_an_overdue_wipe(rig):
+def tagged(rig: Rig, code: str) -> list[str]:
+    """The OPS-ALERT journal lines the last run wrote (stderr; systemd keeps it in the unit's journal)."""
+    return [ln for ln in rig.stderr.splitlines()
+            if ln.startswith(f"OPS-ALERT custom_guest hotel={HOTEL} launch={LAUNCH} {code}")]
+
+
+def test_reconcile_alerts_on_an_overdue_wipe_on_the_apis_clock(rig):
     held(rig)
     rig.world.record["owner_requests"] = []
     assert rig.run("return")[0] == 0
     rc, out = rig.run("reconcile")
-    assert not overdue(out), out  # inside the 72 h: nothing is late
-    rig.world.stopped_at = time.time() - 72 * 3600 - 1800  # due 30 min ago: the sweeper's window
+    assert not overdue(out) and not tagged(rig, "custom_guest_wipe_overdue"), out  # inside the 72 h
+    rig.world.skew = 72 * 3600 + 1800  # allowed 30 min ago: the sweeper's hour
     rc, out = rig.run("reconcile")
     assert not overdue(out), out
-    rig.world.stopped_at = time.time() - 74 * 3600  # due 2 h ago
+    rig.world.skew = 73 * 3600 + 300
     rc, out = rig.run("reconcile")
     assert rc == 2 and overdue(out), out
+    [line] = tagged(rig, "custom_guest_wipe_overdue")
+    assert f"{21 << 30} bytes" in line  # the bytes R15k reported
 
 
 def test_reconcile_alerts_when_a_waiver_wipe_did_not_finish(rig):
     held(rig)  # the owner waived after the stop
-    rig.set_host(fail={"wipe": "custom_guest_hold_failed"})
+    rig.set_host(fail={"wipe": "custom_guest_wipe_unsafe"})
     rc, out = rig.run("return")
-    assert rc == 1 and rig.world.record["state"] == "returned" and rig.world.wipe_started_at is not None, out
+    assert rc == 1 and out["error_code"] == "custom_guest_wipe_unsafe", out
+    assert rig.world.record["state"] == "returned" and rig.world.wipe_started_at is not None
     rig.set_host(fail={})
     rc, out = rig.run("reconcile")
-    assert rc == 2 and overdue(out), out
+    assert not overdue(out), out  # the API gives the sweeper an hour after the return
+    rig.world.skew = 3600 + 120
+    rc, out = rig.run("reconcile")
+    assert rc == 2 and overdue(out) and tagged(rig, "custom_guest_wipe_overdue"), out
     assert rig.run("wipe")[0] == 0 and rig.host()["launch_dir"] is False and rig.world.wiped_at is not None
+
+
+def test_r15_reports_the_folders_bytes_and_done_zeroes_them(rig):
+    held(rig)
+    rig.world.record["owner_requests"] = []
+    assert rig.run("return")[0] == 0
+    assert rig.world.launch_dir_bytes == 21 << 30
+    rig.world.skew = 72 * 3600 + 60
+    assert rig.run("wipe")[0] == 0 and rig.world.launch_dir_bytes == 0
+
+
+def test_a_launch_an_older_script_returned_is_recorded_as_wiped_after_the_notice(rig):
+    """The older R15 removed the folder: the sweep reports 0 bytes, then records the wipe once allowed."""
+    held(rig)
+    rig.world.record["owner_requests"] = []
+    assert rig.run("return")[0] == 0
+    rig.world.launch_dir_bytes = None
+    rig.set_host(launch_dir=False)
+    assert rig.run("wipe")[0] == 0 and rig.world.launch_dir_bytes == 0 and rig.world.wiped_at is None
+    rig.world.skew = 72 * 3600 + 60
+    assert rig.run("wipe")[0] == 0 and rig.world.wiped_at is not None
+    assert "wipe" not in rig.host()["calls"]  # nothing to remove on the host
+
+
+def test_the_sweeper_reconciles_and_wipes_without_a_launch_id(rig):
+    held(rig)
+    rig.world.record["owner_requests"] = []
+    assert rig.run("return")[0] == 0
+    rc, out = rig.run("sweep", "--what", "wipe", launch=False)
+    assert rc == 0 and out["launches"] == [{"launch_id": LAUNCH, "state": "returned", "rc": 0}], out
+    assert rig.host()["launch_dir"] is True  # not due: nothing sent
+    rig.world.skew = 73 * 3600 + 300
+    rc, out = rig.run("sweep", "--what", "reconcile", launch=False)
+    assert rc == 2 and tagged(rig, "custom_guest_wipe_overdue"), out
+    rc, out = rig.run("sweep", "--what", "wipe", launch=False)
+    assert rc == 0 and rig.host()["launch_dir"] is False and rig.world.wiped_at is not None, out
+    rc, out = rig.run("sweep", "--what", "reconcile", launch=False)
+    assert rc == 0 and out["launches"] == [], out  # returned and wiped: finished
+
+
+def test_the_sweeper_turns_a_refusal_into_a_tagged_line(rig):
+    held(rig)
+    rig.world.record["owner_requests"] = []
+    assert rig.run("return")[0] == 0
+    rig.world.skew = 72 * 3600 + 60
+    rig.set_host(fail={"wipe": "custom_guest_wipe_unsafe"})
+    rc, out = rig.run("sweep", "--what", "wipe", launch=False)
+    assert rc == 2 and tagged(rig, "custom_guest_wipe_unsafe"), (out, rig.stderr)
+    assert rig.host()["launch_dir"] is True
+
+
+def test_the_sweeper_skips_while_a_step_holds_the_lock_and_a_step_waits_for_it(rig):
+    held(rig)
+    d = rig.home / HOTEL
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "op.lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        rc, out = rig.run("sweep", "--what", "reconcile", launch=False)
+        assert rc == 0 and out.get("skipped"), out
+        rc, out = rig.run("reconcile", CG_OP_LOCK_WAIT="1")
+        assert rc == 1 and out["error_code"] == "custom_guest_lifecycle_busy", out
+    assert rig.run("reconcile")[0] == 0
+
+
+def fake_tools(rig: Rig, timers: str, journal: str) -> dict:
+    b = rig.tmp / "bin"
+    b.mkdir(exist_ok=True)
+    (b / "systemctl").write_text(f"#!/bin/sh\necho {timers}\n")
+    (b / "journalctl").write_text("#!/bin/sh\ncat <<'EOF'\n" + journal + "EOF\n")
+    for t in ("systemctl", "journalctl"):
+        (b / t).chmod(0o755)
+    return {"PATH": f"{b}:{os.environ['PATH']}"}
+
+
+def test_check_is_read_only_and_reports_overdue_wipes_timers_and_tagged_lines(rig):
+    held(rig)
+    rig.world.record["owner_requests"] = []
+    assert rig.run("return")[0] == 0
+    calls = len(rig.host()["calls"])
+    rc, out = rig.run("check", launch=False, **fake_tools(rig, "active", "a quiet line\n"))
+    assert rc == 0 and out["alerts"] == 0 and out["notes"] == [], (out, rig.stderr)
+    rig.world.skew = 73 * 3600 + 300
+    line = f"OPS-ALERT custom_guest hotel={HOTEL} launch={LAUNCH} custom_guest_wipe_unsafe: x\n"
+    p = subprocess.run([sys.executable, str(OP), "check", "--hotel", HOTEL], capture_output=True, text=True,
+                       env=rig.env(**fake_tools(rig, "inactive", line)), timeout=60)
+    lines = p.stdout.splitlines()
+    assert p.returncode == 2, p.stdout
+    assert any("custom_guest_wipe_overdue" in x for x in lines if x.startswith("OPS-ALERT"))
+    assert any("custom_guest_sweeper_down" in x for x in lines if x.startswith("OPS-ALERT"))
+    assert line.strip() in lines
+    assert len(rig.host()["calls"]) == calls and rig.host()["launch_dir"] is True  # sent nothing anywhere
 
 
 def test_the_notice_sent_at_option_is_gone(rig):

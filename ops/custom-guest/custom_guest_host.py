@@ -921,6 +921,7 @@ def ph_facts(ctx: Ctx) -> dict:
             "kit_absent": kit_absent(ctx), "kit_net_timer": {"active": active(ctx.kit_net_timer),
                                                              "enabled": enabled(ctx.kit_net_timer)},
             "custom_unit": custom, "marker": marker_doc(ctx), "launch_dir": os.path.isdir(ctx.d),
+            "launch_dir_bytes": tree_bytes(ctx.d) if os.path.isdir(ctx.d) else 0,
             "inbox_dir": os.path.isdir(f"{ctx.base}/inbox/{ctx.launch}"),
             "staging_dir": os.path.isdir(f"{ctx.base}/staging/{ctx.launch}"),
             "journal": [e for e in ctx.entries() if e.get("event") != "sub"], "boot_id": boot_id(),
@@ -1634,6 +1635,66 @@ def ph_return_finish(ctx: Ctx) -> dict:
     return {"ok": True}
 
 
+def tree_bytes(path: str) -> int:
+    """Blocks a folder holds on its file system (what the disk ledger loses to it), never following a link."""
+    total = 0
+    for top, dirs, files in os.walk(path, followlinks=False):
+        for name in dirs + files:
+            try:
+                total += os.lstat(os.path.join(top, name)).st_blocks * 512
+            except OSError:
+                pass
+    try:
+        total += os.lstat(path).st_blocks * 512
+    except OSError:
+        pass
+    return total
+
+
+def uid_of(name: str) -> int | None:
+    r = run(["getent", "passwd", name])
+    fields = r.stdout.strip().split(":") if r.returncode == 0 else []
+    return int(fields[2]) if len(fields) > 2 and fields[0] == name and fields[2].isdigit() else None
+
+
+def wipe_target(ctx: Ctx) -> str | None:
+    """The one folder `wipe` may remove: /srv/custom-guest/<hotel>/<launch> exactly, as intake made it.
+
+    Every part of the path is a real directory (no link anywhere, and its real path is the fixed one), the folder
+    belongs to this tool's user (root on a host) and is not group or world writable, and the guest's folders in it
+    belong to cg-<hotel>. None: nothing is there. shutil.rmtree then removes it without following a link inside
+    (its fd-based walk; refused where the platform lacks one).
+    """
+    parts = ["srv", "custom-guest", ctx.hotel, ctx.launch]
+    for i in range(1, len(parts) + 1):
+        path = p("/" + "/".join(parts[:i]))
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise Halt("custom_guest_wipe_unsafe", f"{path} is not a plain directory (a link or a file)")
+    fixed = os.path.join(os.path.realpath(ROOT or "/"), *parts)
+    if os.path.realpath(ctx.d) != fixed:
+        raise Halt("custom_guest_wipe_unsafe", f"{ctx.d} resolves to {os.path.realpath(ctx.d)}, not {fixed}")
+    st = os.lstat(ctx.d)
+    if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise Halt("custom_guest_wipe_unsafe", f"{ctx.d} is not this tool's folder (uid {st.st_uid}, mode "
+                                               f"{stat.S_IMODE(st.st_mode):o})")
+    guest = uid_of(ctx.user)
+    for name in ("disks", "run"):
+        try:
+            sub_st = os.lstat(f"{ctx.d}/{name}")
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(sub_st.st_mode) or sub_st.st_uid != guest:
+            raise Halt("custom_guest_wipe_unsafe", f"{ctx.d}/{name} is not a directory of {ctx.user} "
+                                                   f"(uid {sub_st.st_uid}, {ctx.user} is {guest})")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise Halt("custom_guest_wipe_unsafe", "this platform's rmtree can follow a link swapped in mid-walk")
+    return ctx.d
+
+
 def ph_wipe(ctx: Ctx) -> dict:
     """Q5: remove the owner's launch folder after the return, once the operator has the API's go (wipe started).
 
@@ -1645,7 +1706,8 @@ def ph_wipe(ctx: Ctx) -> dict:
     doc = marker_doc(ctx)
     if doc and doc.get("launch_id") == ctx.launch:
         raise Halt("custom_guest_journal_behind", "the marker still names this launch: finish R15 first")
-    sub(ctx, "launch_wiped", lambda: not os.path.exists(ctx.d), lambda: shutil.rmtree(ctx.d))
+    target = wipe_target(ctx)
+    sub(ctx, "launch_wiped", lambda: not os.path.lexists(ctx.d), lambda: shutil.rmtree(target))
     return {"ok": True}
 
 

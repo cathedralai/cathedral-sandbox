@@ -14,6 +14,9 @@ Steps (each one verify-before-act; a rerun resumes from the journal):
   return      held|stopped -> returning -> returned (R0 to R15; the owner's folder is wiped now only on a
               waiver sent after the stop, else by `wipe`)
   wipe        returned: remove the owner's launch folder once the API allows it (72 h after the stop, Q5)
+  sweep       the operator timers (ops/custom-guest/systemd): --what reconcile (every minute) or wipe (every
+              15 min) over every unfinished launch of the hotel; no --launch-id; alerts are OPS-ALERT lines
+  check       read only, for a heartbeat: overdue wipes, the timers, and the sweeper's OPS-ALERT lines
   resume      rerun the open step of this launch (R15 of an open return whatever the API says)
   reconcile   read both journals, systemd and the record; project exits; watch the hold; alert
   cancel      requested|staged|measured|approved -> cancelled (staged files deleted)
@@ -35,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import fcntl
 import hashlib
 import http.client
 import json
@@ -47,7 +52,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
 
 HOME = os.path.expanduser(os.environ.get("CG_HOME", "~/.cathedral-custom-guest"))
 API = os.environ.get("CG_API_URL", "https://api.polaris.computer").rstrip("/")
@@ -108,16 +112,41 @@ def wipe_pending(rec: dict) -> bool:
     return not rec.get("wiped_at") and (rec.get("wipe_ok") is True or bool(rec.get("wipe_started_at")))
 
 
-def wipe_overdue(rec: dict) -> bool:
-    """The API allows the wipe and the folder is late: by the owner's waiver (allowed before the due time, so the
-    return should have wiped it at R15), or over an hour past the due time (the sweeper's window)."""
-    if not wipe_pending(rec):
-        return False
+ALERT_TAG = "OPS-ALERT"
+
+
+def ops_alert(hotel: str, launch: str, text: str) -> None:
+    """One journal line per alert on the operator machine (systemd keeps the units' stderr), with a fixed tag a
+    heartbeat greps: `OPS-ALERT custom_guest hotel=<h> launch=<l> <alert>`."""
+    print(f"{ALERT_TAG} custom_guest hotel={hotel} launch={launch} {text}", file=sys.stderr, flush=True)
+
+
+LOCK_WAIT = float(os.environ.get("CG_OP_LOCK_WAIT", "120"))
+
+
+@contextlib.contextmanager
+def op_lock(hotel: str, wait: bool):
+    """One step of a hotel at a time on this machine: the sweeper's reconcile and wipe write the same journal as
+    the operator's steps. A step waits up to CG_OP_LOCK_WAIT s; the sweeper does not wait (yields False)."""
+    d = os.path.join(HOME, hotel)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(d, "op.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        due = datetime.fromisoformat(rec["wipe_due_at"]).timestamp()
-    except (KeyError, TypeError, ValueError):
-        return True  # no stop time: only a waiver allows the wipe
-    return time.time() < due or time.time() > due + 3600
+        deadline = time.time() + (LOCK_WAIT if wait else 0)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    if not wait:
+                        yield False
+                        return
+                    raise Blocked("custom_guest_lifecycle_busy", f"another custom-guest.sh step of {hotel} runs here")
+                time.sleep(0.5)
+        yield True
+    finally:
+        os.close(fd)
 
 
 def now_iso() -> str:
@@ -1202,6 +1231,8 @@ class Op:
         self.sub(step, "R15", done, lambda seq: self.host_ok("return-finish", {"record_state": self.record()["state"]}))
         # Q5: the kit is back; the owner's launch folder stays until the API allows the wipe. A waiver sent after
         # the stop allows it now; otherwise `wipe` removes it 72 h after the stop. An API without wipe_ok keeps it.
+        if "wipe_ok" in self.record():
+            self.report_kept(step)
         if wipe_pending(self.record()):
             self.wipe_folder(step)
 
@@ -1211,6 +1242,19 @@ class Op:
         if status != 200:
             raise Blocked(error_code(doc) or "custom_guest_wipe_failed",
                           f"POST wipe {to}: {status} {str(doc.get('message', ''))[:200]}")
+
+    def report_kept(self, step: str) -> None:
+        """R15k: the record shows the folder's bytes on the host while it waits (they hold disk until the wipe)."""
+        def act(seq: int) -> None:
+            f = self.facts()  # no folder (an older script's R15 removed it): 0 bytes held
+            size = int(f.get("launch_dir_bytes") or 0) if f.get("launch_dir") else 0
+            status, doc = self.api.call("POST", f"{ADMIN}/{self.launch}/wipe", {"to": "kept", "launch_dir_bytes": size})
+            if status != 200:
+                raise Blocked(error_code(doc) or "custom_guest_wipe_failed",
+                              f"POST wipe kept: {status} {str(doc.get('message', ''))[:200]}")
+
+        self.sub(step, "R15k", lambda: self.record().get("launch_dir_bytes") is not None
+                 or bool(self.record().get("wiped_at")), act)
 
     def wipe_folder(self, step: str) -> None:
         """W1 ask the API (its clock decides), W2 remove the folder on the host, W3 record it. Each resumes."""
@@ -1228,9 +1272,11 @@ class Op:
         if "wipe_ok" not in rec:
             raise Blocked("custom_guest_notice_pending",
                           "the API record has no wipe_ok (an API before the Q5 stop clock): deploy the API first")
-        if not rec.get("wiped_at") and wipe_pending(rec):
+        if not rec.get("wiped_at") and (wipe_pending(rec) or rec.get("launch_dir_bytes") is None):
             self.begin("wipe")
-            self.wipe_folder("wipe")
+            self.report_kept("wipe")  # a launch an older script returned: its bytes were never reported
+            if wipe_pending(self.record()):
+                self.wipe_folder("wipe")
             self.end("wipe")
             rec = self.record()
         print(json.dumps({"ok": True, "state": rec["state"], "wiped_at": rec.get("wiped_at"),
@@ -1294,8 +1340,9 @@ class Op:
         """Reads only, and projects host facts forward into the record. Starts nothing (5.4)."""
         rec = self.record()
         if int(rec.get("journal_seq") or 0) > self.j.max_seq():
-            print(json.dumps({"ok": False, "error_code": "custom_guest_journal_behind",
-                              "detail": f"API journal_seq {rec.get('journal_seq')} > local {self.j.max_seq()}"}))
+            detail = f"API journal_seq {rec.get('journal_seq')} > local {self.j.max_seq()}"
+            ops_alert(self.hotel, self.launch, f"custom_guest_journal_behind: {detail} (the steps ran on another machine?)")
+            print(json.dumps({"ok": False, "error_code": "custom_guest_journal_behind", "detail": detail}))
             return 3
         alerts: list[str] = []
         f = self.facts()
@@ -1311,9 +1358,9 @@ class Op:
                               f"fence {'kit_down' if want_down else 'fenced'} again")
         if st == "returned" and f.get("marker"):
             alerts.append("R15 open: the marker is still on the host; run resume")
-        if st == "returned" and wipe_overdue(rec):
-            alerts.append(f"custom_guest_wipe_overdue: the launch folder was due for wiping at {rec.get('wipe_due_at')}; "
-                          f"run wipe")
+        if st == "returned" and rec.get("wipe_overdue") is True:
+            alerts.append(f"custom_guest_wipe_overdue: the API allowed the wipe and marks it overdue since "
+                          f"{rec.get('wipe_overdue_at')}; the folder holds {rec.get('launch_dir_bytes')} bytes; run wipe")
         for ev in ("sev_platform_changed", "kit_data_changed", "reboot_required"):
             if self.hj(f, ev):
                 alerts.append(f"host journal: {ev}")
@@ -1340,6 +1387,8 @@ class Op:
                 self.patch(seq, "running", "stopped", {"stop_reason": reason, "error_code": code})
                 self.j.write(self.launch, rec.get("generation"), "reconcile", "project", "done", {"reason": reason})
                 self.close_boots(int(rec.get("generation") or 0))
+        for a in alerts:
+            ops_alert(self.hotel, self.launch, a)
         print(json.dumps({"ok": not alerts, "state": self.record()["state"], "alerts": alerts}))
         return 2 if alerts else 0
 
@@ -1355,10 +1404,98 @@ def step_record_versions(hotel: str, where: list[str], commits: list[str]) -> No
     print(json.dumps({"ok": True, "versions": dict(zip(where, commits))}))
 
 
+# ---------------------------------------------------------------- the sweeper (Q5) and its read-only check
+
+SWEEP_UNITS = ("cathedral-custom-guest-reconcile@{hotel}", "cathedral-custom-guest-wipe@{hotel}")
+
+
+def list_launches(hotel: str) -> list[dict]:
+    try:
+        status, doc = Http(API, ADMIN_KEY_FILE).call("GET", f"{ADMIN}?hotel={hotel}")
+    except Transport as e:
+        raise Blocked("custom_guest_journal_behind", f"the API did not answer: {e}")
+    if status != 200:
+        raise Blocked(error_code(doc) or "custom_guest_not_found", f"API list {status}")
+    items = doc if isinstance(doc, list) else doc.get("launches") or doc.get("items") or doc.get("records") or []
+    return [r for r in items if isinstance(r, dict) and isinstance(r.get("launch_id"), str)]
+
+
+def step_sweep(o: argparse.Namespace) -> int:
+    """The operator timers' entry (ops/custom-guest/systemd): reconcile every launch of the hotel that is not
+    finished (every minute), or wipe every returned launch whose folder is still there (every 15 min). Skips while
+    an operator step of the hotel holds the lock; every alert and every refusal is an OPS-ALERT journal line."""
+    with op_lock(o.hotel, wait=False) as got:
+        if not got:
+            print(json.dumps({"ok": True, "what": o.what, "skipped": "a custom-guest.sh step of this hotel runs"}))
+            return 0
+        try:
+            items = list_launches(o.hotel)
+        except Blocked as e:
+            ops_alert(o.hotel, "-", f"{e.code}: {e.detail}")
+            print(json.dumps({"ok": False, "error_code": e.code, "detail": e.detail}))
+            return 1
+        results = []
+        for r in items:
+            launch, st = r["launch_id"], r.get("state")
+            if st == "cancelled" or (st == "returned" and r.get("wiped_at")):
+                continue
+            if o.what == "wipe" and st != "returned":
+                continue
+            try:
+                op = Op(o.hotel, launch, o)
+                if o.what == "reconcile":
+                    rc = op.step_reconcile()
+                else:
+                    op.step_wipe()
+                    rc = 0
+            except (Blocked, Transport) as e:
+                code, detail = (e.code, e.detail) if isinstance(e, Blocked) else ("custom_guest_journal_behind", str(e))
+                ops_alert(o.hotel, launch, f"{code}: {detail}")
+                rc = 1
+            results.append({"launch_id": launch, "state": st, "rc": rc})
+        bad = any(x["rc"] for x in results)
+        print(json.dumps({"ok": not bad, "what": o.what, "launches": results}))
+        return 2 if bad else 0
+
+
+def step_check(o: argparse.Namespace) -> int:
+    """Read only, for a heartbeat: overdue wipes in the API, the two timers (where systemd runs), and the OPS-ALERT
+    lines of the sweeper's units in the last --since-min minutes (where journald runs). Sends nothing."""
+    found, notes = [], []
+    try:
+        for r in list_launches(o.hotel):
+            if r.get("wipe_overdue") is True:
+                found.append(f"{ALERT_TAG} custom_guest hotel={o.hotel} launch={r['launch_id']} custom_guest_wipe_overdue: "
+                             f"since {r.get('wipe_overdue_at')}, {r.get('launch_dir_bytes')} bytes on the host")
+    except Blocked as e:
+        found.append(f"{ALERT_TAG} custom_guest hotel={o.hotel} launch=- {e.code}: {e.detail}")
+    units = [u.format(hotel=o.hotel) for u in SWEEP_UNITS]
+    if shutil.which("systemctl"):
+        for u in units:
+            r = subprocess.run(["systemctl", "is-active", f"{u}.timer"], capture_output=True, text=True)
+            if r.stdout.strip() != "active":
+                found.append(f"{ALERT_TAG} custom_guest hotel={o.hotel} launch=- custom_guest_sweeper_down: "
+                             f"{u}.timer is {r.stdout.strip() or 'unknown'}")
+    else:
+        notes.append("no systemctl here: the timers were not checked (run this on the operator machine)")
+    if shutil.which("journalctl"):
+        argv = ["journalctl", "--no-pager", "-o", "cat", "--since", f"-{o.since_min}min"]
+        for u in units:
+            argv += ["-u", f"{u}.service"]
+        r = subprocess.run(argv, capture_output=True, text=True)
+        found += [ln for ln in r.stdout.splitlines() if ln.startswith(ALERT_TAG)]
+    else:
+        notes.append("no journalctl here: the sweeper's journal was not read")
+    for line in found:
+        print(line)
+    print(json.dumps({"ok": not found, "alerts": len(found), "notes": notes}))
+    return 2 if found else 0
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="custom-guest.sh", description=__doc__.splitlines()[0])
     ap.add_argument("step", choices=["fetch", "intake", "measure", "hold", "abort", "boot", "stop", "return", "resume",
-                                     "reconcile", "cancel", "wipe", "record-versions"])
+                                     "reconcile", "cancel", "wipe", "sweep", "check", "record-versions"])
     ap.add_argument("--hotel", required=True)
     ap.add_argument("--launch-id")
     ap.add_argument("--toby-go", help="message ref of Toby's written go for a customer image (4.1)")
@@ -1369,6 +1506,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--h5-ok", help="H5: message ref of Toby's OK for an earlier holder's leftovers")
     ap.add_argument("--h5-holder", help="H5: the earlier holder Toby's OK names")
     ap.add_argument("--reason", help="abort: the error code to record")
+    ap.add_argument("--what", choices=["reconcile", "wipe"], default="reconcile", help="sweep: which pass to run")
+    ap.add_argument("--since-min", type=int, default=16, help="check: minutes of the sweeper's journal to read")
     ap.add_argument("--where", action="append", default=[])
     ap.add_argument("--commit", action="append", default=[])
     return ap
@@ -1380,15 +1519,22 @@ def main(argv: list[str]) -> int:
         if o.step == "record-versions":
             step_record_versions(o.hotel, o.where, o.commit)
             return 0
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,58}", o.hotel):
+            raise Blocked("custom_guest_request_invalid", "bad --hotel")
+        if o.step == "sweep":
+            return step_sweep(o)
+        if o.step == "check":
+            return step_check(o)
         if not o.launch_id:
             raise Blocked("custom_guest_request_invalid", "--launch-id is required")
-        op = Op(o.hotel, o.launch_id, o)
-        if o.step == "reconcile":
-            return op.step_reconcile()
-        printed = getattr(op, "step_" + o.step.replace("-", "_"))() is False
-        if o.step != "fetch" and not printed:
-            print(json.dumps({"ok": True, "state": op.record()["state"]}))
-        return 0
+        with op_lock(o.hotel, wait=True):
+            op = Op(o.hotel, o.launch_id, o)
+            if o.step == "reconcile":
+                return op.step_reconcile()
+            printed = getattr(op, "step_" + o.step.replace("-", "_"))() is False
+            if o.step != "fetch" and not printed:
+                print(json.dumps({"ok": True, "state": op.record()["state"]}))
+            return 0
     except Blocked as e:
         print(json.dumps({"ok": False, "error_code": e.code, "detail": e.detail}))
         return 1

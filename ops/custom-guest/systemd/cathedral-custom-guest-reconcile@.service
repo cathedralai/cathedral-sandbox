@@ -1,0 +1,25 @@
+[Unit]
+Description=Custom guest reconcile of hotel %i: project host facts, raise OPS-ALERT lines (spec-r9 5.4, Q5)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/cathedral/custom-guest-operator.env
+
+[Service]
+Type=oneshot
+User=cathedral-cg
+Group=cathedral-cg
+# Paths and URLs only; the admin and operator keys and the host SSH key are files the env names (0600).
+EnvironmentFile=/etc/cathedral/custom-guest-operator.env
+Environment=CG_HOME=/var/lib/cathedral-custom-guest
+ExecStart=/opt/cathedral-custom-guest/sandbox/ops/custom-guest/custom-guest.sh sweep --hotel %i --what reconcile
+# 2: alerts were raised (each one an OPS-ALERT line in this unit's journal), not a failed run.
+SuccessExitStatus=2
+StateDirectory=cathedral-custom-guest
+StateDirectoryMode=0700
+UMask=0077
+SyslogIdentifier=cathedral-custom-guest
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+TimeoutStartSec=5min

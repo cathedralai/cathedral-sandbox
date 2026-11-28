@@ -1,0 +1,9 @@
+[Unit]
+Description=Custom guest reconcile of hotel %i, every minute (spec-r9 5.4)
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
