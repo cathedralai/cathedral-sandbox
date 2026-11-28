@@ -90,6 +90,8 @@ def test_handoff_check_boots_the_built_reference_initrd_and_hands_off_for_real()
     # B3. The check boots this run's kernel and initrd and passes only from inside the check root.
     text = (REPO / ".github" / "workflows" / "reference-build.yml").read_text()
     job = text.split("\n  handoff-check:\n", 1)[1]
+    # v2 is the first reference initrd with the writable hand-off; v1 stays as published.
+    assert "  INITRD_VERSION: ${{ inputs.initrd_version || 'v2' }}\n" in text and "        default: v2\n" in text
     assert "    needs: summary\n" in job and "name: reference-build\n" in job
     assert '"$RUNNER_TEMP/reference/vmlinuz"' in job
     assert '"$RUNNER_TEMP/reference/cathedral-custom-initrd-$INITRD_VERSION.cpio.zst"' in job

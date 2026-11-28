@@ -171,8 +171,9 @@ func PrepareVerifiedRuntime(launch bootstrap.Launch, veritySHA, reportSHA [32]by
 	return &ReadyRoot{ready: true}, nil
 }
 
-// Exec moves kernel mounts, switches to the verified root and executes only
-// /sbin/init with a fixed argument/environment set. It never returns on success.
+// Exec makes /proc and /sys read-write, moves kernel mounts, switches to the
+// verified root and executes only /sbin/init with a fixed argument/environment
+// set. It never returns on success.
 // This consumes the token even on failure. The caller must power off on error.
 func (r *ReadyRoot) Exec() error {
 	if r == nil || !r.ready || os.Getpid() != 1 || os.Geteuid() != 0 {
@@ -206,6 +207,15 @@ func (r *ReadyRoot) Exec() error {
 		return err
 	}
 	defer base.Close()
+	// PrepareKernelViews mounts /proc and /sys read-only for this init's own stages, and a move keeps
+	// a mount's flags. The owner's systemd keeps the API mounts it finds and needs both writable:
+	// each unit's OOMScoreAdjust=, udev's uevent writes, networkd's sysctls (AB#1027). A plain
+	// remount (not MS_BIND) clears the superblock's read-only flag as well as the mount's.
+	for _, name := range []string{"/sys", "/proc"} {
+		if err := syscall.Mount("", name, "", syscall.MS_REMOUNT|syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""); err != nil {
+			return fmt.Errorf("remount %s read-write: %w", name, err)
+		}
+	}
 	for i, name := range []string{"dev", "sys", "proc"} {
 		if err := syscall.Mount("/"+name, descriptorPath(targets[i]), "", syscall.MS_MOVE, ""); err != nil {
 			return fmt.Errorf("move %s: %w", name, err)

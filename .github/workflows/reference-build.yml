@@ -17,7 +17,7 @@ on:
       initrd_version:
         description: "Reference initrd version: the file is cathedral-custom-initrd-<version>.cpio.zst"
         required: true
-        default: v1
+        default: v2
   pull_request:
     paths:
       - "scripts/build_custom_guest_kernel.sh"
@@ -47,7 +47,7 @@ defaults:
     shell: bash
 
 env:
-  INITRD_VERSION: ${{ inputs.initrd_version || 'v1' }}
+  INITRD_VERSION: ${{ inputs.initrd_version || 'v2' }}
 
 jobs:
   kernel:
