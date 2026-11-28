@@ -250,7 +250,7 @@ func (m *Mounted) Finish(cfg FinishConfig) error {
 	// Modules: /usr/lib/modules/<release> of the initrd, read-only, at the same path in the root.
 	// The root's /lib is a link to usr/lib on a usrmerged Ubuntu, so one path serves both.
 	dir := "usr/lib/modules/" + cfg.KernelRelease
-	if err := root.MkdirAll(dir, 0o755); err != nil {
+	if err := mkdirAllMode(root, dir, 0o755); err != nil {
 		return err
 	}
 	modules, err := plainDirectory(root, dir)
@@ -279,7 +279,7 @@ func (m *Mounted) Finish(cfg FinishConfig) error {
 	if err := WriteNetwork(runRoot, cfg.Link); err != nil {
 		return err
 	}
-	if err := runRoot.MkdirAll("cathedral/bin", 0o755); err != nil {
+	if err := mkdirAllMode(runRoot, "cathedral/bin", 0o755); err != nil {
 		return err
 	}
 	for _, tool := range cfg.Tools {
@@ -366,5 +366,8 @@ func (m *Mounted) SwitchRoot(ready func() error) error {
 	}
 	base.Close()
 	root.Close()
+	// The init's own stages run under bootstate.PrepareKernelViews' umask 0077. The root's init
+	// starts with the usual one.
+	syscall.Umask(0o022)
 	return syscall.Exec("/sbin/init", []string{"/sbin/init"}, []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "TERM=linux"})
 }
