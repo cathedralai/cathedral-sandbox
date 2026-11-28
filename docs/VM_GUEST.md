@@ -211,6 +211,12 @@ later bundle (a kernel or init fix) shares it and a VM can `rebundle` to it; ano
   (`OVMF.amdsev.fd` `ac27e626`, the sealed kits' firmware), in place of noble `ovmf`
   2024.02-2ubuntu0.10 (`a50b4bca`). Under SEV-SNP on the proof host, B1's firmware stopped at the
   APIC page before any serial output. A B1 VM can `rebundle` to B2.
+- Bundle B3 `688201fa` (main run 46121305228 at `2275563d`, first built by run 46119855405)
+  replaces B2 `c95300cb` and shares its base root and firmware. Only the initrd changed: its init
+  makes /run before the disk step (#825). B2's init did not, so cryptsetup could not take its LUKS2
+  lock in /run/cryptsetup and F3 `luksFormat` failed on the proof host. Fixture measurement
+  `d594ff6e`. That run's `initrd-check` booted the published kernel and initrd in plain QEMU and
+  passed F1 to F5. A B1 or B2 VM can `rebundle` to B3.
 - **Take only the `vm-bundle` artifact.** The lanes upload `bundle-first` and `bundle-second`
   before the summary checks the pin, so a run that fails the pin still leaves lane artifacts with a
   base root that is not the pin's.
