@@ -207,6 +207,11 @@ jobs:
           sudo -n bash room-kit/vm/build-bundle.sh base-root "$RUNNER_TEMP/bundle.env"
           # File by file, so the summary can say which file differs if the images do.
           sudo -n /usr/bin/python3 -I scripts/vm_bundle_build_summary.py tree "$RUNNER_TEMP/bundle/build/base-root" > "$RUNNER_TEMP/lane/base-root.tree.txt"
+      - name: Base root boot units (sshd must start at boot)
+        # B5 (28 Nov) booted to multi-user.target with no sshd: ssh.service required the masked
+        # ssh.socket, so systemd dropped it from the boot. The initrd check boots its own check
+        # root, not this one, so the unit links of the real base root are checked here.
+        run: sudo -n /usr/bin/python3 -I scripts/vm_bundle_build_summary.py units "$RUNNER_TEMP/bundle/build/base-root"
       - name: Kernel and module tree
         run: |
           sudo -n bash room-kit/vm/build-bundle.sh kernel "$RUNNER_TEMP/bundle.env"

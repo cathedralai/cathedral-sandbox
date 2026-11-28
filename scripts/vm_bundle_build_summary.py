@@ -4,6 +4,9 @@
   vm_bundle_build_summary.py tree ROOT
       one line per entry of a root tree (type, mode, owner, mtime, links, size, sha256 or
       link target, path), so two lanes' base roots can be diffed file by file
+  vm_bundle_build_summary.py units ROOT
+      the base root's systemd unit links, read without following them: sshd must start at
+      boot (ssh.service enabled, ssh.socket masked, no unit wants or requires a masked unit)
   vm_bundle_build_summary.py compare --lanes DIR --out DIR
       DIR holds the downloaded artifacts tools-first, tools-second, bundle-first and
       bundle-second. Every file must be byte-identical across the two lanes (toolchain.txt is
@@ -88,6 +91,103 @@ def tree(root):
             size = "-" if kind == "d" else st.st_size
             out.write(f"{kind} {stat.S_IMODE(st.st_mode):04o} {st.st_uid}:{st.st_gid} {int(st.st_mtime)} "
                       f"{st.st_nlink} {size} {payload} {json.dumps(rel)}\n")
+
+
+# Where the base root's unit links live. Vendor units ship their own .wants and .requires
+# links; the build's enable and mask calls write etc.
+UNIT_DIRS = ("etc/systemd/system", "usr/lib/systemd/system")
+ETC_UNITS = "etc/systemd/system"
+
+
+def link_target(path):
+    """The link target of PATH, or None when PATH is not a link. Never follows it."""
+    try:
+        return os.readlink(path) if stat.S_ISLNK(path.lstat().st_mode) else None
+    except FileNotFoundError:
+        return None
+
+
+def is_dir_here(path):
+    """A real directory inside the root, not a link that could lead out of it."""
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def lstat_inside(root, absolute):
+    """lstat of the root's ABSOLUTE path, walking it one name at a time: None when it is missing
+    or any parent on the way is not a real directory (a link there could lead out of the root)."""
+    parts = Path(absolute).parts[1:]
+    path, st = Path(root), None
+    for i, part in enumerate(parts):
+        if part in (".", ".."):
+            return None
+        path = path / part
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            return None
+        if i < len(parts) - 1 and not stat.S_ISDIR(st.st_mode):
+            return None
+    return st
+
+
+def unit_problems(root):
+    """What would keep the VM's sshd from starting at boot, read from the root's unit links
+    without following any of them (B5: ssh.service required the masked ssh.socket through
+    ssh.service.requires/, so systemd dropped it from the boot and port 22 refused).
+
+    - No .wants or .requires link names a masked unit: a Requires= on a masked unit drops the
+      requiring unit from the boot transaction, with no console line.
+    - ssh.service is enabled: multi-user.target.wants/ssh.service names a unit file in the root.
+    - ssh.socket is masked, and nothing else in etc links it."""
+    root = Path(root)
+    etc = root / ETC_UNITS
+    problems = []
+    masked = set()
+    if is_dir_here(etc):
+        masked = {p.name for p in etc.iterdir() if link_target(p) == "/dev/null"}
+    for unit_dir in UNIT_DIRS:
+        base = root / unit_dir
+        if not is_dir_here(base):
+            continue
+        for dep in sorted(base.iterdir()):
+            kind = dep.suffix.lstrip(".")
+            if kind not in ("wants", "requires") or not is_dir_here(dep):
+                continue
+            for link in sorted(dep.iterdir()):
+                if link.name in masked:
+                    problems.append(f"{link.relative_to(root).as_posix()}: {dep.stem} {kind} {link.name}, "
+                                    f"which is masked")
+    want = etc / "multi-user.target.wants" / "ssh.service"
+    target = link_target(want)
+    if target is None:
+        problems.append(f"{want.relative_to(root).as_posix()}: missing, so ssh.service is not enabled")
+    else:
+        st = lstat_inside(root, target) if target.startswith("/") else None
+        if st is None or not stat.S_ISREG(st.st_mode):
+            problems.append(f"{want.relative_to(root).as_posix()}: links {target}, which is not a unit file in the root")
+    mask = etc / "ssh.socket"
+    if link_target(mask) != "/dev/null":
+        problems.append(f"{mask.relative_to(root).as_posix()}: not masked (a link to /dev/null)")
+    if is_dir_here(etc):
+        for top, dirs, files in os.walk(etc, followlinks=False):
+            for name in sorted(dirs + files):
+                path = Path(top) / name
+                if name == "ssh.socket" and path != mask:
+                    problems.append(f"{path.relative_to(root).as_posix()}: links ssh.socket")
+    return problems
+
+
+def units(root):
+    problems = unit_problems(root)
+    for line in problems:
+        print(f"UNITS: FAIL {line}")
+    if problems:
+        return 1
+    print("UNITS: PASS ssh.service enabled, ssh.socket masked, no unit wants or requires a masked unit")
+    return 0
 
 
 def shell_function(text, name):
@@ -286,6 +386,8 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("tree")
     p.add_argument("root", type=Path)
+    p = sub.add_parser("units")
+    p.add_argument("root", type=Path)
     p = sub.add_parser("compare")
     p.add_argument("--lanes", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True, help="new directory")
@@ -299,6 +401,8 @@ def main():
     if args.command == "tree":
         tree(args.root)
         return 0
+    if args.command == "units":
+        return units(args.root)
     if args.command == "epoch":
         print(pin_epoch(args.pin, args.snapshot, args.lock))
         return 0
