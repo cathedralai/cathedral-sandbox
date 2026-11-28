@@ -9,7 +9,7 @@
     "virtio_net"
   ],
   "executables": {
-    "init": "368191ee6fec800439e0ab8e913c3c8be31b58ccf679efc35d7711e2fce98a8b",
+    "init": "1ecce2b6605ecdb56035b823126309b18c54891856e3f2f4c8cd8dfb20e5a4bb",
     "usr/lib/cathedral/cathedral-vm": "c7395a7a32c4b1816a8b422380b0cf70286f3c90284a49b23e7835913b80fad1",
     "usr/lib/cathedral/cathedral-vm-attest": "39f4e4818b98816204026729ad93b3cf0c180051fe660a50b39228f6f965dd6c",
     "usr/lib/cathedral/cryptsetup": "462da7294fa26fb594f033e8b3e3c4630538003f80e3264f12d4bc19661717cc",
