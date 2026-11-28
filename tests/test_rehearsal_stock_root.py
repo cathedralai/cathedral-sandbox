@@ -54,6 +54,7 @@ def _v1_root(tmp_path):
     _file(root, "etc/shadow", "root:!:20000:0:99999:7:::\n")
     _file(root, "etc/passwd", "root:x:0:0:root:/root:/bin/sh\nsystemd-network:x:998:998::/:/usr/sbin/nologin\n")
     (root / "root/.ssh").mkdir(parents=True)
+    (root / "var/lib/systemd").mkdir(parents=True)
     os.symlink("usr/lib", root / "lib")
     for unit in ("systemd-networkd.service", "systemd-networkd.socket"):
         _file(root, f"{LIB}/{unit}")
@@ -172,6 +173,8 @@ def test_customize_enables_what_the_packages_left_off_and_keeps_vendor_links(tmp
         assert os.readlink(etc / name) == target, name
     assert os.readlink(root / "etc/systemd/network/99-default.link") == "/dev/null"
     assert (root / "usr/lib/cathedral/write-network").stat().st_mode & 0o777 == 0o755
+    linger = root / "var/lib/systemd/linger"
+    assert linger.is_dir() and not linger.is_symlink() and linger.stat().st_mode & 0o777 == 0o755
 
 
 def test_customize_refuses_a_base_without_dbus(tmp_path):

@@ -10,7 +10,9 @@ customize() changes only what networkd needs and keeps the rest of the recipe by
   /usr/lib/cathedral/write-network, which writes /run/systemd/network/10-cathedral.network
   from the three network.env values, before networkd starts;
 - 99-default.link is masked: udev keeps the interface name network.env gives (eth0);
-- dbus.socket and udev's sockets and coldplug trigger are enabled if the packages did not.
+- dbus.socket and udev's sockets and coldplug trigger are enabled if the packages did not;
+- /var/lib/systemd/linger ships empty: with dbus present logind starts, and on the read-only
+  root systemd cannot create its StateDirectory (238/STATE_DIRECTORY, seen in the boot smoke).
 
 check_stock_root.py checks the result. Usage, as the reference recipe without the data disk:
   stock_systemd.py --base BASE.TAR --base-sha256 SHA --helper ATTEST --helper-sha256 SHA \\
@@ -128,6 +130,16 @@ def customize(root):
     _enable(root, "systemd-udevd-kernel.socket", "sockets.target")
     _enable(root, "systemd-udevd-control.socket", "sockets.target")
     _enable(root, "systemd-udev-trigger.service", "sysinit.target")
+    # logind's StateDirectory=systemd/linger. An existing 0755 root directory needs no write at
+    # boot (systemd's setup_exec_directory then only checks it); a missing one fails logind.
+    linger = root / "var/lib/systemd/linger"
+    if linger.parent.is_symlink() or not linger.parent.is_dir():
+        raise ValueError("stock-systemd base is missing var/lib/systemd")
+    if linger.is_symlink() or not linger.parent.resolve().is_relative_to(root.resolve()) \
+            or (linger.exists() and not linger.is_dir()):
+        raise ValueError("var/lib/systemd/linger must be a plain directory inside the root")
+    linger.mkdir(mode=0o755, exist_ok=True)
+    linger.chmod(0o755)
 
 
 def main():

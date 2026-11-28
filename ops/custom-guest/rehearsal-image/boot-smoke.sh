@@ -104,7 +104,9 @@ if [ "$variant" = stock-systemd ]; then
   done
   grep -Eq 'State: routable \(configured\)' "$work/networkctl.txt" || fail "eth0 is not routable (configured)"
   grep -q "inet $GUEST_CIDR " "$work/address.txt" || fail "eth0 does not have $GUEST_CIDR"
-  [ "$fails" = 0 ] && echo "SMOKE: PASS stock-systemd: dbus, udevd, networkd and cathedral-sshd active; eth0 routable (configured) with $GUEST_CIDR"
+  grep -qx running "$work/system-state.txt" || fail "the system is $(cat "$work/system-state.txt"), not running"
+  [ ! -s "$work/failed.txt" ] || fail "failed units: $(cut -d ' ' -f 1 "$work/failed.txt" | tr '\n' ' ')"
+  [ "$fails" = 0 ] && echo "SMOKE: PASS stock-systemd: dbus, udevd, networkd and cathedral-sshd active; eth0 routable (configured) with $GUEST_CIDR; running, no failed unit"
 else
   active cathedral-sshd.service || fail "cathedral-sshd.service is not active"
   active dbus.service && fail "dbus.service is active on the v1 root"
