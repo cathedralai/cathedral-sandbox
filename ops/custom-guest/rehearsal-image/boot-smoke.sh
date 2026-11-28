@@ -90,6 +90,9 @@ done | tee "$work/active.txt"
 guest 'networkctl status eth0 --no-pager 2>&1 || true' | tee "$work/networkctl.txt"
 guest 'ip -4 -o address show dev eth0' | tee "$work/address.txt"
 guest 'systemctl --failed --no-legend --plain || true' | tee "$work/failed.txt"
+# Why each failed unit failed: recorded, not judged (the checks below decide).
+guest 'for u in $(systemctl --failed --no-legend --plain | cut -d " " -f 1); do systemctl status --no-pager --full "$u"; journalctl -b --no-pager -o cat -u "$u" | tail -n 20; done || true' \
+  | tee "$work/failed-status.txt"
 guest 'systemctl is-system-running || true' | tee "$work/system-state.txt"
 
 active() { grep -qx "$1 active" "$work/active.txt"; }
