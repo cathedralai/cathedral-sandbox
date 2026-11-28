@@ -206,6 +206,15 @@ EOF
   # systemd-resolved's postinst keeps the build host's resolv.conf here.
   rm -f "$R/etc/.resolv.conf.systemd-resolved.bak"
   in_root systemctl enable -q ssh.service systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
+  # sshd runs as ssh.service, not socket-activated. openssh's postinst enabled ssh.socket, which
+  # links it into sockets.target.wants/ and ssh.service.requires/, and a mask removes neither: a
+  # service that requires a masked unit is dropped from the boot with no console line (B5, port
+  # 22 refused). So disable it, then mask it ("vm_bundle_build_summary.py units" checks the root).
+  in_root systemctl disable -q ssh.socket
+  rm -f "$R/etc/systemd/system/ssh.service.requires/ssh.socket"
+  if [ -d "$R/etc/systemd/system/ssh.service.requires" ]; then
+    rmdir --ignore-fail-on-non-empty "$R/etc/systemd/system/ssh.service.requires"
+  fi
   in_root systemctl mask -q ssh.socket
   in_root passwd -l root >/dev/null
   # apt upgrade updates userland; the kernel is the bundle's (spec r2 4), so no kernel or

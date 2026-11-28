@@ -133,6 +133,72 @@ def test_a_differing_tool_fails(tmp_path):
     assert r.returncode != 0 and "tools mke2fs differs between lanes" in r.stderr
 
 
+# ---- the base root's boot units: sshd must start (B5, 28 Nov) -------------------------------
+
+def _unit_root(tmp_path, *, requires=True, socket_wants=True, enabled=True, masked=True):
+    """A base root's unit links as Ubuntu's openssh postinst and build-bundle.sh leave them.
+    requires and socket_wants are the links the postinst's enable of ssh.socket makes."""
+    root = tmp_path / "root"
+    lib = root / "usr" / "lib" / "systemd" / "system"
+    etc = root / "etc" / "systemd" / "system"
+    lib.mkdir(parents=True)
+    etc.mkdir(parents=True)
+    for unit in ("ssh.service", "ssh.socket", "systemd-networkd.service"):
+        (lib / unit).write_text("[Unit]\n")
+    (etc / "multi-user.target.wants").mkdir()
+    os.symlink("/usr/lib/systemd/system/systemd-networkd.service", etc / "multi-user.target.wants" / "systemd-networkd.service")
+    if enabled:
+        os.symlink("/usr/lib/systemd/system/ssh.service", etc / "multi-user.target.wants" / "ssh.service")
+    if masked:
+        os.symlink("/dev/null", etc / "ssh.socket")
+    if requires:
+        (etc / "ssh.service.requires").mkdir()
+        os.symlink("/usr/lib/systemd/system/ssh.socket", etc / "ssh.service.requires" / "ssh.socket")
+    if socket_wants:
+        (etc / "sockets.target.wants").mkdir()
+        os.symlink("/usr/lib/systemd/system/ssh.socket", etc / "sockets.target.wants" / "ssh.socket")
+    return root
+
+
+def _units(root):
+    return subprocess.run([sys.executable, "-I", str(SUMMARY), "units", str(root)], capture_output=True, text=True)
+
+
+def test_units_fail_on_the_b5_root_where_ssh_service_requires_the_masked_socket(tmp_path):
+    r = _units(_unit_root(tmp_path))
+    assert r.returncode == 1
+    assert "UNITS: FAIL etc/systemd/system/ssh.service.requires/ssh.socket: ssh.service requires ssh.socket, " \
+           "which is masked" in r.stdout
+    assert "UNITS: FAIL etc/systemd/system/sockets.target.wants/ssh.socket: sockets.target wants ssh.socket, " \
+           "which is masked" in r.stdout
+
+
+def test_units_pass_once_the_socket_is_disabled_before_its_mask(tmp_path):
+    r = _units(_unit_root(tmp_path, requires=False, socket_wants=False))
+    assert r.returncode == 0, r.stdout
+    assert r.stdout.startswith("UNITS: PASS")
+
+
+def test_units_need_ssh_service_enabled(tmp_path):
+    r = _units(_unit_root(tmp_path, requires=False, socket_wants=False, enabled=False))
+    assert r.returncode == 1 and "ssh.service is not enabled" in r.stdout
+
+
+def test_units_need_the_socket_mask(tmp_path):
+    r = _units(_unit_root(tmp_path, requires=False, socket_wants=False, masked=False))
+    assert r.returncode == 1 and "etc/systemd/system/ssh.socket: not masked" in r.stdout
+
+
+def test_units_never_follow_a_link_out_of_the_root(tmp_path):
+    root = _unit_root(tmp_path, requires=False, socket_wants=False)
+    want = root / "etc" / "systemd" / "system" / "multi-user.target.wants" / "ssh.service"
+    want.unlink()
+    # The build host has this file; the root does not. It must not count.
+    os.symlink("/etc/hostname", want)
+    r = _units(root)
+    assert r.returncode == 1 and "links /etc/hostname, which is not a unit file in the root" in r.stdout
+
+
 def test_tree_lists_links_without_following_them(tmp_path):
     root = tmp_path / "root"
     (root / "etc").mkdir(parents=True)
@@ -150,6 +216,7 @@ def test_tree_lists_links_without_following_them(tmp_path):
 @pytest.mark.parametrize("needle", [
     "permissions:\n  contents: read\n",
     "pull_request:",
+    'scripts/vm_bundle_build_summary.py units "$RUNNER_TEMP/bundle/build/base-root"',
 ])
 def test_workflow_shape(needle):
     assert needle in WORKFLOW.read_text()
@@ -352,14 +419,14 @@ def _epoch(pin, snapshot="20261126T000000Z", lock=BASE_LOCK):
                            "--pin", str(pin)], capture_output=True, text=True)
 
 
-def test_the_committed_pin_is_bundle_a9585311s_base_root_and_matches_this_tree():
+def test_the_committed_pin_is_bundle_d232676bs_base_root_and_matches_this_tree():
     pin = summary_mod.load_pin(PIN)
     assert pin["status"] == "pinned"
-    # Run 46095917678 at main 82c964b4: its epoch is that commit's time.
+    # Run 46139434416 at 26917fa8 (the ssh.socket fix, unpinned): its epoch is that commit's time.
     assert (pin["source_date_epoch"], pin["snapshot"], pin["from_run"]) == \
-        (1795831236, "20261126T000000Z", "46095917678")
-    assert pin["base_root_raw_sha256"] == "0a200cc3d608a8dcbe04c3a4b7384fe311b94d88b50c62071bfcb968852368e9"
-    assert pin["base_root_verity"] == "4504476434ccff04fff2c167674f1e952f4772e4516acf621346db4763a2e7d4"
+        (1795864833, "20261126T000000Z", "46139434416")
+    assert pin["base_root_raw_sha256"] == "2097eece6f4d8ef6d782f9e7135683f24aae8961496b51bb3548db62327bdd4c"
+    assert pin["base_root_verity"] == "65059b4ce3c940b74580d1bd28662164713ccaa469fff660952d04be7452af5e"
     assert pin["base_root_data_bytes"] == 771751936
     assert pin["snapshot"] == _workflow_env("VM_BUNDLE_SNAPSHOT")
     assert pin["base_root_packages_lock_sha256"] == _sha(BASE_LOCK.read_bytes())
@@ -371,7 +438,7 @@ def test_the_committed_pin_is_bundle_a9585311s_base_root_and_matches_this_tree()
 def test_epoch_gives_the_pinned_epoch():
     r = _epoch(PIN)
     assert r.returncode == 0, r.stderr
-    assert r.stdout == "pinned 1795831236\n"
+    assert r.stdout == "pinned 1795864833\n"
 
 
 def test_epoch_unpinned_leaves_the_commit_time_to_the_workflow(tmp_path):

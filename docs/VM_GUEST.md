@@ -204,8 +204,13 @@ later bundle (a kernel or init fix) shares it and a VM can `rebundle` to it; ano
 - The summary publishes only a base root whose `base-root.raw`, verity root, data bytes and lock are
   the pin's. The `bundle.env` step also fails when the snapshot, the base lock or the recipe
   (`recipe_sha256`) is not the pin's. The byte check is the gate.
-- The pin today: base root `0a200cc3`, verity `45044764`, of bundle `a9585311` (run 46095917678,
-  rebuilt byte for byte by run 46103583234 at another commit).
+- The pin today: base root `2097eece`, verity `65059b4c`, of bundle `d232676b` (run 46139434416).
+  It replaces base root `0a200cc3` (verity `45044764`) of bundles `a9585311` to `f5389487`. In
+  that root, openssh's postinst had linked ssh.socket into `ssh.service.requires/`, and the build
+  masked ssh.socket without disabling it, so ssh.service required a masked unit and never
+  started: port 22 refused on first boot. The bundle lanes now check the root's unit links
+  (`vm_bundle_build_summary.py units`). A VM on the old base root cannot `rebundle` to it
+  (`base_root_differs`).
 - Bundle B2 `c95300cb` (run 46114654444) replaces B1 `a9585311` and shares its base root. Its firmware is
   `ovmf-amdsev` 2025.11-3ubuntu7.3 (`OVMF.amdsev.fd` `ac27e626`, the sealed kits' firmware), in place of
   noble `ovmf` 2024.02-2ubuntu0.10 (`a50b4bca`). Under SEV-SNP on the proof host, B1's firmware stopped at
