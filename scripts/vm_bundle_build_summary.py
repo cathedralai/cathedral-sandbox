@@ -9,7 +9,16 @@
       bundle-second. Every file must be byte-identical across the two lanes (toolchain.txt is
       recorded, not compared). On any difference it prints which file differs, with both
       sha256 and, for text and tar files, where inside, and fails: it never picks one lane.
-      Otherwise --out gets the files, SHA256SUMS, summary.json and summary.md.
+      Otherwise --out gets the files, SHA256SUMS, summary.json and summary.md. With a pinned
+      base root (--pin, default room-kit/vm/base_root_pin.json) it also fails unless the
+      lanes' base root, its lock, verity root, data bytes and epoch are the pin's.
+  vm_bundle_build_summary.py epoch --snapshot ID --lock FILE [--pin FILE]
+      "pinned EPOCH" when the base root is pinned (and the snapshot, the base lock and the
+      recipe are the pin's, else it fails), or "unpinned": the workflow then takes the
+      commit time. A pinned epoch makes every commit build the same base root bytes, so two
+      bundles can share one base root (spec r3 7.5 rebundle, AB#1022).
+  vm_bundle_build_summary.py recipe
+      the sha256 of every base-root recipe input, and recipe_sha256 over them all
 
 Nothing here boots or qualifies a VM: summary.json records boot_verified false.
 A VM copy of scripts/reference_build_summary.py (#808); the two fold together later.
@@ -19,6 +28,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -27,6 +37,19 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 CLOSURE = REPO / "room-kit" / "vm" / "vm_initrd_closure.json"
+PIN = REPO / "room-kit" / "vm" / "base_root_pin.json"
+PIN_SCHEMA = "cathedral.vm.base-root-pin/v1"
+# What decides the base root's bytes besides the lock, the snapshot and the epoch, which the pin
+# holds itself. A change to any of these without a new recipe_sha256 fails the unit tests; a
+# change that moves the bytes fails the pinned build's byte check anyway (the gate), since the
+# workflow's paths filter covers every file named here.
+RECIPE_SCRIPT = "room-kit/vm/build-bundle.sh"
+RECIPE_FUNCTIONS = ("build_base_root", "pinned_root", "clamp", "uuid_of", "host_leaks", "e2fsprogs_floor")
+RECIPE_LINES = ("BASE_PKGS=",)
+# The static mke2fs and veritysetup the image is made with ($TOOLS), and mmdebstrap.
+RECIPE_FILES = ("scripts/vm_initrd_tools_inputs.json", "scripts/build_vm_initrd_tools.py")
+RECIPE_HOST_INPUT = ("scripts/vm_bundle_build_inputs.json", "mmdebstrap_1.5.7-3_all.deb")
+HEX64 = re.compile(r"[0-9a-f]{64}")
 LANES = ("first", "second")
 KINDS = ("tools", "bundle")
 RECORD_ONLY = {"toolchain.txt"}
@@ -65,6 +88,104 @@ def tree(root):
             size = "-" if kind == "d" else st.st_size
             out.write(f"{kind} {stat.S_IMODE(st.st_mode):04o} {st.st_uid}:{st.st_gid} {int(st.st_mtime)} "
                       f"{st.st_nlink} {size} {payload} {json.dumps(rel)}\n")
+
+
+def shell_function(text, name):
+    """The source of shell function NAME in TEXT: a one-line "name() { ...; }" or the lines from
+    "name() {" to the first line that is "}". A missing function is an error, so a rename
+    cannot drop an input from the recipe."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(f"{name}() {{"):
+            if line.rstrip().endswith("}") and line.count("{") == line.count("}"):
+                return line + "\n"
+            for j in range(i + 1, len(lines)):
+                if lines[j] == "}":
+                    return "\n".join(lines[i:j + 1]) + "\n"
+    raise ValueError(f"{RECIPE_SCRIPT}: no shell function {name}")
+
+
+def recipe_inputs(repo=REPO):
+    """{input name: sha256} for every base-root recipe input."""
+    repo = Path(repo)
+    script = (repo / RECIPE_SCRIPT).read_text()
+    parts = {f"{RECIPE_SCRIPT}:{name}()": shell_function(script, name).encode() for name in RECIPE_FUNCTIONS}
+    for prefix in RECIPE_LINES:
+        found = [line for line in script.splitlines() if line.startswith(prefix)]
+        if len(found) != 1:
+            raise ValueError(f"{RECIPE_SCRIPT}: expected one line starting {prefix}")
+        parts[f"{RECIPE_SCRIPT}:{prefix}"] = found[0].encode()
+    for name in RECIPE_FILES:
+        parts[name] = (repo / name).read_bytes()
+    path, entry = RECIPE_HOST_INPUT
+    pinned = json.loads((repo / path).read_text())["files"][entry]
+    parts[f"{path}:{entry}"] = json.dumps(pinned, sort_keys=True, separators=(",", ":")).encode()
+    return {name: hashlib.sha256(data).hexdigest() for name, data in sorted(parts.items())}
+
+
+def recipe_sha256(repo=REPO):
+    inputs = recipe_inputs(repo)
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def load_pin(path):
+    """The base root pin, checked field by field."""
+    pin = json.loads(Path(path).read_text())
+    if not isinstance(pin, dict) or pin.get("schema") != PIN_SCHEMA:
+        raise ValueError(f"{path}: schema must be {PIN_SCHEMA}")
+    if pin.get("status") == "unpinned":
+        return pin
+    if pin.get("status") != "pinned":
+        raise ValueError(f"{path}: status must be pinned or unpinned")
+    checks = {
+        "source_date_epoch": lambda v: type(v) is int and v > 0,
+        "snapshot": lambda v: isinstance(v, str) and re.fullmatch(r"\d{8}T\d{6}Z", v) is not None,
+        "base_root_packages_lock_sha256": lambda v: isinstance(v, str) and HEX64.fullmatch(v) is not None,
+        "base_root_raw_sha256": lambda v: isinstance(v, str) and HEX64.fullmatch(v) is not None,
+        "base_root_verity": lambda v: isinstance(v, str) and HEX64.fullmatch(v) is not None,
+        "base_root_data_bytes": lambda v: type(v) is int and v > 0 and v % 4096 == 0,
+        "recipe_sha256": lambda v: isinstance(v, str) and HEX64.fullmatch(v) is not None,
+        "from_run": lambda v: isinstance(v, str) and v.isdigit(),
+    }
+    for field, ok in checks.items():
+        if not ok(pin.get(field)):
+            raise ValueError(f"{path}: {field} missing or invalid")
+    return pin
+
+
+def pin_epoch(pin_path, snapshot, lock):
+    """The epoch line for bundle.env: the pin's, after its snapshot, lock and recipe check out."""
+    pin = load_pin(pin_path)
+    if pin["status"] == "unpinned":
+        return "unpinned"
+    problems = []
+    if snapshot != pin["snapshot"]:
+        problems.append(f"VM_BUNDLE_SNAPSHOT is {snapshot}; the pin's base root is from {pin['snapshot']}")
+    have = sha_file(Path(lock))
+    if have != pin["base_root_packages_lock_sha256"]:
+        problems.append(f"the base lock's sha256 is {have}; the pin's is {pin['base_root_packages_lock_sha256']}")
+    recipe = recipe_sha256()
+    if recipe != pin["recipe_sha256"]:
+        problems.append(f"the base-root recipe's sha256 is {recipe}; the pin's is {pin['recipe_sha256']}")
+    if problems:
+        raise ValueError("base root pin: " + "; ".join(problems) +
+                         ". A new base root needs a new pin and a new first bundle (room-kit/vm/README.md)")
+    return f"pinned {pin['source_date_epoch']}"
+
+
+def pin_problems(pin, agreed, bundle):
+    """Why the lanes' base root is not the pinned one (empty when it is)."""
+    want = {
+        "base-root.raw sha256": (agreed.get("base-root.raw", ""), pin["base_root_raw_sha256"]),
+        "base-root.packages.lock sha256": (agreed.get("base-root.packages.lock", ""),
+                                           pin["base_root_packages_lock_sha256"]),
+        "base_root_verity": (read(bundle, "base-root.verity"), pin["base_root_verity"]),
+        "base_root_data_bytes": (read(bundle, "base-root.data-bytes"), str(pin["base_root_data_bytes"])),
+        "source_date_epoch": (read(bundle, "source-date-epoch"), str(pin["source_date_epoch"])),
+        "snapshot": (os.environ.get("VM_BUNDLE_SNAPSHOT", ""), pin["snapshot"]),
+    }
+    return [f"{name}: built {have or 'nothing'}, pinned {expected}"
+            for name, (have, expected) in want.items() if have != expected]
 
 
 def listing(directory):
@@ -145,6 +266,13 @@ def measurement_line(measurement):
             f"identity sha256 `{measurement.get('identity_sha256', '')}`")
 
 
+def pin_line(pin, to_pin):
+    if pin["status"] == "pinned":
+        return f"pinned (run {pin['from_run']}); this build's base root equals it byte for byte"
+    return "unpinned. To pin this base root, commit as room-kit/vm/base_root_pin.json: `" + \
+        json.dumps(to_pin, sort_keys=True, separators=(", ", ": ")) + "`"
+
+
 def same_toolchain(first, second):
     """Toolchains compared without the runner image line: lanes may land on two image versions
     during a rollout, and the bytes are compared anyway."""
@@ -161,12 +289,45 @@ def main():
     p = sub.add_parser("compare")
     p.add_argument("--lanes", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True, help="new directory")
+    p.add_argument("--pin", type=Path, default=PIN)
+    p = sub.add_parser("epoch")
+    p.add_argument("--snapshot", required=True)
+    p.add_argument("--lock", type=Path, required=True)
+    p.add_argument("--pin", type=Path, default=PIN)
+    sub.add_parser("recipe")
     args = parser.parse_args()
     if args.command == "tree":
         tree(args.root)
         return 0
+    if args.command == "epoch":
+        print(pin_epoch(args.pin, args.snapshot, args.lock))
+        return 0
+    if args.command == "recipe":
+        print(json.dumps({"inputs": recipe_inputs(), "recipe_sha256": recipe_sha256()}, indent=1, sort_keys=True))
+        return 0
+    pin = load_pin(args.pin)
     agreed = compare(args.lanes)
     first = {kind: args.lanes / f"{kind}-first" for kind in KINDS}
+    if pin["status"] == "pinned":
+        problems = pin_problems(pin, agreed["bundle"], first["bundle"])
+        if problems:
+            print("\n".join(problems), file=sys.stderr)
+            raise SystemExit("vm_bundle_build_summary: the lanes agree, but their base root is not the pinned one "
+                             f"({args.pin}); nothing is published")
+        to_pin = None
+    else:
+        # What a reviewer commits to pin this run's base root.
+        to_pin = {
+            "schema": PIN_SCHEMA, "status": "pinned",
+            "source_date_epoch": int(read(first["bundle"], "source-date-epoch") or 0),
+            "snapshot": os.environ.get("VM_BUNDLE_SNAPSHOT", ""),
+            "base_root_packages_lock_sha256": agreed["bundle"].get("base-root.packages.lock", ""),
+            "base_root_raw_sha256": agreed["bundle"].get("base-root.raw", ""),
+            "base_root_verity": read(first["bundle"], "base-root.verity"),
+            "base_root_data_bytes": int(read(first["bundle"], "base-root.data-bytes") or 0),
+            "from_run": os.environ.get("GITHUB_RUN_ID", ""),
+            "recipe_sha256": recipe_sha256(),
+        }
     args.out.mkdir()
     files = {}
     for kind in KINDS:
@@ -196,6 +357,8 @@ def main():
         "boot_modules": read(first["bundle"], "boot-modules.txt").splitlines(),
         "base_root_verity": read(first["bundle"], "base-root.verity"),
         "base_root_data_bytes": read(first["bundle"], "base-root.data-bytes"),
+        "base_root_pin": pin["status"],
+        "base_root_to_pin": to_pin,
         "closure_digests": closure_rows(pinned),
         "closure_module_files": len(pinned.get("modules", {})),
         "bundle_id": agreed["bundle"].get("manifest.json", ""),
@@ -221,6 +384,7 @@ def main():
         f"- Snapshot: `{summary['snapshot']}`\n"
         f"- Kernel release: `{summary['kernel_release']}`\n"
         f"- Base root verity: `{summary['base_root_verity']}`, data bytes {summary['base_root_data_bytes']}\n"
+        f"- Base root pin: {pin_line(pin, to_pin)}\n"
         f"- Bundle id (sha256 of manifest.json): `{summary['bundle_id'] or 'not built (closure unpinned)'}`\n"
         f"- Fixture identity a, 2 vCPU, genoa: {measurement_line(summary['measurement'])}\n"
         f"- Initrd: {summary['initrd_bytes'] if summary['initrd_bytes'] is not None else 'not built'} bytes\n"
