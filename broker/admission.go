@@ -307,7 +307,7 @@ func (b *broker) checkAttestation(ctx context.Context, h *hotel) (admission, err
 	if err != nil {
 		return res, err
 	}
-	// URnetwork Q3: optional membership in the published signed sealed-hotels list.
+	// Dedicated customer Q3: optional membership in the published signed sealed-hotels list.
 	if b.cfg.SignedMeasurementsAdmission {
 		b.refreshSignedMeasurements()
 		ok, why := measurementAllowed(h.cfg.ID, res.measurement, b.sealedMeasurements(), true)

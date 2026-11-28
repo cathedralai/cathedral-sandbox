@@ -245,7 +245,7 @@ type config struct {
 	SealedAdmission    string   `json:"sealed_admission,omitempty"`
 	SealedMeasurements []string `json:"sealed_measurements,omitempty"` // a gated hotel's measurement must be one of these; empty refuses every gated hotel
 	SealedHostData     []string `json:"sealed_host_data,omitempty"`    // non-empty: its HOST_DATA must be one of these
-	// SignedMeasurementsURL + SignedMeasurementsAdmission (URnetwork Q3): when
+	// SignedMeasurementsURL + SignedMeasurementsAdmission (dedicated customer Q3): when
 	// admission is true and URL is set, prefer Cathedral's published sealed
 	// hotels list for measurement membership; fall back to sealed_measurements
 	// if the list cannot be loaded.
