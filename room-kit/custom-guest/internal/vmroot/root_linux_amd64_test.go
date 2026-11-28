@@ -353,8 +353,18 @@ func TestRootFinishBindsModulesToolsAndWritesTheNetworkFile(t *testing.T) {
 
 	cfg := FinishConfig{Link: []byte("10.216.0.5 10.216.0.6"), KernelRelease: release,
 		Tools: []Bind{{Source: tool.Path, Name: "cathedral-attest"}, {Source: tool.Path, Name: "cathedral-vm"}}}
-	if err := m.Finish(cfg); err != nil {
+	// The VM init runs Finish under bootstate.PrepareKernelViews' umask.
+	old := syscall.Umask(0o077)
+	err = m.Finish(cfg)
+	syscall.Umask(old)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// B4: /run/systemd was root-only, so every non-root service failed.
+	for _, dir := range []string{"run/systemd", "run/systemd/network", "run/cathedral", "run/cathedral/bin"} {
+		if fi, err := os.Lstat(filepath.Join(m.Path(), dir)); err != nil || fi.Mode().Perm() != 0o755 {
+			t.Errorf("%s: %v %v, want 0755", dir, fi.Mode(), err)
+		}
 	}
 	if got, err := os.ReadFile(filepath.Join(m.Path(), "usr/lib/modules", release, "modules.dep")); err != nil || len(got) == 0 {
 		t.Fatalf("modules not bound: %v", err)
@@ -399,5 +409,30 @@ func TestSwitchRootGuards(t *testing.T) {
 	}
 	if err := (&Mounted{}).Finish(FinishConfig{KernelRelease: "6.8.0-1-generic"}); err == nil {
 		t.Error("Finish with no tools was accepted")
+	}
+}
+
+// The VM init sets up the root under bootstate.PrepareKernelViews' umask 0077. B4's guest got a
+// root-only /run/systemd from it, so every non-root service failed. Each directory the setup
+// creates must still get its own mode.
+func TestCreatedDirectoriesKeepTheirModesUnderTheInitUmask(t *testing.T) {
+	defer syscall.Umask(syscall.Umask(0o077))
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := WriteNetwork(root, []byte("10.216.0.5 10.216.0.6")); err != nil {
+		t.Fatal(err)
+	}
+	if err := AssertCloudInitOff(root); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]os.FileMode{"systemd": 0o755, "systemd/network": 0o755,
+		"systemd/network/10-uplink.network": 0o644, "etc": 0o755, "etc/cloud": 0o755} {
+		if fi, err := os.Lstat(filepath.Join(dir, name)); err != nil || fi.Mode().Perm() != want {
+			t.Errorf("%s: %v %v, want %v", name, fi.Mode().Perm(), err, want)
+		}
 	}
 }

@@ -10,7 +10,9 @@ package main
 //
 // B2's boot 2 powered off at F3 because the initramfs had no /run for cryptsetup's LUKS2 lock. B3
 // booted Ubuntu with /proc and /sys read-only, so every unit with OOMScoreAdjust= failed and the
-// guest got no network. The other tests run the tools on a runner, where neither can happen.
+// guest got no network. B4 then ran the root setup under the init's umask 0077, so /run/systemd was
+// root-only and every non-root service failed. The other tests run the tools on a runner, where
+// none of this can happen.
 
 import (
 	"context"
@@ -19,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"syscall"
@@ -37,11 +40,18 @@ const (
 	checkRootInit = "/sbin/init"
 	// checkLink is the link the check gives Finish (RFC 1918, one /30).
 	checkLink = "10.0.0.1 10.0.0.2"
+	// probeEnv runs the binary as the unprivileged probe the check root's init starts.
+	probeEnv = "CATHEDRAL_INITRD_CHECK_PROBE"
+	// nobody is the uid and gid the probe drops to, as a non-root service runs.
+	nobody = 65534
 )
 
 // TestMain is the check root's /sbin/init when the binary is PID 1 with vmroot's fixed argv: the
 // switch_root passes no test flags and no environment beyond PATH, LANG and TERM.
 func TestMain(m *testing.M) {
+	if os.Getenv(probeEnv) == "1" && os.Getuid() == nobody {
+		os.Exit(probeAsNobody())
+	}
 	if os.Getpid() == 1 && len(os.Args) == 1 && os.Args[0] == checkRootInit {
 		afterSwitchRoot()
 	}
@@ -52,7 +62,9 @@ func TestInitrdDiskCheck(t *testing.T) {
 	if os.Getpid() != 1 || os.Getenv("CATHEDRAL_INITRD_CHECK") != "1" {
 		t.Skip("PID 1 of the initrd check VM (vm-bundle-build.yml)")
 	}
-	// The mounts bootstate.PrepareKernelViews makes. Its SNP device and configfs steps need SNP.
+	// The umask and mounts bootstate.PrepareKernelViews makes. Its SNP device and configfs steps
+	// need SNP. The init keeps the umask for every later step, the root setup included.
+	syscall.Umask(0o077)
 	const readonly = syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC
 	for _, m := range []struct {
 		path, kind, data string
@@ -208,7 +220,53 @@ func checkKernelViews() error {
 	if err != nil {
 		return err
 	}
-	return mountsWritable(info, map[string]string{"/proc": "proc", "/sys": "sysfs"})
+	if err := mountsWritable(info, map[string]string{"/proc": "proc", "/sys": "sysfs"}); err != nil {
+		return err
+	}
+	// networkd, resolved, timesyncd and dbus run as their own users and reach /run/systemd (the
+	// notify socket, their runtime directories) and networkd reads /run/systemd/network.
+	probe := exec.Command(checkRootInit)
+	probe.Env = []string{probeEnv + "=1"}
+	probe.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: nobody, Gid: nobody, Groups: []uint32{}}}
+	if out, err := probe.CombinedOutput(); err != nil {
+		return fmt.Errorf("uid %d: %v: %s", nobody, err, strings.TrimSpace(string(out)))
+	}
+	// The root's own init starts with the usual umask, not the init's 0077.
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(status), "\nUmask:\t0022\n") {
+		return fmt.Errorf("the root's init does not start with umask 0022: %q", umaskLine(status))
+	}
+	return nil
+}
+
+// probeAsNobody is the probe: it reaches what a non-root service reaches under /run/systemd.
+func probeAsNobody() int {
+	if _, err := os.Stat("/run/systemd"); err != nil {
+		fmt.Println(err)
+		return 1
+	}
+	dir, err := os.Open("/run/systemd/network")
+	if err == nil {
+		_, err = dir.Readdirnames(-1)
+		dir.Close()
+	}
+	if err != nil {
+		fmt.Println(err)
+		return 1
+	}
+	return 0
+}
+
+func umaskLine(status []byte) string {
+	for _, line := range strings.Split(string(status), "\n") {
+		if strings.HasPrefix(line, "Umask:") {
+			return line
+		}
+	}
+	return ""
 }
 
 // writeKernelFile writes value as systemd writes a kernel file: an existing file, write-only.
