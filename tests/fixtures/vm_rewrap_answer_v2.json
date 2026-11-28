@@ -253,6 +253,136 @@
    "refusal": "signature_type"
   },
   {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPC4s4ppV8aiB54qp98v4dgoS6kvYOjLPMWVq0Ku7JxkAAAAmdm0tcmV3cmFwLWFuc3dlci12MkBjYXRoZWRyYWwuY29tcHV0ZXIAAAAAAAAABnNoYTUxMgAAAFQAAAALc3NoLWVkMjU1MTkAAABAqftlcPPNsCDzCwTbAyrkbsIB14zj5xkQl/P0L89zpkK8eyyNgOZcwSj6LSDtHUSCVJ0xkbBFBgxH2Hbrr8f/BAA=\"}",
+   "body_bytes": 565,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "ed25519-trailing-in-signature",
+   "note": "one byte after the Ed25519 signature, inside the signature string",
+   "openssh_accepts": false,
+   "refusal": "signature_encoding"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEE7nCJwqeFoclaBPLMH0rKRmGAavBXW9oMrkxlQrcHCDiojfTS+Jt96NvNUCCcOpAjtssWa4pWAH7UR7CuEukeJgAAACZ2bS1yZXdyYXAtYW5zd2VyLXYyQGNhdGhlZHJhbC5jb21wdXRlcgAAAAAAAAAGc2hhNTEyAAAAZQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASgAAACEA14YseSPVEjea3t8I7bDGNdj9AnisaYqf2UqBtE1BHoQAAAAgAtDd8ETyUX2Kl/jgkB0ZrD1EQb4qb5xkqT86UmNUMwEA\"}",
+   "body_bytes": 657,
+   "identity_ssh_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBO5wicKnhaHJWgTyzB9KykZhgGrwV1vaDK5MZUK3Bwg4qI300vibfejbzVAgnDqQI7bLFmuKVgB+1EewrhLpHiY=",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "ecdsa-trailing-after-s",
+   "note": "one byte after s, inside the ECDSA signature",
+   "openssh_accepts": false,
+   "refusal": "signature_encoding"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEE7nCJwqeFoclaBPLMH0rKRmGAavBXW9oMrkxlQrcHCDiojfTS+Jt96NvNUCCcOpAjtssWa4pWAH7UR7CuEukeJgAAACZ2bS1yZXdyYXAtYW5zd2VyLXYyQGNhdGhlZHJhbC5jb21wdXRlcgAAAAAAAAAGc2hhNTEyAAAAZAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASQAAACEA/////wAAAAD//////////7zm+q2nF56E87nKwvxjJVEAAAAgAtDd8ETyUX2Kl/jgkB0ZrD1EQb4qb5xkqT86UmNUMwE=\"}",
+   "body_bytes": 657,
+   "identity_ssh_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBO5wicKnhaHJWgTyzB9KykZhgGrwV1vaDK5MZUK3Bwg4qI300vibfejbzVAgnDqQI7bLFmuKVgB+1EewrhLpHiY=",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "ecdsa-r-equals-n",
+   "note": "ECDSA r = n",
+   "openssh_accepts": false,
+   "refusal": "signature_encoding"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEE7nCJwqeFoclaBPLMH0rKRmGAavBXW9oMrkxlQrcHCDiojfTS+Jt96NvNUCCcOpAjtssWa4pWAH7UR7CuEukeJgAAACZ2bS1yZXdyYXAtYW5zd2VyLXYyQGNhdGhlZHJhbC5jb21wdXRlcgAAAAAAAAAGc2hhNTEyAAAAZQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASgAAACEA14YseSPVEjea3t8I7bDGNdj9AnisaYqf2UqBtE1BHoQAAAAhAP////8AAAAA//////////+85vqtpxeehPO5ysL8YyVR\"}",
+   "body_bytes": 657,
+   "identity_ssh_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBO5wicKnhaHJWgTyzB9KykZhgGrwV1vaDK5MZUK3Bwg4qI300vibfejbzVAgnDqQI7bLFmuKVgB+1EewrhLpHiY=",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "ecdsa-s-equals-n",
+   "note": "ECDSA s = n",
+   "openssh_accepts": false,
+   "refusal": "signature_encoding"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPC4s4ppV8aiB54qp98v4dgoS6kvYOjLPMWVq0Ku7JxkAAAAmdm0tcmV3cmFwLWFuc3dlci12MkBjYXRoZWRyYWwuY29tcHV0ZXIAAAABeAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQKn7ZXDzzbAg8wsE2wMq5G7CAdeM4+cZEJfz9C/Pc6ZCvHssjYDmXMEo+i0g7R1EglSdMZGwRQYMR9h266/H/wQ=\"}",
+   "body_bytes": 565,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "reserved-not-empty",
+   "note": "SSHSIG reserved is not empty: OpenSSH ignores the field; the guest refuses",
+   "openssh_accepts": true,
+   "refusal": "reserved"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPC4s4ppV8aiB54qp98v4dgoS6kvYOjLPMWVq0Ku7JxkAAAAmdm0tcmV3cmFwLWFuc3dlci12MkBjYXRoZWRyYWwuY29tcHV0ZXIAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqftlcPPNsCDzCwTbAyrkbsIB14zj5xkQl/P0L89zpkK8eyyNgOZcwSj6LSDtHUSCVJ0xkbBF\"}",
+   "body_bytes": 549,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "sshsig-truncated",
+   "note": "the SSHSIG cut 10 bytes short: its last string runs past the end",
+   "openssh_accepts": false,
+   "refusal": "sshsig_format"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAA=\"}",
+   "body_bytes": 297,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "sshsig-truncated-in-header",
+   "note": "the SSHSIG cut inside its version",
+   "openssh_accepts": false,
+   "refusal": "sshsig_format"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAAEoAAAAac2stc3NoLWVkMjU1MTlAb3BlbnNzaC5jb20AAAAgVmydaBQ8ut9ygE758O36ZmLGhwwxVjRajfeSRiHvtz0AAAAEc3NoOgAAACZ2bS1yZXdyYXAtYW5zd2VyLXYyQGNhdGhlZHJhbC5jb21wdXRlcgAAAAAAAAAGc2hhNTEyAAAAZwAAABpzay1zc2gtZWQyNTUxOUBvcGVuc3NoLmNvbQAAAECOqTG1vtBKstiw/vyQYxZp9DAAjDQOGxleo/S/Mv0+2gOcuj1JfIs4f7rT6T43JT7bVzSdJ1jzCzMCDlp8+usDBQAAAAc=\"}",
+   "body_bytes": 621,
+   "identity_ssh_public_key": "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIFZsnWgUPLrfcoBO+fDt+mZixocMMVY0Wo33kkYh77c9AAAABHNzaDo=",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "sk-flags-changed",
+   "note": "the sk flags changed after signing (user-present still set)",
+   "openssh_accepts": false,
+   "refusal": "signature_invalid"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAAEoAAAAac2stc3NoLWVkMjU1MTlAb3BlbnNzaC5jb20AAAAgVmydaBQ8ut9ygE758O36ZmLGhwwxVjRajfeSRiHvtz0AAAAEc3NoOgAAACZ2bS1yZXdyYXAtYW5zd2VyLXYyQGNhdGhlZHJhbC5jb21wdXRlcgAAAAAAAAAGc2hhNTEyAAAAZwAAABpzay1zc2gtZWQyNTUxOUBvcGVuc3NoLmNvbQAAAECOqTG1vtBKstiw/vyQYxZp9DAAjDQOGxleo/S/Mv0+2gOcuj1JfIs4f7rT6T43JT7bVzSdJ1jzCzMCDlp8+usDAQAAAAY=\"}",
+   "body_bytes": 621,
+   "identity_ssh_public_key": "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIFZsnWgUPLrfcoBO+fDt+mZixocMMVY0Wo33kkYh77c9AAAABHNzaDo=",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "sk-counter-changed",
+   "note": "the sk counter changed after signing",
+   "openssh_accepts": false,
+   "refusal": "signature_invalid"
+  },
+  {
+   "body": "{\"ct\":\"3Hvia2WkrOoBfxcCTDV/2HO8vEU8P4nt0RT/YDDRfw6EoxhRfQZTx4Ip3BznYpxl\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEE7nCJwqeFoclaBPLMH0rKRmGAavBXW9oMrkxlQrcHCDiojfTS+Jt96NvNUCCcOpAjtssWa4pWAH7UR7CuEukeJgAAACZ2bS1yZXdyYXAtYW5zd2VyLXYyQGNhdGhlZHJhbC5jb21wdXRlcgAAAAAAAAAGc2hhNTEyAAAAYwAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASAAAACCAqszjXN5QQvyGLJ0EgUHlndTDZJmG+eWRcUN4Mo+4pAAAACA2G20SxtsmhbElD5gtqSOCIHns3lxeD5je4SdMnZGIaw==\"}",
+   "body_bytes": 657,
+   "identity_ssh_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBO5wicKnhaHJWgTyzB9KykZhgGrwV1vaDK5MZUK3Bwg4qI300vibfejbzVAgnDqQI7bLFmuKVgB+1EewrhLpHiY=",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a2dc7be26b65a4acea017f17024c357fd873bcbc453c3f89edd114ff6030d17f0e84a318517d0653c78229dc1ce7629c65",
+   "name": "ecdsa-mpint-negative",
+   "note": "ECDSA r with its top bit set and no leading zero: a negative mpint",
+   "openssh_accepts": false,
+   "refusal": "signature_encoding"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\", \"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPC4s4ppV8aiB54qp98v4dgoS6kvYOjLPMWVq0Ku7JxkAAAAmdm0tcmV3cmFwLWFuc3dlci12MkBjYXRoZWRyYWwuY29tcHV0ZXIAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqftlcPPNsCDzCwTbAyrkbsIB14zj5xkQl/P0L89zpkK8eyyNgOZcwSj6LSDtHUSCVJ0xkbBFBgxH2Hbrr8f/BA==\"}",
+   "body_bytes": 566,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "body-not-canonical-space",
+   "note": "a space in the JSON body",
+   "openssh_accepts": null,
+   "refusal": "answer_schema"
+  },
+  {
+   "body": "{\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPC4s4ppV8aiB54qp98v4dgoS6kvYOjLPMWVq0Ku7JxkAAAAmdm0tcmV3cmFwLWFuc3dlci12MkBjYXRoZWRyYWwuY29tcHV0ZXIAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqftlcPPNsCDzCwTbAyrkbsIB14zj5xkQl/P0L89zpkK8eyyNgOZcwSj6LSDtHUSCVJ0xkbBFBgxH2Hbrr8f/BA==\"}",
+   "body_bytes": 565,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "body-not-canonical-key-order",
+   "note": "the JSON keys out of order",
+   "openssh_accepts": null,
+   "refusal": "answer_schema"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"F6EE0CB1F791C88CDF86DEB5CC4D19B90BA864942F759481B442AECD4EBAA1F7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPC4s4ppV8aiB54qp98v4dgoS6kvYOjLPMWVq0Ku7JxkAAAAmdm0tcmV3cmFwLWFuc3dlci12MkBjYXRoZWRyYWwuY29tcHV0ZXIAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqftlcPPNsCDzCwTbAyrkbsIB14zj5xkQl/P0L89zpkK8eyyNgOZcwSj6LSDtHUSCVJ0xkbBFBgxH2Hbrr8f/BA==\"}",
+   "body_bytes": 565,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "offer-sha256-uppercase",
+   "note": "offer_sha256 in uppercase hex",
+   "openssh_accepts": null,
+   "refusal": "answer_schema"
+  },
+  {
    "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekk=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v1\"}",
    "body_bytes": 276,
    "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",

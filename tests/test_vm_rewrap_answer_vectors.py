@@ -22,7 +22,15 @@ ANSWERS = json.loads((REPO / "tests" / "fixtures" / "vm_rewrap_answer_v2.json").
 SHAPES = json.loads((REPO / "tests" / "fixtures" / "vm_ssh_key_shapes_v1.json").read_text())
 CASES = {case["name"]: case for case in ANSWERS["cases"]}
 SSH_KEYGEN = shutil.which("ssh-keygen")
-needs_openssh = pytest.mark.skipif(SSH_KEYGEN is None, reason="needs OpenSSH ssh-keygen")
+
+
+def _ssh_keygen() -> str:
+    """OpenSSH is the independent check: skipped on a machine without it, required in CI."""
+    if SSH_KEYGEN is None:
+        if os.environ.get("CI"):
+            pytest.fail("CI must run the OpenSSH cross-checks, and ssh-keygen is missing")
+        pytest.skip("needs OpenSSH ssh-keygen")
+    return SSH_KEYGEN
 
 
 def _module(name, path):
@@ -69,7 +77,10 @@ def test_every_key_type_has_a_valid_answer_and_each_refusal_is_the_reference_ver
     assert {case["refusal"] for case in ANSWERS["cases"]} >= {
         None, "signature_invalid", "publickey_mismatch", "namespace", "hash_algorithm", "sshsig_version",
         "sshsig_format", "signature_type", "signature_encoding", "sk_user_presence", "answer_schema",
-        "sig_too_long", "answer_too_long", "sig_encoding"}
+        "sig_too_long", "answer_too_long", "sig_encoding", "reserved"}
+    # Erratum 2.6 names these negatives; each has a case.
+    assert {"ed25519-trailing-in-signature", "ecdsa-trailing-after-s", "ecdsa-r-equals-n", "ecdsa-s-equals-n",
+            "reserved-not-empty", "sshsig-truncated", "sshsig-truncated-in-header"} <= set(CASES)
 
 
 def test_every_valid_answer_fits_and_the_worst_case_is_rsa_8192():
@@ -104,27 +115,26 @@ def test_the_seal_inside_is_the_v1_envelope_vector():
         {k: envelope["answer"][k] for k in ("ct", "epk", "nonce", "offer_sha256")}
 
 
-@needs_openssh
 def test_openssh_reads_each_case_as_the_fixture_says(tmp_path):
+    ssh_keygen = _ssh_keygen()
     checked = 0
     for case in ANSWERS["cases"]:
         if case["openssh_accepts"] is None:
             continue
         (tmp_path / "answer.sig").write_text(_armor(_sig(case)))
-        r = subprocess.run([SSH_KEYGEN, "-Y", "check-novalidate", "-n", ANSWERS["namespace"], "-s",
+        r = subprocess.run([ssh_keygen, "-Y", "check-novalidate", "-n", ANSWERS["namespace"], "-s",
                             str(tmp_path / "answer.sig")], input=bytes.fromhex(case["message_hex"]),
                            capture_output=True)
         assert (r.returncode == 0) == case["openssh_accepts"], (case["name"], r.stderr)
         checked += 1
-    assert checked >= 20
+    assert checked >= 30
     # Where OpenSSH accepts what the guest refuses: verify_vm.py rewrap must apply the guest's
     # rules itself, or it prints an answer the guest ignores (r2 review P3-a, P3-b).
     differ = sorted(c["name"] for c in ANSWERS["cases"] if c["openssh_accepts"] and c["refusal"])
-    assert differ == ["ecdsa-mpint-not-minimal", "hash-sha256", "other-key", "rsa-sha2-256",
-                      "rsa-short-signature", "sk-no-user-presence"]
+    assert differ == ["ecdsa-mpint-not-minimal", "hash-sha256", "other-key", "reserved-not-empty",
+                      "rsa-sha2-256", "rsa-short-signature", "sk-no-user-presence"]
 
 
-@needs_openssh
 @pytest.mark.parametrize("name, key", [
     ("valid-ed25519", lambda: gen.ed25519_key("ed25519")),
     ("valid-rsa-2048", lambda: gen.rsa_key(ANSWERS["test_keys"]["rsa-2048"])),
@@ -133,10 +143,11 @@ def test_openssh_reads_each_case_as_the_fixture_says(tmp_path):
 def test_ssh_keygen_signs_the_same_bytes(tmp_path, name, key):
     """Ed25519 and RSA PKCS#1 v1.5 are deterministic, so OpenSSH's own signer must give the
     fixture's SSHSIG byte for byte: the generator's encoding is OpenSSH's."""
+    ssh_keygen = _ssh_keygen()
     path = tmp_path / "key"
     path.write_bytes(key().private.private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()))
     os.chmod(path, 0o600)
-    r = subprocess.run([SSH_KEYGEN, "-Y", "sign", "-n", ANSWERS["namespace"], "-f", str(path)],
+    r = subprocess.run([ssh_keygen, "-Y", "sign", "-n", ANSWERS["namespace"], "-f", str(path)],
                        input=bytes.fromhex(CASES[name]["message_hex"]), capture_output=True)
     assert r.returncode == 0, r.stderr
     armored = b"".join(line for line in r.stdout.splitlines() if not line.startswith(b"-----"))
@@ -183,3 +194,28 @@ def test_a_valid_answer_with_any_bit_of_its_message_flipped_is_refused():
     other = dict(doc, offer_sha256=hashlib.sha256(b"x").hexdigest())
     assert gen.refusal(json.dumps(other, sort_keys=True, separators=(",", ":")).encode(),
                        case["identity_ssh_public_key"]) == "signature_invalid"
+
+
+def test_the_on_curve_check_agrees_with_cryptography():
+    """key_shape's curve equation and constants against an independent implementation: every
+    ECDSA point in the shape vectors is on its curve exactly when cryptography loads it."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    curves = {"nistp256": ec.SECP256R1(), "nistp384": ec.SECP384R1(), "nistp521": ec.SECP521R1()}
+    seen = 0
+    for case in SHAPES["cases"]:
+        r = gen.Reader(base64.b64decode(case["ssh_public_key"].split(" ")[1]), "x")
+        kind = r.string().decode()
+        if "ecdsa" not in kind:
+            continue
+        curve, point = r.string().decode(), r.string()
+        if curve not in curves or len(point) != gen.CURVES[curve][2] or point[0] != 4:
+            continue
+        try:
+            ec.EllipticCurvePublicKey.from_encoded_point(curves[curve], point)
+            loads = True
+        except ValueError:
+            loads = False
+        assert gen.on_curve(curve, point) is loads, case["name"]
+        assert (case["refusal"] is None) is loads, case["name"]
+        seen += 1
+    assert seen >= 5  # the four valid ECDSA keys and the point off the curve

@@ -104,6 +104,11 @@
    "name": "ecdsa-compressed-point",
    "refusal": "ecdsa_point",
    "ssh_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAAhAu5wicKnhaHJWgTyzB9KykZhgGrwV1vaDK5MZUK3Bwg4"
+  },
+  {
+   "name": "ecdsa-point-off-curve",
+   "refusal": "ecdsa_point",
+   "ssh_public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBO5wicKnhaHJWgTyzB9KykZhgGrwV1vaDK5MZUK3Bwg4qI300vibfejbzVAgnDqQI7bLFmuKVgB+1EewrhLpHic="
   }
  ],
  "key_blob_max_bytes": 1100,

@@ -102,15 +102,18 @@ signatures are deterministic, from test keys that protect nothing. Each case car
 code the guest must give (from the generator's reference verifier, `null` when valid) and, where
 known, `openssh_accepts`: `tests/test_vm_rewrap_answer_vectors.py` runs `ssh-keygen -Y
 check-novalidate` over those cases, and `ssh-keygen -Y sign` makes the Ed25519 and RSA vectors byte
-for byte. The worst case is RSA 8192: 3173 bytes. OpenSSH accepts six cases the guest refuses
-(another key, `sha256`, `rsa-sha2-256`, a short RSA signature, a non-minimal mpint, and an sk
-signature without the user-present bit), so `verify_vm.py rewrap` checks those rules itself
-before it prints an answer.
+for byte. Both OpenSSH tests skip on a machine without `ssh-keygen` and fail in CI without it.
+The worst case is RSA 8192: 3173 bytes. OpenSSH accepts seven cases the guest refuses (another
+key, `sha256`, `rsa-sha2-256`, a short RSA signature, a non-minimal mpint, an sk signature
+without the user-present bit, and a reserved field that is not empty), so `verify_vm.py
+rewrap` checks those rules itself before it prints an answer. The negatives of erratum 2.6 each
+have a case, a blob cut short among them: a reader refuses it and never panics.
 
 **Key shape at VM create only:** a key the guest could not verify within 4096 bytes is refused when
 the VM is made (`vm_ssh_key_shapes_v1.json`): a blob of at most 1100 bytes, an RSA modulus of 2048
-to 8192 bits with an odd e in 3..2^31-1, a 32-byte Ed25519 key, and an uncompressed point on the
-named curve. The identity parser that `start`, `rebundle`, `verify` and the init use does not
+to 8192 bits with an odd e in 3..2^31-1, a 32-byte Ed25519 key, and an uncompressed point (0x04,
+65, 97 or 133 bytes) whose coordinates are below p and satisfy the named curve's equation. The
+identity parser that `start`, `rebundle`, `verify` and the init use does not
 change, so a VM made before the rule keeps booting; only its re-wrap is refused
 (`rewrap_key_unsupported`).
 
