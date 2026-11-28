@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# WARNING: never a real private key here. The fixture's test keys are public by design (the RSA
+# primes are in the fixture, the other keys come from the fixed seeds below) and must never be
+# used as an identity: anyone can sign a re-wrap answer with them.
 """Make tests/fixtures/vm_rewrap_answer_v2.json and tests/fixtures/vm_ssh_key_shapes_v1.json
 (AB#1022, spec r3 7.5 with the r4 erratum): the signed re-wrap answer and the key shape that
 VM create allows, as shared vectors for the guest init, the host, the broker and verify_vm.py.
@@ -12,13 +15,14 @@ identity's ssh_public_key:
 
 and the signature over D per key type (docs/VM_GUEST.md "Re-wrap answer v2"). Every signature
 here is deterministic (Ed25519, RSA PKCS#1 v1.5, ECDSA with RFC 6979), so --check compares
-bytes. The keys are test keys and protect nothing: the RSA primes are kept in the fixture so
-it can be made again; the others come from fixed seeds.
+bytes. The keys are test keys, public by design: the RSA primes are kept in the fixture so it
+can be made again, and the others come from fixed seeds. Never use one as a VM identity.
 
 reference_verify() is the erratum 2.4 verifier in Python. It gives each case its expected
 refusal code (None for a valid answer); the Go guest must give the same. The test also runs
 OpenSSH's ssh-keygen over every case whose "openssh_accepts" is set, so the cases where OpenSSH
-and the guest differ (RSA SHA-256, a short RSA signature, a non-minimal mpint) are shown.
+and the guest differ (RSA SHA-256, a short RSA signature, a non-minimal mpint, a reserved field
+that is not empty, and others) are shown.
 
   make_vm_rewrap_answer_vectors.py            write both fixtures
   make_vm_rewrap_answer_vectors.py --check    exit 1 if either file on disk differs
@@ -65,6 +69,17 @@ ORDERS = {
     "nistp384": int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973", 16),
     "nistp521": int("01FF" + "FFFFFFFF" * 7 + "FFFFFFFA"
                     "51868783BF2F966B7FCC0148F709A5D03BB5C9B8899C47AEBB6FB71E91386409", 16),
+}
+# y^2 = x^3 - 3x + b over GF(p) (SEC 2): create checks that an ECDSA point is on its curve.
+CURVE_FIELDS = {
+    "nistp256": (2**256 - 2**224 + 2**192 + 2**96 - 1,
+                 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B),
+    "nistp384": (2**384 - 2**128 - 2**96 + 2**32 - 1,
+                 int("B3312FA7E23EE7E4988E056BE3F82D19181D9C6EFE8141120314088F5013875A"
+                     "C656398D8A2ED19D2A85C8EDD3EC2AEF", 16)),
+    "nistp521": (2**521 - 1,
+                 int("0051953EB9618E1C9A1F929A21A0B68540EEA2DA725B99B315F3B8B489918EF1"
+                     "09E156193951EC7E937B1652C0BD3BB1BF073573DF883D2C34F1EF451FD46B503F00", 16)),
 }
 # Key type: (signature type, curve or None).
 KEY_TYPES = {
@@ -158,9 +173,17 @@ def signed_data(m: bytes, namespace: str = NAMESPACE, hash_name: str = HASH) -> 
 
 
 def sshsig(public_blob: bytes, signature: bytes, namespace: str = NAMESPACE, hash_name: str = HASH,
-           version: int = 1) -> bytes:
-    return (b"SSHSIG" + u32(version) + string(public_blob) + string(namespace) + string(b"")
+           version: int = 1, reserved: bytes = b"") -> bytes:
+    return (b"SSHSIG" + u32(version) + string(public_blob) + string(namespace) + string(reserved)
             + string(hash_name) + string(signature))
+
+
+def on_curve(curve: str, point: bytes) -> bool:
+    """POINT (0x04 || x || y) satisfies its curve's equation, with x and y below p."""
+    p, b = CURVE_FIELDS[curve]
+    size = (len(point) - 1) // 2
+    x, y = int.from_bytes(point[1:1 + size], "big"), int.from_bytes(point[1 + size:], "big")
+    return x < p and y < p and (y * y - (x * x * x - 3 * x + b)) % p == 0
 
 
 # ---------------------------------------------------------------- test keys
@@ -392,7 +415,7 @@ def key_shape(line: str) -> str | None:
             if r.string() != curve.encode():
                 return "ecdsa_curve"
             point = r.string()
-            if len(point) != CURVES[curve][2] or point[0] != 4:
+            if len(point) != CURVES[curve][2] or point[0] != 4 or not on_curve(curve, point):
                 return "ecdsa_point"
         else:
             e = r.mpint("rsa_exponent")
@@ -434,6 +457,8 @@ def shape_cases(keys: dict) -> list:
         ("ecdsa-curve-mismatch", line(string("ecdsa-sha2-nistp256") + string("nistp384") + string(point))),
         ("ecdsa-compressed-point", line(string("ecdsa-sha2-nistp256") + string("nistp256")
                                         + string(b"\x02" + point[1:33]))),
+        ("ecdsa-point-off-curve", line(string("ecdsa-sha2-nistp256") + string("nistp256")
+                                       + string(point[:-1] + bytes([point[-1] ^ 1])))),
     ]
     return [{"name": name, "ssh_public_key": text, "refusal": key_shape(text)} for name, text in cases]
 
@@ -567,6 +592,52 @@ def build(kept: dict) -> tuple[dict, dict]:
         "check-novalidate accepts it, so verify_vm.py rewrap checks the bit itself; the guest refuses")
     add("sk-plain-signature-type", sk, answer_for(sk, base, sig_type="ssh-ed25519"), False,
         "an sk-ed25519 key with a signature of type ssh-ed25519")
+    # Erratum 2.6 negatives inside the blob: trailing bytes in the signature string, r or s at n,
+    # a reserved field that is not empty, and a blob cut short (a reader must refuse, not panic).
+    add("ed25519-trailing-in-signature", ed, dict(good, sig=b64(sshsig(ed.blob, string("ssh-ed25519")
+        + string(raw64) + b"\0"))), False, "one byte after the Ed25519 signature, inside the signature string")
+    d256 = signed_data(message(dict(base, schema=SCHEMA)))
+    r256, s256 = decode_dss_signature(p256.private.sign(d256, ec.ECDSA(hashes.SHA256(), deterministic_signing=True)))
+    p256_good = dict(base, schema=SCHEMA, sig=b64(sshsig(p256.blob, string(p256.kind) + string(mpint(r256) + mpint(s256)))))
+    assert refusal(canonical(p256_good).encode(), p256.line) is None
+    n256 = ORDERS["nistp256"]
+    for name, inner, note in (
+            ("ecdsa-trailing-after-s", mpint(r256) + mpint(s256) + b"\0", "one byte after s, inside the ECDSA signature"),
+            ("ecdsa-r-equals-n", mpint(n256) + mpint(s256), "ECDSA r = n"),
+            ("ecdsa-s-equals-n", mpint(r256) + mpint(n256), "ECDSA s = n")):
+        add(name, p256, dict(p256_good, sig=b64(sshsig(p256.blob, string(p256.kind) + string(inner)))), False, note)
+    add("reserved-not-empty", ed, dict(good, sig=b64(sshsig(ed.blob, ed.sign(signed_data(message(good))),
+                                                            reserved=b"x"))), True,
+        "SSHSIG reserved is not empty: OpenSSH ignores the field; the guest refuses")
+    add("sshsig-truncated", ed, dict(good, sig=b64(blob[:-10])), False,
+        "the SSHSIG cut 10 bytes short: its last string runs past the end")
+    add("sshsig-truncated-in-header", ed, dict(good, sig=b64(blob[:8])), False, "the SSHSIG cut inside its version")
+
+    # More binding and encoding cases (the #820 review, P3-b).
+    sk_sig = base64.b64decode(answer_for(sk, base)["sig"])
+    for name, at, note in (("sk-flags-changed", -5, "the sk flags changed after signing (user-present still set)"),
+                           ("sk-counter-changed", -1, "the sk counter changed after signing")):
+        changed = bytearray(sk_sig)
+        changed[at] ^= 0x04 if at == -5 else 0x01
+        add(name, sk, dict(base, schema=SCHEMA, sig=b64(bytes(changed))), False, note)
+    for i in range(256):
+        fields = variant("mpint-negative", i)
+        d = signed_data(message(dict(fields, schema=SCHEMA)))
+        rr, ss = decode_dss_signature(p256.private.sign(d, ec.ECDSA(hashes.SHA256(), deterministic_signing=True)))
+        raw_r = rr.to_bytes(32, "big")
+        if raw_r[0] & 0x80:
+            signature = string(p256.kind) + string(string(raw_r) + mpint(ss))
+            add("ecdsa-mpint-negative", p256, dict(fields, schema=SCHEMA, sig=b64(sshsig(p256.blob, signature))),
+                False, "ECDSA r with its top bit set and no leading zero: a negative mpint")
+            break
+    else:
+        raise SystemExit("no ECDSA r with its top bit set in 256 tries")
+    add("body-not-canonical-space", ed, canonical(good).replace('",', '", ', 1), None, "a space in the JSON body")
+    add("body-not-canonical-key-order", ed, "{" + ",".join(f'"{k}":{json.dumps(good[k])}' for k in
+        ("epk", "ct", "nonce", "offer_sha256", "schema", "sig")) + "}", None, "the JSON keys out of order")
+    add("offer-sha256-uppercase", ed, dict(good, offer_sha256=good["offer_sha256"].upper()), None,
+        "offer_sha256 in uppercase hex")
+
     v1 = dict(base, schema="cathedral.vm.rewrap-answer/v1")
     add("answer-v1", ed, v1, None, "a v1 answer, with no signature")
     pad = SIG_MAX + 1 - len(blob)
@@ -592,7 +663,8 @@ def build(kept: dict) -> tuple[dict, dict]:
         "sig_max_bytes": SIG_MAX,
         "largest_valid_body_bytes": max(c["body_bytes"] for c in valid),
         "cases": cases,
-        "test_keys": {"note": "test keys; they protect nothing. The RSA primes are kept so --check can rebuild the "
+        "test_keys": {"note": "never a real private key; the fixture's test keys are public by design and must "
+                              "never be used as an identity. The RSA primes are kept so --check can rebuild the "
                               "same bytes; the other keys come from fixed seeds in the generator.",
                       **{f"rsa-{bits}": primes[bits] for bits in (2048, 8192)}},
     }

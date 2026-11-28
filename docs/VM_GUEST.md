@@ -101,19 +101,23 @@ keeps polling.
 
 **Vectors:** `tests/fixtures/vm_rewrap_answer_v2.json` and `tests/fixtures/vm_ssh_key_shapes_v1.json`,
 made by `scripts/make_vm_rewrap_answer_vectors.py` (`--check` fails if either file differs). All
-signatures are deterministic, from test keys that protect nothing. Each case carries the refusal
-code the guest must give (from the generator's reference verifier, `null` when valid) and, where
+signatures are deterministic, from test keys: never a real private key; the fixture's test keys
+are public by design and must never be used as an identity. Each case carries the refusal code
+the guest must give (from the generator's reference verifier, `null` when valid) and, where
 known, `openssh_accepts`: `tests/test_vm_rewrap_answer_vectors.py` runs `ssh-keygen -Y
 check-novalidate` over those cases, and `ssh-keygen -Y sign` makes the Ed25519 and RSA vectors byte
-for byte. The worst case is RSA 8192: 3173 bytes. OpenSSH accepts six cases the guest refuses
-(another key, `sha256`, `rsa-sha2-256`, a short RSA signature, a non-minimal mpint, and an sk
-signature without the user-present bit), so `verify_vm.py rewrap` checks those rules itself
-before it prints an answer.
+for byte. Both OpenSSH tests skip on a machine without `ssh-keygen` and fail in CI without it.
+The worst case is RSA 8192: 3173 bytes. OpenSSH accepts seven cases the guest refuses (another
+key, `sha256`, `rsa-sha2-256`, a short RSA signature, a non-minimal mpint, an sk signature
+without the user-present bit, and a reserved field that is not empty), so `verify_vm.py
+rewrap` checks those rules itself before it prints an answer. The negatives of erratum 2.6 each
+have a case, a blob cut short among them: a reader refuses it and never panics.
 
 **Key shape at VM create only:** a key the guest could not verify within 4096 bytes is refused when
 the VM is made (`vm_ssh_key_shapes_v1.json`): a blob of at most 1100 bytes, an RSA modulus of 2048
-to 8192 bits with an odd e in 3..2^31-1, a 32-byte Ed25519 key, and an uncompressed point on the
-named curve. The identity parser that `start`, `rebundle`, `verify` and the init use does not
+to 8192 bits with an odd e in 3..2^31-1, a 32-byte Ed25519 key, and an uncompressed point (0x04,
+65, 97 or 133 bytes) whose coordinates are below p and satisfy the named curve's equation. The
+identity parser that `start`, `rebundle`, `verify` and the init use does not
 change, so a VM made before the rule keeps booting; only its re-wrap is refused
 (`rewrap_key_unsupported`).
 
@@ -192,6 +196,24 @@ mode fixed per artifact. It reuses `custom_guest_initrd.py` read-only.
   A new snapshot, kernel or tool changes them: build with `VM_BUNDLE_LOCK_UPDATE=1` and an unpinned
   closure, review the pin output the lanes agree on, commit it. `build` and `check` refuse an unpinned
   closure.
+
+## Base root pin (AB#1022)
+
+`room-kit/vm/base_root_pin.json` (schema `cathedral.vm.base-root-pin/v1`) fixes the base root, so a
+later bundle (a kernel or init fix) shares it and a VM can `rebundle` to it; another base root is
+`base_root_differs`.
+
+- While it is `pinned`, both lanes build with its `source_date_epoch`, not the commit time.
+- The summary publishes only a base root whose `base-root.raw`, verity root, data bytes and lock are
+  the pin's. The `bundle.env` step also fails when the snapshot, the base lock or the recipe
+  (`recipe_sha256`) is not the pin's. The byte check is the gate.
+- The pin today: base root `0a200cc3`, verity `45044764`, of bundle `a9585311` (run 46095917678,
+  rebuilt byte for byte by run 46103583234 at another commit).
+- **Take only the `vm-bundle` artifact.** The lanes upload `bundle-first` and `bundle-second`
+  before the summary checks the pin, so a run that fails the pin still leaves lane artifacts with a
+  base root that is not the pin's.
+- A new base root (snapshot, lock or recipe) means a new pin and a new first bundle: set `status`
+  to `unpinned`, run the workflow, and commit the pin its summary prints.
 
 ## Static tools build
 
