@@ -1,8 +1,10 @@
 """The VM bundle build workflow's own scripts: every download resolves to a pin, and the summary
 refuses lanes that differ and says where (the real builds run in .github/workflows/vm-bundle-build.yml)."""
+import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -74,9 +76,17 @@ def _lanes(root, second=None):
             (bundle / name).write_bytes(data)
 
 
-def _compare(tmp_path):
+def _unpinned(tmp_path):
+    path = tmp_path / "unpinned-pin.json"
+    path.write_text(json.dumps({"schema": "cathedral.vm.base-root-pin/v1", "status": "unpinned"}))
+    return path
+
+
+def _compare(tmp_path, pin=None, env=None):
+    pin = pin or _unpinned(tmp_path)
     return subprocess.run([sys.executable, str(SUMMARY), "compare", "--lanes", str(tmp_path / "lanes"),
-                           "--out", str(tmp_path / "out")], capture_output=True, text=True)
+                           "--out", str(tmp_path / "out"), "--pin", str(pin)], capture_output=True, text=True,
+                          env=env)
 
 
 def test_identical_lanes_publish_with_digests(tmp_path):
@@ -251,8 +261,7 @@ def test_summary_records_the_built_commit_event_ref_and_epoch(tmp_path):
         (tmp_path / "lanes" / f"bundle-{lane}" / "source-date-epoch").write_text("1795823010\n")
     env = dict(os.environ, SOURCE_SHA="57ef14113bb9d6e989b41dbbf28b60d7a4e46459", GITHUB_SHA="bb20398",
                GITHUB_EVENT_NAME="pull_request", GITHUB_REF="refs/pull/817/merge")
-    r = subprocess.run([sys.executable, str(SUMMARY), "compare", "--lanes", str(tmp_path / "lanes"),
-                        "--out", str(tmp_path / "out")], capture_output=True, text=True, env=env)
+    r = _compare(tmp_path, env=env)
     assert r.returncode == 0, r.stderr
     summary = json.loads((tmp_path / "out" / "summary.json").read_text())
     assert summary["source_commit"] == "57ef14113bb9d6e989b41dbbf28b60d7a4e46459"
@@ -296,3 +305,203 @@ def test_summary_reports_the_initrd_size(tmp_path):
     assert r.returncode == 0, r.stderr
     assert json.loads((tmp_path / "out" / "summary.json").read_text())["initrd_bytes"] == 1234
     assert "- Initrd: 1234 bytes" in (tmp_path / "out" / "summary.md").read_text()
+
+
+# ---- the base root pin (AB#1022 PR A): every commit builds the pinned base root --------------
+
+PIN = REPO / "room-kit" / "vm" / "base_root_pin.json"
+BASE_LOCK = LOCKS / "base-root.packages.lock"
+import vm_bundle_build_summary as summary_mod  # noqa: E402
+
+
+def _sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _epoch(pin, snapshot="20261126T000000Z", lock=BASE_LOCK):
+    return subprocess.run([sys.executable, "-I", str(SUMMARY), "epoch", "--snapshot", snapshot, "--lock", str(lock),
+                           "--pin", str(pin)], capture_output=True, text=True)
+
+
+def test_the_committed_pin_is_bundle_a9585311s_base_root_and_matches_this_tree():
+    pin = summary_mod.load_pin(PIN)
+    assert pin["status"] == "pinned"
+    # Run 46095917678 at main 82c964b4: its epoch is that commit's time.
+    assert (pin["source_date_epoch"], pin["snapshot"], pin["from_run"]) == \
+        (1795831236, "20261126T000000Z", "46095917678")
+    assert pin["base_root_raw_sha256"] == "0a200cc3d608a8dcbe04c3a4b7384fe311b94d88b50c62071bfcb968852368e9"
+    assert pin["base_root_verity"] == "4504476434ccff04fff2c167674f1e952f4772e4516acf621346db4763a2e7d4"
+    assert pin["base_root_data_bytes"] == 771751936
+    assert pin["snapshot"] == _workflow_env("VM_BUNDLE_SNAPSHOT")
+    assert pin["base_root_packages_lock_sha256"] == _sha(BASE_LOCK.read_bytes())
+    # The recipe guard: an edit to any base-root input needs a new pin (and a new first bundle).
+    # If this fails, run "scripts/vm_bundle_build_summary.py recipe" and read README "Base root pin".
+    assert pin["recipe_sha256"] == summary_mod.recipe_sha256()
+
+
+def test_epoch_gives_the_pinned_epoch():
+    r = _epoch(PIN)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "pinned 1795831236\n"
+
+
+def test_epoch_unpinned_leaves_the_commit_time_to_the_workflow(tmp_path):
+    r = _epoch(_unpinned(tmp_path))
+    assert r.returncode == 0 and r.stdout == "unpinned\n"
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("snapshot", "20261127T000000Z", "VM_BUNDLE_SNAPSHOT is 20261126T000000Z"),
+    ("base_root_packages_lock_sha256", "00" * 32, "the base lock's sha256 is"),
+    ("recipe_sha256", "00" * 32, "the base-root recipe's sha256 is"),
+])
+def test_epoch_refuses_a_pin_for_another_snapshot_lock_or_recipe(tmp_path, field, value, message):
+    pin = json.loads(PIN.read_text())
+    pin[field] = value
+    path = tmp_path / "pin.json"
+    path.write_text(json.dumps(pin))
+    r = _epoch(path)
+    assert r.returncode != 0 and r.stdout == ""
+    assert message in r.stderr and "needs a new pin" in r.stderr
+
+
+@pytest.mark.parametrize("field, value", [
+    ("status", "maybe"), ("schema", "cathedral.vm.base-root-pin/v2"), ("source_date_epoch", "1795831236"),
+    ("base_root_data_bytes", 4097), ("base_root_verity", "AB" * 32), ("from_run", ""),
+])
+def test_a_malformed_pin_is_refused(tmp_path, field, value):
+    pin = json.loads(PIN.read_text())
+    pin[field] = value
+    path = tmp_path / "pin.json"
+    path.write_text(json.dumps(pin))
+    with pytest.raises(ValueError):
+        summary_mod.load_pin(path)
+
+
+def _pinned_lanes(tmp_path, raw=b"base root", second=None):
+    base = {"base-root.raw": raw, "base-root.packages.lock": b"lock\n", "source-date-epoch": b"1795831236\n"}
+    _lanes(tmp_path / "lanes", dict(base, **(second or {})))
+    for name, data in base.items():
+        (tmp_path / "lanes" / "bundle-first" / name).write_bytes(data)
+    pin = {"schema": "cathedral.vm.base-root-pin/v1", "status": "pinned", "source_date_epoch": 1795831236,
+           "snapshot": "20261126T000000Z", "base_root_packages_lock_sha256": _sha(b"lock\n"),
+           "base_root_raw_sha256": _sha(b"base root"), "base_root_verity": "ab" * 32, "base_root_data_bytes": 8192,
+           "from_run": "1", "recipe_sha256": "cd" * 32}
+    path = tmp_path / "pin.json"
+    path.write_text(json.dumps(pin))
+    return path, pin
+
+
+def test_a_base_root_equal_to_the_pin_publishes_and_says_pinned(tmp_path):
+    path, _ = _pinned_lanes(tmp_path)
+    r = _compare(tmp_path, path, env=dict(os.environ, VM_BUNDLE_SNAPSHOT="20261126T000000Z"))
+    assert r.returncode == 0, r.stderr
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert summary["base_root_pin"] == "pinned" and summary["base_root_to_pin"] is None
+    assert "- Base root pin: pinned (run 1)" in (tmp_path / "out" / "summary.md").read_text()
+
+
+@pytest.mark.parametrize("change, named", [
+    ({"raw": b"another base root"}, "base-root.raw sha256"),
+    ({"verity": "ef" * 32}, "base_root_verity"),
+    ({"data_bytes": 4096}, "base_root_data_bytes"),
+    ({"epoch": 1795831237}, "source_date_epoch"),
+    ({"lock": "00" * 32}, "base-root.packages.lock sha256"),
+    ({"snapshot": "20261127T000000Z"}, "snapshot"),
+])
+def test_lanes_that_agree_on_another_base_root_publish_nothing(tmp_path, change, named):
+    raw = change.get("raw", b"base root")
+    path, pin = _pinned_lanes(tmp_path, raw=raw, second={"base-root.raw": raw})
+    pin["base_root_verity"] = change.get("verity", pin["base_root_verity"])
+    pin["base_root_data_bytes"] = change.get("data_bytes", pin["base_root_data_bytes"])
+    pin["source_date_epoch"] = change.get("epoch", pin["source_date_epoch"])
+    pin["base_root_packages_lock_sha256"] = change.get("lock", pin["base_root_packages_lock_sha256"])
+    path.write_text(json.dumps(pin))
+    env = dict(os.environ, VM_BUNDLE_SNAPSHOT=change.get("snapshot", "20261126T000000Z"))
+    r = _compare(tmp_path, path, env=env)
+    assert r.returncode != 0 and not (tmp_path / "out").exists()
+    assert "not the pinned one" in r.stderr and named in r.stderr
+
+
+def test_lanes_that_differ_fail_before_the_pin_is_read(tmp_path):
+    path, _ = _pinned_lanes(tmp_path, second={"base-root.raw": b"other lane"})
+    r = _compare(tmp_path, path)
+    assert r.returncode != 0 and "bundle base-root.raw differs between lanes" in r.stderr
+
+
+def test_an_unpinned_run_prints_the_pin_to_commit(tmp_path):
+    _pinned_lanes(tmp_path)
+    env = dict(os.environ, VM_BUNDLE_SNAPSHOT="20261126T000000Z", GITHUB_RUN_ID="42")
+    r = _compare(tmp_path, env=env)
+    assert r.returncode == 0, r.stderr
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    to_pin = summary["base_root_to_pin"]
+    assert summary["base_root_pin"] == "unpinned"
+    assert to_pin["base_root_raw_sha256"] == _sha(b"base root") and to_pin["source_date_epoch"] == 1795831236
+    assert (to_pin["from_run"], to_pin["recipe_sha256"]) == ("42", summary_mod.recipe_sha256())
+    # What it prints is a pin load_pin accepts.
+    (tmp_path / "printed.json").write_text(json.dumps(to_pin))
+    assert summary_mod.load_pin(tmp_path / "printed.json")["status"] == "pinned"
+
+
+def _recipe_tree(tmp_path):
+    root = tmp_path / "repo"
+    for name in (summary_mod.RECIPE_SCRIPT, *summary_mod.RECIPE_FILES, summary_mod.RECIPE_HOST_INPUT[0]):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO / name, root / name)
+    return root
+
+
+@pytest.mark.parametrize("name", [*summary_mod.RECIPE_FUNCTIONS])
+def test_an_edit_to_any_recipe_function_moves_the_recipe(tmp_path, name):
+    root = _recipe_tree(tmp_path)
+    script = root / summary_mod.RECIPE_SCRIPT
+    text = script.read_text()
+    body = summary_mod.shell_function(text, name)
+    script.write_text(text.replace(body, body.replace(f"{name}() {{", f"{name}() {{ :;", 1), 1))
+    assert summary_mod.recipe_sha256(root) != summary_mod.recipe_sha256(REPO)
+
+
+def test_an_edit_to_the_package_list_tools_or_mmdebstrap_moves_the_recipe(tmp_path):
+    base = summary_mod.recipe_sha256(REPO)
+    edits = [
+        (summary_mod.RECIPE_SCRIPT, "BASE_PKGS=systemd,", "BASE_PKGS=systemd,jq,"),
+        ("scripts/vm_initrd_tools_inputs.json", "{", "{ "),
+        ("scripts/build_vm_initrd_tools.py", "import", "import  "),
+        ("scripts/vm_bundle_build_inputs.json", "d4acfd32", "00acfd32"),
+    ]
+    for path, old, new in edits:
+        root = _recipe_tree(tmp_path / path.replace("/", "_"))
+        text = (root / path).read_text()
+        assert old in text, path
+        (root / path).write_text(text.replace(old, new, 1))
+        assert summary_mod.recipe_sha256(root) != base, path
+
+
+def test_an_edit_outside_the_base_root_recipe_does_not_move_it(tmp_path):
+    root = _recipe_tree(tmp_path)
+    script = root / summary_mod.RECIPE_SCRIPT
+    text = script.read_text()
+    kernel = summary_mod.shell_function(text, "build_kernel")
+    script.write_text(text.replace(kernel, kernel.replace("build_kernel() {", "build_kernel() { :;", 1), 1))
+    assert summary_mod.recipe_sha256(root) == summary_mod.recipe_sha256(REPO)
+
+
+def test_a_renamed_recipe_function_is_an_error(tmp_path):
+    root = _recipe_tree(tmp_path)
+    script = root / summary_mod.RECIPE_SCRIPT
+    script.write_text(script.read_text().replace("host_leaks() {", "host_leaks_v2() {", 1))
+    with pytest.raises(ValueError, match="no shell function host_leaks"):
+        summary_mod.recipe_sha256(root)
+
+
+def test_workflow_takes_the_epoch_from_the_pin_and_the_commit_time_only_when_unpinned():
+    text = WORKFLOW.read_text()
+    step = text.split("- name: bundle.env", 1)[1].split("- name:", 1)[0]
+    assert "vm_bundle_build_summary.py epoch --snapshot \"$VM_BUNDLE_SNAPSHOT\"" in step
+    assert "--lock room-kit/vm/locks/base-root.packages.lock" in step
+    assert 'if [ "$pin_status" = unpinned ]; then epoch=$(git log -1 --format=%ct); fi' in step
+    assert step.count("git log -1 --format=%ct") == 1
+    assert "SOURCE_DATE_EPOCH=$epoch" in step
+    # The summary checks against the committed pin, never one a step names.
+    assert "vm_bundle_build_summary.py compare --lanes" in text and "--pin" not in text
