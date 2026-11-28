@@ -24,7 +24,16 @@
    install -d -m 0700 -o cathedral-cg -g cathedral-cg /var/lib/cathedral-custom-guest
    ```
 
-   If `/etc/cathedral` already exists with mode 0700, `cathedral-cg` cannot reach its folder inside, and every key read fails. Give it traverse only, `chmod 0711 /etc/cathedral`, and keep the files already there at 0600.
+   If `/etc/cathedral` already exists with mode 0700, `cathedral-cg` cannot reach its folder inside, and every key read fails. Give traverse to that one user:
+
+   - **Where the `acl` package is installed:** `setfacl -m u:cathedral-cg:x /etc/cathedral`. Nothing changes for any other account.
+   - **Otherwise:** `chmod 0711 /etc/cathedral`, but only after this read-only check:
+
+     ```sh
+     find /etc/cathedral -mindepth 1 \( -perm -o+r -o -perm -o+x \) -printf '%m %u:%g %p\n'
+     ```
+
+     It must list nothing, or only `custom-guest-operator.env` where step 4 already ran. With `o+x` on the folder, any local account can open an entry by name when that entry's own mode lets others in, and other tools' file names there are public. If it lists anything else, take the others' access off that entry first (`chmod o-rwx`), or don't chmod.
 
    `systemd-journal` lets `check`, run as `cathedral-cg`, read the units' lines in the system journal. On a machine where the user already exists, add it with `usermod -aG systemd-journal cathedral-cg`. Without it, `check` alerts `custom_guest_journal_unreadable`.
 
@@ -39,9 +48,9 @@
    - The files are the admin key, the operator key, the host SSH key and a known-hosts file holding the host's key.
    - Copy each one into `/etc/cathedral/custom-guest-operator/` as `cathedral-cg`, with mode 0600.
    - Keys are file paths only: never put a key value in the env file, a unit or a command line.
-   - Copy a key file to file: send it on stdin, as in `ssh <operator> 'install -m 0600 -o cathedral-cg -g cathedral-cg /dev/stdin <path>' < <file>`, then compare the hashes without printing them.
-   - **The host SSH key is made on the operator machine** and never leaves it: `ssh-keygen -t ed25519 -N '' -f /etc/cathedral/custom-guest-operator/host.key`, then `chown cathedral-cg:cathedral-cg` and mode 0600. Only its public half goes to the host. Add it to root's `authorized_keys` there as `from="<operator address>",restrict <public key>`.
-   - **Take the host's key for `known_hosts` over a session you already trust**, for example `cat /etc/ssh/ssh_host_ed25519_key.pub` on the host. Do not use `ssh-keyscan` from the operator machine.
+   - Copy a key file to file: send it on stdin, as in `ssh <operator> 'install -m 0600 -o cathedral-cg -g cathedral-cg /dev/stdin <path>' < <file>`. Then compare the sha256 of the source file with the sha256 of the copy (`sha256sum < <path>` on the operator machine), and print only OK or FAIL. Never print the key.
+   - **The host SSH key is made on the operator machine** and never leaves it: `ssh-keygen -t ed25519 -N '' -f /etc/cathedral/custom-guest-operator/host.key`, then `chown cathedral-cg:cathedral-cg` and mode 0600 on both files. Only its public half goes to the host. Add it to root's `authorized_keys` there as `from="<operator address>",restrict <public key>`.
+   - **Take the host's key for `known_hosts` over a session you already trust**, for example `cat /etc/ssh/ssh_host_ed25519_key.pub` on the host. Do not use `ssh-keyscan` from the operator machine. Write the line as `<host address> ssh-ed25519 AAAA...`: it starts with the same host address as `hosts.conf`, and the `.pub` file's trailing comment is dropped.
 4. **Write `/etc/cathedral/custom-guest-operator.env` and `hosts.conf`.** The env file is root, 0644, paths and URLs only. Quote the values: systemd and a shell read the same file.
 
    ```sh
@@ -105,7 +114,12 @@ It sends nothing. It reads the API's list, the host's launch folders (one read-o
 
 It exits 2 when it prints any alert, and 0 when there is none.
 
-**Someone must run it.** The alerts land only in the operator machine's journal, and nothing posts them anywhere. Run `cg check` from the team's heartbeat over SSH, and treat exit 2 as an alert.
+**Someone must run it.** The alerts land only in the operator machine's journal, and nothing posts them anywhere. Run the check from the team's heartbeat over SSH, and treat exit 2 as an alert. `cg` is a shell function, so over SSH send the full line:
+
+```sh
+ssh <operator> "sudo -u cathedral-cg bash -c 'set -a; . /etc/cathedral/custom-guest-operator.env; CG_HOME=/var/lib/cathedral-custom-guest; cd /
+  exec /opt/cathedral-custom-guest/sandbox/ops/custom-guest/custom-guest.sh check --hotel <hotel> --since-min 16'"
+```
 
 The alert lines alone can also be read from the journal:
 
