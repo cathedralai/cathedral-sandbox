@@ -71,6 +71,7 @@ Remove both entries when the rehearsal ends.
   - `check_stock_root.py` passes on this root, and fails on v1 on dbus and networkd;
   - both lanes are byte-identical;
   - `boot-smoke.sh` boots it under QEMU (no SNP) behind a shim that hands off as v2 does. Over SSH, dbus, udevd, networkd and cathedral-sshd must be active, eth0 routable (configured), and the system running with no failed unit.
+  - The smoke's shim is a test-only busybox initrd, not reference initrd v2. cathedral-init's verity mount, kernel views and hand-off into this root are not exercised in CI; the live run covers them.
 - **The workflow artifact** is `rehearsal-ref-root-stock-systemd`.
 
 | File | Value |
@@ -88,4 +89,4 @@ These hold for any owner root under reference initrd v2, not only this one:
 
 - **(a) A root that uses systemd-networkd needs udev, or eth0 stays pending.** v2 hands the root a read-write /sys, and then systemd's networkd waits for udev to initialize each link (systemd v252 `udev_available()`). udev's coldplug trigger must run too: the NIC exists before udevd starts.
 - **(b) With udev present, configs must not assume eth0 unless `99-default.link` is masked.** udev's default policy renames interfaces, and `network.env` names the one the initrd saw.
-- **(c) On a read-only root, every enabled unit's `StateDirectory=` must ship in the image.** systemd cannot create it at boot. Once dbus is installed, bookworm's systemd-logind fails with 238/STATE_DIRECTORY without `/var/lib/systemd/linger`.
+- **(c) A read-only root must pre-create every `StateDirectory=` its enabled units need, or give /var a writable mount.** systemd cannot create the directory at boot. Pre-created with the unit's owner and mode, it needs no write. Once dbus is installed, bookworm's systemd-logind fails with 238/STATE_DIRECTORY without `/var/lib/systemd/linger` (root, 0755).
