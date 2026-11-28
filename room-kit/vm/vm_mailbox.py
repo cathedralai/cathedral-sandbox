@@ -42,12 +42,15 @@ HEADER = struct.Struct(">8sBI32s")  # magic, kind, body length, sha256(body): 45
 KIND_STATUS, KIND_OFFER, KIND_ANSWER = 1, 2, 3
 SLOT_KIND = {STATUS_OFFSET: KIND_STATUS, OFFER_OFFSET: KIND_OFFER, ANSWER_OFFSET: KIND_ANSWER}
 ANSWER_MAX = 4096  # what vm-ctl.sh rewrap takes on stdin; the broker refuses a longer answer too
+SIG_MAX = 2400  # the answer's SSHSIG blob, decoded (spec r4 erratum 2.2)
 BODY_MAX = {KIND_STATUS: SLOT_BYTES - HEADER.size, KIND_OFFER: SLOT_BYTES - HEADER.size, KIND_ANSWER: ANSWER_MAX}
 SNP_REPORT_BYTES = 1184  # an SEV-SNP attestation report
 
 STATUS_SCHEMA = "cathedral.vm.status/v1"
 OFFER_SCHEMA = "cathedral.vm.rewrap-offer/v1"
-ANSWER_SCHEMA = "cathedral.vm.rewrap-answer/v1"
+# v2 is the signed answer (spec r3 7.5 with the r4 erratum, AB#1022). The host checks its shape
+# only; the guest verifies the signature. A v1 answer has no signature and is refused.
+ANSWER_SCHEMA = "cathedral.vm.rewrap-answer/v2"
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
 STATE_RE = re.compile(r"[a-z]{1,16}")  # the init's disk state: new, open, locked, tampered, broken
 KEY_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -57,13 +60,18 @@ def b64(size: int):
     return ("b64", size)
 
 
-# Each schema's fields: a fixed string, a regex, or ("b64", decoded byte length).
+def b64_max(size: int):
+    return ("b64_max", size)
+
+
+# Each schema's fields: a fixed string, a regex, ("b64", exact decoded length) or ("b64_max",
+# the most decoded bytes).
 SCHEMAS = {
     KIND_STATUS: {"schema": STATUS_SCHEMA, "state": STATE_RE, "key_id": KEY_ID_RE, "report": b64(SNP_REPORT_BYTES)},
     KIND_OFFER: {"schema": OFFER_SCHEMA, "vm_id": vm_measure.VM_ID_RE, "pubkey": b64(32), "nonce": b64(32),
                  "report": b64(SNP_REPORT_BYTES)},
     KIND_ANSWER: {"schema": ANSWER_SCHEMA, "offer_sha256": HEX64_RE, "epk": b64(32), "nonce": b64(12),
-                  "ct": b64(48)},
+                  "ct": b64(48), "sig": b64_max(SIG_MAX)},
 }
 
 
@@ -165,8 +173,11 @@ def parse_body(body: bytes, kind: int) -> dict:
                 raw = base64.b64decode(value, validate=True)
             except (binascii.Error, ValueError):
                 raise Refusal(f"{key} is not base64") from None
-            need(len(raw) == rule[1] and base64.b64encode(raw).decode("ascii") == value,
-                 f"{key} must be the padded base64 of {rule[1]} bytes")
+            need(base64.b64encode(raw).decode("ascii") == value, f"{key} is not canonical base64")
+            if rule[0] == "b64":
+                need(len(raw) == rule[1], f"{key} must be the padded base64 of {rule[1]} bytes")
+            else:
+                need(len(raw) <= rule[1], f"{key} must be the padded base64 of at most {rule[1]} bytes")
         else:
             need(rule.fullmatch(value), f"{key} does not match {rule.pattern}")
     return doc

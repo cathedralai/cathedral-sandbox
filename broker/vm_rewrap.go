@@ -1,7 +1,7 @@
 // Rewrap route for sealed customer VMs (AB#999 VM6, VM runtime spec r3 7.5 step 4).
 // Operator key only, like every VM route; off with vms_enabled.
 //
-//	POST /v1/broker/vms/{id}/rewrap  {"generation": G, "answer": {"schema", "offer_sha256", "epk", "nonce", "ct"}}
+//	POST /v1/broker/vms/{id}/rewrap  {"generation": G, "answer": {"schema", "offer_sha256", "epk", "nonce", "ct", "sig"}}
 //
 // rewrap relays the customer's answer to the offer a running guest waits
 // with (host_status.rewrap_offer). The answer travels on stdin, never on the
@@ -9,6 +9,9 @@
 // host's forced command reads at most vmRewrapAnswerMax + 1 bytes for it.
 // host_status.rewrap_offer and guest_status are guest-controlled data: the
 // broker passes them on and trusts none of it; the customer's tool verifies.
+// The answer is v2 (spec r3 7.5 with the r4 erratum, AB#1022): sig is the
+// customer's SSHSIG over it. The broker checks its shape only; the guest
+// verifies it against the VM identity's key.
 package main
 
 import (
@@ -25,7 +28,8 @@ import (
 const (
 	// vmRewrapAnswerMax is room-kit/vm/vm_mailbox.py ANSWER_MAX.
 	vmRewrapAnswerMax = 4096
-	vmRewrapSchema    = "cathedral.vm.rewrap-answer/v1"
+	vmRewrapSigMax    = 2400 // vm_mailbox.py SIG_MAX: the SSHSIG blob, decoded
+	vmRewrapSchema    = "cathedral.vm.rewrap-answer/v2"
 )
 
 var vmRewrapRefusals = map[string]vmHostRefusal{
@@ -46,6 +50,7 @@ type vmRewrapEnvelope struct {
 	Nonce       string `json:"nonce"`
 	OfferSHA256 string `json:"offer_sha256"`
 	Schema      string `json:"schema"`
+	Sig         string `json:"sig"`
 }
 
 func (b *broker) rewrapVM(w http.ResponseWriter, r *http.Request, id string) {
@@ -113,14 +118,15 @@ func vmRewrapAnswer(raw json.RawMessage) ([]byte, error) {
 		Epk         *string `json:"epk"`
 		Nonce       *string `json:"nonce"`
 		Ct          *string `json:"ct"`
+		Sig         *string `json:"sig"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if len(bytes.TrimSpace(raw)) == 0 || raw[0] != '{' || dec.Decode(&a) != nil || dec.More() {
-		return nil, errors.New("answer must be one JSON object with only schema, offer_sha256, epk, nonce and ct")
+		return nil, errors.New("answer must be one JSON object with only schema, offer_sha256, epk, nonce, ct and sig")
 	}
-	if a.Schema == nil || a.OfferSHA256 == nil || a.Epk == nil || a.Nonce == nil || a.Ct == nil {
-		return nil, errors.New("answer needs schema, offer_sha256, epk, nonce and ct")
+	if a.Schema == nil || a.OfferSHA256 == nil || a.Epk == nil || a.Nonce == nil || a.Ct == nil || a.Sig == nil {
+		return nil, errors.New("answer needs schema, offer_sha256, epk, nonce, ct and sig")
 	}
 	if *a.Schema != vmRewrapSchema {
 		return nil, errors.New("answer schema must be " + vmRewrapSchema)
@@ -136,7 +142,11 @@ func vmRewrapAnswer(raw json.RawMessage) ([]byte, error) {
 			return nil, fmt.Errorf("answer %s must be the padded base64 of %d bytes", f.name, f.size)
 		}
 	}
-	out, err := json.Marshal(vmRewrapEnvelope{Ct: *a.Ct, Epk: *a.Epk, Nonce: *a.Nonce, OfferSHA256: *a.OfferSHA256, Schema: *a.Schema})
+	if b, err := base64.StdEncoding.Strict().DecodeString(*a.Sig); err != nil || len(b) > vmRewrapSigMax {
+		return nil, fmt.Errorf("answer sig must be the padded base64 of at most %d bytes", vmRewrapSigMax)
+	}
+	out, err := json.Marshal(vmRewrapEnvelope{Ct: *a.Ct, Epk: *a.Epk, Nonce: *a.Nonce, OfferSHA256: *a.OfferSHA256,
+		Schema: *a.Schema, Sig: *a.Sig})
 	if err != nil || len(out) > vmRewrapAnswerMax {
 		return nil, fmt.Errorf("answer must be at most %d bytes", vmRewrapAnswerMax)
 	}

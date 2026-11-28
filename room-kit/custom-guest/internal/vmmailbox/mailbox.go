@@ -1,7 +1,9 @@
 package vmmailbox
 
 import (
+	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"io"
 	"unsafe"
@@ -46,12 +48,14 @@ type Offer struct {
 	Report []byte
 }
 
-// Answer is the host-written envelope (7.5), already parsed.
+// Answer is the host-written envelope (7.5), already parsed. Sig is the SSHSIG blob the customer
+// made over Message; the parser checks only its shape, and internal/sshsig verifies it.
 type Answer struct {
 	OfferSHA256 string
 	EPK         [32]byte
 	Nonce       [12]byte
 	CT          [48]byte
+	Sig         []byte
 }
 
 const directAlign = 4096
@@ -208,7 +212,30 @@ func answerFrom(doc map[string]string) (Answer, bool) {
 		}
 		copy(dst, raw)
 	}
+	sig, err := decodeB64(doc["sig"])
+	if err != nil || len(sig) > SigMax {
+		return Answer{}, false
+	}
+	ans.Sig = sig
 	return ans, true
+}
+
+// answerDomain starts the signed message: the v2 schema and a zero byte (r4 erratum 2.2).
+const answerDomain = AnswerSchema + "\x00"
+
+// Message is what the answer's sig signs: the domain, then offer_sha256 as 32 raw bytes, epk,
+// nonce and ct (154 bytes). It binds the signature to one offer and to this ciphertext.
+func (a Answer) Message() ([]byte, error) {
+	offer, err := hex.DecodeString(a.OfferSHA256)
+	if err != nil || len(offer) != sha256.Size {
+		return nil, ErrInvalid
+	}
+	out := make([]byte, 0, len(answerDomain)+sha256.Size+len(a.EPK)+len(a.Nonce)+len(a.CT))
+	out = append(out, answerDomain...)
+	out = append(out, offer...)
+	out = append(out, a.EPK[:]...)
+	out = append(out, a.Nonce[:]...)
+	return append(out, a.CT[:]...), nil
 }
 
 // RewrapReportData is REPORT_DATA of an offer's report (7.5 step 2):

@@ -27,6 +27,7 @@ const (
 	AnswerOffset = 128 << 10
 	HeaderBytes  = 45
 	AnswerMax    = 4096
+	SigMax       = 2400 // the answer's SSHSIG blob, decoded (r4 erratum 2.2)
 	ReportBytes  = 1184 // an SEV-SNP attestation report
 )
 
@@ -43,7 +44,9 @@ const (
 const (
 	StatusSchema = "cathedral.vm.status/v1"
 	OfferSchema  = "cathedral.vm.rewrap-offer/v1"
-	AnswerSchema = "cathedral.vm.rewrap-answer/v1"
+	// AnswerSchema is v2, the signed answer (spec r3 7.5 with the r4 erratum, AB#1022). A v1
+	// answer carries no signature and is refused like any other schema.
+	AnswerSchema = "cathedral.vm.rewrap-answer/v2"
 )
 
 var (
@@ -62,11 +65,13 @@ func bodyMax(kind Kind) int {
 	return 0
 }
 
-// field is one schema member: a fixed string, a regexp, or the padded base64 of n bytes.
+// field is one schema member: a fixed string, a regexp, the padded base64 of exactly b64 bytes,
+// or the padded base64 of at most b64Max bytes.
 type field struct {
-	fixed string
-	re    *regexp.Regexp
-	b64   int
+	fixed  string
+	re     *regexp.Regexp
+	b64    int
+	b64Max int
 }
 
 var (
@@ -81,7 +86,7 @@ var schemas = map[Kind]map[string]field{
 	KindOffer: {"schema": {fixed: OfferSchema}, "vm_id": {re: vmIDRe}, "pubkey": {b64: 32}, "nonce": {b64: 32},
 		"report": {b64: ReportBytes}},
 	KindAnswer: {"schema": {fixed: AnswerSchema}, "offer_sha256": {re: hex64Re}, "epk": {b64: 32}, "nonce": {b64: 12},
-		"ct": {b64: 48}},
+		"ct": {b64: 48}, "sig": {b64Max: SigMax}},
 }
 
 // EncodeSlot returns the whole 64 KiB slot holding one record: what a writer writes in one call.
@@ -218,6 +223,11 @@ func ParseBody(body []byte, kind Kind) (map[string]string, error) {
 			}
 		case rule.re != nil:
 			if !rule.re.MatchString(value) {
+				return nil, ErrInvalid
+			}
+		case rule.b64Max > 0:
+			raw, err := base64.StdEncoding.Strict().DecodeString(value)
+			if err != nil || len(raw) > rule.b64Max || base64.StdEncoding.EncodeToString(raw) != value {
 				return nil, ErrInvalid
 			}
 		default:

@@ -1224,6 +1224,13 @@ def cmd_create(args: list[str], key_text: str | None) -> dict:
         except (OSError, UnicodeDecodeError):
             raise Refusal("invalid_ssh_key", "cannot read --ssh-key-file") from None
     key = check_key(key_text)
+    # The re-wrap answer is signed by this key, and the guest must verify it within 4096 bytes
+    # (spec r4 erratum 2.5). Create only: start and rebundle keep check_key's rule.
+    shape = vm_measure.rewrap_key_shape(key)
+    if shape is not None:
+        raise Refusal("ssh_key_unsupported",
+                      f"this key cannot sign a re-wrap answer the guest verifies ({shape}): use ssh-ed25519, "
+                      "ECDSA, an sk-* key, or RSA of 2048 to 8192 bits")
     cfg = host_config()
     bundle = opts.get("--bundle", cfg["default_bundle"])
     if bundle not in cfg["bundles"]:

@@ -653,3 +653,17 @@ def test_kernel_step_records_built_in_boot_modules():
     kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]
     assert "modules.builtin" in kernel and '"$B/boot-modules.txt"' in kernel
     assert "build/boot-modules.txt" in text[text.index("step_outputs() {"):]
+
+
+# ---- the re-wrap key shape, create only (spec r4 erratum 2.5, AB#1022) ------------------------
+
+def test_rewrap_key_shape_vectors_and_the_identity_rules_do_not_change():
+    shapes = json.loads((REPO / "tests" / "fixtures" / "vm_ssh_key_shapes_v1.json").read_text())
+    assert shapes["key_blob_max_bytes"] == vm.REWRAP_KEY_BLOB_MAX
+    assert list(shapes["rsa_modulus_bits"]) == list(vm.REWRAP_RSA_BITS)
+    for case in shapes["cases"]:
+        assert vm.rewrap_key_shape(case["ssh_public_key"]) == case["refusal"], case["name"]
+        # ssh_public_key and parse_identity run at every start: they still take every key.
+        assert vm.ssh_public_key(case["ssh_public_key"]) == case["ssh_public_key"], case["name"]
+        raw = vm.identity_document("vm-0123456789ab", case["ssh_public_key"], VERITY, 8192)
+        assert vm.parse_identity(raw)["ssh_public_key"] == case["ssh_public_key"], case["name"]

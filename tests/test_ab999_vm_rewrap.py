@@ -39,6 +39,7 @@ STATUS_BODY = VEC["status"]["body_utf8"].encode()
 OFFER_BODY = VEC["offer"]["body_utf8"].encode()
 ANSWER = VEC["answer"]["body_utf8"].encode()
 OFFER_SHA = VEC["offer"]["body_sha256"]
+VECTORS = json.loads((FIXTURE.parent / "vm_rewrap_answer_v2.json").read_text())
 
 
 def put(path: Path, offset: int, data: bytes) -> None:
@@ -235,6 +236,40 @@ def test_rewrap_writes_only_the_answer_slot_once(waiting):
     # A retry (the broker's answer was lost): the same slot, not written again.
     code, res = rewrap(waiting, ANSWER)
     assert code == 0 and res["written"] is False and waiting.box.read_bytes() == after
+
+
+def test_rewrap_takes_the_largest_signed_answer_whole(waiting):
+    """RSA 8192 is the largest key create allows (spec r4 erratum 2.5): the answer with its
+    signature is 3173 bytes in the shared vectors, and the host writes it whole. The host checks
+    the shape only, so this sig need not verify here; the guest verifies it."""
+    rsa = next(c for c in VECTORS["cases"] if c["name"] == "valid-rsa-8192")
+    answer = M.vm_measure.canonical(dict(VEC["answer"]["document"], sig=json.loads(rsa["body"])["sig"]))
+    assert len(answer) == rsa["body_bytes"] == 3173
+    code, res = rewrap(waiting, answer)
+    assert (code, res["written"]) == (0, True), res
+    assert slot_of(waiting.box, M.ANSWER_OFFSET) == M.encode_slot(M.KIND_ANSWER, answer)
+
+
+def test_the_host_parser_refuses_exactly_the_shape_cases_of_the_shared_vectors():
+    """tests/fixtures/vm_rewrap_answer_v2.json: parse_answer refuses each case the reference
+    refuses for its shape or length, and takes every other one, signature refusals included."""
+    shape = {"answer_schema", "sig_encoding", "sig_too_long", "answer_too_long"}
+    for case in VECTORS["cases"]:
+        body = case["body"].encode()
+        if case["refusal"] in shape:
+            with pytest.raises(M.Refusal):
+                M.parse_answer(body)
+        else:
+            assert M.parse_answer(body) == json.loads(body), case["name"]
+
+
+def test_the_fixture_answer_is_signed():
+    """The mailbox fixture's answer carries a real signature by the vectors' Ed25519 test key."""
+    gen = _load("make_vm_rewrap_answer_vectors_rewrap_test",
+                FIXTURE.parents[2] / "scripts" / "make_vm_rewrap_answer_vectors.py")
+    rec = VEC["answer"]
+    assert gen.refusal(rec["body_utf8"].encode(), rec["signed_by_ssh_public_key"]) is None
+    assert rec["signed_by_ssh_public_key"] == gen.ed25519_key("ed25519").line
 
 
 def test_an_answer_for_another_offer_is_refused(waiting):

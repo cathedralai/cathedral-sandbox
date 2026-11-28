@@ -248,6 +248,13 @@ enabled one.
 `create` writes the identity and the launch values below; the launcher recomputes the
 cmdline and HOST_DATA from the identity on every launch.
 
+`create` also refuses, as `ssh_key_unsupported` (exit 2), a key the guest could not verify a
+re-wrap answer from within 4096 bytes (`vm_measure.rewrap_key_shape`, spec r4 erratum 2.5): a
+blob over 1100 bytes, RSA outside 2048 to 8192 bits or with an exponent that is even, below 3
+or 2^31 and above, and a malformed Ed25519 key or ECDSA point. Only `create` checks this:
+`start`, `rebundle`, `verify` and the init keep the identity rule, so a VM made before it
+keeps booting.
+
 - **Bundle:** one directory addressed by `sha256(manifest.json)`: `OVMF.amdsev.fd`,
   `vmlinuz`, `initrd.cpio.zst` (the VM initrd, PR VM1b), `base-root.raw` (ext4 plus its
   dm-verity tree after the data), the two `packages.lock` files and `manifest.json`
@@ -419,8 +426,11 @@ the 45-byte header; 4096 bytes for the answer).
 
 **`rewrap <name> --generation G`**, the answer on stdin (step 4), never an argument: the
 broker's argument check allows 64 characters. The envelope is canonical JSON of at most 4096
-bytes with exactly `schema`, `offer_sha256`, `epk`, `nonce`, `ct` (`invalid_rewrap_answer`,
-exit 2). It is written only while G is the current, open generation (`stale_generation`,
+bytes with exactly `schema` (`cathedral.vm.rewrap-answer/v2`), `offer_sha256`, `epk`, `nonce`,
+`ct` and `sig`, the customer's SSHSIG in canonical base64 of at most 2400 bytes
+(`invalid_rewrap_answer`, exit 2; a v1 answer has no `sig` and is refused). The host checks
+the shape only: the guest verifies the signature against the identity's key (AB#1022,
+docs/VM_GUEST.md "Re-wrap answer v2"). It is written only while G is the current, open generation (`stale_generation`,
 `generation_closed`) and the unit is active, and only for the offer now in the offer slot:
 `no_rewrap_offer` or `rewrap_offer_changed`, exit 3. One `pwrite` of the answer slot, then
 `fsync`; the same answer again is not written again (`"written": false`).
