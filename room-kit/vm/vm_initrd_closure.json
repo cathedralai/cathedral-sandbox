@@ -2,19 +2,20 @@
   "boot_modules": [
     "sev-guest",
     "dm-verity",
+    "aesni_intel",
     "dm-crypt",
     "qemu_fw_cfg",
     "virtio_blk",
     "virtio_net"
   ],
   "executables": {
-    "init": "02000b0d2b75d98acde795429840607ba20a79a5811e9a9160580bf922b78692",
-    "usr/lib/cathedral/cathedral-vm": "c7395a7a32c4b1816a8b422380b0cf70286f3c90284a49b23e7835913b80fad1",
-    "usr/lib/cathedral/cathedral-vm-attest": "39f4e4818b98816204026729ad93b3cf0c180051fe660a50b39228f6f965dd6c",
-    "usr/lib/cathedral/cryptsetup": "462da7294fa26fb594f033e8b3e3c4630538003f80e3264f12d4bc19661717cc",
-    "usr/lib/cathedral/mke2fs": "099686e23e99441c59d1183075c11375eaed91e13e5c8d151df94ceb20f716f6",
-    "usr/lib/cathedral/resize2fs": "994c957157bf5497f0cf4cc0602932e5111277fe9a148f99ba82f64990bf5268",
-    "usr/lib/cathedral/veritysetup": "e2aedaff03ab492589a9f5e3d99eb064e8e44fb4ce14de4fd3b4da533af4f0ab"
+    "init": null,
+    "usr/lib/cathedral/cathedral-vm": null,
+    "usr/lib/cathedral/cathedral-vm-attest": null,
+    "usr/lib/cathedral/cryptsetup": null,
+    "usr/lib/cathedral/mke2fs": null,
+    "usr/lib/cathedral/resize2fs": null,
+    "usr/lib/cathedral/veritysetup": null
   },
   "go_mains": {
     "init": "./cmd/cathedral-vm-init",
@@ -22,27 +23,7 @@
     "usr/lib/cathedral/cathedral-vm-attest": "./cmd/cathedral-vm-attest"
   },
   "kernel_release": "6.8.0-151-generic",
-  "modules": {
-    "usr/lib/modules/6.8.0-151-generic/kernel/drivers/firmware/qemu_fw_cfg.ko.zst": "55775138f31923d2d272602ca51f658b4ebe84415a0029673f6e13575cd12a6a",
-    "usr/lib/modules/6.8.0-151-generic/kernel/drivers/md/dm-bufio.ko.zst": "cb092cc0478a3fbfb5bce17b2aebf496b8ab3a6ad76b3ccd661bc6ad9cb84411",
-    "usr/lib/modules/6.8.0-151-generic/kernel/drivers/md/dm-crypt.ko.zst": "e245aca1b3c32d534974d25a77b29e7cfc8f1fa29ee62b569ff575b518923b18",
-    "usr/lib/modules/6.8.0-151-generic/kernel/drivers/md/dm-verity.ko.zst": "3a2fe72533870b5850417ecb97987c0fdd67781f030d34b2e315c085c14dda33",
-    "usr/lib/modules/6.8.0-151-generic/kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst": "787851985142e010f86d549757d97b8d7142fd72bbcead2672728e51eeb87130",
-    "usr/lib/modules/6.8.0-151-generic/kernel/drivers/virt/coco/tsm.ko.zst": "dfdcb5c23acbdd98efa43d5f6ae1414bb3cb26c861b3df80bbf4fa5c1a550cf5",
-    "usr/lib/modules/6.8.0-151-generic/modules.alias": "5a48799c6e6fb4e39b18623613437ba1382ab560fcfa2ede63fde770fb4c92f7",
-    "usr/lib/modules/6.8.0-151-generic/modules.alias.bin": "cbd759a69c94aa93095be1e0e4da2e7f6bdeb45cc4610757dd3912515dd665ca",
-    "usr/lib/modules/6.8.0-151-generic/modules.builtin": "508ae45959f569e45b1e6f1888b254cdc02da5c4bb8b3edc043539b6dd2d735d",
-    "usr/lib/modules/6.8.0-151-generic/modules.builtin.alias.bin": "359d3654135201e9ebedd502352f6e8fc994e4ecea2dc22df54f857c086ebe3a",
-    "usr/lib/modules/6.8.0-151-generic/modules.builtin.bin": "cc4afe25cf47d43565ef5452955789974c7f3ad92710a18fcca0015796a9634d",
-    "usr/lib/modules/6.8.0-151-generic/modules.builtin.modinfo": "0bfb2407d4ff23d68735c6643e65f738d6ae4bc62ef79486a1afbac8d55393ad",
-    "usr/lib/modules/6.8.0-151-generic/modules.dep": "405c22b623ca1344053c738385fbc41d077e61b9d2a78a42439772d80f0bbfe2",
-    "usr/lib/modules/6.8.0-151-generic/modules.dep.bin": "f92349f9c8d28110a0a0faf529d0f1ddab26e74eaa2de577b0866fa43b8fae74",
-    "usr/lib/modules/6.8.0-151-generic/modules.devname": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    "usr/lib/modules/6.8.0-151-generic/modules.order": "d7be84e8c1868be80f7f7f618cf5c36d940446b040749e9d68bb9740cfad1408",
-    "usr/lib/modules/6.8.0-151-generic/modules.softdep": "ac2de753255c506934be29e69261f1485f51ee9cf9c2bf467bcc0c4cf95f8713",
-    "usr/lib/modules/6.8.0-151-generic/modules.symbols": "71027c380a15ad682250da62a8162b7f1b6e50d2553b767c18f9f143a9b9d7cd",
-    "usr/lib/modules/6.8.0-151-generic/modules.symbols.bin": "41ed71f42855cc735667c4d7b2b45d4efc701701043fdb12c9e8c92978478010"
-  },
+  "modules": {},
   "schema": "cathedral.vm.initrd-closure/v1",
   "static_tools": [
     "usr/lib/cathedral/cryptsetup",
@@ -50,5 +31,5 @@
     "usr/lib/cathedral/mke2fs",
     "usr/lib/cathedral/resize2fs"
   ],
-  "status": "pinned"
+  "status": "unpinned"
 }

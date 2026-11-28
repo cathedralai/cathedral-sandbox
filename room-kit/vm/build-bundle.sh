@@ -34,16 +34,22 @@ LOCK_TOOL=$KIT/sealed/packages_lock.py
 # the link; sshd takes the host keys the init makes at first boot.
 BASE_PKGS=systemd,systemd-sysv,systemd-resolved,systemd-timesyncd,udev,kmod,dbus,iproute2,iputils-ping,netbase,openssh-server,sudo,ca-certificates,curl,gnupg,less,vim-tiny,procps,psmisc,util-linux,passwd,e2fsprogs,tzdata,locales,bash-completion,apt-utils,lsb-release
 # Stock Ubuntu kernel, the package the kit boots (build-guest.sh PKGS). Only its vmlinuz
-# and the boot modules leave this root.
+# and module tree leave this root.
 KERNEL_PKGS=linux-image-virtual
+# The customer root gets this package's whole module tree (read-only, from the initrd), so
+# Docker, nft, ufw, WireGuard and overlay work as on a stock Ubuntu VM.
+KERNEL_TREE_PKG=linux-modules
 # sev-guest (with tsm, which it needs) and qemu_fw_cfg are only in linux-modules-extra, which
 # is versioned: bundle.env names the release (VM_BUNDLE_KERNEL_RELEASE) and the build stops
 # unless linux-image-virtual resolves to the same one in the snapshot.
 KERNEL_EXTRA_PKG=linux-modules-extra
-# Loaded or built in; the VM init (7.2) needs each one before it can open the disks.
-KERNEL_MODULES="sev-guest dm-verity dm-crypt qemu_fw_cfg virtio_blk virtio_net"
+# Loaded or built in; the VM init (7.2) needs each one before it can open the disks. The
+# order is the closure's boot_modules order. aesni_intel gives dm-crypt the AES-NI xts(aes):
+# without it dm-crypt takes the generic T-table AES, which is slow and whose key-dependent
+# memory accesses the host can see through the cache.
+KERNEL_MODULES="sev-guest dm-verity aesni_intel dm-crypt qemu_fw_cfg virtio_blk virtio_net"
 KERNEL_CONFIG_Y="AMD_MEM_ENCRYPT EFI_STUB BLK_DEV_INITRD RD_ZSTD"
-KERNEL_CONFIG_YM="SEV_GUEST DM_VERITY DM_CRYPT VIRTIO_BLK VIRTIO_NET"
+KERNEL_CONFIG_YM="SEV_GUEST DM_VERITY DM_CRYPT VIRTIO_BLK VIRTIO_NET CRYPTO_AES_NI_INTEL"
 
 usage() { echo "usage: build-bundle.sh base-root|kernel bundle.env [--verify-reproducible] | manifest bundle.env" >&2; exit 2; }
 [ $# = 2 ] || [ $# = 3 ] || usage
@@ -312,17 +318,22 @@ build_kernel() {
       echo "$m module ${file#"$tree/"}" >> "$B/boot-modules.txt"
     fi
   done
+  # The one crypto guard: AES-NI built in, or loaded by the init before any disk opens.
+  grep -qx 'CONFIG_CRYPTO_AES_NI_INTEL=y' "$K/boot/config-$kver" || grep -q '^aesni_intel module ' "$B/boot-modules.txt" \
+    || die "kernel $kver: aesni_intel is neither built in nor a boot module, so dm-crypt would run the generic AES"
   install -m 0644 "$K/boot/vmlinuz-$kver" "$OUT/vmlinuz"
   install -m 0644 "$K/boot/config-$kver" "$B/config-$kver"
   # The module tree for the VM initrd (VM1b), which bind-mounts it read-only at
-  # /lib/modules/<release> in the customer root (6.1). It holds the boot module files and
-  # what modules.dep says they need, nothing else of the two packages: every other module,
-  # the vdso and its .build-id links go, modules.order is cut to the kept files, and the
-  # depmod of this root (its pinned kmod) rebuilds the indexes for that set.
-  python3 -I - "$tree" "$B/boot-modules.txt" <<'EOF' || die "kernel $kver: cannot cut the module tree to the boot modules"
+  # /lib/modules/<release> in the customer root (6.1). It holds every file $KERNEL_TREE_PKG
+  # ships there, and from linux-modules-extra only the boot modules and what modules.dep says
+  # they need. Links go (the vdso .build-id debug links; the initrd recipe takes no link),
+  # modules.order is cut to the kept files, and the depmod of this root (its pinned kmod)
+  # rebuilds the indexes for that set. The init still loads only the boot modules.
+  python3 -I - "$tree" "$B/boot-modules.txt" "$K/var/lib/dpkg/info/$KERNEL_TREE_PKG-$kver.list" <<'EOF' \
+    || die "kernel $kver: cannot cut the module tree"
 import sys
 from pathlib import Path
-tree, listing = Path(sys.argv[1]), Path(sys.argv[2])
+tree, listing, package = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
 dep = {}
 for line in (tree / "modules.dep").read_text().splitlines():
     name, _, needs = line.partition(":")
@@ -335,6 +346,15 @@ for line in listing.read_text().splitlines():
             sys.exit(f"modules.dep has no entry for {fields[2]}")
         keep.add(fields[2])
         keep.update(dep[fields[2]])
+boot = len(keep)
+prefixes = (f"/lib/modules/{tree.name}/", f"/usr/lib/modules/{tree.name}/")
+for line in package.read_text().splitlines():
+    for prefix in prefixes:
+        if line.startswith(prefix) and (tree / line[len(prefix):]).is_file() \
+                and not (tree / line[len(prefix):]).is_symlink():
+            keep.add(line[len(prefix):])
+if len(keep) == boot:
+    sys.exit(f"{package.name} lists no file of this tree")
 indexes = {"modules.builtin", "modules.builtin.modinfo", "modules.order"}
 for path in sorted(tree.rglob("*"), reverse=True):
     rel = path.relative_to(tree).as_posix()
@@ -346,7 +366,7 @@ for path in sorted(tree.rglob("*"), reverse=True):
 order = tree / "modules.order"
 kept = [line for line in order.read_text().splitlines() if line in keep or line + ".zst" in keep]
 order.write_text("".join(line + "\n" for line in kept))
-print("kept module files:", " ".join(sorted(keep)))
+print(f"kept {len(keep)} files: the {package.name.removesuffix('.list')} tree and {boot} boot module files")
 EOF
   chroot "$K" depmod -a "$kver"
   for m in $KERNEL_MODULES; do

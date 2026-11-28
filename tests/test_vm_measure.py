@@ -547,22 +547,41 @@ def test_kernel_step_takes_the_extra_modules_of_the_named_release():
 
 def _module_cut_script() -> str:
     text = BUILD.read_text()
-    start = text.index("\n", text.index('python3 -I - "$tree" "$B/boot-modules.txt" <<\'EOF\'')) + 1
+    start = text.index("\n", text.index('python3 -I - "$tree" "$B/boot-modules.txt"')) + 1
+    start = text.index("\n", start) + 1  # the "|| die" line
     return text[start:text.index("\nEOF\n", start) + 1]
 
 
-def test_module_cut_keeps_the_boot_modules_and_their_dependencies_only(tmp_path):
-    tree = tmp_path / "6.8.0-151-generic"
-    files = {
-        "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst": "kernel/drivers/virt/coco/tsm.ko.zst",
-        "kernel/drivers/virt/coco/tsm.ko.zst": "",
-        "kernel/drivers/md/dm-verity.ko.zst": "kernel/drivers/md/dm-bufio.ko.zst",
-        "kernel/drivers/md/dm-bufio.ko.zst": "",
-        "kernel/drivers/md/dm-crypt.ko.zst": "",
-        "kernel/drivers/firmware/qemu_fw_cfg.ko.zst": "",
-        "kernel/sound/core/snd.ko.zst": "",
-        "kernel/drivers/net/wireless/foo.ko.zst": "kernel/sound/core/snd.ko.zst",
-    }
+RELEASE_DIR = "6.8.0-151-generic"
+# linux-modules (the whole tree ships) and linux-modules-extra (only the boot set ships).
+PACKAGE_FILES = {
+    "kernel/drivers/md/dm-verity.ko.zst": "kernel/drivers/md/dm-bufio.ko.zst",
+    "kernel/drivers/md/dm-bufio.ko.zst": "",
+    "kernel/drivers/md/dm-crypt.ko.zst": "",
+    "kernel/arch/x86/crypto/aesni-intel.ko.zst": "kernel/crypto/crypto_simd.ko.zst kernel/crypto/cryptd.ko.zst",
+    "kernel/crypto/crypto_simd.ko.zst": "kernel/crypto/cryptd.ko.zst",
+    "kernel/crypto/cryptd.ko.zst": "",
+    "kernel/fs/overlayfs/overlay.ko.zst": "",
+    "kernel/net/netfilter/nf_tables.ko.zst": "",
+}
+EXTRA_FILES = {
+    "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst": "kernel/drivers/virt/coco/tsm.ko.zst",
+    "kernel/drivers/virt/coco/tsm.ko.zst": "",
+    "kernel/drivers/firmware/qemu_fw_cfg.ko.zst": "",
+    "kernel/drivers/net/wireless/foo.ko.zst": "kernel/sound/core/snd.ko.zst",
+    "kernel/sound/core/snd.ko.zst": "",
+}
+BOOT_LISTING = ("sev-guest module kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst\n"
+                "dm-verity module kernel/drivers/md/dm-verity.ko.zst\n"
+                "aesni_intel module kernel/arch/x86/crypto/aesni-intel.ko.zst\n"
+                "dm-crypt module kernel/drivers/md/dm-crypt.ko.zst\n"
+                "qemu_fw_cfg module kernel/drivers/firmware/qemu_fw_cfg.ko.zst\n"
+                "virtio_blk built-in\nvirtio_net built-in\n")
+
+
+def _cut(tmp_path, listing=BOOT_LISTING):
+    tree = tmp_path / "usr/lib/modules" / RELEASE_DIR
+    files = {**PACKAGE_FILES, **EXTRA_FILES}
     for rel in files:
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
         (tree / rel).write_bytes(b"ko")
@@ -573,33 +592,60 @@ def test_module_cut_keeps_the_boot_modules_and_their_dependencies_only(tmp_path)
     (tree / "vdso" / ".build-id" / "3e").mkdir(parents=True)
     (tree / "vdso" / "vdso64.so").write_bytes(b"elf")
     os.symlink("../../vdso64.so", tree / "vdso" / ".build-id" / "3e" / "e2.debug")
-    listing = tmp_path / "boot-modules.txt"
-    listing.write_text("sev-guest module kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst\n"
-                       "dm-verity module kernel/drivers/md/dm-verity.ko.zst\n"
-                       "dm-crypt module kernel/drivers/md/dm-crypt.ko.zst\n"
-                       "qemu_fw_cfg module kernel/drivers/firmware/qemu_fw_cfg.ko.zst\n"
-                       "virtio_blk built-in\nvirtio_net built-in\n")
-    r = subprocess.run([sys.executable, "-I", "-", str(tree), str(listing)], input=_module_cut_script(),
+    # dpkg's list of linux-modules: its files, its directories and its one link, under /lib.
+    shipped = list(PACKAGE_FILES) + ["modules.builtin", "modules.builtin.modinfo", "modules.order",
+                                     "vdso", "vdso/vdso64.so", "vdso/.build-id/3e/e2.debug", "kernel"]
+    package = tmp_path / f"linux-modules-{RELEASE_DIR}.list"
+    package.write_text("".join(f"/lib/modules/{RELEASE_DIR}/{rel}\n" for rel in shipped) + "/boot/vmlinuz\n")
+    boot = tmp_path / "boot-modules.txt"
+    boot.write_text(listing)
+    r = subprocess.run([sys.executable, "-I", "-", str(tree), str(boot), str(package)], input=_module_cut_script(),
                        capture_output=True, text=True)
+    return r, tree
+
+
+def test_module_cut_ships_the_package_tree_and_only_the_boot_set_of_extra(tmp_path):
+    r, tree = _cut(tmp_path)
     assert r.returncode == 0, r.stderr
     left = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file() or p.is_symlink())
-    kept = sorted(rel for rel in files if "snd" not in rel and "wireless" not in rel)
-    # modules.dep and the other depmod outputs go too; depmod rebuilds them for the kept set.
-    assert left == sorted(kept + ["modules.builtin", "modules.builtin.modinfo", "modules.order"])
-    assert not (tree / "vdso").exists() and not (tree / "kernel/sound").exists()
-    assert (tree / "modules.order").read_text().splitlines() == [rel.removesuffix(".zst") for rel in files if rel in kept]
+    extra_kept = ["kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst", "kernel/drivers/virt/coco/tsm.ko.zst",
+                  "kernel/drivers/firmware/qemu_fw_cfg.ko.zst"]
+    # The depmod outputs go too (depmod rebuilds them), and so do the links.
+    assert left == sorted(list(PACKAGE_FILES) + extra_kept +
+                          ["modules.builtin", "modules.builtin.modinfo", "modules.order", "vdso/vdso64.so"])
+    assert not (tree / "kernel/sound").exists() and not (tree / "vdso/.build-id").exists()
+    kept = set(PACKAGE_FILES) | set(extra_kept)
+    assert (tree / "modules.order").read_text().splitlines() == \
+        [rel.removesuffix(".zst") for rel in {**PACKAGE_FILES, **EXTRA_FILES} if rel in kept]
 
 
 def test_module_cut_refuses_a_boot_module_modules_dep_does_not_know(tmp_path):
-    tree = tmp_path / "t"
-    tree.mkdir()
-    (tree / "modules.dep").write_text("kernel/a.ko.zst:\n")
-    (tree / "modules.order").write_text("kernel/a.ko\n")
-    listing = tmp_path / "boot-modules.txt"
-    listing.write_text("sev-guest module kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst\n")
-    r = subprocess.run([sys.executable, "-I", "-", str(tree), str(listing)], input=_module_cut_script(),
-                       capture_output=True, text=True)
+    r, _ = _cut(tmp_path, "vfio module kernel/drivers/vfio/vfio.ko.zst\n")
     assert r.returncode != 0 and "modules.dep has no entry" in r.stderr
+
+
+def test_module_cut_refuses_a_package_list_of_another_tree(tmp_path):
+    r, tree = _cut(tmp_path)
+    assert r.returncode == 0
+    tree2 = tmp_path / "other" / "6.8.0-152-generic"
+    tree2.mkdir(parents=True)
+    (tree2 / "modules.dep").write_text("")
+    (tree2 / "modules.order").write_text("")
+    boot = tmp_path / "empty-boot.txt"
+    boot.write_text("virtio_blk built-in\n")
+    r = subprocess.run([sys.executable, "-I", "-", str(tree2), str(boot), str(tmp_path / f"linux-modules-{RELEASE_DIR}.list")],
+                       input=_module_cut_script(), capture_output=True, text=True)
+    assert r.returncode != 0 and "lists no file of this tree" in r.stderr
+
+
+def test_kernel_step_requires_aes_ni_for_dm_crypt():
+    modules = _assignment("KERNEL_MODULES").strip('"').split()
+    assert modules.index("aesni_intel") < modules.index("dm-crypt")
+    assert "CRYPTO_AES_NI_INTEL" in _assignment("KERNEL_CONFIG_YM")
+    text = BUILD.read_text()
+    kernel = text[text.index("build_kernel() {"):text.index("# ---------------------------------------------------------------- manifest")]
+    assert "grep -qx 'CONFIG_CRYPTO_AES_NI_INTEL=y'" in kernel and "grep -q '^aesni_intel module '" in kernel
+    assert _assignment("KERNEL_TREE_PKG") == "linux-modules"
 
 
 def test_kernel_step_records_built_in_boot_modules():

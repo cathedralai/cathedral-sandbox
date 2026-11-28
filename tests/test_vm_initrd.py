@@ -45,7 +45,9 @@ MODULE_FILES = {
         "kernel/drivers/md/dm-crypt.ko.zst:\n"
         "kernel/drivers/virt/coco/sev-guest/sev-guest.ko.zst:\n"
     ),
-    "modules.builtin": "kernel/drivers/md/dm-verity.ko\nkernel/drivers/firmware/qemu_fw_cfg.ko\nkernel/drivers/net/virtio_net.ko\n",
+    # aesni_intel built in here (a module file in the reference kernel), so the checked-in boot list fits.
+    "modules.builtin": "kernel/drivers/md/dm-verity.ko\nkernel/drivers/firmware/qemu_fw_cfg.ko\nkernel/drivers/net/virtio_net.ko\n"
+                       "kernel/arch/x86/crypto/aesni-intel.ko\n",
     "kernel/drivers/virtio/virtio.ko.zst": "m1",
     "kernel/drivers/virtio/virtio_ring.ko.zst": "m2",
     "kernel/drivers/block/virtio_blk.ko.zst": "m3",
