@@ -416,6 +416,12 @@ BAD_ARGS = {
     "--addr a name": ["--addr", "operator", "--laddr", "198.51.100.20"],
     "--addr a network": ["--addr", "192.0.2.0/24", "--laddr", "198.51.100.20"],
     "--laddr aa": ["--addr", "192.0.2.10", "--laddr", "aa"],
+    # ipaddress keeps an IPv6 scope id as written, so it could carry ",user=nobody" into the -C spec and dodge a
+    # Match User root block. A scoped address is refused in both flags.
+    "--addr scoped, with a spec": ["--addr", "2001:db8::1%x,user=nobody", "--laddr", "198.51.100.20"],
+    "--laddr scoped, with a spec": ["--addr", "192.0.2.10", "--laddr", "2001:db8::1%x,user=nobody"],
+    "--addr scoped": ["--addr", "2001:db8::1%x", "--laddr", "198.51.100.20"],
+    "--laddr scoped": ["--addr", "192.0.2.10", "--laddr", "2001:db8::1%x"],
     "--lport x": [*LOGIN, "--lport", "x"],
     "--lport 0": [*LOGIN, "--lport", "0"],
     "--lport 70000": [*LOGIN, "--lport", "70000"],
@@ -563,6 +569,7 @@ GUARD_CASES = {
     "global BASH_ENV": (["AcceptEnv BASH_ENV"], [], False),
     "PermitUserEnvironment yes": (["PermitUserEnvironment yes"], [], False),
     "Match Address": (["Match Address 192.0.2.10", "    AcceptEnv LD_PRELOAD"], [], False),
+    "Match User root": (["Match User root", "    AcceptEnv LD_PRELOAD"], [], False),
     "Match LocalAddress": (["Match LocalAddress 198.51.100.20", "    AcceptEnv *"], [], False),
     "Match LocalPort": (["Match LocalPort 22", "    AcceptEnv *"], [], False),
     "Match RDomain": (["Match RDomain vrf-a", "    AcceptEnv *"], ["--rdomain", "vrf-a"], False),
