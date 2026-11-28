@@ -109,14 +109,15 @@ def wipe_pending(rec: dict) -> bool:
 
 
 def wipe_overdue(rec: dict) -> bool:
-    """The API allowed the wipe over an hour ago (by its due time), and the sweeper has not done it."""
+    """The API allows the wipe and the folder is late: by the owner's waiver (allowed before the due time, so the
+    return should have wiped it at R15), or over an hour past the due time (the sweeper's window)."""
     if not wipe_pending(rec):
         return False
-    due = rec.get("wipe_due_at")
     try:
-        return due is None or time.time() > datetime.fromisoformat(due).timestamp() + 3600
-    except (TypeError, ValueError):
-        return True
+        due = datetime.fromisoformat(rec["wipe_due_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return True  # no stop time: only a waiver allows the wipe
+    return time.time() < due or time.time() > due + 3600
 
 
 def now_iso() -> str:

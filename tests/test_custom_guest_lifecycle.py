@@ -1118,13 +1118,33 @@ def test_a_crash_between_the_host_wipe_and_done_is_finished_by_the_next_wipe(rig
     assert rig.host()["calls"].count("wipe") == 1  # W2 observed done: the host phase did not run again
 
 
+def overdue(out: dict) -> bool:
+    return any(a.startswith("custom_guest_wipe_overdue") for a in out.get("alerts", []))
+
+
 def test_reconcile_alerts_on_an_overdue_wipe(rig):
     held(rig)
     rig.world.record["owner_requests"] = []
     assert rig.run("return")[0] == 0
-    rig.world.stopped_at = time.time() - 74 * 3600  # the API's due time passed 2 h ago
     rc, out = rig.run("reconcile")
-    assert rc == 2 and any(a.startswith("custom_guest_wipe_overdue") for a in out["alerts"]), out
+    assert not overdue(out), out  # inside the 72 h: nothing is late
+    rig.world.stopped_at = time.time() - 72 * 3600 - 1800  # due 30 min ago: the sweeper's window
+    rc, out = rig.run("reconcile")
+    assert not overdue(out), out
+    rig.world.stopped_at = time.time() - 74 * 3600  # due 2 h ago
+    rc, out = rig.run("reconcile")
+    assert rc == 2 and overdue(out), out
+
+
+def test_reconcile_alerts_when_a_waiver_wipe_did_not_finish(rig):
+    held(rig)  # the owner waived after the stop
+    rig.set_host(fail={"wipe": "custom_guest_hold_failed"})
+    rc, out = rig.run("return")
+    assert rc == 1 and rig.world.record["state"] == "returned" and rig.world.wipe_started_at is not None, out
+    rig.set_host(fail={})
+    rc, out = rig.run("reconcile")
+    assert rc == 2 and overdue(out), out
+    assert rig.run("wipe")[0] == 0 and rig.host()["launch_dir"] is False and rig.world.wiped_at is not None
 
 
 def test_the_notice_sent_at_option_is_gone(rig):
