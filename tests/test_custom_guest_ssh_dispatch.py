@@ -324,11 +324,14 @@ def test_behind_sshd_a_shell_command_and_sftp_are_refused(sshd):
     p = subprocess.run(["sftp", *sshd["base"], "-P", str(sshd["port"]), "-b", "-", "root@localhost"],
                        input="ls /\n", capture_output=True, text=True, timeout=60)
     assert p.returncode != 0 and "etc" not in p.stdout, (p.stdout, p.stderr)
-    # The sftp request reached the forced command, with the configured subsystem command as SSH_ORIGINAL_COMMAND.
+    # The same subsystem request from ssh -s, which waits for the remote's stderr (the sftp client quits on the first
+    # bad packet): it reached the forced command, with the configured subsystem command as SSH_ORIGINAL_COMMAND.
+    p = ssh(sshd, "sftp", opts=("-s",))
+    assert p.returncode == 1 and result(p)["error_code"] == "custom_guest_request_invalid", (p.stdout, p.stderr)
     assert f"cathedral-cg-dispatch: refused: not the host tool of this install: {sshd['subsystem']!r}" in p.stderr, \
         p.stderr
     log = (sshd["d"] / "sshd.log").read_text()
-    assert log.count("Starting session: forced-command (key-option)") == 3 and "subsystem 'sftp'" not in log, log[-3000:]
+    assert log.count("Starting session: forced-command (key-option)") == 4 and "subsystem 'sftp'" not in log, log[-3000:]
 
 
 @sshd_tests
