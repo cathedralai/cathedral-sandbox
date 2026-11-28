@@ -104,8 +104,8 @@ func TestFixtureRecordsRoundTripByteForByte(t *testing.T) {
 
 func TestFixtureInvalidBodiesReadEmpty(t *testing.T) {
 	f := loadFixture(t)
-	if len(f.Invalid) != 18 {
-		t.Fatalf("expected 18 invalid bodies, fixture has %d", len(f.Invalid))
+	if len(f.Invalid) != 21 {
+		t.Fatalf("expected 21 invalid bodies, fixture has %d", len(f.Invalid))
 	}
 	for _, c := range f.Invalid {
 		kind := kindByName[c.Kind]
@@ -237,7 +237,7 @@ func TestWritersRefuseValuesTheirSchemaRefuses(t *testing.T) {
 func answerSlotFor(t *testing.T, a Answer) []byte {
 	t.Helper()
 	body := canonical(map[string]string{"schema": AnswerSchema, "offer_sha256": a.OfferSHA256, "epk": b64(a.EPK[:]),
-		"nonce": b64(a.Nonce[:]), "ct": b64(a.CT[:])})
+		"nonce": b64(a.Nonce[:]), "ct": b64(a.CT[:]), "sig": b64(a.Sig)})
 	slot, err := EncodeSlot(KindAnswer, body)
 	if err != nil {
 		t.Fatal(err)
@@ -474,5 +474,82 @@ func TestAllIOIsAlignedForODirect(t *testing.T) {
 	m.ReadAnswer()
 	if err := m.ZeroOffer(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The shared signed-answer vectors (tests/fixtures/vm_rewrap_answer_v2.json): the mailbox parser
+// refuses exactly the answer-level cases and reads every other one, with the sig and message the
+// reference verifier used. The signature itself is internal/sshsig's.
+func TestAnswerV2VectorsParseAsTheReferenceSays(t *testing.T) {
+	raw, err := os.ReadFile("../../../../tests/fixtures/vm_rewrap_answer_v2.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Cases []struct {
+			Name       string  `json:"name"`
+			Body       string  `json:"body"`
+			Refusal    *string `json:"refusal"`
+			MessageHex string  `json:"message_hex"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	answerLevel := map[string]bool{"answer_schema": true, "answer_too_long": true, "sig_encoding": true,
+		"sig_too_long": true}
+	read, refused := 0, 0
+	for _, c := range f.Cases {
+		slot, err := EncodeSlot(KindAnswer, []byte(c.Body))
+		var ans Answer
+		ok := false
+		if err == nil {
+			box := newMem()
+			copy(box.b[AnswerOffset:], slot)
+			ans, ok = (&Mailbox{f: box}).ReadAnswer()
+		}
+		if c.Refusal != nil && answerLevel[*c.Refusal] {
+			if ok {
+				t.Errorf("%s: the mailbox read an answer the reference refuses as %s", c.Name, *c.Refusal)
+			}
+			refused++
+			continue
+		}
+		if !ok {
+			t.Errorf("%s: the mailbox refused an answer the reference parses", c.Name)
+			continue
+		}
+		var doc map[string]string
+		_ = json.Unmarshal([]byte(c.Body), &doc)
+		message, err := ans.Message()
+		if err != nil || hex.EncodeToString(message) != c.MessageHex || b64(ans.Sig) != doc["sig"] {
+			t.Errorf("%s: message or sig differs from the reference: %v", c.Name, err)
+		}
+		read++
+	}
+	if read < 20 || refused < 5 {
+		t.Fatalf("read %d, refused %d", read, refused)
+	}
+}
+
+func TestAnswerSigShape(t *testing.T) {
+	a := Answer{OfferSHA256: strings.Repeat("c", 64)}
+	for size, want := range map[int]bool{0: true, 1: true, SigMax: true, SigMax + 1: false} {
+		a.Sig = make([]byte, size)
+		box := newMem()
+		copy(box.b[AnswerOffset:], answerSlotFor(t, a))
+		got, ok := (&Mailbox{f: box}).ReadAnswer()
+		if ok != want || (ok && len(got.Sig) != size) {
+			t.Errorf("a %d-byte sig: read %v", size, ok)
+		}
+	}
+	// A v1 answer, which has no sig, reads as no answer.
+	v1 := canonical(map[string]string{"schema": "cathedral.vm.rewrap-answer/v1", "offer_sha256": a.OfferSHA256,
+		"epk": b64(a.EPK[:]), "nonce": b64(a.Nonce[:]), "ct": b64(a.CT[:])})
+	slot, _ := EncodeSlot(KindAnswer, v1)
+	box := newMem()
+	copy(box.b[AnswerOffset:], slot)
+	if _, ok := (&Mailbox{f: box}).ReadAnswer(); ok {
+		t.Fatal("a v1 answer read")
 	}
 }

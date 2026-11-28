@@ -34,7 +34,7 @@ func rewrapVector(t *testing.T) (map[string]any, string) {
 func TestVMsRewrapAnswerIsTheHostsCanonicalBytes(t *testing.T) {
 	doc, body := rewrapVector(t)
 	// Any key order and spacing in, the canonical body out.
-	loose := `{ "ct": "` + doc["ct"].(string) + `", "schema": "` + vmRewrapSchema + `",
+	loose := `{ "sig": "` + doc["sig"].(string) + `", "ct": "` + doc["ct"].(string) + `", "schema": "` + vmRewrapSchema + `",
 	  "nonce": "` + doc["nonce"].(string) + `", "offer_sha256": "` + doc["offer_sha256"].(string) + `",
 	  "epk": "` + doc["epk"].(string) + `" }`
 	got, err := vmRewrapAnswer(json.RawMessage(loose))
@@ -61,7 +61,12 @@ func TestVMsRewrapAnswerIsTheHostsCanonicalBytes(t *testing.T) {
 		"an array":        json.RawMessage(`[]`),
 		"unknown field":   with(map[string]any{"algorithm": "x"}),
 		"missing ct":      with(map[string]any{"ct": nil}),
-		"another schema":  with(map[string]any{"schema": "cathedral.vm.rewrap-answer/v2"}),
+		"a v1 answer":     with(map[string]any{"schema": "cathedral.vm.rewrap-answer/v1", "sig": nil}),
+		"another schema":  with(map[string]any{"schema": "cathedral.vm.rewrap-answer/v1"}),
+		"missing sig":     with(map[string]any{"sig": nil}),
+		"2401-byte sig":   with(map[string]any{"sig": base64.StdEncoding.EncodeToString(make([]byte, 2401))}),
+		"unpadded sig":    with(map[string]any{"sig": strings.TrimRight(base64.StdEncoding.EncodeToString(make([]byte, 10)), "=")}),
+		"number sig":      with(map[string]any{"sig": 1}),
 		"uppercase hex":   with(map[string]any{"offer_sha256": strings.ToUpper(doc["offer_sha256"].(string))}),
 		"47-byte ct":      with(map[string]any{"ct": base64.StdEncoding.EncodeToString(make([]byte, 47))}),
 		"unpadded epk":    with(map[string]any{"epk": strings.TrimRight(doc["epk"].(string), "=")}),
@@ -194,4 +199,95 @@ func TestVMsRewrapAnswerOverTheRealSSHExecutor(t *testing.T) {
 	if in, _ := os.ReadFile(ssh + ".stdin"); string(in) != body {
 		t.Fatalf("route stdin %q", in)
 	}
+	// The largest answer create allows: an RSA 8192 signature (3173 bytes in the shared vectors).
+	raw, err := os.ReadFile(filepath.Join("..", "tests", "fixtures", "vm_rewrap_answer_v2.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vec struct {
+		Cases []struct {
+			Name string `json:"name"`
+			Body string `json:"body"`
+		} `json:"cases"`
+	}
+	_ = json.Unmarshal(raw, &vec)
+	var rsa map[string]any
+	for _, c := range vec.Cases {
+		if c.Name == "valid-rsa-8192" {
+			_ = json.Unmarshal([]byte(c.Body), &rsa)
+		}
+	}
+	big := map[string]any{}
+	for k, v := range doc {
+		big[k] = v
+	}
+	big["sig"] = rsa["sig"]
+	if st, out := tb.call(t, "operator-key", "POST", base+"/rewrap", map[string]any{"generation": 1, "answer": big}); st != 200 {
+		t.Fatalf("RSA 8192 answer over ssh: %d %v", st, out)
+	}
+	if in, _ := os.ReadFile(ssh + ".stdin"); len(in) != 3173 || !bytes.Contains(in, []byte(rsa["sig"].(string))) {
+		t.Fatalf("RSA 8192 stdin: %d bytes", len(in))
+	}
+}
+
+// The shared signed-answer vectors (tests/fixtures/vm_rewrap_answer_v2.json): the broker refuses
+// every case the reference refuses for its shape, and passes every other one on byte for byte.
+// The broker re-encodes, so length alone cannot refuse the 4097-byte case (a canonical body and
+// trailing spaces); its sig, padded to fill 4096 bytes, is over 2400 and refuses it.
+// The route takes the answer as a value inside a JSON request, so a client's spacing or key order
+// is not the answer's: the two non-canonical bodies come out as the canonical bytes the host reads
+// (the signature covers the fields, not the body bytes). Every other answer_schema case is refused.
+func TestVMsRewrapAnswerV2Vectors(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "tests", "fixtures", "vm_rewrap_answer_v2.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Cases []struct {
+			Name    string  `json:"name"`
+			Body    string  `json:"body"`
+			Refusal *string `json:"refusal"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil || len(f.Cases) < 25 {
+		t.Fatalf("vectors: %v", err)
+	}
+	shape := map[string]bool{"answer_schema": true, "sig_encoding": true, "sig_too_long": true, "answer_too_long": true}
+	reencoded := map[string]bool{"body-not-canonical-space": false, "body-not-canonical-key-order": false}
+	for _, c := range f.Cases {
+		out, err := vmRewrapAnswer(json.RawMessage(c.Body))
+		switch {
+		case hasKey(reencoded, c.Name):
+			if c.Refusal == nil || *c.Refusal != "answer_schema" {
+				t.Fatalf("%s: the reference no longer refuses it as answer_schema", c.Name)
+			}
+			reencoded[c.Name] = true
+			var doc map[string]string
+			if json.Unmarshal([]byte(c.Body), &doc) != nil {
+				t.Fatalf("%s: not a JSON object of strings", c.Name)
+			}
+			want, _ := json.Marshal(doc) // sorted keys, no spaces
+			if err != nil || string(out) != string(want) || string(out) == c.Body {
+				t.Errorf("%s: want the canonical bytes %s, got %q, %v", c.Name, want, out, err)
+			}
+		case c.Refusal != nil && shape[*c.Refusal]:
+			if err == nil {
+				t.Errorf("%s: accepted an answer the reference refuses as %s", c.Name, *c.Refusal)
+			}
+		default:
+			if err != nil || string(out) != c.Body {
+				t.Errorf("%s: want the same bytes, got %v", c.Name, err)
+			}
+		}
+	}
+	for name, seen := range reencoded {
+		if !seen {
+			t.Errorf("%s: no such answer_schema case in the vectors", name)
+		}
+	}
+}
+
+func hasKey(m map[string]bool, k string) bool {
+	_, ok := m[k]
+	return ok
 }

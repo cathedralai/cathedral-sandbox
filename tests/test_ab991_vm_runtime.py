@@ -211,19 +211,28 @@ def test_create_refuses_bad_keys(host, tmp_path, text):
     assert not (host.root / "vm1").exists()
 
 
-def _sk_key(typ):
-    import base64
-    blob = len(typ).to_bytes(4, "big") + typ.encode() + b"\x00" * 8
-    return typ + " " + base64.b64encode(blob).decode() + " user@laptop"
+# The key shapes VM create allows and refuses (spec r4 erratum 2.5, AB#1022).
+SHAPES = json.loads((Path(__file__).resolve().parent / "fixtures" / "vm_ssh_key_shapes_v1.json").read_text())["cases"]
 
 
-@pytest.mark.parametrize("typ", ["sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"])
-def test_create_accepts_security_key_types(host, tmp_path, typ):
+@pytest.mark.parametrize("name", ["sk-ed25519", "sk-ecdsa-nistp256"])
+def test_create_accepts_security_key_types(host, tmp_path, name):
     f = tmp_path / "sk.pub"
-    f.write_text(_sk_key(typ) + "\n")
+    f.write_text(next(c for c in SHAPES if c["name"] == name)["ssh_public_key"] + " user@laptop\n")
     code, out = host.create(key=f)
     assert code == 0, out
     assert (host.root / "vm1").exists()
+
+
+@pytest.mark.parametrize("case", [c for c in SHAPES if c["refusal"]], ids=lambda c: c["name"])
+def test_create_refuses_a_key_the_rewrap_cannot_use(host, tmp_path, case):
+    """A key the guest could not verify a re-wrap answer from, within 4096 bytes: refused before
+    anything is written. Every one of these passes check_key, so start keeps taking them."""
+    f = tmp_path / "odd.pub"
+    f.write_text(case["ssh_public_key"] + "\n")
+    code, out = host.create(key=f)
+    assert code == 2 and out["error"] == "ssh_key_unsupported" and case["refusal"] in out["detail"], out
+    assert not (host.root / "vm1").exists()
 
 
 def test_key_types_equal_the_broker_set():

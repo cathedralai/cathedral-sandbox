@@ -43,8 +43,9 @@ func loadEnvelope(t *testing.T) []envelopeCase {
 
 func answerOf(t *testing.T, c envelopeCase) Answer {
 	t.Helper()
+	// The seal does not read sig: an empty one has the v2 shape (internal/sshsig refuses it).
 	doc := map[string]string{"schema": AnswerSchema, "offer_sha256": c.Answer["offer_sha256"], "epk": c.Answer["epk"],
-		"nonce": c.Answer["nonce"], "ct": c.Answer["ct"]}
+		"nonce": c.Answer["nonce"], "ct": c.Answer["ct"], "sig": ""}
 	parsed, err := ParseBody(canonical(doc), KindAnswer)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +81,7 @@ func TestEnvelopeEqualsThePythonGenerator(t *testing.T) {
 		customer, _ := ecdh.X25519().NewPrivateKey(mustHex(t, c.CustomerPrivateHex))
 		want := answerOf(t, c)
 		got, err := sealAnswer(vm.PublicKey().Bytes(), customer, want.Nonce, c.OfferSHA256, mustHex(t, c.RecoveryKeyHex))
-		if err != nil || got != want {
+		if err != nil || !sameSeal(got, want) {
 			t.Fatalf("case %d: Go seal differs from the Python generator", i)
 		}
 	}
@@ -137,4 +138,9 @@ func mustHex(t *testing.T, s string) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// sameSeal compares the sealed fields of two answers; the seal makes no signature.
+func sameSeal(a, b Answer) bool {
+	return a.OfferSHA256 == b.OfferSHA256 && a.EPK == b.EPK && a.Nonce == b.Nonce && a.CT == b.CT
 }

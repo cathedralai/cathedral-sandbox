@@ -34,6 +34,9 @@ slot offsets 0, 64 KiB and 128 KiB. Rules that matter:
 - The guest writes status and offer, each as one write of the whole slot and a flush. It never
   writes the answer slot. `ZeroOffer` reads the slot back as zero.
 - `AnswerFor(offer_sha256)` ignores an answer for another offer. An answer over 4096 bytes is refused.
+- The answer is v2 (below): `Answer.Sig` holds the SSHSIG, at most 2400 bytes, and
+  `Answer.Message()` the 154 bytes it signs. `internal/sshsig` verifies it; the init does not
+  call it yet (AB#1022 PR C).
 
 ## Re-wrap envelope
 
