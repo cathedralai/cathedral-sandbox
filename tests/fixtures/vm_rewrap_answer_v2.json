@@ -291,6 +291,16 @@
    "note": "a sig whose base64 has a nonzero padding bit",
    "openssh_accepts": null,
    "refusal": "sig_encoding"
+  },
+  {
+   "body": "{\"ct\":\"FOUR110jqjgeChxNpVrxjCkTrz7FVkrNOxofqdlebXGkyhjMHXUaptkZ9iw6FTi/\",\"epk\":\"AG98TmK7oz0Gxgm3se9gJJj93fIRaiQ+23r+bVSRekl=\",\"nonce\":\"/r4pVndhO71h11ai\",\"offer_sha256\":\"f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7\",\"schema\":\"cathedral.vm.rewrap-answer/v2\",\"sig\":\"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgPC4s4ppV8aiB54qp98v4dgoS6kvYOjLPMWVq0Ku7JxkAAAAmdm0tcmV3cmFwLWFuc3dlci12MkBjYXRoZWRyYWwuY29tcHV0ZXIAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqftlcPPNsCDzCwTbAyrkbsIB14zj5xkQl/P0L89zpkK8eyyNgOZcwSj6LSDtHUSCVJ0xkbBFBgxH2Hbrr8f/BA==\"}",
+   "body_bytes": 565,
+   "identity_ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDwuLOKaVfGogeeKqffL+HYKEupL2DoyzzFlatCruycZ",
+   "message_hex": "63617468656472616c2e766d2e7265777261702d616e737765722f763200f6ee0cb1f791c88cdf86deb5cc4d19b90ba864942f759481b442aecd4ebaa1f7006f7c4e62bba33d06c609b7b1ef602498fdddf2116a243edb7afe6d54917a49febe295677613bbd61d756a214e511d75d23aa381e0a1c4da55af18c2913af3ec5564acd3b1a1fa9d95e6d71a4ca18cc1d751aa6d919f62c3a1538bf",
+   "name": "epk-not-canonical-base64",
+   "note": "an epk whose base64 has a nonzero padding bit: it decodes to the signed bytes, and every mailbox reader refuses it before the signature",
+   "openssh_accepts": null,
+   "refusal": "answer_schema"
   }
  ],
  "hash_algorithm": "sha512",

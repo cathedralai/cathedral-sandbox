@@ -290,11 +290,13 @@ def reference_verify(body: bytes, identity_line: str) -> None:
             or not all(isinstance(doc[k], str) for k in FIELDS) or canonical(doc).encode() != body:
         raise Refused("answer_schema")
     for name, size in LENGTHS.items():
+        # The padded base64 of exactly size bytes, canonical, as every mailbox reader takes it.
         try:
-            if len(base64.b64decode(doc[name], validate=True)) != size:
-                raise ValueError
+            raw = base64.b64decode(doc[name], validate=True)
         except ValueError:
             raise Refused("answer_schema") from None
+        if len(raw) != size or b64(raw) != doc[name]:
+            raise Refused("answer_schema")
     if len(doc["offer_sha256"]) != 64 or doc["offer_sha256"].strip("0123456789abcdef"):
         raise Refused("answer_schema")
     blob = strict_b64(doc["sig"])
@@ -573,6 +575,9 @@ def build(kept: dict) -> tuple[dict, dict]:
         "an answer of 4097 bytes: the length is refused before any parse")
     add("sig-not-canonical-base64", ed, dict(good, sig=_padding_bit(good["sig"])), None,
         "a sig whose base64 has a nonzero padding bit")
+    add("epk-not-canonical-base64", ed, dict(good, epk=_padding_bit(good["epk"])), None,
+        "an epk whose base64 has a nonzero padding bit: it decodes to the signed bytes, and every "
+        "mailbox reader refuses it before the signature")
 
     valid = [c for c in cases if c["refusal"] is None]
     answers = {
