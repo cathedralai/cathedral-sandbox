@@ -226,6 +226,24 @@ def ssh_public_key(text: str) -> str:
 REWRAP_KEY_BLOB_MAX = 1100  # every key within it signs a re-wrap answer of at most 4096 bytes
 REWRAP_RSA_BITS = (2048, 8192)
 _EC_POINT_BYTES = {"nistp256": 65, "nistp384": 97, "nistp521": 133}
+# y^2 = x^3 - 3x + b over GF(p) (SEC 2): the point must be on its curve.
+_EC_FIELD = {
+    "nistp256": (2**256 - 2**224 + 2**192 + 2**96 - 1,
+                 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B),
+    "nistp384": (2**384 - 2**128 - 2**96 + 2**32 - 1,
+                 int("B3312FA7E23EE7E4988E056BE3F82D19181D9C6EFE8141120314088F5013875A"
+                     "C656398D8A2ED19D2A85C8EDD3EC2AEF", 16)),
+    "nistp521": (2**521 - 1,
+                 int("0051953EB9618E1C9A1F929A21A0B68540EEA2DA725B99B315F3B8B489918EF1"
+                     "09E156193951EC7E937B1652C0BD3BB1BF073573DF883D2C34F1EF451FD46B503F00", 16)),
+}
+
+
+def _on_curve(curve: str, point: bytes) -> bool:
+    p, b = _EC_FIELD[curve]
+    size = (len(point) - 1) // 2
+    x, y = int.from_bytes(point[1:1 + size], "big"), int.from_bytes(point[1 + size:], "big")
+    return x < p and y < p and (y * y - (x * x * x - 3 * x + b)) % p == 0
 
 
 class _Shape(Exception):
@@ -280,7 +298,7 @@ def rewrap_key_shape(line: str) -> str | None:
             if string() != curve.encode():
                 return "ecdsa_curve"
             point = string()
-            if len(point) != _EC_POINT_BYTES[curve] or point[0] != 4:
+            if len(point) != _EC_POINT_BYTES[curve] or point[0] != 4 or not _on_curve(curve, point):
                 return "ecdsa_point"
         if kind.startswith("sk-"):
             string()  # the application

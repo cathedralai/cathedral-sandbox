@@ -1,6 +1,7 @@
 package vmidentity
 
 import (
+	"crypto/ecdh"
 	"encoding/base64"
 	"encoding/binary"
 	"math/big"
@@ -17,7 +18,11 @@ type RewrapKeyError string
 
 func (e RewrapKeyError) Error() string { return string(e) }
 
-var ecPointBytes = map[string]int{"nistp256": 65, "nistp384": 97, "nistp521": 133}
+// ecCurves: the point's size and the curve whose NewPublicKey refuses a point off the curve.
+var ecCurves = map[string]struct {
+	size  int
+	curve ecdh.Curve
+}{"nistp256": {65, ecdh.P256()}, "nistp384": {97, ecdh.P384()}, "nistp521": {133, ecdh.P521()}}
 
 // CheckRewrapKey is vm_measure.rewrap_key_shape: nil if the identity's key can sign a re-wrap
 // answer the guest verifies within 4096 bytes. key is CheckSSHKey's "type base64".
@@ -74,7 +79,11 @@ func CheckRewrapKey(key string) error {
 		if !ok {
 			return RewrapKeyError("key_format")
 		}
-		if len(point) != ecPointBytes[curve] || point[0] != 4 {
+		c := ecCurves[curve]
+		if len(point) != c.size || point[0] != 4 {
+			return RewrapKeyError("ecdsa_point")
+		}
+		if _, err := c.curve.NewPublicKey(point); err != nil { // off the curve, or a coordinate >= p
 			return RewrapKeyError("ecdsa_point")
 		}
 	}
