@@ -83,3 +83,25 @@ def test_lanes_that_differ_are_refused(tmp_path):
 def test_a_version_outside_the_name_rule_is_refused(tmp_path, version):
     lanes(tmp_path / "lanes")
     assert run(tmp_path / "lanes", tmp_path / "out", version).returncode != 0
+
+
+def test_handoff_check_boots_the_built_reference_initrd_and_hands_off_for_real():
+    # AB#1027: cathedral-init handed the owner root /proc and /sys read-only, as the VM init did in
+    # B3. The check boots this run's kernel and initrd and passes only from inside the check root.
+    text = (REPO / ".github" / "workflows" / "reference-build.yml").read_text()
+    job = text.split("\n  handoff-check:\n", 1)[1]
+    # v2 is the first reference initrd with the writable hand-off; v1 stays as published.
+    assert "  INITRD_VERSION: ${{ inputs.initrd_version || 'v2' }}\n" in text and "        default: v2\n" in text
+    assert "    needs: summary\n" in job and "name: reference-build\n" in job
+    assert '"$RUNNER_TEMP/reference/vmlinuz"' in job
+    assert '"$RUNNER_TEMP/reference/cathedral-custom-initrd-$INITRD_VERSION.cpio.zst"' in job
+    assert "rdinit=/handoff-check CATHEDRAL_HANDOFF_CHECK=1 -- -test.v -test.run=^TestReferenceHandoffCheck\\$" in job
+    assert "grep -qx 'HANDOFF-CHECK: PASS'" in job
+    check = (REPO / "room-kit" / "custom-guest" / "internal" / "bootstate" / "handoff_check_linux_amd64_test.go").read_text()
+    assert 'handoffCheckPass = "HANDOFF-CHECK: PASS"' in check and check.count("fmt.Println(handoffCheckPass)") == 1
+    # The real kernel views and the real hand-off, with only the SNP restrictions left out.
+    assert "prepareKernelViews(kernelOperations{directory: bootDirectory, mount: syscall.Mount," in check
+    assert "err := (&ReadyRoot{ready: true}).Exec()" in check
+    assert "if os.Getpid() == 1 && len(os.Args) == 1 && os.Args[0] == handoffCheckInit {" in check
+    assert 'writeKernelFile("/proc/self/oom_score_adj", "-250\\n")' in check
+    assert 'writeKernelFile("/sys/devices/virtual/mem/null/uevent", "change\\n")' in check
