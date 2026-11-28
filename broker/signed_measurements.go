@@ -1,4 +1,4 @@
-// Flag-gated admission against Cathedral's signed sealed-hotels list (URnetwork Q3).
+// Flag-gated admission against Cathedral's signed sealed-hotels list (dedicated customer Q3).
 //
 // When config "signed_measurements_url" is set and "signed_measurements_admission"
 // is true, a hotel's launch measurement must appear in the signed list for its

@@ -580,7 +580,7 @@ class CreateSandboxRequest:
     workspace: WorkspaceSpec | None = None
     # Per-room start-up tunables (cathedral/room_tunables.py). None: the room starts as before.
     tunables: Any = None
-    # URnetwork Q5: "tun" asks for CAP_NET_ADMIN + /dev/net/tun (dedicated hotels;
+    # Dedicated customer Q5: "tun" asks for CAP_NET_ADMIN + /dev/net/tun (dedicated hotels;
     # gated by ROOM_ALLOW_TUN=1 on the hotel). Default / None: ordinary networking.
     network_capability: str | None = None
 

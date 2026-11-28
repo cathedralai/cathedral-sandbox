@@ -101,7 +101,7 @@ type placement struct {
 	// matches, whatever the guest policy says, so no retry, fallback or
 	// queue move can reach one either.
 	ownHostsOnly bool
-	// preferChipID / requireChipID (URnetwork Q10): soft (or hard) match on
+	// preferChipID / requireChipID (dedicated customer Q10): soft (or hard) match on
 	// the hotel's admitted SNP CHIP_ID (128 hex).
 	preferChipID  string
 	requireChipID bool
