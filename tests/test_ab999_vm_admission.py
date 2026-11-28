@@ -350,7 +350,7 @@ def test_only_an_exact_net_check_unit_is_skipped(host, cap, damage):
 
 
 def test_an_escape_slot_supervisor_is_not_a_kit(host, cap):
-    """many-moccasin: kit chi-escape and its #496 supervisor room-sealed-chi-escape-escape.service.
+    """A fresh slot host: kit chi-escape and its #496 supervisor room-sealed-chi-escape-escape.service.
     The supervisor runs no guest (it stops and starts room-sealed-chi-escape.service), so the kit
     counts once and VM creates go on."""
     unit = host.escape_slot("chi-escape", vcpus=4, mem=16, scratch=20)
