@@ -6,7 +6,9 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -274,6 +276,84 @@ def test_start_is_refused_when_unpaid_and_runs_when_paid(host):
     u = host.systemd()["cathedral-vm-vm1.service"]
     assert u["active"] and u["enabled"]
     assert host.ctl("check-paid", "vm1")[0] == 0
+
+
+# The unit's root steps run through this (vm_ctl.HOST_NS); pinned here so a change to it is seen.
+HOST_NS = "/usr/bin/nsenter --mount=/proc/1/ns/mnt --"
+
+# Runs vm_ctl.py with an audit hook that writes every path the process opens, one per line.
+RECORD_OPENS = r"""
+import runpy, sys
+log = open(sys.argv[1], "a", buffering=1)
+def hook(event, args):
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        log.write(args[0].decode() if isinstance(args[0], bytes) else args[0])
+        log.write("\n")
+sys.addaudithook(hook)
+sys.argv = sys.argv[2:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+def unit_entries(unit: str, key: str) -> list[str]:
+    return [e for ln in unit.splitlines() if ln.startswith(key + "=") for e in ln.split("=", 1)[1].split()]
+
+
+def hook_sees(unit: str, marker: str, path: str) -> bool:
+    """Whether the Exec line of `unit` that contains `marker` can open `path`. A step that runs through HOST_NS is
+    in the host's mount namespace and sees every path. Any other step, `+` or not, is in the unit's namespace
+    (systemd 255 and 259): it sees a path only when no TemporaryFileSystem hides it or a bind gives it back."""
+    (line,) = [ln for ln in unit.splitlines() if ln.startswith("Exec") and marker in ln]
+    if line.split("=", 1)[1].lstrip("+-@:!").startswith(HOST_NS + " "):
+        return True
+    real = os.path.realpath(path)
+
+    def under(base: str) -> bool:
+        b = os.path.realpath(base)
+        return real == b or real.startswith(b.rstrip("/") + "/")
+
+    hidden = any(under(e.split(":", 1)[0]) for e in unit_entries(unit, "TemporaryFileSystem"))
+    bound = any(under(e) for e in unit_entries(unit, "BindReadOnlyPaths") + unit_entries(unit, "BindPaths"))
+    return not hidden or bound
+
+
+def test_check_paid_in_the_unit_can_read_every_file_it_reads(host, tmp_path):
+    """Live VM proof, 28 Nov (systemd 259.5): the unit's `+` check-paid ran inside the unit's mount namespace, found
+    no authorization.json under the hidden VM_ROOT, read the default generation 0 and refused every start as
+    generation_closed, while the same command as plain root passed. Record every file check-paid opens for a paid,
+    started VM, then check each one against the rendered unit."""
+    host.create()
+    host.ctl("authorize", "vm1", str(int(time.time()) + 3600), "1")
+    assert host.ctl("start", "vm1")[0] == 0
+    log = tmp_path / "opens.txt"
+    p = subprocess.run([sys.executable, "-I", "-c", RECORD_OPENS, str(log), str(KIT / "vm_ctl.py"), "check-paid", "vm1"],
+                       capture_output=True, text=True, env=host.environ, timeout=60)
+    assert p.returncode == 0 and json.loads(p.stdout)["paid"] is True, (p.stdout, p.stderr)
+    opened = sorted({os.path.realpath(x) for x in log.read_text().splitlines() if os.path.isabs(x)})
+    d = host.root / "vm1"
+    # The recorder works: it saw the files the decision rests on.
+    for want in (d / "authorization.json", d / "launch.json", d / "vm.env", host.root / ".history" / "vm1.jsonl"):
+        assert os.path.realpath(want) in opened, (want, opened)
+    unit = (host.units / "cathedral-vm-vm1.service").read_text()
+    assert [f for f in opened if not hook_sees(unit, " check-paid vm1", f)] == []
+    # The control: the same unit without the wrapper hides the files that made the live start fail, so the
+    # assertion above can fail, and binding only authorization.json would not have been enough.
+    bare = unit.replace(HOST_NS + " ", "")
+    unseen = {f for f in opened if not hook_sees(bare, " check-paid vm1", f)}
+    assert {os.path.realpath(d / "authorization.json"), os.path.realpath(d / "launch.json"),
+            os.path.realpath(host.root / ".history" / "vm1.jsonl")} <= unseen, unseen
+
+
+def test_every_root_step_of_the_unit_runs_in_the_host_namespace_and_qemu_does_not(host):
+    host.create()
+    unit = (host.units / "cathedral-vm-vm1.service").read_text()
+    plus = [ln for ln in unit.splitlines() if re.match(r"Exec\w+=[-@:!]*\+", ln)]
+    # modprobe, the /dev/kvm wait, check-paid, the gates, net up, rm, ExecStop powerdown, ExecStopPost net down.
+    assert len(plus) == 8, plus
+    for ln in plus:
+        assert ln.split("=", 1)[1].lstrip("+-@:!").startswith(HOST_NS + " "), ln
+    (start,) = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
+    assert "nsenter" not in start and not start.startswith("ExecStart=+"), start
 
 
 def test_stop_keeps_the_disk_closes_the_generation_and_is_idempotent(host):
