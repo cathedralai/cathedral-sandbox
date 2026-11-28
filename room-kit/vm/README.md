@@ -258,6 +258,18 @@ cmdline and HOST_DATA from the identity on every launch.
   writes the manifest. The reference build is `.github/workflows/vm-bundle-build.yml`:
   two lanes on fresh hosted runners, with the pinned static `mke2fs` and `veritysetup`,
   and a summary that publishes only when every file is byte-identical across the lanes.
+- **Base root pin (AB#1022):** `base_root_pin.json` fixes the base root, so a later bundle
+  (a kernel or init fix) shares it and a VM can `rebundle` to it (`base_root_differs`
+  otherwise). While it is `pinned`, both lanes build with its `source_date_epoch` instead of
+  the commit time, and the summary publishes only a base root whose bytes, lock, verity root
+  and data bytes are the pin's. The `bundle.env` step also fails when the snapshot, the base
+  lock or the base-root recipe is not the pin's: `recipe_sha256` covers the functions of
+  `build-bundle.sh` that build it, `BASE_PKGS`, the static tool inputs and mmdebstrap
+  (`scripts/vm_bundle_build_summary.py recipe` prints each input). The byte check is the gate;
+  the recipe check only fails earlier and names the input. The pin today is the base root of
+  bundle `a9585311` (run 46095917678). A new base root (new snapshot, lock or recipe) means a
+  new pin and a new first bundle: set `status` to `unpinned`, run the workflow, and commit
+  the pin that its summary prints.
 - **Identity:** `vm-identity.json` (schema `cathedral.vm.identity/v1`): `vm_id`, a random
   salt, the first-boot SSH key and the bundle's base root hash. Written once at create.
   `create`'s answer, `status` and `list` carry it as `identity_document`, the file's exact
