@@ -323,24 +323,29 @@ def test_the_default_scp_uses_the_legacy_protocol():
 # ---------------------------------------------------------------- the install-time sshd guard
 
 GOOD_PUE = "permituserenvironment no\n"
+HOTEL_LINE = "acceptenv LANG\nacceptenv LC_*\nacceptenv COLORTERM\nacceptenv NO_COLOR\n"
 SSHD_DUMPS = {
     # What the dedicated hotel's sshd -T shows today.
-    "LANG LC_* COLORTERM NO_COLOR, one per line": (
-        "acceptenv LANG\nacceptenv LC_*\nacceptenv COLORTERM\nacceptenv NO_COLOR\n" + GOOD_PUE, True),
+    "LANG LC_* COLORTERM NO_COLOR, one per line": (HOTEL_LINE + GOOD_PUE, True),
     "LANG LC_* COLORTERM NO_COLOR, one line": ("acceptenv LANG LC_* COLORTERM NO_COLOR\n" + GOOD_PUE, True),
+    "TZ": ("acceptenv LANG TZ\n" + GOOD_PUE, True),
     "no acceptenv": (GOOD_PUE, True),
-    "CG_*": ("acceptenv CG_*\n" + GOOD_PUE, True),
+    "upper-case keywords": ("AcceptEnv LANG\nPermitUserEnvironment no\n", True),
+    # An allowlist: only the five patterns pass, as written.
+    "CG_*": ("acceptenv CG_*\n" + GOOD_PUE, False),
+    "GCONV_PATH": ("acceptenv LANG GCONV_PATH\n" + GOOD_PUE, False),
+    "LOCPATH": ("acceptenv LOCPATH\n" + GOOD_PUE, False),
+    "BASHOPTS": ("acceptenv BASHOPTS\n" + GOOD_PUE, False),
+    "LC_ALL, not the LC_* pattern": ("acceptenv LC_ALL\n" + GOOD_PUE, False),
+    "lower-case lang": ("acceptenv lang\n" + GOOD_PUE, False),
+    "LANG?": ("acceptenv LANG?\n" + GOOD_PUE, False),
     "*": ("acceptenv LANG *\n" + GOOD_PUE, False),
     "L*": ("acceptenv L*\n" + GOOD_PUE, False),
     "LD_PRELOAD": ("acceptenv LD_PRELOAD\n" + GOOD_PUE, False),
     "LD_*": ("acceptenv LD_*\n" + GOOD_PUE, False),
-    "LD_BIND_NOW": ("acceptenv LD_BIND_NOW\n" + GOOD_PUE, False),
     "BASH_ENV": ("acceptenv BASH_ENV\n" + GOOD_PUE, False),
-    "B*": ("acceptenv B*\n" + GOOD_PUE, False),
     "ENV": ("acceptenv ENV\n" + GOOD_PUE, False),
-    "E??": ("acceptenv E??\n" + GOOD_PUE, False),
     "PATH": ("acceptenv PATH\n" + GOOD_PUE, False),
-    "P?TH": ("acceptenv P?TH\n" + GOOD_PUE, False),
     "BASH_FUNC_*": ("acceptenv BASH_FUNC_*\n" + GOOD_PUE, False),
     "SHELLOPTS": ("acceptenv SHELLOPTS\n" + GOOD_PUE, False),
     "permituserenvironment yes": ("acceptenv LANG\npermituserenvironment yes\n", False),
@@ -351,9 +356,9 @@ SSHD_DUMPS = {
 
 
 @pytest.mark.parametrize("name", sorted(SSHD_DUMPS))
-def test_the_sshd_guard_refuses_variables_root_s_shell_reads(name):
+def test_the_sshd_guard_allows_only_the_locale_and_terminal_variables(name):
     """sshd hands accepted variables to root's shell, which runs before the dispatcher: the fixed env can't undo
-    them."""
+    them. Only LANG, LC_*, COLORTERM, NO_COLOR and TZ may be accepted."""
     dump, ok = SSHD_DUMPS[name]
     problems = load().sshd_env_problems(dump)
     assert (problems == []) is ok, problems
@@ -373,31 +378,65 @@ def check_sshd(*args: str) -> subprocess.CompletedProcess:
                           text=True, env={"PATH": "/usr/bin:/bin", "LD_PRELOAD": "x"}, timeout=60)
 
 
-def test_the_sshd_guard_reads_sshd_for_a_root_login_from_the_operator(tmp_path):
-    f = fake_sshd(tmp_path, SSHD_DUMPS["LANG LC_* COLORTERM NO_COLOR, one per line"][0])
-    p = check_sshd("--sshd", str(f), "--addr", "192.0.2.10")
+LOGIN = ["--addr", "192.0.2.10", "--laddr", "198.51.100.20"]
+SPEC = "user=root,host=192.0.2.10,addr=192.0.2.10,laddr=198.51.100.20"
+
+
+@pytest.mark.parametrize("extra,spec", [
+    ([], SPEC + ",lport=22"),
+    (["--lport", "2222"], SPEC + ",lport=2222"),
+    (["--rdomain", "vrf-a"], SPEC + ",lport=22,rdomain=vrf-a"),
+    (["--addr", "192.0.2.010"], None),
+])
+def test_the_sshd_guard_reads_sshd_for_this_key_s_own_login(tmp_path, extra, spec):
+    """The whole connection goes to sshd -T -C, so Match Address, LocalAddress, LocalPort and RDomain blocks
+    count."""
+    f = fake_sshd(tmp_path, HOTEL_LINE + GOOD_PUE)
+    p = check_sshd("--sshd", str(f), *LOGIN, *extra)
+    if spec is None:  # a leading zero is not an address ipaddress takes
+        assert p.returncode == 1 and p.stdout.startswith("FAIL sshd"), (p.stdout, p.stderr)
+        return
     assert p.returncode == 0 and p.stdout.startswith("OK sshd"), (p.stdout, p.stderr)
     args = json.loads((tmp_path / "fake-sshd.args").read_text())
-    assert args == ["-T", "-C", "user=root,host=192.0.2.10,addr=192.0.2.10"], args
+    assert args == ["-T", "-C", spec], args
 
 
 @pytest.mark.parametrize("dump,rc", [("acceptenv BASH_ENV\n" + GOOD_PUE, 0), (GOOD_PUE, 255), ("", 0)])
 def test_the_sshd_guard_fails_closed(tmp_path, dump, rc):
-    p = check_sshd("--sshd", str(fake_sshd(tmp_path, dump, rc)), "--addr", "192.0.2.10")
+    p = check_sshd("--sshd", str(fake_sshd(tmp_path, dump, rc)), *LOGIN)
     assert p.returncode == 1 and p.stdout.startswith("FAIL sshd"), (p.stdout, p.stderr)
 
 
-@pytest.mark.parametrize("args", [["--addr", "192.0.2.10,user=x"], ["--addr"], ["--port", "22"]])
-def test_the_sshd_guard_takes_only_its_own_arguments(tmp_path, args):
-    p = check_sshd("--sshd", str(fake_sshd(tmp_path, GOOD_PUE)), *args)
+BAD_ARGS = {
+    "no --addr": ["--laddr", "198.51.100.20"],
+    "no --laddr": ["--addr", "192.0.2.10"],
+    "nothing": [],
+    "--addr aa": ["--addr", "aa", "--laddr", "198.51.100.20"],
+    "--addr with a spec": ["--addr", "192.0.2.10,user=x", "--laddr", "198.51.100.20"],
+    "--addr a name": ["--addr", "operator", "--laddr", "198.51.100.20"],
+    "--addr a network": ["--addr", "192.0.2.0/24", "--laddr", "198.51.100.20"],
+    "--laddr aa": ["--addr", "192.0.2.10", "--laddr", "aa"],
+    "--lport x": [*LOGIN, "--lport", "x"],
+    "--lport 0": [*LOGIN, "--lport", "0"],
+    "--lport 70000": [*LOGIN, "--lport", "70000"],
+    "--rdomain with a spec": [*LOGIN, "--rdomain", "a,user=x"],
+    "dangling --addr": ["--laddr", "198.51.100.20", "--addr"],
+    "unknown --port": [*LOGIN, "--port", "22"],
+    "repeated --addr": [*LOGIN, "--addr", "192.0.2.11"],
+}
+
+
+@pytest.mark.parametrize("name", sorted(BAD_ARGS))
+def test_the_sshd_guard_takes_only_its_own_arguments(tmp_path, name):
+    p = check_sshd("--sshd", str(fake_sshd(tmp_path, GOOD_PUE)), *BAD_ARGS[name])
     assert p.returncode == 1 and p.stdout.startswith("FAIL sshd"), (p.stdout, p.stderr)
     assert not (tmp_path / "fake-sshd.args").exists()
 
 
 def test_the_guide_installs_the_forced_command():
     text = (REPO / "ops" / "custom-guest" / "OPERATOR.md").read_text()
-    assert ("cg_ssh_dispatch.py --check-sshd --addr <operator address> && install -m 0755 -o root -g root"
-            in text)
+    assert ("cg_ssh_dispatch.py --check-sshd --addr <operator address> --laddr <host address> && "
+            "install -m 0755 -o root -g root" in text)
     assert "chown -R root:root /opt/cathedral/cathedral-sandbox-cg-<sha7>" in text
     assert "chmod -R go-w /opt/cathedral/cathedral-sandbox-cg-<sha7>" in text
     assert 'command="/usr/local/sbin/cathedral-cg-dispatch <hotel> <sha7>",from="<operator address>",restrict' in text
@@ -517,15 +556,35 @@ def test_behind_sshd_a_group_writable_python_file_refuses_every_phase(sshd):
     assert result(ssh(sshd, f"{sshd['tool']} folders --hotel {HOTEL}"))["ok"] is True
 
 
+GUARD_CASES = {
+    # name: (config lines, extra --check-sshd args, passes)
+    "the hotel's line": ([], [], True),
+    "CG_*": (["AcceptEnv CG_*"], [], False),
+    "global BASH_ENV": (["AcceptEnv BASH_ENV"], [], False),
+    "PermitUserEnvironment yes": (["PermitUserEnvironment yes"], [], False),
+    "Match Address": (["Match Address 192.0.2.10", "    AcceptEnv LD_PRELOAD"], [], False),
+    "Match LocalAddress": (["Match LocalAddress 198.51.100.20", "    AcceptEnv *"], [], False),
+    "Match LocalPort": (["Match LocalPort 22", "    AcceptEnv *"], [], False),
+    "Match RDomain": (["Match RDomain vrf-a", "    AcceptEnv *"], ["--rdomain", "vrf-a"], False),
+    # A block for another local address does not apply to this key's login.
+    "Match another LocalAddress": (["Match LocalAddress 198.51.100.21", "    AcceptEnv *"], [], True),
+}
+
+
 @sshd_tests
-def test_behind_sshd_the_install_guard_reads_the_real_sshd(sshd):
-    """sshd -T on a real config: the test sshd passes (CG_* is not a risk); a risky AcceptEnv, globally or in a
-    Match block for the operator's address, or PermitUserEnvironment yes, fails."""
-    base = (sshd["d"] / "sshd_config").read_text()
-    for name, extra, ok in (("as is", "", True), ("global", "AcceptEnv BASH_ENV\n", False),
-                            ("user env", "PermitUserEnvironment yes\n", False),
-                            ("match", "Match Address 192.0.2.10\n    AcceptEnv LD_PRELOAD\n", False)):
-        cfg = sshd["d"] / f"sshd_config.{name.replace(' ', '-')}"
-        cfg.write_text(extra + base if not extra.startswith("Match") else base + extra)
-        p = check_sshd("--sshd", SSHD, "--config", str(cfg), "--addr", "192.0.2.10")
-        assert (p.returncode == 0 and p.stdout.startswith("OK sshd")) is ok, (name, p.stdout, p.stderr)
+@pytest.mark.parametrize("name", sorted(GUARD_CASES))
+def test_behind_sshd_the_install_guard_reads_the_real_sshd(tmp_path, name):
+    """The real sshd -T -C on a config like the hotel's, plus one change."""
+    lines, extra, ok = GUARD_CASES[name]
+    d = Path(os.path.realpath(tmp_path))
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / "hostkey")], check=True)
+    if os.geteuid() == 0:
+        Path("/run/sshd").mkdir(exist_ok=True)
+    globals_ = [ln for ln in lines if not ln.startswith(("Match", " "))]
+    match = [ln for ln in lines if ln not in globals_]
+    (d / "sshd_config").write_text("\n".join([
+        f"HostKey {d}/hostkey", "UsePAM no", *globals_, "AcceptEnv LANG LC_* COLORTERM NO_COLOR", *match, ""]))
+    p = check_sshd("--sshd", SSHD, "--config", str(d / "sshd_config"), *LOGIN, *extra)
+    assert (p.returncode == 0 and p.stdout.startswith("OK sshd")) is ok, (name, p.stdout, p.stderr)
+    # A failure is the setting itself, not sshd or the arguments.
+    assert ok or "FAIL sshd: acceptenv" in p.stdout or "FAIL sshd: permituserenvironment" in p.stdout, p.stdout
