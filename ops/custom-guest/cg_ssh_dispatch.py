@@ -1,8 +1,9 @@
 #!/usr/bin/python3 -I
 """Forced command for the operator machine's key on a custom guest hotel (AB#1008).
 
-Install on the hotel (OPERATOR.md, install step 3):
+Install on the hotel (OPERATOR.md, install step 3), after the sshd check passes:
 
+    python3 -I <checkout>/ops/custom-guest/cg_ssh_dispatch.py --check-sshd --addr <operator address> &&
     install -m 0755 -o root -g root <checkout>/ops/custom-guest/cg_ssh_dispatch.py /usr/local/sbin/cathedral-cg-dispatch
 
 and give the operator key this line in root's authorized_keys:
@@ -28,10 +29,12 @@ broker's commands): there is no shell and no quote handling to get wrong.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import stat
+import subprocess
 import sys
 
 TOOL_REL = "ops/custom-guest/custom-guest-host.sh"
@@ -51,6 +54,13 @@ PHASES: dict[str, dict[str, str]] = {
 }
 UPLOAD_NAMES = r"(vmlinuz|initrd|root\.raw)"
 FIXED_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+# sshd hands the variables it accepts to root's shell, which runs the forced command, so they act before this
+# program can drop them: LD_* loads code into the shell, BASH_ENV and ENV make it source a file, BASH_FUNC_*
+# defines functions, SHELLOPTS changes how it runs and PATH picks its programs. --check-sshd refuses an install
+# where a client could set any of them.
+RISKY_ENV = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "BASH_ENV", "ENV", "PATH", "BASH_FUNC_x%%", "SHELLOPTS")
+RISKY_PREFIXES = ("LD_", "BASH_FUNC_")
+IP_RE = re.compile(r"[0-9A-Fa-f.:]{2,45}")
 
 
 class Refused(Exception):
@@ -65,6 +75,8 @@ def check(cmd: str | None, hotel: str, tool: str, srv: str = "/srv/custom-guest"
     if not SAFE.fullmatch(cmd):
         raise Refused("a character outside letters, digits, space and ._/-")
     w = cmd.split()
+    if not w:
+        raise Refused("no command: a login shell is not offered")
     if w[0] == tool:
         if len(w) < 2 or w[1] not in PHASES:
             raise Refused("not a phase the operator sends")
@@ -151,7 +163,54 @@ def install_args(argv: list[str]) -> dict:
     return a
 
 
+def sshd_env_problems(dump: str) -> list[str]:
+    """What in an `sshd -T` dump would let a client set a variable root's shell reads. Empty means sound."""
+    accept: list[str] = []
+    user_env = None
+    for line in dump.splitlines():
+        w = line.split()
+        if w and w[0].lower() == "acceptenv":
+            accept += w[1:]
+        elif w and w[0].lower() == "permituserenvironment":
+            user_env = " ".join(w[1:])
+    problems = [f"acceptenv {p} lets a client set a variable root's shell reads" for p in accept
+                if p.startswith(RISKY_PREFIXES) or any(fnmatch.fnmatchcase(n, p) for n in RISKY_ENV)]
+    if user_env != "no":
+        problems.append(f"permituserenvironment is {user_env or 'not in the dump'}, not no")
+    return problems
+
+
+def check_sshd(argv: list[str]) -> int:
+    """--check-sshd [--addr <operator address>] [--sshd PATH] [--config FILE]: OK sshd and 0, or FAIL sshd and 1."""
+    a = {"--sshd": "/usr/sbin/sshd", "--config": None, "--addr": None}
+    try:
+        if len(argv) % 2 or any(k not in a for k in argv[::2]):
+            raise ValueError("usage: --check-sshd [--addr <operator address>] [--sshd PATH] [--config FILE]")
+        a.update(zip(argv[::2], argv[1::2]))
+        if a["--addr"] is not None and not IP_RE.fullmatch(a["--addr"]):
+            raise ValueError("--addr takes the operator's IP address")
+        cmd = [a["--sshd"], "-T"] + (["-f", a["--config"]] if a["--config"] else [])
+        if a["--addr"]:
+            # The settings for this key's own login, Match blocks included.
+            cmd += ["-C", f"user=root,host={a['--addr']},addr={a['--addr']}"]
+        p = subprocess.run(cmd, capture_output=True, text=True, env=dict(FIXED_ENV), timeout=60)
+        if p.returncode != 0:
+            raise ValueError(f"sshd -T exit {p.returncode}: {p.stderr.strip()[-300:]}")
+        problems = sshd_env_problems(p.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        problems = [str(e)]
+    if problems:
+        for line in problems:
+            print(f"FAIL sshd: {line}")
+        return 1
+    accepted = [ln.split(None, 1)[1] for ln in p.stdout.splitlines() if ln.lower().startswith("acceptenv ")]
+    print(f"OK sshd: acceptenv {' '.join(accepted) or 'none'}, permituserenvironment no")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv[:1] == ["--check-sshd"]:  # the install-time guard; a forced command's argv comes from authorized_keys
+        return check_sshd(argv[1:])
     cmd = os.environ.get("SSH_ORIGINAL_COMMAND")
     try:
         a = install_args(argv)
